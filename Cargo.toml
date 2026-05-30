@@ -10,7 +10,7 @@ serde = { version = "1", features = ["derive"] }
 image = { version = "0.25.10", features = ["png", "jpeg", "gif", "bmp", "webp", "ico", "tiff"] }
 rfd = "0.17.2"
 sysinfo = "0.39.2"
-egui_extras = { version = "0.34.2", features = ["svg"] }
+egui_extras = { version = "0.34.3", features = ["svg"] }
 chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
 jpeg-decoder = { version = "0.3.2", default-features = false }
 png = "0.18.1"
@@ -19,19 +19,20 @@ tiff = "0.11.3"
 libwebp-sys = "0.14.4"
 # HTTP client for the AI Model Manager downloads. native-tls => Windows SChannel,
 # so no extra build toolchain (avoids rustls/ring needing nasm on MSVC).
-ureq = { version = "2", default-features = false, features = ["native-tls"] }
-native-tls = "0.2"
+ureq = { version = "3.3.0", default-features = false, features = ["native-tls"] }
+native-tls = "0.2.18"
 # ONNX Runtime bindings for AI tagging inference. download-binaries (default)
 # fetches a prebuilt ORT at build time; copy-dylibs stages the DLL next to the exe.
 ort = "2.0.0-rc.12"
 # Per-user data dir for downloaded models (writable even when installed read-only).
-dirs = "5"
+dirs = "6.0.0"
 # Embedded VLC playback — needs the VLC SDK + VLC_LIB_DIR (see .cargo/config.toml).
-vlc-rs = { version = "0.3", optional = true }
+vlc-rs = { version = "0.3.0", optional = true }
+zip = { version = "8.6.0", default-features = false, features = ["deflate", "aes-crypto"] }
 
 [build-dependencies]
 # Embeds the Windows app icon (and version info) into the exe at build time.
-winresource = "0.1"
+winresource = "0.1.31"
 
 [features]
 # In-app video playback + poster thumbnails via libVLC, on by default so a plain

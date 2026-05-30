@@ -44,6 +44,7 @@ use theme::*;
 
 mod ai_models;
 mod ai_orb;
+mod backup;
 mod image_cache;
 mod left_browser;
 mod right_details;
@@ -135,6 +136,9 @@ fn apply_theme(ctx: &egui::Context) {
 // ---------------------------------------------------------------------------
 struct ViewerApp {
     images: Vec<PathBuf>,
+    /// The folder last opened via the folder button (the backup root). `None`
+    /// when the list was built only from individually dropped files.
+    current_folder: Option<PathBuf>,
     /// CACHED list of indexes mapping into `self.images` after the search string is applied
     filtered: Vec<usize>,
     selected: Option<usize>,
@@ -144,6 +148,8 @@ struct ViewerApp {
     // Panel States
     right_state: right_details::RightPanelState,
     settings: settings::Settings,
+    /// The "Create Backup" dialog (top bar).
+    backup: backup::BackupState,
     /// Tag Manager view state, shown in the right panel when selected from its
     /// menu dropdown. In-memory only for now — not persisted or wired into
     /// tagging behaviour yet.
@@ -168,12 +174,14 @@ impl Default for ViewerApp {
     fn default() -> Self {
         Self {
             images: Vec::new(),
+            current_folder: None,
             filtered: Vec::new(),
             selected: None,
             search: String::new(),
             stats: top_bar::SystemStats::default(),
             right_state: right_details::RightPanelState::default(),
             settings: settings::Settings::default(),
+            backup: backup::BackupState::default(),
             tag_manager: tag_manager::TagManagerState::default(),
             // Separate large-decode gates: the viewer gets a dedicated permit so
             // the clicked image always decodes immediately (priority); the browser
@@ -206,8 +214,21 @@ impl ViewerApp {
     /// Replace the browser contents with all images found directly in `dir`.
     fn load_folder(&mut self, dir: &std::path::Path) {
         self.images = images_in_dir(dir);
+        self.current_folder = Some(dir.to_path_buf());
         self.selected = if self.images.is_empty() { None } else { Some(0) };
         self.update_filtered();
+    }
+
+    /// Open the Create Backup dialog for the current folder and its media. The
+    /// backup root is the last-opened folder, falling back to the first image's
+    /// parent (e.g. when files were dropped in individually).
+    fn start_backup(&mut self) {
+        let source = self
+            .current_folder
+            .clone()
+            .or_else(|| self.images.first().and_then(|p| p.parent().map(|d| d.to_path_buf())))
+            .unwrap_or_default();
+        self.backup.open(source, self.images.clone());
     }
 
     fn add_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
@@ -368,7 +389,11 @@ impl ViewerApp {
                     image_cache::Cached::Ready(tex) => show_fitted(ui, &tex, false),
                     image_cache::Cached::Animated(frame) => {
                         show_fitted(ui, &frame, false);
-                        ui.ctx().request_repaint(); // keep playing the GIF
+                        // Keep playing the GIF, but cap to ~60 Hz instead of
+                        // repainting (and relaying out the whole app) as fast as
+                        // the monitor allows — GIFs top out at 50 fps, so this is
+                        // smooth while leaving CPU for decoding.
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
                     }
                     image_cache::Cached::Failed => {
                         ui.centered_and_justified(|ui| {
@@ -448,6 +473,8 @@ impl eframe::App for ViewerApp {
         match top_bar::show(ui, &self.stats) {
             top_bar::TopBarAction::OpenFolder => self.open_dialog(),
             top_bar::TopBarAction::OpenSettings => self.settings.open = !self.settings.open,
+            top_bar::TopBarAction::CreateBackup => self.start_backup(),
+            top_bar::TopBarAction::FindIssues => {}
             top_bar::TopBarAction::None => {}
         }
 
@@ -538,6 +565,9 @@ impl eframe::App for ViewerApp {
         // 4. Settings window (floats on top when opened from the gear).
         settings::show(ui.ctx(), &mut self.settings);
 
+        // 5. Backup dialog (floats on top when opened from the top bar).
+        self.backup.show(ui.ctx());
+
         // Keep the live graphs animating without busy-looping.
         ui.ctx().request_repaint_after(Duration::from_millis(250));
     }
@@ -616,7 +646,7 @@ pub(crate) fn svg_button(ui: &mut egui::Ui, source: egui::ImageSource<'_>, toolt
 // ---------------------------------------------------------------------------
 // Small utilities
 // ---------------------------------------------------------------------------
-fn is_image(p: &std::path::Path) -> bool {
+pub(crate) fn is_image(p: &std::path::Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
         .map(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))

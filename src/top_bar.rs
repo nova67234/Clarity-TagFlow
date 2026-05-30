@@ -83,6 +83,10 @@ pub enum TopBarAction {
     OpenFolder,
     /// The user clicked the settings gear.
     OpenSettings,
+    /// The user clicked "Create Backup".
+    CreateBackup,
+    /// The user clicked "Find Issues".
+    FindIssues,
 }
 
 /// Render the top bar. Returns any action the app should perform.
@@ -116,9 +120,13 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats) -> TopBarAction {
                             }
 
                             ui.add_space(6.0);
-                            bar_button(ui, "Create Backup", 150.0);
+                            if bar_button(ui, "Create Backup", 150.0).clicked() {
+                                action = TopBarAction::CreateBackup;
+                            }
                             ui.add_space(6.0);
-                            bar_button(ui, "Find Issues", 130.0);
+                            if bar_button(ui, "Find Issues", 130.0).clicked() {
+                                action = TopBarAction::FindIssues;
+                            }
                             ui.add_space(14.0);
 
                             // CENTRE: CPU / RAM live graphs in the leftover space.
