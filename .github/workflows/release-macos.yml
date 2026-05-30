@@ -1,7 +1,12 @@
 name: Build macOS app
 
-# Build a universal (Apple Silicon + Intel) .app and package it as a .dmg.
+# Build an Apple Silicon (arm64) .app and package it as a .dmg.
 # Triggered manually, or automatically when a v* tag is pushed.
+#
+# Apple Silicon only: the `ort` crate (ONNX Runtime, used for AI tagging) ships
+# no prebuilt binary for x86_64-apple-darwin, so an Intel/universal build can't
+# link without compiling ONNX Runtime from source. Every Mac since late 2020 is
+# Apple Silicon; Intel Macs aren't supported by this build.
 on:
   workflow_dispatch:
   push:
@@ -9,14 +14,14 @@ on:
 
 jobs:
   macos:
-    runs-on: macos-14 # Apple Silicon runner; we also cross-build x86_64.
+    runs-on: macos-14 # Apple Silicon runner.
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (both Apple targets)
+      - name: Install Rust (Apple Silicon target)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: aarch64-apple-darwin
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -25,16 +30,11 @@ jobs:
       - name: Build (Apple Silicon)
         run: cargo build --release --no-default-features --target aarch64-apple-darwin
 
-      - name: Build (Intel)
-        run: cargo build --release --no-default-features --target x86_64-apple-darwin
-
-      - name: Combine into a universal binary
+      - name: Stage the binary
         run: |
           mkdir -p build
-          lipo -create -output build/Clarity_TagFlow \
-            target/aarch64-apple-darwin/release/Clarity_TagFlow \
-            target/x86_64-apple-darwin/release/Clarity_TagFlow
-          lipo -info build/Clarity_TagFlow
+          cp target/aarch64-apple-darwin/release/Clarity_TagFlow build/Clarity_TagFlow
+          file build/Clarity_TagFlow
 
       - name: Generate AppIcon.icns from the 1024px PNG
         run: |
@@ -54,7 +54,7 @@ jobs:
           chmod +x "$APP/Contents/MacOS/Clarity_TagFlow"
           cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
           cp installer/Info.plist "$APP/Contents/Info.plist"
-          # Ad-hoc sign so it launches on Apple Silicon (lipo invalidates signatures).
+          # Ad-hoc sign so it launches on Apple Silicon without a Gatekeeper block.
           codesign --force --deep --sign - "$APP"
           codesign --verify --verbose "$APP" || true
 
