@@ -12,6 +12,11 @@ on:
   push:
     tags: ["v*"]
 
+# Needed so the tag build can create/attach to the GitHub Release; the default
+# workflow token is read-only.
+permissions:
+  contents: write
+
 jobs:
   macos:
     runs-on: macos-14 # Apple Silicon runner.

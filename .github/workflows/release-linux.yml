@@ -7,6 +7,11 @@ on:
   push:
     tags: ["v*"]
 
+# Needed so the tag build can create/attach to the GitHub Release; the default
+# workflow token is read-only.
+permissions:
+  contents: write
+
 jobs:
   linux:
     # 24.04 ships glibc 2.39. The prebuilt ONNX Runtime the `ort` crate downloads

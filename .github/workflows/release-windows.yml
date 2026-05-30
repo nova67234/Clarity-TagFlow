@@ -7,6 +7,11 @@ on:
   push:
     tags: ["v*"]
 
+# Needed so the tag build can create/attach to the GitHub Release; the default
+# workflow token is read-only.
+permissions:
+  contents: write
+
 jobs:
   windows:
     runs-on: windows-2022
