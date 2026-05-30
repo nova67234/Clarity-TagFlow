@@ -1,0 +1,22 @@
+# Rust build output
+/target
+
+# Packaged build artifacts (regenerated locally / by CI — don't commit)
+/dist
+/installer/Output
+/Clarity_TagFlow.zip
+*.dmg
+
+# Downloaded AI models (1.7GB; fetched in-app via the AI Model Manager)
+/tools
+
+# Backups created by the app while testing
+/images/backups
+
+# Debug screenshots
+/images/*.png
+
+# Editor / tooling local state
+/.idea
+/.claude
+/.vscode

@@ -22,14 +22,9 @@ use std::thread;
 use std::time::Duration;
 
 use eframe::egui;
-use image::AnimationDecoder;
 
-/// GIF frames are capped smaller than stills — they're low-res by nature and an
-/// animation holds one texture *per frame*, so this keeps total memory sane.
-const GIF_MAX_EDGE: u32 = 512;
-/// Animation frames shorter than this are clamped (matches browser behaviour and
-/// avoids hyper-speed / divide-by-zero on 0-delay GIFs).
-const MIN_FRAME_DELAY: Duration = Duration::from_millis(20);
+mod anim;
+use anim::{current_frame, stream_gif, AnimFrame, ANIM_FRAMES_PER_FRAME, MIN_FRAME_DELAY};
 
 /// Pixel count (≈ 4K: 3840×2160 ≈ 8.3 MP) at/above which a decode is "large".
 const LARGE_PIXELS: u64 = 8_000_000;
@@ -80,12 +75,6 @@ fn large_decode_permit<'a>(path: &Path, gate: &'a Semaphore) -> Option<Semaphore
     (pixels >= LARGE_PIXELS).then(|| gate.acquire())
 }
 
-/// One uploaded frame of an animation.
-struct AnimFrame {
-    tex: egui::TextureHandle,
-    delay: Duration,
-}
-
 /// State of a single cached image.
 enum Slot {
     Loading,
@@ -93,6 +82,15 @@ enum Slot {
     Animated {
         frames: Vec<AnimFrame>,
         total: Duration,
+        /// egui time (seconds) when the first frame was uploaded — the playback
+        /// clock's zero point, so position is measured from when the GIF started,
+        /// not from absolute time.
+        start: f64,
+        /// `false` while more frames are still streaming in from the decoder.
+        /// Playback starts on the first frame and is visible immediately; until
+        /// `done`, it plays *forward only* and holds on the latest decoded frame
+        /// rather than looping over a partial animation. Once `done`, it loops.
+        done: bool,
     },
     Failed,
 }
@@ -113,10 +111,16 @@ pub enum Cached {
     Failed,
 }
 
-/// What a worker produces for a path: a still image or a sequence of GIF frames.
+/// What a worker produces for a path. A still arrives in one message; a GIF is
+/// streamed as a series of [`DecodedImage::AnimChunk`] messages (so the first
+/// frames can be shown before the whole animation has decoded), the last of
+/// which has `done = true`.
 enum DecodedImage {
     Still(egui::ColorImage),
-    Animated(Vec<(egui::ColorImage, Duration)>),
+    AnimChunk {
+        frames: Vec<(egui::ColorImage, Duration)>,
+        done: bool,
+    },
 }
 
 type Decoded = (PathBuf, Option<DecodedImage>);
@@ -213,50 +217,88 @@ impl ImageCache {
     pub fn begin_frame(&mut self, ctx: &egui::Context) {
         self.frame = self.frame.wrapping_add(1);
 
-        // Upload only a few finished decodes per frame (see `max_uploads_per_frame`).
-        let mut processed = 0;
-        while processed < self.max_uploads_per_frame {
+        // Upload finished decodes, but bound the GPU work per frame so a burst
+        // can't stutter the UI thread. Big viewer stills are limited tightly
+        // (`max_uploads_per_frame`); small streamed GIF frames get their own,
+        // larger budget so an animation drains quickly while still playing.
+        let mut stills = 0;
+        let mut anim_frames = 0;
+        let mut did_work = false;
+        while stills < self.max_uploads_per_frame && anim_frames < ANIM_FRAMES_PER_FRAME {
             let Ok((path, decoded)) = self.results.try_recv() else { break };
-            let slot = self.build_slot(ctx, &path, decoded);
-            // Keep it only if the entry still exists (may have been evicted while
-            // the decode was in flight; if so, drop the result).
-            if let Some(entry) = self.entries.get_mut(&path) {
-                entry.slot = slot;
+            match &decoded {
+                Some(DecodedImage::Still(_)) | None => stills += 1,
+                Some(DecodedImage::AnimChunk { frames, .. }) => anim_frames += frames.len(),
             }
-            processed += 1;
+            self.apply_decoded(ctx, &path, decoded);
+            did_work = true;
         }
-        if processed > 0 {
+        if did_work {
             // Show what we just uploaded, and come back next frame to drain the rest.
             ctx.request_repaint();
         }
         self.evict();
     }
 
-    /// Upload a finished decode into GPU texture(s) and record its aspect ratio.
-    fn build_slot(&mut self, ctx: &egui::Context, path: &Path, decoded: Option<DecodedImage>) -> Slot {
+    /// Upload a finished decode (or a streamed GIF chunk) into GPU texture(s) and
+    /// record its aspect ratio. GIF chunks append to the entry's existing frames,
+    /// so playback can begin before the whole animation has arrived.
+    fn apply_decoded(&mut self, ctx: &egui::Context, path: &Path, decoded: Option<DecodedImage>) {
         match decoded {
             Some(DecodedImage::Still(img)) => {
                 self.record_aspect(path, img.size);
                 let name = format!("img:{}", path.display());
-                Slot::Ready(ctx.load_texture(name, img, egui::TextureOptions::LINEAR))
+                let tex = ctx.load_texture(name, img, egui::TextureOptions::LINEAR);
+                if let Some(entry) = self.entries.get_mut(path) {
+                    entry.slot = Slot::Ready(tex);
+                }
             }
-            Some(DecodedImage::Animated(raw)) if !raw.is_empty() => {
-                self.record_aspect(path, raw[0].0.size);
-                let mut total = Duration::ZERO;
-                let frames = raw
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (img, delay))| {
-                        let delay = delay.max(MIN_FRAME_DELAY);
-                        total += delay;
-                        let name = format!("img:{}#{}", path.display(), i);
-                        let tex = ctx.load_texture(name, img, egui::TextureOptions::LINEAR);
-                        AnimFrame { tex, delay }
-                    })
-                    .collect();
-                Slot::Animated { frames, total }
+            Some(DecodedImage::AnimChunk { frames, done }) => {
+                if let Some((img, _)) = frames.first() {
+                    self.record_aspect(path, img.size);
+                }
+                // Entry may have been evicted while the decode was in flight.
+                let Some(entry) = self.entries.get_mut(path) else { return };
+                // Append onto an in-progress animation, or start a new one (with
+                // the playback clock anchored to now, when its first frame lands).
+                let (frame_vec, total) = match &mut entry.slot {
+                    Slot::Animated { frames, total, .. } => (frames, total),
+                    _ => {
+                        entry.slot = Slot::Animated {
+                            frames: Vec::new(),
+                            total: Duration::ZERO,
+                            start: ctx.input(|i| i.time),
+                            done: false,
+                        };
+                        match &mut entry.slot {
+                            Slot::Animated { frames, total, .. } => (frames, total),
+                            _ => unreachable!(),
+                        }
+                    }
+                };
+                for (img, delay) in frames {
+                    let delay = delay.max(MIN_FRAME_DELAY);
+                    *total += delay;
+                    let name = format!("img:{}#{}", path.display(), frame_vec.len());
+                    let tex = ctx.load_texture(name, img, egui::TextureOptions::LINEAR);
+                    frame_vec.push(AnimFrame { tex, delay });
+                }
+                // Mark completion / fall back to Failed if a GIF yielded no frames.
+                if let Slot::Animated { frames, done: d, .. } = &mut entry.slot {
+                    if frames.is_empty() {
+                        entry.slot = Slot::Failed;
+                    } else {
+                        *d = done;
+                    }
+                }
             }
-            _ => Slot::Failed,
+            None => {
+                if let Some(entry) = self.entries.get_mut(path) {
+                    if matches!(entry.slot, Slot::Loading) {
+                        entry.slot = Slot::Failed;
+                    }
+                }
+            }
         }
     }
 
@@ -274,7 +316,9 @@ impl ImageCache {
             entry.last_used = frame;
             return match &entry.slot {
                 Slot::Ready(tex) => Cached::Ready(tex.clone()),
-                Slot::Animated { frames, total } => Cached::Animated(current_frame(frames, *total, now)),
+                Slot::Animated { frames, total, start, done } => {
+                    Cached::Animated(current_frame(frames, *total, *start, now, *done))
+                }
                 Slot::Loading => Cached::Loading,
                 Slot::Failed => Cached::Failed,
             };
@@ -331,22 +375,6 @@ impl ImageCache {
     }
 }
 
-/// Pick the animation frame to show at time `now` (seconds), looping.
-fn current_frame(frames: &[AnimFrame], total: Duration, now: f64) -> egui::TextureHandle {
-    if frames.len() == 1 || total.is_zero() {
-        return frames[0].tex.clone();
-    }
-    let mut t = (now * 1000.0).rem_euclid(total.as_millis() as f64);
-    for f in frames {
-        let ms = f.delay.as_millis() as f64;
-        if t < ms {
-            return f.tex.clone();
-        }
-        t -= ms;
-    }
-    frames[frames.len() - 1].tex.clone()
-}
-
 fn worker_loop(queue: JobQueue, results: Sender<Decoded>, max_edge: Arc<AtomicU32>, animate: bool, gate: Arc<Semaphore>) {
     let (lock, cv) = &*queue;
     loop {
@@ -361,24 +389,22 @@ fn worker_loop(queue: JobQueue, results: Sender<Decoded>, max_edge: Arc<AtomicU3
         };
         // Read the resolution per job so a live change (e.g. HD toggle) applies.
         let edge = max_edge.load(Ordering::Relaxed);
-        let decoded = decode(&job, edge, animate, &gate);
-        if results.send((job, decoded)).is_err() {
+        let is_gif = job
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("gif"))
+            .unwrap_or(false);
+
+        let alive = if animate && is_gif {
+            // GIF: stream frames as they decode (sends several messages itself).
+            stream_gif(&job, &results, gate.as_ref())
+        } else {
+            let decoded = decode_still(&job, edge, &gate).map(DecodedImage::Still);
+            results.send((job, decoded)).is_ok()
+        };
+        if !alive {
             break; // UI side is gone; stop the worker.
         }
-    }
-}
-
-fn decode(path: &Path, max_edge: u32, animate: bool, gate: &Semaphore) -> Option<DecodedImage> {
-    let is_gif = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("gif"))
-        .unwrap_or(false);
-
-    if animate && is_gif {
-        decode_gif(path, gate).map(DecodedImage::Animated)
-    } else {
-        decode_still(path, max_edge, gate).map(DecodedImage::Still)
     }
 }
 
@@ -639,34 +665,6 @@ fn decode_webp_scaled(path: &Path, src_w: u32, src_h: u32, max_edge: u32) -> Opt
         webp::WebPFreeDecBuffer(&mut config.output);
         result
     }
-}
-
-/// Decode every frame of an animated GIF (composited to the full canvas), each
-/// downscaled to [`GIF_MAX_EDGE`], paired with its display delay.
-fn decode_gif(path: &Path, gate: &Semaphore) -> Option<Vec<(egui::ColorImage, Duration)>> {
-    // Throttle large decodes so a burst of them can't spike RAM and freeze the UI.
-    let _gate = large_decode_permit(path, gate);
-
-    let file = std::fs::File::open(path).ok()?;
-    let decoder = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(file)).ok()?;
-    let frames = decoder.into_frames().collect_frames().ok()?;
-    if frames.is_empty() {
-        return None;
-    }
-    let out = frames
-        .into_iter()
-        .map(|frame| {
-            let delay = Duration::from(frame.delay());
-            let mut buf = frame.into_buffer();
-            if buf.width() > GIF_MAX_EDGE || buf.height() > GIF_MAX_EDGE {
-                buf = image::DynamicImage::ImageRgba8(buf)
-                    .thumbnail(GIF_MAX_EDGE, GIF_MAX_EDGE)
-                    .to_rgba8();
-            }
-            (color_image(&buf), delay)
-        })
-        .collect();
-    Some(out)
 }
 
 fn color_image(rgba: &image::RgbaImage) -> egui::ColorImage {

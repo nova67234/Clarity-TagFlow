@@ -459,11 +459,18 @@ fn download_all(files: &[(String, String)], folder: &str, prog: &Progress) -> Re
     std::fs::create_dir_all(&dir).map_err(|e| format!("Create {}: {e}", dir.display()))?;
 
     // native-tls => Windows SChannel; follow HuggingFace's redirect to the CDN.
-    let connector = native_tls::TlsConnector::new().map_err(|e| format!("TLS: {e}"))?;
-    let agent = ureq::builder()
-        .tls_connector(Arc::new(connector))
-        .redirects(10)
-        .build();
+    // ureq 3.x defaults to rustls even with the native-tls feature on, so the
+    // provider must be selected explicitly (avoids rustls/ring needing nasm on
+    // MSVC — see Cargo.toml). The connector is managed by ureq internally now.
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .build(),
+        )
+        .max_redirects(10)
+        .build()
+        .into();
 
     let n = files.len() as f32;
     for (i, (name, url)) in files.iter().enumerate() {
@@ -471,13 +478,15 @@ fn download_all(files: &[(String, String)], folder: &str, prog: &Progress) -> Re
 
         let resp = agent.get(url).call().map_err(|e| format!("{name}: {e}"))?;
         let total_len: u64 = resp
-            .header("Content-Length")
+            .headers()
+            .get("Content-Length")
+            .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
         let tmp = dir.join(format!("{name}.part"));
         let mut out = std::fs::File::create(&tmp).map_err(|e| format!("{name}: {e}"))?;
-        let mut reader = resp.into_reader();
+        let mut reader = resp.into_body().into_reader();
         let mut buf = vec![0u8; 1 << 16];
         let mut got: u64 = 0;
         loop {
