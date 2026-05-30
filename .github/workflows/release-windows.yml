@@ -1,0 +1,45 @@
+name: Build Windows app
+
+# Build the Windows .exe (icon embedded via build.rs) and package it as a .zip.
+# Triggered manually, or automatically when a v* tag is pushed.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # Video playback (libVLC) needs the VLC SDK, which isn't on the runner, so
+      # build without it. The app's icon is still embedded by build.rs.
+      - name: Build
+        run: cargo build --release --no-default-features
+
+      - name: Package into a .zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ClarityTagFlow-windows | Out-Null
+          Copy-Item target/release/Clarity_TagFlow.exe ClarityTagFlow-windows/
+          Compress-Archive -Path ClarityTagFlow-windows/* -DestinationPath ClarityTagFlow-windows.zip -Force
+
+      - name: Upload .zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClarityTagFlow-windows-zip
+          path: ClarityTagFlow-windows.zip
+
+      # When triggered by a v* tag, also attach the .zip to the GitHub Release.
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ClarityTagFlow-windows.zip
