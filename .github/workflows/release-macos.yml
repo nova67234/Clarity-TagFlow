@@ -1,0 +1,80 @@
+name: Build macOS app
+
+# Build a universal (Apple Silicon + Intel) .app and package it as a .dmg.
+# Triggered manually, or automatically when a v* tag is pushed.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  macos:
+    runs-on: macos-14 # Apple Silicon runner; we also cross-build x86_64.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (both Apple targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # Video playback (libVLC) is Windows-only here, so build without it.
+      - name: Build (Apple Silicon)
+        run: cargo build --release --no-default-features --target aarch64-apple-darwin
+
+      - name: Build (Intel)
+        run: cargo build --release --no-default-features --target x86_64-apple-darwin
+
+      - name: Combine into a universal binary
+        run: |
+          mkdir -p build
+          lipo -create -output build/Clarity_TagFlow \
+            target/aarch64-apple-darwin/release/Clarity_TagFlow \
+            target/x86_64-apple-darwin/release/Clarity_TagFlow
+          lipo -info build/Clarity_TagFlow
+
+      - name: Generate AppIcon.icns from the 1024px PNG
+        run: |
+          mkdir -p AppIcon.iconset
+          for s in 16 32 64 128 256 512; do
+            sips -z $s $s icons/app-icon.PNG --out "AppIcon.iconset/icon_${s}x${s}.png"
+            d=$((s * 2))
+            sips -z $d $d icons/app-icon.PNG --out "AppIcon.iconset/icon_${s}x${s}@2x.png"
+          done
+          iconutil -c icns AppIcon.iconset -o AppIcon.icns
+
+      - name: Assemble Clarity TagFlow.app
+        run: |
+          APP="Clarity TagFlow.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp build/Clarity_TagFlow "$APP/Contents/MacOS/Clarity_TagFlow"
+          chmod +x "$APP/Contents/MacOS/Clarity_TagFlow"
+          cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+          cp installer/Info.plist "$APP/Contents/Info.plist"
+          # Ad-hoc sign so it launches on Apple Silicon (lipo invalidates signatures).
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --verbose "$APP" || true
+
+      - name: Create .dmg (with /Applications drop target)
+        run: |
+          mkdir -p dmgroot
+          cp -R "Clarity TagFlow.app" dmgroot/
+          ln -s /Applications dmgroot/Applications
+          hdiutil create -volname "Clarity TagFlow" \
+            -srcfolder dmgroot -ov -format UDZO "ClarityTagFlow-macOS.dmg"
+
+      - name: Upload .dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClarityTagFlow-macOS-dmg
+          path: ClarityTagFlow-macOS.dmg
+
+      # When triggered by a v* tag, also attach the .dmg to the GitHub Release.
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ClarityTagFlow-macOS.dmg
