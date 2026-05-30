@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width="512" height="512"
+  viewBox="0 0 512 512"
+>
+  <!-- Tilt right: rotate(10deg) around center (256,256) -->
+  <g transform="rotate(10 256 256)">
+    <path
+      d="M256 468
+         C256 468 38 332 38 196
+         C38 118 96 74 162 74
+         C208 74 238 98 256 124
+         C274 98 304 74 350 74
+         C416 74 474 118 474 196
+         C474 332 256 468 256 468 Z"
+      fill="#FF5FA0"
+    />
+  </g>
+</svg>

@@ -1,0 +1,42 @@
+[package]
+name = "Clarity_TagFlow"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# "persistence" enables eframe's storage (saves settings to the OS data dir).
+eframe = { version = "0.34.2", features = ["persistence"] }
+serde = { version = "1", features = ["derive"] }
+image = { version = "0.25.10", features = ["png", "jpeg", "gif", "bmp", "webp", "ico", "tiff"] }
+rfd = "0.17.2"
+sysinfo = "0.39.2"
+egui_extras = { version = "0.34.2", features = ["svg"] }
+chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
+jpeg-decoder = { version = "0.3.2", default-features = false }
+png = "0.18.1"
+tiff = "0.11.3"
+# libwebp (C) for reduced-resolution WebP decode — image-webp (pure Rust) can't scale.
+libwebp-sys = "0.14.4"
+# HTTP client for the AI Model Manager downloads. native-tls => Windows SChannel,
+# so no extra build toolchain (avoids rustls/ring needing nasm on MSVC).
+ureq = { version = "2", default-features = false, features = ["native-tls"] }
+native-tls = "0.2"
+# ONNX Runtime bindings for AI tagging inference. download-binaries (default)
+# fetches a prebuilt ORT at build time; copy-dylibs stages the DLL next to the exe.
+ort = "2.0.0-rc.12"
+# Per-user data dir for downloaded models (writable even when installed read-only).
+dirs = "5"
+# Embedded VLC playback — needs the VLC SDK + VLC_LIB_DIR (see .cargo/config.toml).
+vlc-rs = { version = "0.3", optional = true }
+
+[build-dependencies]
+# Embeds the Windows app icon (and version info) into the exe at build time.
+winresource = "0.1"
+
+[features]
+# In-app video playback + poster thumbnails via libVLC, on by default so a plain
+# `cargo run` (and the IDE's Run button) play videos embedded. Build with
+# `--no-default-features` to drop the VLC SDK requirement; videos then show a
+# "couldn't start playback" notice instead.
+default = ["vlc"]
+vlc = ["dep:vlc-rs"]
