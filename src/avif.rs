@@ -47,8 +47,8 @@ pub fn decode_avif(path: &std::path::Path) -> Option<RgbaImage> {
     if ext == "heic" {
         return decode_heic(path);
     }
-    if ext == "dng" {
-        return decode_dng(path);
+    if matches!(ext.as_str(), "dng" | "arw") {
+        return decode_raw(path);
     }
 
     let bytes = std::fs::read(path).ok()?;
@@ -161,34 +161,37 @@ fn read_f32(row: &[u8], o: usize) -> f64 {
     f32::from_le_bytes(b) as f64
 }
 
-/// Decode a camera-raw DNG to display-ready sRGB.
+/// Decode a camera-raw file (DNG, Sony ARW, …) to display-ready sRGB.
 ///
-/// Tries a full raw develop first ([`decode_dng_raw`]); if that fails — e.g. the
-/// camera model isn't supported by zenraw's rawloader backend (DJI drones and
-/// many newer bodies report `Unsupported`) — falls back to the camera-rendered
-/// JPEG preview embedded in the file ([`decode_dng_embedded_jpeg`]). The preview
-/// has correct colour and is usually full or near-full resolution, so the file
-/// still displays well even when we can't develop its raw sensor data.
-fn decode_dng(path: &std::path::Path) -> Option<RgbaImage> {
+/// zenraw auto-detects the format from the bytes, so a single path handles every
+/// raw type its rawloader backend supports — we just dispatch any raw extension
+/// here. Tries a full raw develop first ([`decode_raw_develop`]); if that fails —
+/// e.g. the camera model isn't supported by the backend (DJI drones, some newer
+/// Sony bodies, exotic compression all report `Unsupported`) — falls back to the
+/// camera-rendered JPEG preview embedded in the file ([`decode_raw_embedded_jpeg`]).
+/// The preview has correct colour and is usually full or near-full resolution, so
+/// the file still displays well even when we can't develop its raw sensor data.
+fn decode_raw(path: &std::path::Path) -> Option<RgbaImage> {
     let bytes = std::fs::read(path).ok()?;
-    if let Some(img) = decode_dng_raw(&bytes) {
+    if let Some(img) = decode_raw_develop(&bytes) {
         return Some(img);
     }
-    decode_dng_embedded_jpeg(&bytes)
+    decode_raw_embedded_jpeg(&bytes)
 }
 
-/// Scan a DNG/TIFF for embedded JPEG previews and decode the largest one.
+/// Scan a raw file (DNG/ARW/TIFF-based) for embedded JPEG previews and decode the
+/// largest one.
 ///
-/// Every DNG carries at least one camera-rendered JPEG (a small thumbnail, and
-/// usually a larger preview). We byte-scan for JPEG start markers (`FF D8 FF`),
+/// Every such file carries at least one camera-rendered JPEG (a small thumbnail,
+/// and usually a larger preview). We byte-scan for JPEG start markers (`FF D8 FF`),
 /// decode each candidate, and keep the one with the most pixels. Used as the
 /// fallback when the raw develop can't run.
 ///
 /// The previews are stored in *sensor* orientation; the rotation/flip needed to
-/// view them upright lives in the DNG container's TIFF `Orientation` tag (274),
-/// not inside each preview JPEG — so we read that once and apply it (falling back
-/// to the JPEG's own EXIF orientation if the container has none).
-fn decode_dng_embedded_jpeg(bytes: &[u8]) -> Option<RgbaImage> {
+/// view them upright lives in the container's TIFF `Orientation` tag (274), not
+/// inside each preview JPEG — so we read that once and apply it (falling back to
+/// the JPEG's own EXIF orientation if the container has none).
+fn decode_raw_embedded_jpeg(bytes: &[u8]) -> Option<RgbaImage> {
     let container_orientation = tiff_orientation(bytes);
 
     let mut best: Option<RgbaImage> = None;
@@ -285,9 +288,9 @@ fn decode_jpeg_oriented(bytes: &[u8], container_orientation: Option<u8>) -> Opti
     Some(img.into_rgba8())
 }
 
-/// Full raw develop of a DNG via zenraw. Returns `None` if zenraw can't decode
-/// the file (unsupported camera, exotic compression, …) so the caller can fall
-/// back to the embedded preview.
+/// Full raw develop of a camera-raw file (DNG/ARW/…) via zenraw. Returns `None`
+/// if zenraw can't decode the file (unsupported camera, exotic compression, …) so
+/// the caller can fall back to the embedded preview.
 ///
 /// zenraw 0.2's built-in `Develop` mode renders real DNGs with a strong magenta
 /// cast: its camera→sRGB matrix isn't white-preserving (it normalises the
@@ -306,7 +309,7 @@ fn decode_jpeg_oriented(bytes: &[u8], container_orientation: Option<u8>) -> Opti
 /// 2. **White-preserving camera→sRGB matrix** (see [`camera_to_srgb_matrix`]),
 ///    so a neutral (gray-world-balanced) pixel maps to neutral sRGB.
 /// 3. **sRGB transfer curve.**
-fn decode_dng_raw(bytes: &[u8]) -> Option<RgbaImage> {
+fn decode_raw_develop(bytes: &[u8]) -> Option<RgbaImage> {
     let cfg = zenraw::RawDecodeConfig::new().with_output(zenraw::OutputMode::CameraRaw);
     let out = zenraw::decode(bytes, &cfg, &enough::Unstoppable).ok()?;
 
@@ -598,28 +601,32 @@ mod tests {
         }
     }
 
-    // cargo test --no-default-features --features avif dng_smoke -- --nocapture
+    // Decode every raw sample (DNG + ARW) to a PNG so the result can be eyeballed.
+    // Skips cleanly when the local sample folders are absent.
+    // cargo test --no-default-features --features avif raw_smoke -- --nocapture
     #[test]
-    fn dng_smoke() {
-        let dir = std::path::Path::new("tests/DNG");
-        if !dir.is_dir() {
-            eprintln!("skipping dng_smoke: no tests/DNG folder");
-            return;
-        }
-        for entry in std::fs::read_dir(dir).unwrap().flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("dng"))
-                != Some(true)
-            {
+    fn raw_smoke() {
+        for (dir, ext) in [("tests/DNG", "dng"), ("tests/ARW", "arw")] {
+            let dir = std::path::Path::new(dir);
+            if !dir.is_dir() {
+                eprintln!("skipping {ext}: no {} folder", dir.display());
                 continue;
             }
-            match decode_avif(&p) {
-                Some(img) => {
-                    let out = format!("{}.decoded.png", p.display());
-                    img.save(&out).unwrap();
-                    println!("OK {} -> {}x{} -> {out}", p.display(), img.width(), img.height());
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case(ext))
+                    != Some(true)
+                {
+                    continue;
                 }
-                None => println!("FAIL {}", p.display()),
+                match decode_avif(&p) {
+                    Some(img) => {
+                        let out = format!("{}.decoded.png", p.display());
+                        img.save(&out).unwrap();
+                        println!("OK {} -> {}x{} -> {out}", p.display(), img.width(), img.height());
+                    }
+                    None => println!("FAIL {}", p.display()),
+                }
             }
         }
     }

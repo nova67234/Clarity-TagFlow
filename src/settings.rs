@@ -31,7 +31,7 @@ pub struct Settings {
     pub hd_thumbnails: bool,
     /// Ask for confirmation before deleting an image and its sidecar.
     pub confirm_before_delete: bool,
-    /// Recognise extended image formats (AVIF / HEIC / DNG) that rely on heavy C-library
+    /// Recognise extended image formats (AVIF / HEIC / RAW) that rely on heavy C-library
     /// decoders. Off by default. Only has an effect when the app was *built* with
     /// the matching support compiled in (the `avif` / `heic` cargo features);
     /// otherwise opening one shows a "couldn't load" notice.
@@ -146,12 +146,12 @@ pub fn show(ctx: &egui::Context, settings: &mut Settings) {
                     ui.add_space(6.0);
                     ui.checkbox(
                         &mut settings.enable_extended_formats,
-                        egui::RichText::new("Enable extended formats (AVIF / HEIC / DNG)").color(TEXT),
+                        egui::RichText::new("Enable extended formats (AVIF / HEIC / RAW)").color(TEXT),
                     );
                     hint(
                         ui,
-                        "Recognise .avif, .heic, and .dng (camera raw) files. These use \
-                         heavy decoders, so loading is slower.",
+                        "Recognise .avif, .heic, and camera raw (.dng, .arw) files. These \
+                         use heavy decoders, so loading is slower.",
                     );
                 }
             });
