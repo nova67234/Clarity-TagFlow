@@ -584,9 +584,9 @@ dependencies = [
 
 [[package]]
 name = "avif-parse"
-version = "1.4.0"
+version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f85ce2a7cd14ac0a30dc29a115de22466aeb8a029410f9f1e4f283443c959d1"
+checksum = "048e72663e14be27bfd8a9e01e8a0bf27610511ffd5f74c7955f4e4847ce2530"
 dependencies = [
  "arrayvec",
  "bitreader",

@@ -32,8 +32,8 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate", "aes
 # Pure-Rust AVIF decode (no C deps): avif-parse pulls the AV1 frame out of the
 # container, rav1d (a Rust port of dav1d) decodes it to YUV. Optional — only the
 # `avif` feature pulls them in. `asm` is left off so no nasm toolchain is needed.
-avif-parse = { version = "1", optional = true }
-rav1d = { version = "1", optional = true, default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+avif-parse = { version = "2.1.0", optional = true }
+rav1d = { version = "1.1.0", optional = true, default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 # Pure-Rust HEIC/HEIF decode (no C deps, forbids unsafe). Optional — pulled in by
 # the `avif` feature alongside the AVIF decoder, since both are "extended formats".
 heic = { version = "0.1.6", optional = true }
@@ -42,7 +42,7 @@ heic = { version = "0.1.6", optional = true }
 # so there's no version clash. `enough` supplies its cancellation-signal type
 # (`Unstoppable`). Both optional, behind `avif`.
 zenraw = { version = "0.2.0", optional = true }
-enough = { version = "0.4", optional = true }
+enough = { version = "0.4.4", optional = true }
 
 [build-dependencies]
 # Embeds the Windows app icon (and version info) into the exe at build time.
