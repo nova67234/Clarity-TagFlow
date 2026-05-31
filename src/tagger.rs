@@ -33,13 +33,13 @@ pub enum TaggerKind {
 }
 
 /// The writable directory where downloaded models live. A per-user data dir
-/// (e.g. `%APPDATA%\ClarityTagFlow\tools` on Windows,
-/// `~/Library/Application Support/ClarityTagFlow/tools` on macOS) so it works
+/// (e.g. `%APPDATA%\Clarity TagFlow\tools` on Windows,
+/// `~/Library/Application Support/Clarity TagFlow/tools` on macOS) so it works
 /// even when the app itself is installed read-only (a `.app`, Program Files).
 /// Falls back to a local `tools/` dir if no data dir is available.
 pub fn models_root() -> PathBuf {
     dirs::data_dir()
-        .map(|d| d.join("ClarityTagFlow").join("tools"))
+        .map(|d| d.join("Clarity TagFlow").join("tools"))
         .unwrap_or_else(|| PathBuf::from("tools"))
 }
 

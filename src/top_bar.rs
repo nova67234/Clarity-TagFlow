@@ -85,8 +85,9 @@ pub enum TopBarAction {
     OpenSettings,
     /// The user clicked "Create Backup".
     CreateBackup,
-    /// The user clicked "Find Issues".
-    FindIssues,
+    /// The user clicked "Find Issues". Carries the button's bottom-left so the
+    /// Deep Scan window can pop up just under it.
+    FindIssues(egui::Pos2),
 }
 
 /// Render the top bar. Returns any action the app should perform.
@@ -124,8 +125,9 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats) -> TopBarAction {
                                 action = TopBarAction::CreateBackup;
                             }
                             ui.add_space(6.0);
-                            if bar_button(ui, "Find Issues", 130.0).clicked() {
-                                action = TopBarAction::FindIssues;
+                            let fi = bar_button(ui, "Find Issues", 130.0);
+                            if fi.clicked() {
+                                action = TopBarAction::FindIssues(fi.rect.left_bottom());
                             }
                             ui.add_space(14.0);
 
