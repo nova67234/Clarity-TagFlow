@@ -7,10 +7,25 @@ use std::time::Duration;
 use eframe::egui;
 use egui::{Color32, CornerRadius, Margin, Stroke};
 
-/// File extensions we offer in the open dialog and accept via drag-and-drop.
+/// Always-available image extensions (pure-Rust decoders, no heavy deps).
+/// `jfif` is just JPEG with a different extension — the decoder content-sniffs it.
 const IMAGE_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "tif", "tiff",
+    "png", "jpg", "jpeg", "jfif", "gif", "bmp", "webp", "ico", "tif", "tiff",
 ];
+
+/// "Extended" image extensions that rely on heavy C-library decoders (AVIF via
+/// dav1d, HEIC via libheif). Only recognised when the user enables them in
+/// Settings AND the app was built with support compiled in (the `avif` cargo
+/// feature). Defined only in such builds so a stale persisted setting can't make
+/// a normal build list files it can't decode.
+#[cfg(feature = "avif")]
+const EXTENDED_IMAGE_EXTENSIONS: &[&str] = &["avif", "heic", "heif"];
+
+/// Runtime flag mirroring `Settings::enable_extended_formats`, so the free
+/// `is_image()` helper (called all over) can gate the extended formats without
+/// threading `Settings` through every call site.
+#[cfg(feature = "avif")]
+static EXTENDED_FORMATS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Browser thumbnail decode resolution (longest side, px). HD gives crisper
 /// tiles at the cost of more memory and slower decoding.
@@ -44,6 +59,8 @@ use theme::*;
 
 mod ai_models;
 mod ai_orb;
+#[cfg(feature = "avif")]
+mod avif;
 mod backup;
 mod image_cache;
 mod left_browser;
@@ -139,6 +156,10 @@ struct ViewerApp {
     /// The folder last opened via the folder button (the backup root). `None`
     /// when the list was built only from individually dropped files.
     current_folder: Option<PathBuf>,
+    /// Last-seen value of `settings.enable_extended_formats`, so we can re-scan
+    /// the folder when the user toggles AVIF/HEIC on or off and the new file
+    /// types appear (or disappear) without needing to reopen the folder.
+    last_extended_formats: bool,
     /// CACHED list of indexes mapping into `self.images` after the search string is applied
     filtered: Vec<usize>,
     selected: Option<usize>,
@@ -175,6 +196,7 @@ impl Default for ViewerApp {
         Self {
             images: Vec::new(),
             current_folder: None,
+            last_extended_formats: settings::Settings::default().enable_extended_formats,
             filtered: Vec::new(),
             selected: None,
             search: String::new(),
@@ -563,6 +585,30 @@ impl eframe::App for ViewerApp {
         self.center(ui);
 
         // 4. Settings window (floats on top when opened from the gear).
+        // Keep the global extended-formats flag in sync with the setting so the
+        // free `is_image()` helper recognises (or ignores) .avif/.heic live.
+        // Only relevant in builds with a decoder compiled in (the `avif` feature).
+        #[cfg(feature = "avif")]
+        EXTENDED_FORMATS_ON.store(
+            self.settings.enable_extended_formats,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        // If the AVIF/HEIC toggle changed, re-scan the open folder so those files
+        // appear (or disappear) right away instead of only after a reopen.
+        if self.settings.enable_extended_formats != self.last_extended_formats {
+            self.last_extended_formats = self.settings.enable_extended_formats;
+            if let Some(dir) = self.current_folder.clone() {
+                let keep = self.selected.and_then(|i| self.images.get(i).cloned());
+                self.images = images_in_dir(&dir);
+                // Try to keep the same image selected across the re-scan.
+                self.selected = keep
+                    .and_then(|p| self.images.iter().position(|q| *q == p))
+                    .or(if self.images.is_empty() { None } else { Some(0) });
+                self.update_filtered();
+            }
+        }
+
         settings::show(ui.ctx(), &mut self.settings);
 
         // 5. Backup dialog (floats on top when opened from the top bar).
@@ -647,10 +693,25 @@ pub(crate) fn svg_button(ui: &mut egui::Ui, source: egui::ImageSource<'_>, toolt
 // Small utilities
 // ---------------------------------------------------------------------------
 pub(crate) fn is_image(p: &std::path::Path) -> bool {
-    p.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+    let Some(ext) = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) else {
+        return false;
+    };
+    if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+        return true;
+    }
+    // Extended (heavy) formats are only recognised when BOTH a decoder was
+    // compiled in (the `avif` cargo feature) AND the user turned them on. Without
+    // the feature this whole branch is gone, so a stale persisted "on" setting
+    // can't make the app list .avif files it can't actually decode.
+    #[cfg(feature = "avif")]
+    {
+        if EXTENDED_FORMATS_ON.load(std::sync::atomic::Ordering::Relaxed)
+            && EXTENDED_IMAGE_EXTENSIONS.contains(&ext.as_str())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// True if `path` has a recognised video extension.
