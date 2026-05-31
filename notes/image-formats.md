@@ -171,7 +171,25 @@ raw-decodable DNGs are tested.
 
 ---
 
-## 6. Where the decode is wired in
+## 6. EXIF orientation (all formats)
+
+The `image` crate does **not** auto-apply EXIF orientation, and the fast
+reduced-resolution paths (`jpeg_decoder` DCT scaling, the row-subsampled PNG/TIFF
+readers) don't even read EXIF — so a portrait phone/camera photo (orientation
+6/8: stored landscape plus a rotate tag) would display sideways.
+
+`image_cache::decode_still` reads the tag once via `exif_orientation` (header
+only, no pixel cost) and calls `img.apply_orientation(..)` on **both** decode
+branches — the fast `decode_downscaled` path and the full-decode fallback. Since
+`decode_still` is the single path feeding both the browser thumbnails and the
+centre viewer, every still is oriented consistently. `oriented_dimensions` does
+the matching width/height swap for the Image Info panel (`image_dimensions`
+returns the stored, pre-rotation size). DNG previews are handled separately via
+the container's TIFF tag (see §5) because they carry no EXIF of their own.
+
+---
+
+## 7. Where the decode is wired in
 All call sites route extended formats to `crate::avif::decode_avif()`:
 - `image_cache::decode_still` — thumbnails + the centre viewer.
 - `right_details::load_meta` — the Image Info panel's Dimensions + colour palette
@@ -184,7 +202,7 @@ Toggling the Settings checkbox re-scans the open folder (`main.rs` tracks
 
 ---
 
-## 7. Build / CI notes
+## 8. Build / CI notes
 - `avif` is in `default` features, so normal `cargo run`, the IDE Run button, and
   the release workflows all compile rav1d + heic. **No nasm / no C libs required.**
 - Trade-off: clean builds are ~30-60s longer (rav1d is large).
