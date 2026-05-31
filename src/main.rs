@@ -51,9 +51,14 @@ mod ai_orb;
 mod avif;
 mod backup;
 mod image_cache;
+mod download;
+mod gif_info;
 mod left_browser;
+mod mp4;
 mod right_details;
+mod scan;
 mod sd_metadata;
+mod secret;
 mod settings;
 mod tag_manager;
 mod tag_manager_settings;
@@ -75,7 +80,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "Clarity TagFlow — Image Viewer",
+        "Clarity TagFlow",
         options,
         Box::new(|cc| {
             // REQUIRED: Install the image loaders so egui can parse SVG bytes
@@ -151,6 +156,8 @@ struct ViewerApp {
     // Panel States
     right_state: right_details::RightPanelState,
     settings: settings::Settings,
+    /// Deep Scan ("Find Issues") window state.
+    scan: scan::ScanState,
     /// The "Create Backup" dialog (top bar).
     backup: backup::BackupState,
     /// Tag Manager view state, shown in the right panel when selected from its
@@ -186,6 +193,7 @@ impl Default for ViewerApp {
             stats: top_bar::SystemStats::default(),
             right_state: right_details::RightPanelState::default(),
             settings: settings::Settings::default(),
+            scan: scan::ScanState::default(),
             backup: backup::BackupState::default(),
             tag_manager: tag_manager::TagManagerState::default(),
             // Separate large-decode gates: the viewer gets a dedicated permit so
@@ -486,7 +494,10 @@ impl eframe::App for ViewerApp {
             top_bar::TopBarAction::OpenFolder => self.open_dialog(),
             top_bar::TopBarAction::OpenSettings => self.settings.open = !self.settings.open,
             top_bar::TopBarAction::CreateBackup => self.start_backup(),
-            top_bar::TopBarAction::FindIssues => {}
+            top_bar::TopBarAction::FindIssues(pos) => {
+                self.scan
+                    .open_with(self.current_folder.as_deref(), Some(pos));
+            }
             top_bar::TopBarAction::None => {}
         }
 
@@ -600,6 +611,21 @@ impl eframe::App for ViewerApp {
         }
 
         settings::show(ui.ctx(), &mut self.settings);
+
+        // Deep Scan window. When a scan finishes it may have moved files out of
+        // the current folder, so refresh the browser list once.
+        scan::show(ui.ctx(), &mut self.scan);
+        if self.scan.finished_tick {
+            self.scan.finished_tick = false;
+            if let Some(dir) = self.current_folder.clone() {
+                let keep = self.selected.and_then(|i| self.images.get(i).cloned());
+                self.images = images_in_dir(&dir);
+                self.selected = keep
+                    .and_then(|p| self.images.iter().position(|q| *q == p))
+                    .or(if self.images.is_empty() { None } else { Some(0) });
+                self.update_filtered();
+            }
+        }
 
         // Apply a theme change from the Appearance tab live (only when it
         // actually changed, so we don't re-push visuals every frame).
