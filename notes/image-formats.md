@@ -141,6 +141,12 @@ display-white. Neutral tones come out tinted and there's no config knob to fix i
    64 marker candidates so a run of false `FF D8 FF` byte coincidences inside
    compressed data can't make it loop forever.)
 
+   The preview JPEGs are stored in *sensor* orientation and carry **no EXIF
+   orientation of their own** — the rotation lives in the DNG container's TIFF
+   `Orientation` tag (274). `tiff_orientation` hand-parses the TIFF IFD0 for that
+   tag and we apply it to the decoded preview, so a portrait drone shot comes out
+   upright (e.g. test2.dng → 4480×6720) instead of sideways.
+
 ### Full raw develop (`decode_dng_raw`)
 Request `OutputMode::CameraRaw` — demosaiced, cropped, oriented camera-RGB as f32
 in `[0,1]`, with **no** WB or colour matrix applied — then run our own develop:
