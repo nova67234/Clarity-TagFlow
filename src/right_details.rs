@@ -55,6 +55,11 @@ impl Default for ImageMeta {
 /// and whether the user is currently in edit mode.
 pub struct RightPanelState {
     pub current_tags: String,
+    /// Embedded Stable-Diffusion generation metadata for the selected image,
+    /// or `None` when the image carries none. Read by `crate::sd_metadata`.
+    pub sd_metadata: Option<String>,
+    /// When true, the tag box shows the (read-only) SD metadata instead of tags.
+    pub showing_meta: bool,
     pub is_editing: bool,
 
     /// Which view the panel currently shows (Details vs Tag Manager).
@@ -89,6 +94,8 @@ impl Default for RightPanelState {
     fn default() -> Self {
         Self {
             current_tags: String::new(),
+            sd_metadata: None,
+            showing_meta: false,
             is_editing: false,
             view: RightView::default(),
             show_delete_confirm: false,
@@ -144,6 +151,10 @@ pub fn show(
         if let Some(path) = current_image {
             let txt_path = sidecar_txt(path);
             state.current_tags = std::fs::read_to_string(&txt_path).unwrap_or_default();
+            // Read embedded SD generation metadata (PNG text chunks / EXIF
+            // UserComment). Cheap relative to the full-res decode below.
+            state.sd_metadata = crate::sd_metadata::read(path);
+            state.showing_meta = false;
 
             // Set temporary loading state for the card
             state.meta = ImageMeta {
@@ -178,6 +189,8 @@ pub fn show(
 
         } else {
             state.current_tags.clear();
+            state.sd_metadata = None;
+            state.showing_meta = false;
             state.meta = ImageMeta::default();
         }
     }
@@ -300,9 +313,16 @@ pub fn show(
                                         .on_hover_text("Copy tags to clipboard")
                                         .clicked()
                                     {
-                                        let ok = !state.current_tags.trim().is_empty();
+                                        // Copy whichever text is on screen — tags or
+                                        // the embedded generation metadata.
+                                        let to_copy = if state.showing_meta {
+                                            state.sd_metadata.clone().unwrap_or_default()
+                                        } else {
+                                            state.current_tags.clone()
+                                        };
+                                        let ok = !to_copy.trim().is_empty();
                                         if ok {
-                                            ui.ctx().copy_text(state.current_tags.clone());
+                                            ui.ctx().copy_text(to_copy);
                                         }
                                         state.copy_flash = Some((Instant::now(), ok));
                                     }
@@ -322,7 +342,9 @@ pub fn show(
                                         }
                                     }
 
-                                    if ui.add_sized(size, edit_btn).clicked() {
+                                    // The metadata view is read-only, so Edit is a
+                                    // no-op there (switch back to Tags to edit).
+                                    if ui.add_sized(size, edit_btn).clicked() && !state.showing_meta {
                                         if state.is_editing {
                                             let txt_path = sidecar_txt(img_path);
                                             let ok = std::fs::write(&txt_path, &state.current_tags).is_ok();
@@ -376,7 +398,11 @@ pub fn show(
                                     ui.add_space(8.0);
                                 });
 
-                                // 2. Tags Label
+                                // 2. Tags / Metadata Label + switch button. When the
+                                //    image carries embedded SD generation metadata, a
+                                //    small button (right-aligned) toggles the box
+                                //    between the .txt tags and the read-only metadata
+                                //    view, mirroring terminus2's switch.
                                 ui.horizontal(|ui| {
                                     // Tight gap between the icon and the label.
                                     ui.spacing_mut().item_spacing.x = 4.0;
@@ -386,55 +412,108 @@ pub fn show(
                                             .fit_to_exact_size(egui::vec2(18.0, 18.0))
                                             .tint(TEXT()),
                                     );
-                                    ui.label(egui::RichText::new("Tags:").color(TEXT()).strong());
+                                    let title = if state.showing_meta { "Metadata:" } else { "Tags:" };
+                                    ui.label(egui::RichText::new(title).color(TEXT()).strong());
+
+                                    if state.sd_metadata.is_some() {
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let to = if state.showing_meta { "Tags" } else { "Metadata" };
+                                                let switch_icon =
+                                                    egui::include_image!("../icons/window_switch.svg");
+                                                let btn = egui::Button::image_and_text(
+                                                    egui::Image::new(switch_icon)
+                                                        .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                                                        .tint(TEXT()),
+                                                    egui::RichText::new(to).size(13.0),
+                                                );
+                                                if ui
+                                                    .add(btn)
+                                                    .on_hover_text(
+                                                        "Switch between .txt tags and embedded generation metadata",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    state.showing_meta = !state.showing_meta;
+                                                    state.is_editing = false; // leave edit mode on switch
+                                                }
+                                            },
+                                        );
+                                    }
                                 });
                                 ui.add_space(4.0);
 
-                                // 3. Tags Text Area
-                                let mut display_text = state.current_tags.clone();
+                                // 3. Tags / Metadata Text Area. The metadata view is
+                                //    always read-only (no editing, no save-back).
+                                let showing_meta = state.showing_meta && state.sd_metadata.is_some();
+                                let editable = state.is_editing && !showing_meta;
+                                let mut display_text = if showing_meta {
+                                    state.sd_metadata.clone().unwrap_or_default()
+                                } else {
+                                    state.current_tags.clone()
+                                };
 
-                                ui.scope(|ui| {
-                                    let radius = egui::CornerRadius::same(22);
-                                    // `noninteractive` covers the view-mode box (interactive(false)),
-                                    // the others cover edit mode — so both share the rounded edges.
-                                    ui.visuals_mut().widgets.noninteractive.corner_radius = radius;
-                                    ui.visuals_mut().widgets.inactive.corner_radius = radius;
-                                    ui.visuals_mut().widgets.hovered.corner_radius = radius;
-                                    ui.visuals_mut().widgets.active.corner_radius = radius;
+                                // The box is a FIXED-size rounded frame that always
+                                // fills the remaining panel height — it never resizes
+                                // and never moves. Long text (e.g. SD metadata) scrolls
+                                // *inside* it via the ScrollArea, while the box and its
+                                // rounded corners stay put. The TextEdit is frameless
+                                // (`.frame(false)`) so it paints no background of its
+                                // own that could scroll with the text — the Frame below
+                                // is the only box.
+                                let radius = egui::CornerRadius::same(22);
 
-                                    // "Ready to edit" flash: for a brief moment after entering
-                                    // edit mode, pulse the box background toward the accent so the
-                                    // user notices the box is now editable.
-                                    if let Some(start) = state.edit_flash_start {
-                                        let elapsed = start.elapsed().as_secs_f32();
-                                        if elapsed < EDIT_FLASH_SECS {
-                                            let t = elapsed / EDIT_FLASH_SECS;          // 0..1
-                                            let envelope = 1.0 - t;                     // overall fade-out
-                                            let osc = (t * std::f32::consts::PI * 2.0).sin().abs(); // two pulses
-                                            let intensity = (envelope * osc).clamp(0.0, 1.0);
-                                            ui.visuals_mut().extreme_bg_color =
-                                                lerp_color(FIELD(), ACCENT1(), intensity * 0.55);
-                                            ui.ctx().request_repaint(); // keep the animation smooth
-                                        }
+                                // Box background, with the "ready to edit" flash pulsing
+                                // it toward the accent just after entering edit mode.
+                                let mut box_fill = FIELD();
+                                if let Some(start) = state.edit_flash_start {
+                                    let elapsed = start.elapsed().as_secs_f32();
+                                    if elapsed < EDIT_FLASH_SECS {
+                                        let t = elapsed / EDIT_FLASH_SECS;          // 0..1
+                                        let envelope = 1.0 - t;                     // overall fade-out
+                                        let osc = (t * std::f32::consts::PI * 2.0).sin().abs(); // two pulses
+                                        let intensity = (envelope * osc).clamp(0.0, 1.0);
+                                        box_fill = lerp_color(FIELD(), ACCENT1(), intensity * 0.55);
+                                        ui.ctx().request_repaint(); // keep the animation smooth
                                     }
+                                }
 
-                                    let mut text_edit = egui::TextEdit::multiline(&mut display_text)
-                                        .desired_width(f32::INFINITY)
-                                        .font(egui::TextStyle::Monospace)
-                                        .margin(egui::Margin::same(12))
-                                        // Only selectable/editable in edit mode — outside of it
-                                        // the box just displays the tags (no clicking, no cursor,
-                                        // no text selection). Click "Edit Text" to interact.
-                                        .interactive(state.is_editing);
+                                // Lock the box height to the remaining space *before*
+                                // building the frame, so its size is independent of the
+                                // text it holds.
+                                let box_outer_h = ui.available_height();
+                                let inner_h = (box_outer_h - 24.0).max(0.0); // minus the 12px margins
 
-                                    if !state.is_editing {
-                                        text_edit = text_edit.text_color(TEXT().gamma_multiply(0.8));
-                                    }
+                                egui::Frame::new()
+                                    .fill(box_fill)
+                                    .corner_radius(radius)
+                                    .inner_margin(egui::Margin::same(12))
+                                    .show(ui, |ui| {
+                                        ui.set_height(inner_h); // fixed — never grows with text
+                                        ui.set_width(ui.available_width());
 
-                                    ui.add_sized(ui.available_size(), text_edit);
-                                });
+                                        egui::ScrollArea::vertical()
+                                            .auto_shrink([false, false])
+                                            .max_height(inner_h)
+                                            .show(ui, |ui| {
+                                                let mut text_edit = egui::TextEdit::multiline(&mut display_text)
+                                                    .desired_width(f32::INFINITY)
+                                                    .font(egui::TextStyle::Monospace)
+                                                    .frame(egui::Frame::NONE) // the Frame above is the box
+                                                    // Only selectable/editable in edit
+                                                    // mode — otherwise display only.
+                                                    .interactive(editable);
 
-                                if state.is_editing {
+                                                if !editable {
+                                                    text_edit = text_edit.text_color(TEXT().gamma_multiply(0.8));
+                                                }
+
+                                                ui.add(text_edit);
+                                            });
+                                    });
+
+                                if editable {
                                     state.current_tags = display_text;
                                 }
                             });

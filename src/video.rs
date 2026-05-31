@@ -13,8 +13,27 @@
 //! but could not be *run* in this environment (no VLC SDK here); expect to iterate.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui;
+
+/// Whether videos should loop (restart at the end). Mirrors
+/// `Settings::loop_video`; the main loop pushes the current value via
+/// [`set_loop`] and the player reads it when a clip starts. A global atomic
+/// keeps `VideoPlayer::start`'s signature stable across the stub / real
+/// backends.
+static LOOP_VIDEO: AtomicBool = AtomicBool::new(false);
+
+/// Update the desired video-loop state (called from the app each frame).
+pub fn set_loop(enabled: bool) {
+    LOOP_VIDEO.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether videos should currently loop.
+#[allow(dead_code)] // only read by the libVLC backend (feature = "vlc")
+pub fn loop_enabled() -> bool {
+    LOOP_VIDEO.load(Ordering::Relaxed)
+}
 
 // ---------------------------------------------------------------------------
 // Stub used when the `vlc` feature is off — keeps the rest of the app building
@@ -99,6 +118,14 @@ mod backend {
         pub fn start(path: &Path, ctx: &egui::Context) -> Option<VideoPlayer> {
             let instance = vlc::Instance::new()?;
             let media = vlc::Media::new_path(&instance, path)?;
+            // Loop the clip when the user enabled it in Settings. A large repeat
+            // count stands in for "infinite" (libVLC has no unbounded value).
+            if loop_enabled() {
+                unsafe {
+                    let opt = std::ffi::CString::new(":input-repeat=65535").unwrap();
+                    sys::libvlc_media_add_option(media.raw(), opt.as_ptr());
+                }
+            }
             let player = vlc::MediaPlayer::new(&instance)?;
             player.set_media(&media);
 

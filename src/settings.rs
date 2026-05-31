@@ -54,6 +54,9 @@ pub struct Settings {
     /// The active app colour theme (Dark / Light). Applied on launch and live
     /// whenever changed from the Appearance tab.
     pub theme: Theme,
+    /// Loop videos: restart playback from the beginning when a video reaches its
+    /// end. Read by the embedded video player when a clip starts.
+    pub loop_video: bool,
 }
 
 impl Default for Settings {
@@ -69,6 +72,7 @@ impl Default for Settings {
             enable_extended_formats: false,
             last_ai_model: "Select AI...".to_string(),
             theme: Theme::default(),
+            loop_video: false,
         }
     }
 }
@@ -190,6 +194,18 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
                  use heavy decoders, so loading is slower.",
             );
         }
+    });
+
+    section(ui, "Video", |ui| {
+        ui.checkbox(
+            &mut settings.loop_video,
+            egui::RichText::new("Loop videos").color(TEXT()),
+        );
+        hint(
+            ui,
+            "Restart a video from the beginning when it reaches the end. \
+             Applies the next time a video starts playing.",
+        );
     });
 
     section(ui, "About", |ui| {
