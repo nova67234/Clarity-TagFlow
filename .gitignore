@@ -16,11 +16,14 @@
 # Debug screenshots
 /images/*.png
 
-# Local AVIF/HEIC/DNG test sample sets + decoder smoke-test output (not committed)
+# Local extended-format test sample sets + decoder smoke-test output (not committed)
 /avif
 /tests/avif
 /tests/HEIC
 /tests/DNG
+/tests/ARW
+/tests/HDR
+/tests/bug
 
 # Machine-specific local cargo config (e.g. the VLC lib path) — not portable.
 /.cargo

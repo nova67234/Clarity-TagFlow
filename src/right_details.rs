@@ -679,7 +679,7 @@ fn load_meta(path: &Path) -> ImageMeta {
         let is_avif = path
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "avif" | "heic" | "heif" | "dng"))
+            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "avif" | "heic" | "heif" | "dng" | "arw"))
             .unwrap_or(false);
         if is_avif {
             crate::avif::decode_avif(path).map(image::DynamicImage::ImageRgba8)
