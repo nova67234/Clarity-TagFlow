@@ -214,7 +214,7 @@ pub fn show(
         .show_inside(ui, |ui| {
             // Header bar
             egui::Frame::new()
-                .fill(FIELD)
+                .fill(FIELD())
                 .corner_radius(CornerRadius::same(18))
                 .inner_margin(Margin::symmetric(12, 6))
                 .show(ui, |ui| {
@@ -224,8 +224,8 @@ pub fn show(
                     ui.horizontal_centered(|ui| {
                         // Left: tag2 icon + title.
                         let tag_icon = egui::include_image!("../icons/tag2.svg");
-                        ui.add(egui::Image::new(tag_icon).fit_to_exact_size(egui::vec2(16.0, 16.0)).tint(TEXT));
-                        ui.label(egui::RichText::new("Tag Manager").color(TEXT).strong().size(14.0));
+                        ui.add(egui::Image::new(tag_icon).fit_to_exact_size(egui::vec2(16.0, 16.0)).tint(TEXT()));
+                        ui.label(egui::RichText::new("Tag Manager").color(TEXT()).strong().size(14.0));
 
                         // Right: status. The 3D particle orb always sits just to
                         // the left of the status text — gently breathing while
@@ -235,7 +235,7 @@ pub fn show(
                             let color = if state.status_is_error {
                                 egui::Color32::from_rgb(220, 70, 70)
                             } else if state.status_accent || thinking || state.status_msg.contains("selected") {
-                                ACCENT1
+                                ACCENT1()
                             } else {
                                 egui::Color32::from_rgb(46, 160, 67)
                             };
@@ -274,7 +274,7 @@ pub fn show(
                 state.models.show(&get_models);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let gear = egui::include_image!("../icons/settings.svg");
-                    let gear_resp = crate::svg_button(ui, gear, "Settings", 20.0, MUTED);
+                    let gear_resp = crate::svg_button(ui, gear, "Settings", 20.0, MUTED());
                     if gear_resp.clicked() {
                         state.settings.open = !state.settings.open;
                     }
@@ -287,9 +287,9 @@ pub fn show(
 
             // AI selection bar — model dropdown + Tag button.
             egui::Frame::new()
-                .fill(PANEL)
+                .fill(PANEL())
                 .corner_radius(CornerRadius::same(12))
-                .stroke(egui::Stroke::new(1.0, EDGE))
+                .stroke(egui::Stroke::new(1.0, EDGE()))
                 .inner_margin(Margin::symmetric(6, 6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -298,7 +298,7 @@ pub fn show(
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let tag_btn = egui::Button::new(egui::RichText::new("Tag").color(Color32::WHITE))
                                 .corner_radius(CornerRadius::same(12))
-                                .fill(ACCENT1);
+                                .fill(ACCENT1());
                             if ui.add_sized(egui::vec2(56.0, 28.0), tag_btn).clicked()
                                 && state.tag_job.is_none()
                             {
@@ -317,7 +317,7 @@ pub fn show(
                                     if installed.is_empty() {
                                         ui.label(
                                             egui::RichText::new("No models — click Get Models")
-                                                .color(MUTED)
+                                                .color(MUTED())
                                                 .italics(),
                                         );
                                     } else {
@@ -341,12 +341,12 @@ pub fn show(
         .show_inside(ui, |ui| {
             ui.add_space(12.0);
 
-            ui.label(egui::RichText::new("Add Tags (manual):").color(TEXT).strong().size(14.0));
+            ui.label(egui::RichText::new("Add Tags (manual):").color(TEXT()).strong().size(14.0));
             ui.add_space(6.0);
             egui::Frame::new()
-                .fill(PANEL)
+                .fill(PANEL())
                 .corner_radius(CornerRadius::same(12))
-                .stroke(egui::Stroke::new(1.0, EDGE))
+                .stroke(egui::Stroke::new(1.0, EDGE()))
                 // Vertical padding so the text/caret sits inside the box instead of
                 // poking out the top edge.
                 .inner_margin(Margin::symmetric(8, 6))
@@ -439,7 +439,7 @@ pub fn show(
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(format!("Add to all {} files?", all_images.len()))
-                            .color(MUTED)
+                            .color(MUTED())
                             .size(12.0),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -468,10 +468,10 @@ pub fn show(
         .frame(egui::Frame::NONE)
         .show_inside(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Current Tags:").color(TEXT).strong().size(14.0));
+                ui.label(egui::RichText::new("Current Tags:").color(TEXT()).strong().size(14.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let copy_icon = egui::include_image!("../icons/copy.svg");
-                    if crate::svg_button(ui, copy_icon, "Copy", 16.0, MUTED).clicked() {
+                    if crate::svg_button(ui, copy_icon, "Copy", 16.0, MUTED()).clicked() {
                         let text = serialize_tags(&tags);
                         ui.ctx().copy_text(text);
                         state.status_msg = "Copied to clipboard".to_string();
@@ -484,9 +484,9 @@ pub fn show(
             // Tag list box: 22 rounded corners, fills the remaining vertical space.
             let list_h = ui.available_height().max(120.0);
             egui::Frame::new()
-                .fill(PANEL)
+                .fill(PANEL())
                 .corner_radius(CornerRadius::same(22))
-                .stroke(egui::Stroke::new(1.0, EDGE))
+                .stroke(egui::Stroke::new(1.0, EDGE()))
                 .inner_margin(Margin::same(6))
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
@@ -496,12 +496,12 @@ pub fn show(
                             ui.set_min_width(ui.available_width());
                             if tags.is_empty() {
                                 ui.add_space(16.0);
-                                ui.vertical_centered(|ui| ui.label(egui::RichText::new("No tags").color(MUTED)));
+                                ui.vertical_centered(|ui| ui.label(egui::RichText::new("No tags").color(MUTED())));
                             } else {
                                 for tag in &tags {
                                     let is_selected = state.selected_tags.contains(tag);
                                     let bg_color = if is_selected {
-                                        ACCENT1.gamma_multiply(0.4)
+                                        ACCENT1().gamma_multiply(0.4)
                                     } else {
                                         Color32::TRANSPARENT
                                     };
@@ -511,7 +511,7 @@ pub fn show(
                                         .inner_margin(Margin::symmetric(10, 6))
                                         .show(ui, |ui| {
                                             ui.set_width(ui.available_width());
-                                            ui.label(egui::RichText::new(tag).color(TEXT).size(13.0))
+                                            ui.label(egui::RichText::new(tag).color(TEXT()).size(13.0))
                                         })
                                         .response;
                                     let interact = ui.interact(resp.rect, ui.id().with(tag), egui::Sense::click());

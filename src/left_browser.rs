@@ -49,7 +49,7 @@ pub fn show(
         .show_separator_line(false)
         // Trim the top margin so the card rises up close to the top bar,
         // matching the right details panel.
-        .frame(egui::Frame::new().fill(BG).inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 10 }))
+        .frame(egui::Frame::new().fill(BG()).inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 10 }))
         .show_inside(ui, |ui| {
             card_frame(22).show(ui, |ui| {
                 // Always fill the full panel height, even with no/few images — otherwise
@@ -71,7 +71,7 @@ pub fn show(
 
                             // Draw the button on the far right
                             let settings_svg = egui::include_image!("../icons/settings.svg");
-                            svg_button(ui, settings_svg, "Filter Settings", 20.0, MUTED);
+                            svg_button(ui, settings_svg, "Filter Settings", 20.0, MUTED());
 
                             // The text field consumes exactly the remaining space to the left
                             let resp = ui.add(
@@ -100,7 +100,7 @@ pub fn show(
                         } else {
                             "No matches"
                         };
-                        ui.label(egui::RichText::new(msg).color(MUTED).size(13.0));
+                        ui.label(egui::RichText::new(msg).color(MUTED()).size(13.0));
                     });
                     return;
                 }
@@ -262,11 +262,11 @@ fn draw_tile(
                     .paint_at(ui, rect);
             }
             None => {
-                ui.painter().rect_filled(rect, radius, FIELD);
+                ui.painter().rect_filled(rect, radius, FIELD());
                 let s = (rect.width().min(rect.height()) * 0.4).clamp(24.0, 72.0);
                 let icon_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(s, s));
                 egui::Image::new(egui::include_image!("../icons/video.svg"))
-                    .tint(MUTED)
+                    .tint(MUTED())
                     .paint_at(ui, icon_rect);
             }
         }
@@ -282,18 +282,18 @@ fn draw_tile(
                     .paint_at(ui, rect);
             }
             Cached::Loading => {
-                ui.painter().rect_filled(rect, radius, FIELD);
+                ui.painter().rect_filled(rect, radius, FIELD());
                 let spinner = egui::Rect::from_center_size(rect.center(), egui::vec2(28.0, 28.0));
-                egui::Spinner::new().color(MUTED).paint_at(ui, spinner);
+                egui::Spinner::new().color(MUTED()).paint_at(ui, spinner);
             }
             Cached::Failed => {
-                ui.painter().rect_filled(rect, radius, FIELD);
+                ui.painter().rect_filled(rect, radius, FIELD());
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
                     "Failed",
                     egui::FontId::proportional(13.0),
-                    MUTED,
+                    MUTED(),
                 );
             }
         }

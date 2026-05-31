@@ -191,7 +191,7 @@ pub fn show(
         .show_separator_line(false)
         // Trim the top margin so the card rises up close to the top bar
         // (left/right/bottom keep the standard 10px breathing room).
-        .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin { left: 10, right: 10, top: 0, bottom: 10 }))
+        .frame(egui::Frame::new().fill(BG()).inner_margin(egui::Margin { left: 10, right: 10, top: 0, bottom: 10 }))
         .show_inside(ui, |ui| {
             // Trim the card's bottom padding so the Image Details box can sit
             // close to the bottom edge of the panel (other sides keep 12).
@@ -216,7 +216,7 @@ pub fn show(
 
                     let menu_icon = egui::Image::new(egui::include_image!("../icons/menu.svg"))
                         .fit_to_exact_size(egui::vec2(20.0, 20.0))
-                        .tint(MUTED);
+                        .tint(MUTED());
 
                     let menu_resp = ui.put(
                         gear_rect,
@@ -372,7 +372,7 @@ pub fn show(
                                 // 1. Header
                                 ui.vertical_centered(|ui| {
                                     ui.add_space(4.0);
-                                    ui.heading(egui::RichText::new("Details & Actions").color(TEXT).strong());
+                                    ui.heading(egui::RichText::new("Details & Actions").color(TEXT()).strong());
                                     ui.add_space(8.0);
                                 });
 
@@ -384,9 +384,9 @@ pub fn show(
                                     ui.add(
                                         egui::Image::new(icon)
                                             .fit_to_exact_size(egui::vec2(18.0, 18.0))
-                                            .tint(TEXT),
+                                            .tint(TEXT()),
                                     );
-                                    ui.label(egui::RichText::new("Tags:").color(TEXT).strong());
+                                    ui.label(egui::RichText::new("Tags:").color(TEXT()).strong());
                                 });
                                 ui.add_space(4.0);
 
@@ -413,7 +413,7 @@ pub fn show(
                                             let osc = (t * std::f32::consts::PI * 2.0).sin().abs(); // two pulses
                                             let intensity = (envelope * osc).clamp(0.0, 1.0);
                                             ui.visuals_mut().extreme_bg_color =
-                                                lerp_color(FIELD, ACCENT1, intensity * 0.55);
+                                                lerp_color(FIELD(), ACCENT1(), intensity * 0.55);
                                             ui.ctx().request_repaint(); // keep the animation smooth
                                         }
                                     }
@@ -428,7 +428,7 @@ pub fn show(
                                         .interactive(state.is_editing);
 
                                     if !state.is_editing {
-                                        text_edit = text_edit.text_color(TEXT.gamma_multiply(0.8));
+                                        text_edit = text_edit.text_color(TEXT().gamma_multiply(0.8));
                                     }
 
                                     ui.add_sized(ui.available_size(), text_edit);
@@ -443,9 +443,9 @@ pub fn show(
                         // --- Empty State ---
                         ui.vertical_centered(|ui| {
                             ui.add_space(4.0);
-                            ui.heading(egui::RichText::new("Details & Actions").color(TEXT).strong());
+                            ui.heading(egui::RichText::new("Details & Actions").color(TEXT()).strong());
                             ui.add_space(20.0);
-                            ui.label(egui::RichText::new("No image selected").color(MUTED).size(13.0));
+                            ui.label(egui::RichText::new("No image selected").color(MUTED()).size(13.0));
                         });
                     }
                 });
@@ -461,7 +461,7 @@ pub fn show(
             .resizable(false)
             .collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO) // Anchor directly in the middle of the screen
-            .frame(card_frame(22)) // match the rest of the UI (PANEL fill, radius 22, shadow)
+            .frame(card_frame(22)) // match the rest of the UI (PANEL() fill, radius 22, shadow)
             .show(ui.ctx(), |ui| {
                 ui.set_max_width(260.0); // Stop it from stretching too wide
 
@@ -479,7 +479,7 @@ pub fn show(
                         egui::RichText::new("Are you sure you want to delete this file?")
                             .size(15.0)
                             .strong()
-                            .color(TEXT)
+                            .color(TEXT())
                     );
 
                     ui.add_space(16.0);
@@ -560,18 +560,18 @@ fn image_details_section(ui: &mut egui::Ui, meta: &ImageMeta) {
         ui.add(
             egui::Image::new(icon)
                 .fit_to_exact_size(egui::vec2(18.0, 18.0))
-                .tint(TEXT),
+                .tint(TEXT()),
         );
-        ui.label(egui::RichText::new("Image Info").color(TEXT).strong().size(15.0));
+        ui.label(egui::RichText::new("Image Info").color(TEXT()).strong().size(15.0));
     });
     ui.add_space(8.0);
 
     let frame = egui::Frame::new()
-        .fill(FIELD)
+        .fill(FIELD())
         .corner_radius(egui::CornerRadius::same(22)) // match the tag box
         .inner_margin(egui::Margin::symmetric(16, 12))
         // Use the same soft light edge the tag box gets from egui's default field
-        // border (the gentle highlight), instead of the very faint EDGE — so both
+        // border (the gentle highlight), instead of the very faint EDGE() — so both
         // inset boxes look identical.
         .stroke(ui.visuals().widgets.noninteractive.bg_stroke);
 
@@ -593,12 +593,12 @@ fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
             egui::vec2(DETAIL_LABEL_W, 18.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(egui::RichText::new(label).color(TEXT).strong());
+                ui.label(egui::RichText::new(label).color(TEXT()).strong());
             },
         );
 
         let unknown = value == "---" || value == "Loading...";
-        let color = if unknown { MUTED } else { TEXT };
+        let color = if unknown { MUTED() } else { TEXT() };
         let resp = ui.add(egui::Label::new(egui::RichText::new(value).color(color)).truncate());
         if !unknown {
             resp.on_hover_text(value);
@@ -615,12 +615,12 @@ fn detail_color_row(ui: &mut egui::Ui, label: &str, colors: &[egui::Color32]) {
             egui::vec2(DETAIL_LABEL_W, 18.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(egui::RichText::new(label).color(TEXT).strong());
+                ui.label(egui::RichText::new(label).color(TEXT()).strong());
             },
         );
 
         if colors.is_empty() {
-            ui.label(egui::RichText::new("---").color(MUTED));
+            ui.label(egui::RichText::new("---").color(MUTED()));
         } else {
             // CHANGED HERE: Use horizontal_wrapped so colors wrap to the next line if there are many!
             ui.horizontal_wrapped(|ui| {
@@ -633,7 +633,7 @@ fn detail_color_row(ui: &mut egui::Ui, label: &str, colors: &[egui::Color32]) {
                     ui.painter().rect_stroke(
                         rect,
                         corner_radius,
-                        egui::Stroke::new(1.0, EDGE),
+                        egui::Stroke::new(1.0, EDGE()),
                         egui::StrokeKind::Inside,
                     );
                 }

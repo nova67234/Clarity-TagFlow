@@ -289,9 +289,9 @@ impl ModelManager {
 
     fn body(&mut self, ui: &mut egui::Ui) {
         // No title bar on a popup — render our own header.
-        ui.label(RichText::new("AI Model Manager").color(TEXT).strong().size(14.0));
+        ui.label(RichText::new("AI Model Manager").color(TEXT()).strong().size(14.0));
         ui.add_space(1.0);
-        ui.label(RichText::new("Download high-performance tagging models.").color(MUTED).size(11.0));
+        ui.label(RichText::new("Download high-performance tagging models.").color(MUTED()).size(11.0));
         ui.add_space(8.0);
 
         // Tab pills.
@@ -311,18 +311,18 @@ impl ModelManager {
 
         // Model card.
         egui::Frame::new()
-            .fill(FIELD)
+            .fill(FIELD())
             .corner_radius(egui::CornerRadius::same(22))
-            .stroke(egui::Stroke::new(1.0, EDGE))
+            .stroke(egui::Stroke::new(1.0, EDGE()))
             .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
 
-                ui.label(RichText::new(info.name).color(TEXT).strong().size(14.5));
+                ui.label(RichText::new(info.name).color(TEXT()).strong().size(14.5));
                 ui.add_space(3.0);
-                ui.label(RichText::new(info.desc).color(MUTED).size(11.5));
+                ui.label(RichText::new(info.desc).color(MUTED()).size(11.5));
                 ui.add_space(5.0);
-                ui.hyperlink_to(RichText::new("Visit Repository  ↗").color(ACCENT1).size(11.5), info.repo);
+                ui.hyperlink_to(RichText::new("Visit Repository  ↗").color(ACCENT1()).size(11.5), info.repo);
 
                 ui.add_space(9.0);
 
@@ -332,7 +332,7 @@ impl ModelManager {
                         badge(ui, GREEN, "Installed", Some(egui::include_image!("../icons/check.svg")))
                     }
                     Status::NotInstalled => badge(ui, RED, "Not Installed", None),
-                    Status::Downloading => badge(ui, ACCENT1, "Downloading…", None),
+                    Status::Downloading => badge(ui, ACCENT1(), "Downloading…", None),
                     Status::Error(e) => badge(ui, RED, &format!("Error: {e}"), None),
                 }
 
@@ -344,7 +344,7 @@ impl ModelManager {
                     ui.add(
                         egui::ProgressBar::new(frac)
                             .desired_width(ui.available_width())
-                            .text(RichText::new(label).color(TEXT).size(10.5)),
+                            .text(RichText::new(label).color(TEXT()).size(10.5)),
                     );
                 }
 
@@ -356,7 +356,7 @@ impl ModelManager {
                     Status::Downloading => {
                         ui.add_space(10.0);
                         let btn = egui::Button::new(RichText::new("Downloading…").color(Color32::WHITE).strong())
-                            .fill(ACCENT1.gamma_multiply(0.5))
+                            .fill(ACCENT1().gamma_multiply(0.5))
                             .corner_radius(egui::CornerRadius::same(10))
                             .min_size(egui::vec2(0.0, 28.0));
                         ui.add_enabled(false, btn);
@@ -364,7 +364,7 @@ impl ModelManager {
                     _ => {
                         ui.add_space(10.0);
                         let btn = egui::Button::new(RichText::new("Download").color(Color32::WHITE).strong())
-                            .fill(ACCENT1)
+                            .fill(ACCENT1())
                             .corner_radius(egui::CornerRadius::same(10))
                             .min_size(egui::vec2(0.0, 28.0));
                         if ui.add(btn).clicked() {
@@ -374,7 +374,7 @@ impl ModelManager {
                 }
 
                 ui.add_space(6.0);
-                ui.label(RichText::new(info.note).color(MUTED).italics().size(10.0));
+                ui.label(RichText::new(info.note).color(MUTED()).italics().size(10.0));
             });
 
         ui.add_space(8.0);
@@ -387,7 +387,7 @@ impl ModelManager {
             egui::vec2(ui.available_width(), 28.0),
             egui::Layout::right_to_left(egui::Align::Center),
             |ui| {
-                let close = egui::Button::new(RichText::new("Close").color(TEXT))
+                let close = egui::Button::new(RichText::new("Close").color(TEXT()))
                     .corner_radius(egui::CornerRadius::same(10))
                     .min_size(egui::vec2(78.0, 26.0));
                 if ui.add(close).clicked() {
@@ -439,9 +439,9 @@ fn badge(ui: &mut egui::Ui, color: Color32, text: &str, icon: Option<egui::Image
 /// A rounded tab pill — accent-tinted when active, muted text otherwise.
 fn tab_pill(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
     let (fill, fg) = if selected {
-        (ACCENT1.gamma_multiply(0.30), TEXT)
+        (ACCENT1().gamma_multiply(0.30), TEXT())
     } else {
-        (Color32::TRANSPARENT, MUTED)
+        (Color32::TRANSPARENT, MUTED())
     };
     ui.add(
         egui::Button::new(RichText::new(text).color(fg).size(11.0))

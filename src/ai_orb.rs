@@ -124,7 +124,7 @@ impl AiOrb {
             return;
         }
 
-        let base = color.unwrap_or(crate::theme::ACCENT1);
+        let base = color.unwrap_or(crate::theme::ACCENT1());
         // Blend from the base blue (t=0) toward white (t=1); `a` is alpha 0..255.
         let mix = |t: f32, a: f32| -> Color32 {
             let t = t.clamp(0.0, 1.0);

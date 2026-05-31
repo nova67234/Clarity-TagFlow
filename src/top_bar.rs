@@ -96,7 +96,7 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats) -> TopBarAction {
     egui::Panel::top("topbar")
         .resizable(false) // This locks the height and removes the drag handle
         .show_separator_line(false)
-        .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(10)))
+        .frame(egui::Frame::new().fill(BG()).inner_margin(egui::Margin::same(10)))
         .show_inside(ui, |ui| {
             card_frame(22).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -115,7 +115,7 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats) -> TopBarAction {
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             let settings_svg = egui::include_image!("../icons/top_settings.svg");
-                            if svg_button(ui, settings_svg, "Settings", 37.0, MUTED).clicked() {
+                            if svg_button(ui, settings_svg, "Settings", 37.0, MUTED()).clicked() {
                                 action = TopBarAction::OpenSettings;
                             }
 
@@ -188,7 +188,7 @@ fn bar_button(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
 
 /// CPU/RAM label + live line graph, matching the top bar's center stats.
 fn stat_graph(ui: &mut egui::Ui, label: &str, data: &VecDeque<f32>, graph_width: f32) {
-    ui.label(egui::RichText::new(label).color(MUTED).size(12.0));
+    ui.label(egui::RichText::new(label).color(MUTED()).size(12.0));
     ui.add_space(8.0);
 
     // Replaced the hardcoded 150.0 width with our dynamic parameter
