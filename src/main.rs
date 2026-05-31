@@ -13,13 +13,13 @@ const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "jfif", "gif", "bmp", "webp", "ico", "tif", "tiff",
 ];
 
-/// "Extended" image extensions that rely on heavy C-library decoders (AVIF via
-/// dav1d, HEIC via libheif). Only recognised when the user enables them in
-/// Settings AND the app was built with support compiled in (the `avif` cargo
-/// feature). Defined only in such builds so a stale persisted setting can't make
-/// a normal build list files it can't decode.
+/// "Extended" image extensions decoded via the heavier pure-Rust crates: AVIF
+/// (avif-parse + rav1d), HEIC/HEIF (heic), and DNG camera raw (zenraw). Only
+/// recognised when the user enables them in Settings AND the app was built with
+/// the `avif` feature. Defined only in such builds so a stale persisted setting
+/// can't make a normal build list files it can't decode.
 #[cfg(feature = "avif")]
-const EXTENDED_IMAGE_EXTENSIONS: &[&str] = &["avif", "heic", "heif"];
+const EXTENDED_IMAGE_EXTENSIONS: &[&str] = &["avif", "heic", "heif", "dng"];
 
 /// Runtime flag mirroring `Settings::enable_extended_formats`, so the free
 /// `is_image()` helper (called all over) can gate the extended formats without

@@ -37,6 +37,12 @@ rav1d = { version = "1", optional = true, default-features = false, features = [
 # Pure-Rust HEIC/HEIF decode (no C deps, forbids unsafe). Optional — pulled in by
 # the `avif` feature alongside the AVIF decoder, since both are "extended formats".
 heic = { version = "0.1.6", optional = true }
+# Pure-Rust camera-raw (DNG) decode: zenraw wraps rawloader and runs a full
+# develop pipeline to sRGB. Pure Rust, and (unlike imagepipe) it's on image 0.25
+# so there's no version clash. `enough` supplies its cancellation-signal type
+# (`Unstoppable`). Both optional, behind `avif`.
+zenraw = { version = "0.2.0", optional = true }
+enough = { version = "0.4", optional = true }
 
 [build-dependencies]
 # Embeds the Windows app icon (and version info) into the exe at build time.
@@ -52,4 +58,4 @@ vlc = ["dep:vlc-rs"]
 # Pure-Rust AVIF decoding via avif-parse + rav1d (no C library / nasm needed).
 # Off by default to keep compile times down. Build with `--features avif`; the
 # in-app "extended formats" setting then turns .avif recognition on.
-avif = ["dep:avif-parse", "dep:rav1d", "dep:heic"]
+avif = ["dep:avif-parse", "dep:rav1d", "dep:heic", "dep:zenraw", "dep:enough"]

@@ -11,9 +11,10 @@ Defined in `src/main.rs`:
 - `IMAGE_EXTENSIONS` — always available, pure-Rust via the `image` crate:
   `png, jpg, jpeg, jfif, gif, bmp, webp, ico, tif, tiff`
   (`jfif` is just JPEG with a different extension — the decoder content-sniffs it.)
-- `EXTENDED_IMAGE_EXTENSIONS` — `avif, heic, heif`. Only recognised when **both**
-  the `avif` cargo feature is compiled in **and** the user enables "extended
-  formats" in Settings. Gated so a normal build never lists files it can't decode.
+- `EXTENDED_IMAGE_EXTENSIONS` — `avif, heic, heif, dng`. Only recognised when
+  **both** the `avif` cargo feature is compiled in **and** the user enables
+  "extended formats" in Settings. Gated so a normal build never lists files it
+  can't decode.
 - `VIDEO_EXTENSIONS` — listed/taggable, played via libVLC (the `vlc` feature).
 
 `is_image()` checks `IMAGE_EXTENSIONS` always, and the extended list only when
@@ -37,9 +38,11 @@ nothing extra for CI to install. All the decode logic lives in `src/avif.rs`
 
 Cargo features (`Cargo.toml`):
 ```toml
-avif = ["dep:avif-parse", "dep:rav1d", "dep:heic"]
+avif = ["dep:avif-parse", "dep:rav1d", "dep:heic", "dep:zenraw", "dep:enough"]
 default = ["vlc", "avif"]   # on by default
 ```
+(The `avif` feature is the umbrella for *all* extended formats, DNG included —
+the name is historical.)
 
 ---
 
@@ -107,8 +110,63 @@ responsive; it's a known, accepted cost of avoiding the C library.
 
 ---
 
-## 5. Where the decode is wired in
-All three call sites route extended formats to `crate::avif::decode_avif()`:
+## 5. DNG (camera raw) — zenraw + our own develop
+
+DNG is a camera-raw container: a Bayer/X-Trans sensor mosaic plus metadata
+(black/white levels, white-balance coefficients, a camera→XYZ colour matrix).
+Turning that into a viewable sRGB image is a *develop* pipeline, not just a decode.
+
+- **`zenraw`** (imazen, pure Rust, rawloader backend) parses the raw, normalises
+  sensor data, and demosaics. Pulled in by the `avif` feature alongside `enough`
+  (which supplies zenraw's `Unstoppable` cancellation token).
+
+### Why we don't use zenraw's built-in `Develop` mode
+On real DNGs `OutputMode::Develop` produces a strong **magenta cast**: its
+camera→sRGB matrix isn't white-preserving — it row-normalises the XYZ→camera
+matrix *before* inverting, instead of building the matrix so camera-white maps to
+display-white. Neutral tones come out tinted and there's no config knob to fix it.
+
+### `decode_dng` — two-tier strategy
+1. **Full raw develop** (`decode_dng_raw`) — the path below, for DNGs zenraw can
+   decode.
+2. **Embedded-JPEG-preview fallback** (`decode_dng_embedded_jpeg`) — when the raw
+   develop returns `None` because zenraw/rawloader can't read the file. Common
+   triggers: an unsupported camera, or **lossy DNG** (TIFF compression `34892`,
+   used by DJI drones and Lightroom's lossy-DNG export) which rawloader rejects
+   outright. Every DNG embeds at least one camera-rendered baseline JPEG preview;
+   we byte-scan for `FF D8 FF` start markers, decode each candidate, and keep the
+   largest that decodes. DJI's lossy DNGs embed a **full-resolution** preview
+   (e.g. test2.dng → 6720×4480), so these still display at full size — just from
+   the camera's JPEG rather than a from-scratch raw develop. (We cap the scan at
+   64 marker candidates so a run of false `FF D8 FF` byte coincidences inside
+   compressed data can't make it loop forever.)
+
+### Full raw develop (`decode_dng_raw`)
+Request `OutputMode::CameraRaw` — demosaiced, cropped, oriented camera-RGB as f32
+in `[0,1]`, with **no** WB or colour matrix applied — then run our own develop:
+
+1. **Gray-world white balance.** The as-shot WB coefficients rawloader reads from
+   older DNGs are unreliable — the Canon EOS 350D sample reports `[2.25, 1.0, 1.49]`,
+   which over-boosts red/blue into the same magenta cast. Rather than trust them,
+   we scale R and B so the image's *mean* matches green. Metadata-independent and
+   reproduces the camera's near-neutral average. (Tradeoff: gray-world slightly
+   neutralises genuinely warm/cool scenes — a sunset loses a little warmth.)
+2. **White-preserving camera→sRGB matrix** (`camera_to_srgb_matrix`): the dcraw
+   `cam_xyz_coeff` algorithm — `cam_rgb = xyz_to_cam · XYZ_RGB`, normalise each row
+   to sum to 1 (camera-white → display-white), then invert. Built from the DNG's
+   own `color_matrix`.
+3. **sRGB transfer curve** (`linear_to_srgb8`).
+
+**Caveats:** the raw develop is validated against one sample (`tests/DNG/sample1.dng`,
+Canon EOS 350D, full-res 3474×2314); `tests/DNG/test2.dng` (DJI, lossy DNG) goes
+through the embedded-JPEG fallback. The gray-world WB in particular may want
+revisiting (daylight-fixed, or derived from the embedded preview) as more cameras'
+raw-decodable DNGs are tested.
+
+---
+
+## 6. Where the decode is wired in
+All call sites route extended formats to `crate::avif::decode_avif()`:
 - `image_cache::decode_still` — thumbnails + the centre viewer.
 - `right_details::load_meta` — the Image Info panel's Dimensions + colour palette
   (the `image` crate can't even read AVIF/HEIC dimensions, so we decode once and
@@ -120,14 +178,14 @@ Toggling the Settings checkbox re-scans the open folder (`main.rs` tracks
 
 ---
 
-## 6. Build / CI notes
+## 7. Build / CI notes
 - `avif` is in `default` features, so normal `cargo run`, the IDE Run button, and
   the release workflows all compile rav1d + heic. **No nasm / no C libs required.**
 - Trade-off: clean builds are ~30-60s longer (rav1d is large).
-- The local sample sets (`/avif`, `/tests/avif`, `/tests/HEIC`) and the
-  `*.decoded.png` smoke-test outputs are gitignored — not committed.
-- Smoke tests live in `src/avif.rs` (`avif_smoke`, `heic_smoke`) — they skip
-  cleanly when the sample folders are absent, so they never break CI.
+- The local sample sets (`/avif`, `/tests/avif`, `/tests/HEIC`, `/tests/DNG`) and
+  the `*.decoded.png` smoke-test outputs are gitignored — not committed.
+- Smoke tests live in `src/avif.rs` (`avif_smoke`, `heic_smoke`, `dng_smoke`) —
+  they skip cleanly when the sample folders are absent, so they never break CI.
 
 ### If you ever want max AVIF speed
 Enable rav1d's `asm` feature and install `nasm` on every build machine + CI
