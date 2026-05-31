@@ -31,6 +31,11 @@ pub struct Settings {
     pub hd_thumbnails: bool,
     /// Ask for confirmation before deleting an image and its sidecar.
     pub confirm_before_delete: bool,
+    /// Recognise extended image formats (AVIF / HEIC) that rely on heavy C-library
+    /// decoders. Off by default. Only has an effect when the app was *built* with
+    /// the matching support compiled in (the `avif` / `heic` cargo features);
+    /// otherwise opening one shows a "couldn't load" notice.
+    pub enable_extended_formats: bool,
     /// The last AI tagger model selected in the Tag Manager, restored on launch
     /// so the user doesn't have to re-pick it each run.
     pub last_ai_model: String,
@@ -45,6 +50,7 @@ impl Default for Settings {
             thumbnail_size: 300.0,
             hd_thumbnails: false,
             confirm_before_delete: true,
+            enable_extended_formats: false,
             last_ai_model: "Select AI...".to_string(),
         }
     }
@@ -131,6 +137,23 @@ pub fn show(ctx: &egui::Context, settings: &mut Settings) {
                     "Show a confirmation dialog before deleting an image and its \
                      .txt sidecar.",
                 );
+
+                // Only shown in builds that actually compiled in a decoder for the
+                // extended formats (the `avif` cargo feature). Without it the
+                // toggle would do nothing useful, so it's hidden entirely.
+                #[cfg(feature = "avif")]
+                {
+                    ui.add_space(6.0);
+                    ui.checkbox(
+                        &mut settings.enable_extended_formats,
+                        egui::RichText::new("Enable extended formats (AVIF / HEIC)").color(TEXT),
+                    );
+                    hint(
+                        ui,
+                        "Recognise .avif and .heic files. These use heavy decoders, \
+                         so loading is slower.",
+                    );
+                }
             });
 
             section(ui, "About", |ui| {

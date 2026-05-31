@@ -16,6 +16,12 @@
 # Debug screenshots
 /images/*.png
 
+# Local AVIF test sample set + decoder smoke-test output (not committed)
+/avif
+
+# Machine-specific local cargo config (e.g. the VLC lib path) — not portable.
+/.cargo
+
 # Editor / tooling local state
 /.idea
 /.claude

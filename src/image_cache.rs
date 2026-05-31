@@ -416,6 +416,24 @@ fn worker_loop(queue: JobQueue, results: Sender<Decoded>, max_edge: Arc<AtomicU3
 /// `ImageReader.setSourceSubsampling`). Everything else, and any failure of the
 /// fast path, falls back to a full decode + downscale (memory-gated).
 fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::ColorImage> {
+    // AVIF/HEIF go through the pure-Rust rav1d path (the `image` crate can't
+    // decode them without the C dav1d library). Only compiled in with the `avif`
+    // feature; downscale the result to fit like any other still.
+    #[cfg(feature = "avif")]
+    {
+        let is_avif = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "avif" | "heic" | "heif"))
+            .unwrap_or(false);
+        if is_avif {
+            let _gate = large_decode_permit(path, gate);
+            let rgba = crate::avif::decode_avif(path)?;
+            let img = image::DynamicImage::ImageRgba8(rgba).thumbnail(max_edge, max_edge);
+            return Some(color_image(&img.to_rgba8()));
+        }
+    }
+
     if let Ok((w, h)) = image::image_dimensions(path) {
         if w > max_edge || h > max_edge {
             if let Some(img) = decode_downscaled(path, w, h, max_edge) {
