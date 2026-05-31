@@ -32,11 +32,28 @@ use rav1d::src::lib::{
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Decode an AVIF/HEIF file to an RGBA image. Returns `None` on any failure so
-/// the caller falls back to the usual "couldn't load" placeholder.
+/// Decode an AVIF, HEIC, or HEIF file to an RGBA image. Returns `None` on any
+/// failure so the caller falls back to the usual "couldn't load" placeholder.
+///
+/// HEIC/HEIF (HEVC-coded) goes through the pure-Rust `heic` crate; AVIF
+/// (AV1-coded) goes through avif-parse + rav1d below. They share the `.heif`
+/// extension, so we try the AVIF path first and fall back to HEVC if it fails.
 pub fn decode_avif(path: &std::path::Path) -> Option<RgbaImage> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext == "heic" {
+        return decode_heic(path);
+    }
+
     let bytes = std::fs::read(path).ok()?;
-    let parsed = avif_parse::read_avif(&mut bytes.as_slice()).ok()?;
+    let parsed = match avif_parse::read_avif(&mut bytes.as_slice()) {
+        Ok(p) => p,
+        // A `.heif`/`.avif` that isn't actually AV1 — try the HEVC decoder.
+        Err(_) => return decode_heic(path),
+    };
 
     let (mut rgba, w, h) = decode_obu_to_rgba(&parsed.primary_item)?;
     if let Some(alpha_obu) = &parsed.alpha_item {
@@ -49,6 +66,15 @@ pub fn decode_avif(path: &std::path::Path) -> Option<RgbaImage> {
         }
     }
     RgbaImage::from_raw(w, h, rgba)
+}
+
+/// Decode a HEIC/HEIF (HEVC-coded) file via the pure-Rust `heic` crate.
+fn decode_heic(path: &std::path::Path) -> Option<RgbaImage> {
+    let bytes = std::fs::read(path).ok()?;
+    let out = heic::DecoderConfig::new()
+        .decode(&bytes, heic::PixelLayout::Rgba8)
+        .ok()?;
+    RgbaImage::from_raw(out.width, out.height, out.data)
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +275,32 @@ mod tests {
                     println!("OK {c} -> {}x{} -> {out}", img.width(), img.height());
                 }
                 None => println!("FAIL {c}"),
+            }
+        }
+    }
+
+    // cargo test --no-default-features --features avif heic_smoke -- --nocapture
+    #[test]
+    fn heic_smoke() {
+        let dir = std::path::Path::new("tests/HEIC");
+        if !dir.is_dir() {
+            eprintln!("skipping heic_smoke: no tests/HEIC folder");
+            return;
+        }
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("heic"))
+                != Some(true)
+            {
+                continue;
+            }
+            match decode_avif(&p) {
+                Some(img) => {
+                    let out = format!("{}.decoded.png", p.display());
+                    img.save(&out).unwrap();
+                    println!("OK {} -> {}x{} -> {out}", p.display(), img.width(), img.height());
+                }
+                None => println!("FAIL {}", p.display()),
             }
         }
     }
