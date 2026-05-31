@@ -53,6 +53,7 @@ mod backup;
 mod image_cache;
 mod left_browser;
 mod right_details;
+mod sd_metadata;
 mod settings;
 mod tag_manager;
 mod tag_manager_settings;
@@ -337,6 +338,9 @@ impl ViewerApp {
                     // Start/refresh the embedded player when the selection changes.
                     // start() only returns None in a --no-default-features build
                     // (or if libVLC fails to init), handled by the notice below.
+                    // Push the current loop preference so the player picks it up
+                    // when it (re)starts this clip.
+                    video::set_loop(self.settings.loop_video);
                     if self.last_video_path.as_deref() != Some(path.as_path()) {
                         self.last_video_path = Some(path.clone());
                         self.video_player = video::VideoPlayer::start(&path, ui.ctx());
