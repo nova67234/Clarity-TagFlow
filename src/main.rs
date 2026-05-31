@@ -42,19 +42,7 @@ const VIDEO_EXTENSIONS: &[&str] = &[
 // ---------------------------------------------------------------------------
 // Theme — mirrors the dark palette from terminus2's AppTheme.
 // ---------------------------------------------------------------------------
-mod theme {
-    use crate::egui::Color32;
-
-    pub const BG: Color32 = Color32::from_rgb(24, 24, 26);
-    pub const PANEL: Color32 = Color32::from_rgb(32, 32, 34);
-    pub const FIELD: Color32 = Color32::from_rgb(45, 47, 50);
-    pub const TEXT: Color32 = Color32::from_rgb(235, 235, 235);
-    pub const MUTED: Color32 = Color32::from_rgb(170, 170, 170);
-    pub const ACCENT1: Color32 = Color32::from_rgb(64, 140, 255);
-
-    /// Faint light edge drawn around rounded panels (TEXT @ ~8% alpha).
-    pub const EDGE: Color32 = Color32::from_rgba_premultiplied(18, 18, 18, 20);
-}
+mod theme;
 use theme::*;
 
 mod ai_models;
@@ -92,7 +80,6 @@ fn main() -> eframe::Result {
             // REQUIRED: Install the image loaders so egui can parse SVG bytes
             egui_extras::install_image_loaders(&cc.egui_ctx);
 
-            apply_theme(&cc.egui_ctx);
             let mut app = ViewerApp::default();
             // Restore saved settings (if any) from eframe's persistent storage.
             if let Some(storage) = cc.storage {
@@ -102,6 +89,11 @@ fn main() -> eframe::Result {
                     app.tag_manager.ai_model = app.settings.last_ai_model.clone();
                 }
             }
+            // Apply the saved colour theme before the first paint so a Light-mode
+            // user doesn't see a dark flash on launch.
+            theme::set(app.settings.theme);
+            app.last_theme = app.settings.theme;
+            apply_theme(&cc.egui_ctx);
             // Optional: open a folder passed on the command line (e.g. "Open with").
             if let Some(arg) = std::env::args().nth(1) {
                 let dir = PathBuf::from(arg);
@@ -130,22 +122,8 @@ fn load_app_icon() -> egui::IconData {
 /// Push the dark palette into egui's global visuals so stock widgets
 /// (text fields, scrollbars, etc.) match the custom-painted panels.
 fn apply_theme(ctx: &egui::Context) {
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = BG;
-    v.window_fill = PANEL;
-    v.extreme_bg_color = FIELD; // text-edit background
-    v.override_text_color = Some(TEXT);
-    v.selection.bg_fill = ACCENT1.gamma_multiply(0.45);
-    for w in [
-        &mut v.widgets.noninteractive,
-        &mut v.widgets.inactive,
-        &mut v.widgets.hovered,
-        &mut v.widgets.active,
-        &mut v.widgets.open,
-    ] {
-        w.corner_radius = CornerRadius::same(8);
-    }
-    ctx.set_visuals(v);
+    // Delegates to the theme module, which picks the active Dark/Light palette.
+    theme::apply(ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +138,9 @@ struct ViewerApp {
     /// the folder when the user toggles AVIF/HEIC on or off and the new file
     /// types appear (or disappear) without needing to reopen the folder.
     last_extended_formats: bool,
+    /// Last-applied colour theme, so we re-push the egui visuals only when the
+    /// user actually changes it in the Appearance tab.
+    last_theme: theme::Theme,
     /// CACHED list of indexes mapping into `self.images` after the search string is applied
     filtered: Vec<usize>,
     selected: Option<usize>,
@@ -197,6 +178,7 @@ impl Default for ViewerApp {
             images: Vec::new(),
             current_folder: None,
             last_extended_formats: settings::Settings::default().enable_extended_formats,
+            last_theme: theme::Theme::default(),
             filtered: Vec::new(),
             selected: None,
             search: String::new(),
@@ -332,7 +314,7 @@ impl ViewerApp {
         egui::CentralPanel::default()
             // Match the side panels' margins (top: 0) so the viewer rises to the
             // top bar and is the same height as the left/right panels.
-            .frame(egui::Frame::new().fill(BG).inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 10 }))
+            .frame(egui::Frame::new().fill(BG()).inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 10 }))
             .show_inside(ui, |ui| {
                 let Some(idx) = self.selected else {
                     ui.centered_and_justified(|ui| {
@@ -341,7 +323,7 @@ impl ViewerApp {
                                 "Open a folder to get started\n\nClick the folder button, or drag a folder or images here",
                             )
                                 .size(18.0)
-                                .color(MUTED),
+                                .color(MUTED()),
                         );
                     });
                     return;
@@ -364,7 +346,7 @@ impl ViewerApp {
                             Some(tex) => show_fitted(ui, &tex, false),
                             None => {
                                 ui.centered_and_justified(|ui| {
-                                    ui.add(egui::Spinner::new().size(48.0).color(MUTED));
+                                    ui.add(egui::Spinner::new().size(48.0).color(MUTED()));
                                 });
                             }
                         }
@@ -388,14 +370,14 @@ impl ViewerApp {
                         ui.add(
                             egui::Image::new(icon)
                                 .fit_to_exact_size(egui::vec2(84.0, 84.0))
-                                .tint(MUTED),
+                                .tint(MUTED()),
                         );
                         ui.add_space(10.0);
-                        ui.label(egui::RichText::new(file_name(&path)).color(TEXT).strong().size(15.0));
+                        ui.label(egui::RichText::new(file_name(&path)).color(TEXT()).strong().size(15.0));
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new("Couldn't start video playback.")
-                                .color(MUTED)
+                                .color(MUTED())
                                 .size(13.0),
                         );
                     });
@@ -419,7 +401,7 @@ impl ViewerApp {
                     }
                     image_cache::Cached::Failed => {
                         ui.centered_and_justified(|ui| {
-                            ui.label(egui::RichText::new("Couldn't load image").color(MUTED));
+                            ui.label(egui::RichText::new("Couldn't load image").color(MUTED()));
                         });
                     }
                     image_cache::Cached::Loading => {
@@ -430,7 +412,7 @@ impl ViewerApp {
                             }
                             _ => {
                                 ui.centered_and_justified(|ui| {
-                                    ui.add(egui::Spinner::new().size(48.0).color(MUTED));
+                                    ui.add(egui::Spinner::new().size(48.0).color(MUTED()));
                                 });
                             }
                         }
@@ -471,6 +453,10 @@ impl eframe::App for ViewerApp {
 
         self.thumbs.begin_frame(ui.ctx());
         self.viewer.begin_frame(ui.ctx());
+
+        // Paint the theme's full-window background (the Space theme's animated
+        // starfield) on the bottom layer, beneath every panel. No-op otherwise.
+        theme::paint_background(ui.ctx());
 
         // --- Toggle fullscreen on F12 ---
         if ui.input(|i| i.key_pressed(egui::Key::F12)) {
@@ -611,6 +597,15 @@ impl eframe::App for ViewerApp {
 
         settings::show(ui.ctx(), &mut self.settings);
 
+        // Apply a theme change from the Appearance tab live (only when it
+        // actually changed, so we don't re-push visuals every frame).
+        if self.settings.theme != self.last_theme {
+            self.last_theme = self.settings.theme;
+            theme::set(self.settings.theme);
+            theme::apply(ui.ctx());
+            ui.ctx().request_repaint();
+        }
+
         // 5. Backup dialog (floats on top when opened from the top bar).
         self.backup.show(ui.ctx());
 
@@ -655,18 +650,18 @@ fn show_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle, is_loading: bool) {
 
         if is_loading {
             let spinner_rect = egui::Rect::from_center_size(resp.rect.center(), egui::vec2(48.0, 48.0));
-            egui::Spinner::new().color(MUTED).paint_at(ui, spinner_rect);
+            egui::Spinner::new().color(MUTED()).paint_at(ui, spinner_rect);
         }
     });
 }
 
-/// A rounded panel with the PANEL fill, faint edge, and a soft drop shadow.
+/// A rounded panel with the PANEL() fill, faint edge, and a soft drop shadow.
 pub(crate) fn card_frame(radius: u8) -> egui::Frame {
     egui::Frame::new()
-        .fill(PANEL)
+        .fill(PANEL())
         .corner_radius(CornerRadius::same(radius))
         .inner_margin(Margin::same(12))
-        .stroke(Stroke::new(1.0, EDGE))
+        .stroke(Stroke::new(1.0, EDGE()))
         .shadow(egui::epaint::Shadow {
             offset: [0, 4],
             blur: 14,

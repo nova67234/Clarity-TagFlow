@@ -139,7 +139,7 @@ pub fn show(anchor: &egui::Response, s: &mut TagManagerSettings) {
             });
 
             section(ui, "Global Tag Blacklist", |ui| {
-                ui.label(egui::RichText::new("Comma or newline separated").color(MUTED).size(12.0));
+                ui.label(egui::RichText::new("Comma or newline separated").color(MUTED()).size(12.0));
                 ui.add_space(4.0);
                 ui.add(
                     egui::TextEdit::multiline(&mut s.blacklist)
@@ -197,20 +197,20 @@ pub fn show(anchor: &egui::Response, s: &mut TagManagerSettings) {
 }
 
 fn rich(text: &str) -> egui::RichText {
-    egui::RichText::new(text).color(TEXT)
+    egui::RichText::new(text).color(TEXT())
 }
 
 /// A titled rounded group card, matching the app's settings style.
 fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(6.0);
-    ui.label(egui::RichText::new(title).color(MUTED).strong().size(12.0));
+    ui.label(egui::RichText::new(title).color(MUTED()).strong().size(12.0));
     ui.add_space(4.0);
 
     egui::Frame::new()
-        .fill(FIELD)
+        .fill(FIELD())
         .corner_radius(egui::CornerRadius::same(22))
         .inner_margin(egui::Margin::symmetric(14, 12))
-        .stroke(egui::Stroke::new(1.0, EDGE))
+        .stroke(egui::Stroke::new(1.0, EDGE()))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui);

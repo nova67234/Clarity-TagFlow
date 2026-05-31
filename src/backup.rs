@@ -230,8 +230,8 @@ impl BackupState {
             //    into pills otherwise. Everything else (checkmark colour, fills)
             //    stays at the theme default so the checkbox looks identical to the
             //    Tag Manager settings one.
-            //  * only the text wells use the darker BG fill so the name/password
-            //    boxes read as distinct inputs against the lighter FIELD cards.
+            //  * only the text wells use the darker BG() fill so the name/password
+            //    boxes read as distinct inputs against the lighter FIELD() cards.
             let mut style = ui.style().as_ref().clone();
             let sq = egui::CornerRadius::same(4);
             for w in [
@@ -247,7 +247,7 @@ impl BackupState {
             // card colour so the name/password boxes blend with the card behind
             // them, then give the input widgets a thin visible outline so the box
             // still reads as an input.
-            style.visuals.extreme_bg_color = FIELD;
+            style.visuals.extreme_bg_color = FIELD();
             let outline = egui::Stroke::new(1.0, Color32::from_gray(80));
             style.visuals.widgets.inactive.bg_stroke = outline;
             style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, Color32::from_gray(110));
@@ -272,7 +272,7 @@ impl BackupState {
         header(ui, "Archive this folder's media and tags into a .zip.");
 
         section(ui, "Details", |ui| {
-            ui.label(RichText::new("Backup name").color(MUTED).size(12.0));
+            ui.label(RichText::new("Backup name").color(MUTED()).size(12.0));
             ui.add_space(4.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.name)
@@ -286,12 +286,12 @@ impl BackupState {
         section(ui, "Security", |ui| {
             ui.checkbox(
                 &mut self.encrypt,
-                RichText::new("Encrypt with password (AES-256)").color(TEXT).size(13.0),
+                RichText::new("Encrypt with password (AES-256)").color(TEXT()).size(13.0),
             );
 
             if self.encrypt {
                 ui.add_space(8.0);
-                ui.label(RichText::new("Password").color(MUTED).size(12.0));
+                ui.label(RichText::new("Password").color(MUTED()).size(12.0));
                 ui.add_space(4.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.password)
@@ -300,7 +300,7 @@ impl BackupState {
                         .desired_width(FIELD_WIDTH)
                 );
                 ui.add_space(8.0);
-                ui.label(RichText::new("Confirm password").color(MUTED).size(12.0));
+                ui.label(RichText::new("Confirm password").color(MUTED()).size(12.0));
                 ui.add_space(4.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.confirm)
@@ -420,7 +420,7 @@ impl BackupState {
 
         section(ui, "Progress", |ui| {
             let label = prog.label.lock().unwrap().clone();
-            ui.label(RichText::new(label).color(MUTED).size(12.0));
+            ui.label(RichText::new(label).color(MUTED()).size(12.0));
             ui.add_space(8.0);
 
             let total = prog.total.load(Relaxed);
@@ -485,13 +485,13 @@ fn done_body(ui: &mut egui::Ui, outcome: &Outcome) -> bool {
         Outcome::NoFiles => {
             header(ui, "Nothing was archived.");
             section(ui, "Details", |ui| {
-                ui.label(RichText::new("No valid files found to back up.").color(MUTED).size(13.0));
+                ui.label(RichText::new("No valid files found to back up.").color(MUTED()).size(13.0));
             });
         }
         Outcome::Cancelled => {
             header(ui, "The backup was stopped.");
             section(ui, "Details", |ui| {
-                ui.label(RichText::new("Backup operation canceled.").color(MUTED).size(13.0));
+                ui.label(RichText::new("Backup operation canceled.").color(MUTED()).size(13.0));
             });
         }
         Outcome::Error(e) => {
@@ -525,19 +525,19 @@ fn done_body(ui: &mut egui::Ui, outcome: &Outcome) -> bool {
 /// Dialog sub-header: a muted one-line description under the window title bar
 /// (which already shows the dialog name, so there's no title duplicated here).
 fn header(ui: &mut egui::Ui, subtitle: &str) {
-    ui.label(RichText::new(subtitle).color(MUTED).size(11.0));
+    ui.label(RichText::new(subtitle).color(MUTED()).size(11.0));
     ui.add_space(10.0);
 }
 
 /// A titled, rounded group card holding related controls (matches Settings).
 fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    ui.label(RichText::new(title).color(MUTED).strong().size(12.0));
+    ui.label(RichText::new(title).color(MUTED()).strong().size(12.0));
     ui.add_space(4.0);
     egui::Frame::new()
-        .fill(FIELD)
+        .fill(FIELD())
         .corner_radius(egui::CornerRadius::same(22))
         .inner_margin(egui::Margin::symmetric(14, 12))
-        .stroke(egui::Stroke::new(1.0, EDGE))
+        .stroke(egui::Stroke::new(1.0, EDGE()))
         .show(ui, |ui| {
             // Fixed width, never `available_width()` (which is infinite in an
             // auto-sized window and would leak `inf` into the persisted state).
@@ -550,21 +550,21 @@ fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 /// A small muted explanatory line, shown under a control.
 fn hint(ui: &mut egui::Ui, text: &str) {
     ui.add_space(4.0);
-    ui.label(RichText::new(text).color(MUTED).size(11.0));
+    ui.label(RichText::new(text).color(MUTED()).size(11.0));
 }
 
 /// A label : value row, used in the result summary.
 fn kv(ui: &mut egui::Ui, key: &str, value: &str) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("{key}:")).color(MUTED).size(12.0));
-        ui.label(RichText::new(value).color(TEXT).size(12.0));
+        ui.label(RichText::new(format!("{key}:")).color(MUTED()).size(12.0));
+        ui.label(RichText::new(value).color(TEXT()).size(12.0));
     });
 }
 
 /// A footer button — 90×32, radius 10. Plain themed style (so it keeps the app's
 /// default hover glow); pass `flash = Some(color)` to tint it for a click-flash.
 fn footer_button(ui: &mut egui::Ui, label: &str, flash: Option<Color32>) -> egui::Response {
-    let text = if flash.is_some() { Color32::WHITE } else { TEXT };
+    let text = if flash.is_some() { Color32::WHITE } else { TEXT() };
     let mut btn = egui::Button::new(RichText::new(label).color(text).size(14.0))
         .corner_radius(egui::CornerRadius::same(10));
     if let Some(color) = flash {
@@ -758,10 +758,10 @@ fn write_zip(
 /// A themed frame for the dialog body (matches the settings window).
 fn window_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(PANEL)
+        .fill(PANEL())
         .corner_radius(egui::CornerRadius::same(22))
         .inner_margin(egui::Margin::same(16))
-        .stroke(egui::Stroke::new(1.0, EDGE))
+        .stroke(egui::Stroke::new(1.0, EDGE()))
         .shadow(egui::epaint::Shadow {
             offset: [0, 4],
             blur: 16,
