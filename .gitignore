@@ -18,6 +18,7 @@
 
 # Local AVIF/HEIC test sample sets + decoder smoke-test output (not committed)
 /avif
+/tests/avif
 /tests/HEIC
 
 # Machine-specific local cargo config (e.g. the VLC lib path) — not portable.
