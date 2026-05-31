@@ -24,6 +24,8 @@ pub enum RightView {
     Details,
     /// The Tag Manager settings UI (replaces the details view).
     TagManager,
+    /// The Gelbooru downloader UI (replaces the details view).
+    Downloader,
 }
 
 /// Read-only file metadata shown in the bottom "Image Details" card. A Rust
@@ -36,6 +38,18 @@ pub struct ImageMeta {
     date: String,
     /// A small palette of dominant colors extracted from the image.
     colors: Vec<egui::Color32>,
+    /// True when the selected file is a video. The details card then shows a
+    /// "Video Info" view (video icon + duration / codec) instead of "Image Info".
+    is_video: bool,
+    /// True when the selected file is an animated GIF. The card then shows a
+    /// "GIF Info" view (gif icon + frame count / duration).
+    is_gif: bool,
+    /// Playback length, e.g. "12:34" (videos / animated GIFs; "---" otherwise).
+    duration: String,
+    /// Video codec, e.g. "H.264 (avc1)" (videos only; "---" otherwise).
+    codec: String,
+    /// Animation frame count, e.g. "48 frames" (GIFs only; "---" otherwise).
+    frames: String,
 }
 
 impl Default for ImageMeta {
@@ -47,6 +61,11 @@ impl Default for ImageMeta {
             size: "---".into(),
             date: "---".into(),
             colors: Vec::new(),
+            is_video: false,
+            is_gif: false,
+            duration: "---".into(),
+            codec: "---".into(),
+            frames: "---".into(),
         }
     }
 }
@@ -60,6 +79,8 @@ pub struct RightPanelState {
     pub sd_metadata: Option<String>,
     /// When true, the tag box shows the (read-only) SD metadata instead of tags.
     pub showing_meta: bool,
+    /// State for the Gelbooru downloader view.
+    pub downloader: crate::download::DownloaderState,
     pub is_editing: bool,
 
     /// Which view the panel currently shows (Details vs Tag Manager).
@@ -96,6 +117,7 @@ impl Default for RightPanelState {
             current_tags: String::new(),
             sd_metadata: None,
             showing_meta: false,
+            downloader: crate::download::DownloaderState::default(),
             is_editing: false,
             view: RightView::default(),
             show_delete_confirm: false,
@@ -160,7 +182,8 @@ pub fn show(
             state.meta = ImageMeta {
                 name: "Loading...".into(), file_type: "...".into(),
                 dimensions: "...".into(), size: "...".into(),
-                date: "...".into(), colors: vec![]
+                date: "...".into(), colors: vec![],
+                ..ImageMeta::default()
             };
 
             // Spawn a background thread to calculate metadata and heavy colors
@@ -261,6 +284,13 @@ pub fn show(
                                 state.view = RightView::TagManager;
                                 ui.close(); // Fixed deprecation
                             }
+                            if ui
+                                .selectable_label(state.view == RightView::Downloader, "Downloader")
+                                .clicked()
+                            {
+                                state.view = RightView::Downloader;
+                                ui.close();
+                            }
                         });
 
                     // --- Swap Views ---
@@ -268,6 +298,8 @@ pub fn show(
                     // but stays constrained perfectly within the 420px width and 22px rounded box.
                     if state.view == RightView::TagManager {
                         crate::tag_manager::show(ui, tag_manager, current_image, &mut state.current_tags, all_images);
+                    } else if state.view == RightView::Downloader {
+                        crate::download::show(ui, &mut state.downloader);
                     } else if let Some(img_path) = current_image {
                         // --- FOOTER SECTION (Strictly Bottom Anchored) ---
                         egui::Panel::bottom("right_footer")
@@ -632,16 +664,31 @@ const DETAIL_LABEL_W: f32 = 110.0;
 const DETAIL_ROW_VPAD: f32 = 3.0;
 
 fn image_details_section(ui: &mut egui::Ui, meta: &ImageMeta) {
+    // Swap the heading + icon to match the selection: "Video Info" (video icon)
+    // for videos, "GIF Info" (gif icon) for animated GIFs, else "Image Info".
     ui.horizontal(|ui| {
         // Tight gap between the icon and the heading text.
         ui.spacing_mut().item_spacing.x = 4.0;
-        let icon = egui::include_image!("../icons/image.svg");
+        let icon = if meta.is_video {
+            egui::include_image!("../icons/video_info.svg")
+        } else if meta.is_gif {
+            egui::include_image!("../icons/gif_info.svg")
+        } else {
+            egui::include_image!("../icons/image.svg")
+        };
         ui.add(
             egui::Image::new(icon)
                 .fit_to_exact_size(egui::vec2(18.0, 18.0))
                 .tint(TEXT()),
         );
-        ui.label(egui::RichText::new("Image Info").color(TEXT()).strong().size(15.0));
+        let heading = if meta.is_video {
+            "Video Info"
+        } else if meta.is_gif {
+            "GIF Info"
+        } else {
+            "Image Info"
+        };
+        ui.label(egui::RichText::new(heading).color(TEXT()).strong().size(15.0));
     });
     ui.add_space(8.0);
 
@@ -658,10 +705,28 @@ fn image_details_section(ui: &mut egui::Ui, meta: &ImageMeta) {
         ui.set_width(ui.available_width());
         detail_row(ui, "File Name:", &meta.name);
         detail_row(ui, "File Type:", &meta.file_type);
-        detail_row(ui, "Dimensions:", &meta.dimensions);
-        detail_row(ui, "File Size:", &meta.size);
-        detail_row(ui, "Date Modified:", &meta.date);
-        detail_color_row(ui, "Colors:", &meta.colors); // NEW COLOR ROW!
+        if meta.is_video {
+            // Video-specific facts that are actually useful to see at a glance.
+            detail_row(ui, "Resolution:", &meta.dimensions);
+            detail_row(ui, "Duration:", &meta.duration);
+            detail_row(ui, "Codec:", &meta.codec);
+            detail_row(ui, "File Size:", &meta.size);
+            detail_row(ui, "Date Modified:", &meta.date);
+        } else if meta.is_gif {
+            // GIF-specific facts: how many frames and how long it plays. The
+            // colour palette is still useful, so keep it too.
+            detail_row(ui, "Dimensions:", &meta.dimensions);
+            detail_row(ui, "Frames:", &meta.frames);
+            detail_row(ui, "Duration:", &meta.duration);
+            detail_row(ui, "File Size:", &meta.size);
+            detail_row(ui, "Date Modified:", &meta.date);
+            detail_color_row(ui, "Colors:", &meta.colors);
+        } else {
+            detail_row(ui, "Dimensions:", &meta.dimensions);
+            detail_row(ui, "File Size:", &meta.size);
+            detail_row(ui, "Date Modified:", &meta.date);
+            detail_color_row(ui, "Colors:", &meta.colors); // NEW COLOR ROW!
+        }
     });
 }
 
@@ -749,6 +814,26 @@ fn load_meta(path: &Path) -> ImageMeta {
         }
         Err(_) => ("---".to_string(), "---".to_string()),
     };
+
+    // Videos: skip the image decode / colour extraction entirely (it can't read a
+    // video and would waste time). Read lightweight container facts instead and
+    // return a "Video Info" meta.
+    if crate::is_video(path) {
+        let (dimensions, duration, codec) = read_video_meta(path);
+        return ImageMeta {
+            name,
+            file_type,
+            dimensions,
+            size,
+            date,
+            colors: Vec::new(),
+            is_video: true,
+            is_gif: false,
+            duration,
+            codec,
+            frames: "---".into(),
+        };
+    }
 
     // AVIF/HEIC/HEIF can't be read by the `image` crate's header reader or
     // `open()`, so decode them once via our pure-Rust path and reuse the result
@@ -894,7 +979,80 @@ fn load_meta(path: &Path) -> ImageMeta {
         }).collect();
     }
 
-    ImageMeta { name, file_type, dimensions, size, date, colors: palette }
+    // Animated GIFs get their frame count + play time read cheaply from the
+    // container (no pixel decode); the dimensions and palette above still apply.
+    let (is_gif, gif_frames, gif_duration) = read_gif_meta(path);
+
+    ImageMeta {
+        name,
+        file_type,
+        dimensions,
+        size,
+        date,
+        colors: palette,
+        is_video: false,
+        is_gif,
+        duration: gif_duration,
+        codec: "---".into(),
+        frames: gif_frames,
+    }
+}
+
+/// Read animated-GIF facts: `(is_animated_gif, "N frames", "M:SS")`. A
+/// single-frame (static) GIF reports `is_gif = false` so it stays in the normal
+/// "Image Info" view. Non-GIFs return all-default.
+fn read_gif_meta(path: &Path) -> (bool, String, String) {
+    let is_gif_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("gif"))
+        .unwrap_or(false);
+    if !is_gif_ext {
+        return (false, "---".into(), "---".into());
+    }
+    match crate::gif_info::probe(path) {
+        // Only treat it as a GIF "animation" when it has more than one frame.
+        Some(info) if info.frames > 1 => {
+            let frames = format!("{} frames", info.frames);
+            let duration = info.duration_secs.map(format_duration).unwrap_or_else(|| "---".into());
+            (true, frames, duration)
+        }
+        _ => (false, "---".into(), "---".into()),
+    }
+}
+
+/// Read useful video facts — resolution, duration, codec — without external
+/// tools. Parses the ISO base-media (MP4 / MOV / M4V) box structure, reading only
+/// the small `moov` header rather than the whole (often huge) file. Containers we
+/// can't parse (MKV / WebM / AVI / …) return "---" for the unknown fields, so the
+/// card still shows the file name, type, size and date.
+fn read_video_meta(path: &Path) -> (String, String, String) {
+    let unknown = || ("---".to_string(), "---".to_string(), "---".to_string());
+    match crate::mp4::probe(path) {
+        Some(info) => {
+            let resolution = match (info.width, info.height) {
+                (Some(w), Some(h)) if w > 0 && h > 0 => format!("{w} x {h}"),
+                _ => "---".to_string(),
+            };
+            let duration = info.duration_secs.map(format_duration).unwrap_or_else(|| "---".into());
+            let codec = info.codec.unwrap_or_else(|| "---".into());
+            (resolution, duration, codec)
+        }
+        None => unknown(),
+    }
+}
+
+/// Format a duration in seconds as `H:MM:SS` (or `M:SS` under an hour).
+fn format_duration(secs: f64) -> String {
+    let total = secs.round().max(0.0) as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 fn human_bytes(bytes: u64) -> String {
