@@ -671,15 +671,15 @@ fn load_meta(path: &Path) -> ImageMeta {
         Err(_) => ("---".to_string(), "---".to_string()),
     };
 
-    // AVIF/HEIC can't be read by the `image` crate's header reader or `open()`
-    // (no C dav1d), so decode them once via our pure-Rust path and reuse the
-    // result for both the dimensions and the colour palette below.
+    // AVIF/HEIC/HEIF can't be read by the `image` crate's header reader or
+    // `open()`, so decode them once via our pure-Rust path and reuse the result
+    // for both the dimensions and the colour palette below.
     #[cfg(feature = "avif")]
     let avif_img: Option<image::DynamicImage> = {
         let is_avif = path
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "avif" | "heic" | "heif"))
+            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "avif" | "heic" | "heif" | "dng"))
             .unwrap_or(false);
         if is_avif {
             crate::avif::decode_avif(path).map(image::DynamicImage::ImageRgba8)
@@ -693,9 +693,11 @@ fn load_meta(path: &Path) -> ImageMeta {
     let dimensions = if let Some(img) = &avif_img {
         format!("{} x {}", img.width(), img.height())
     } else {
-        image::image_dimensions(path)
+        // Use orientation-aware dimensions so a portrait photo (EXIF orientation
+        // 6/8) reports the size the user sees, matching the rotated display.
+        crate::image_cache::oriented_dimensions(path)
             .map(|(w, h)| format!("{} x {}", w, h))
-            .unwrap_or_else(|_| "---".to_string())
+            .unwrap_or_else(|| "---".to_string())
     };
 
     // --- COLOR EXTRACTION V3 (Vibrancy & Saturation Weighted) ---

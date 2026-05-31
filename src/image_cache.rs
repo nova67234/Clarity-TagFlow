@@ -416,17 +416,17 @@ fn worker_loop(queue: JobQueue, results: Sender<Decoded>, max_edge: Arc<AtomicU3
 /// `ImageReader.setSourceSubsampling`). Everything else, and any failure of the
 /// fast path, falls back to a full decode + downscale (memory-gated).
 fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::ColorImage> {
-    // AVIF/HEIF go through the pure-Rust rav1d path (the `image` crate can't
-    // decode them without the C dav1d library). Only compiled in with the `avif`
-    // feature; downscale the result to fit like any other still.
+    // AVIF/HEIC/HEIF go through the pure-Rust extended decoders (the `image`
+    // crate can't handle them). Only compiled in with the `avif` feature;
+    // downscale the result to fit like any other still.
     #[cfg(feature = "avif")]
     {
-        let is_avif = path
+        let is_extended = path
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "avif" | "heic" | "heif"))
+            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "avif" | "heic" | "heif" | "dng"))
             .unwrap_or(false);
-        if is_avif {
+        if is_extended {
             let _gate = large_decode_permit(path, gate);
             let rgba = crate::avif::decode_avif(path)?;
             let img = image::DynamicImage::ImageRgba8(rgba).thumbnail(max_edge, max_edge);
@@ -434,9 +434,16 @@ fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::Co
         }
     }
 
+    // EXIF orientation isn't applied by `image` (nor read at all by the fast
+    // `jpeg_decoder`/`png` subsample paths), so phone/drone/camera photos shot in
+    // portrait (or any rotated orientation) would display sideways. Read the tag
+    // once and apply it to whatever the decode paths below produce.
+    let orientation = exif_orientation(path);
+
     if let Ok((w, h)) = image::image_dimensions(path) {
         if w > max_edge || h > max_edge {
-            if let Some(img) = decode_downscaled(path, w, h, max_edge) {
+            if let Some(mut img) = decode_downscaled(path, w, h, max_edge) {
+                img.apply_orientation(orientation);
                 // Cheap final fit: the result is already near `max_edge`.
                 let img = img.thumbnail(max_edge, max_edge);
                 return Some(color_image(&img.to_rgba8()));
@@ -448,15 +455,30 @@ fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::Co
     // spike RAM and freeze the UI (small images skip the gate inside the helper).
     let _gate = large_decode_permit(path, gate);
 
-    let img = image::ImageReader::open(path)
+    let mut img = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
         .ok()?
         .decode()
         .ok()?;
+    img.apply_orientation(orientation);
     // `thumbnail` only ever downscales (small images pass through) and keeps aspect.
     let img = img.thumbnail(max_edge, max_edge);
     Some(color_image(&img.to_rgba8()))
+}
+
+/// Read a file's EXIF orientation tag (defaulting to no-op). `image`'s decoders
+/// expose it but never apply it; the fast subsample paths skip EXIF entirely, so
+/// we read it here once and apply it to every decoded still. Reads only the
+/// header/metadata, not the pixels.
+fn exif_orientation(path: &Path) -> image::metadata::Orientation {
+    use image::ImageDecoder;
+    image::ImageReader::open(path)
+        .ok()
+        .and_then(|r| r.with_guessed_format().ok())
+        .and_then(|r| r.into_decoder().ok())
+        .and_then(|mut d| d.orientation().ok())
+        .unwrap_or(image::metadata::Orientation::NoTransforms)
 }
 
 /// Integer subsample factor that brings the long edge down to roughly `max_edge`,
@@ -688,4 +710,44 @@ fn decode_webp_scaled(path: &Path, src_w: u32, src_h: u32, max_edge: u32) -> Opt
 fn color_image(rgba: &image::RgbaImage) -> egui::ColorImage {
     let size = [rgba.width() as usize, rgba.height() as usize];
     egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
+}
+
+/// Image dimensions as *displayed*, i.e. with EXIF orientation applied.
+/// `image::image_dimensions` returns the stored (pre-rotation) size, so for a
+/// portrait phone/camera photo (orientation 6/8) it reports width/height
+/// transposed from what the user sees; we swap them for the 90°/270° rotations so
+/// the Image Info panel matches the displayed image.
+pub fn oriented_dimensions(path: &Path) -> Option<(u32, u32)> {
+    use image::metadata::Orientation;
+    let (w, h) = image::image_dimensions(path).ok()?;
+    let rotated = matches!(
+        exif_orientation(path),
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    );
+    Some(if rotated { (h, w) } else { (w, h) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The sample carries EXIF Orientation=6 (rotate 90° CW). Confirm we report
+    // the *displayed* (rotated) dimensions, i.e. width/height swapped. Skips
+    // cleanly when the local sample isn't present.
+    // cargo test --no-default-features --features avif exif_orientation_swaps_dims -- --nocapture
+    #[test]
+    fn exif_orientation_swaps_dims() {
+        let p = std::path::Path::new("tests/bug/canon_hdr_YES.jpg");
+        if !p.exists() {
+            eprintln!("skipping: no tests/bug sample");
+            return;
+        }
+        let (sw, sh) = image::image_dimensions(p).unwrap();
+        let (dw, dh) = oriented_dimensions(p).unwrap();
+        println!("stored {sw}x{sh} -> displayed {dw}x{dh} (orientation {:?})", exif_orientation(p));
+        assert_eq!((dw, dh), (sh, sw), "portrait photo should report swapped dims");
+    }
 }
