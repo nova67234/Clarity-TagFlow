@@ -190,7 +190,7 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             );
             hint(
                 ui,
-                "Recognise .avif, .heic, and camera raw (.dng, .arw, .cr2) files. These \
+                "Recognise .avif, .heic, and camera raw (.dng, .arw, .cr2, .nef) files. These \
                  use heavy decoders, so loading is slower.",
             );
         }

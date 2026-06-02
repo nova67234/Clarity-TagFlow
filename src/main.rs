@@ -16,12 +16,12 @@ const IMAGE_EXTENSIONS: &[&str] = &[
 ];
 
 /// "Extended" image extensions decoded via the heavier pure-Rust crates: AVIF
-/// (avif-parse + rav1d), HEIC/HEIF (heic), and camera raw — DNG, Sony ARW and
-/// Canon CR2 — (zenraw). Only recognised when the user enables them in Settings
+/// (avif-parse + rav1d), HEIC/HEIF (heic), and camera raw — DNG, Sony ARW,
+/// Canon CR2 and Nikon NEF — (zenraw). Only recognised when the user enables them in Settings
 /// AND the app was built with the `avif` feature. Defined only in such builds so
 /// a stale persisted setting can't make a normal build list files it can't decode.
 #[cfg(feature = "avif")]
-const EXTENDED_IMAGE_EXTENSIONS: &[&str] = &["avif", "heic", "heif", "dng", "arw", "cr2"];
+const EXTENDED_IMAGE_EXTENSIONS: &[&str] = &["avif", "heic", "heif", "dng", "arw", "cr2", "nef"];
 
 /// Runtime flag mirroring `Settings::enable_extended_formats`, so the free
 /// `is_image()` helper (called all over) can gate the extended formats without

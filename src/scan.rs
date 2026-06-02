@@ -27,7 +27,7 @@ const DUPLICATES_FOLDER: &str = "duplicates";
 /// Image extensions the corruption scan will try to decode.
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp", "ico", "hdr"];
 /// Extended formats only decodable when built with `--features avif`.
-const EXTENDED_EXTS: &[&str] = &["avif", "heic", "heif", "dng", "arw", "cr2"];
+const EXTENDED_EXTS: &[&str] = &["avif", "heic", "heif", "dng", "arw", "cr2", "nef"];
 /// Media we list but never decode-validate.
 const SKIP_EXTS: &[&str] = &["gif", "mp4", "webm", "avi", "mov", "mkv", "m4v", "wmv", "flv"];
 
