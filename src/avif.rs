@@ -47,7 +47,7 @@ pub fn decode_avif(path: &std::path::Path) -> Option<RgbaImage> {
     if ext == "heic" {
         return decode_heic(path);
     }
-    if matches!(ext.as_str(), "dng" | "arw" | "cr2") {
+    if matches!(ext.as_str(), "dng" | "arw" | "cr2" | "nef") {
         return decode_raw(path);
     }
 
@@ -606,7 +606,7 @@ mod tests {
     // cargo test --no-default-features --features avif raw_smoke -- --nocapture
     #[test]
     fn raw_smoke() {
-        for (dir, ext) in [("tests/DNG", "dng"), ("tests/ARW", "arw"), ("tests/CR2", "cr2")] {
+        for (dir, ext) in [("tests/DNG", "dng"), ("tests/ARW", "arw"), ("tests/CR2", "cr2"), ("tests/NEF", "nef")] {
             let dir = std::path::Path::new(dir);
             if !dir.is_dir() {
                 eprintln!("skipping {ext}: no {} folder", dir.display());

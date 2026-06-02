@@ -434,7 +434,7 @@ fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::Co
         let is_extended = path
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "avif" | "heic" | "heif" | "dng" | "arw" | "cr2"))
+            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "avif" | "heic" | "heif" | "dng" | "arw" | "cr2" | "nef"))
             .unwrap_or(false);
         if is_extended {
             let _gate = large_decode_permit(path, gate);

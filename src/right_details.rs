@@ -865,7 +865,7 @@ fn load_meta(path: &Path) -> ImageMeta {
         } else {
             #[cfg(feature = "avif")]
             {
-                if matches!(ext.as_str(), "avif" | "heic" | "heif" | "dng" | "arw" | "cr2") {
+                if matches!(ext.as_str(), "avif" | "heic" | "heif" | "dng" | "arw" | "cr2" | "nef") {
                     crate::avif::decode_avif(path).map(image::DynamicImage::ImageRgba8)
                 } else {
                     None
