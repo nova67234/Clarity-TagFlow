@@ -26,6 +26,8 @@ pub enum RightView {
     TagManager,
     /// The Gelbooru downloader UI (replaces the details view).
     Downloader,
+    /// The Civitai resource-info UI (replaces the details view).
+    Civitai,
 }
 
 /// Read-only file metadata shown in the bottom "Image Details" card. A Rust
@@ -81,6 +83,8 @@ pub struct RightPanelState {
     pub showing_meta: bool,
     /// State for the Gelbooru downloader view.
     pub downloader: crate::download::DownloaderState,
+    /// State for the Civitai resource-info view.
+    pub civitai: crate::civitai::CivitaiState,
     pub is_editing: bool,
 
     /// Which view the panel currently shows (Details vs Tag Manager).
@@ -118,6 +122,7 @@ impl Default for RightPanelState {
             sd_metadata: None,
             showing_meta: false,
             downloader: crate::download::DownloaderState::default(),
+            civitai: crate::civitai::CivitaiState::default(),
             is_editing: false,
             view: RightView::default(),
             show_delete_confirm: false,
@@ -291,6 +296,13 @@ pub fn show(
                                 state.view = RightView::Downloader;
                                 ui.close();
                             }
+                            if ui
+                                .selectable_label(state.view == RightView::Civitai, "Civitai Resources")
+                                .clicked()
+                            {
+                                state.view = RightView::Civitai;
+                                ui.close();
+                            }
                         });
 
                     // --- Swap Views ---
@@ -300,6 +312,8 @@ pub fn show(
                         crate::tag_manager::show(ui, tag_manager, current_image, &mut state.current_tags, all_images);
                     } else if state.view == RightView::Downloader {
                         crate::download::show(ui, &mut state.downloader);
+                    } else if state.view == RightView::Civitai {
+                        crate::civitai::show(ui, &mut state.civitai, current_image, state.sd_metadata.as_deref());
                     } else if let Some(img_path) = current_image {
                         // --- FOOTER SECTION (Strictly Bottom Anchored) ---
                         egui::Panel::bottom("right_footer")
@@ -835,26 +849,36 @@ fn load_meta(path: &Path) -> ImageMeta {
         };
     }
 
-    // AVIF/HEIC/HEIF can't be read by the `image` crate's header reader or
-    // `open()`, so decode them once via our pure-Rust path and reuse the result
-    // for both the dimensions and the colour palette below.
-    #[cfg(feature = "avif")]
-    let avif_img: Option<image::DynamicImage> = {
-        let is_avif = path
+    // AVIF/HEIC/HEIF/raw can't be read by the `image` crate's header reader or
+    // `open()` at all; HDR can but must be tone-mapped to look right. Decode either
+    // once via our own path (HDR is always available; the heavy formats only with
+    // the `avif` feature) and reuse the result for both the dimensions and the
+    // colour palette below.
+    let predecoded: Option<image::DynamicImage> = {
+        let ext = path
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "avif" | "heic" | "heif" | "dng" | "arw"))
-            .unwrap_or(false);
-        if is_avif {
-            crate::avif::decode_avif(path).map(image::DynamicImage::ImageRgba8)
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if ext == "hdr" {
+            crate::image_cache::decode_hdr(path).map(image::DynamicImage::ImageRgba8)
         } else {
-            None
+            #[cfg(feature = "avif")]
+            {
+                if matches!(ext.as_str(), "avif" | "heic" | "heif" | "dng" | "arw" | "cr2") {
+                    crate::avif::decode_avif(path).map(image::DynamicImage::ImageRgba8)
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(feature = "avif"))]
+            {
+                None
+            }
         }
     };
-    #[cfg(not(feature = "avif"))]
-    let avif_img: Option<image::DynamicImage> = None;
 
-    let dimensions = if let Some(img) = &avif_img {
+    let dimensions = if let Some(img) = &predecoded {
         format!("{} x {}", img.width(), img.height())
     } else {
         // Use orientation-aware dimensions so a portrait photo (EXIF orientation
@@ -867,7 +891,7 @@ fn load_meta(path: &Path) -> ImageMeta {
     // --- COLOR EXTRACTION V3 (Vibrancy & Saturation Weighted) ---
     let mut palette = Vec::new();
 
-    let loaded = match avif_img {
+    let loaded = match predecoded {
         Some(img) => Some(img),
         None => image::open(path).ok(),
     };

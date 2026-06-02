@@ -124,12 +124,35 @@ impl AiOrb {
             return;
         }
 
-        let base = color.unwrap_or(crate::theme::ACCENT1());
-        // Blend from the base blue (t=0) toward white (t=1); `a` is alpha 0..255.
+        // Default to the theme accent — Aurora tints it pink so the orb matches.
+        let base = color.unwrap_or_else(|| crate::theme::icon_tint(crate::theme::ACCENT1()));
+        // On dark themes near particles brighten toward white (the classic glow);
+        // on light themes that would vanish on the white panel, so they deepen
+        // toward a dark version of the base colour instead, and alpha is boosted
+        // so the orb stays clearly visible.
+        let light = crate::theme::is_light();
+        let alpha_scale = if light { 1.7 } else { 1.0 };
+        // The colour each particle blends toward as `t -> 1`.
+        let tip = if light {
+            // A darker, saturated version of the base.
+            Color32::from_rgb(
+                (base.r() as f32 * 0.45) as u8,
+                (base.g() as f32 * 0.45) as u8,
+                (base.b() as f32 * 0.45) as u8,
+            )
+        } else {
+            Color32::WHITE
+        };
         let mix = |t: f32, a: f32| -> Color32 {
             let t = t.clamp(0.0, 1.0);
-            let lerp = |c: u8| (c as f32 + (255.0 - c as f32) * t) as u8;
-            Color32::from_rgba_unmultiplied(lerp(base.r()), lerp(base.g()), lerp(base.b()), a.clamp(0.0, 255.0) as u8)
+            let lerp = |c: u8, to: u8| (c as f32 + (to as f32 - c as f32) * t) as u8;
+            let a = (a * alpha_scale).clamp(0.0, 255.0) as u8;
+            Color32::from_rgba_unmultiplied(
+                lerp(base.r(), tip.r()),
+                lerp(base.g(), tip.g()),
+                lerp(base.b(), tip.b()),
+                a,
+            )
         };
 
         let boost = self.burst; // 0..1, click easter-egg

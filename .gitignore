@@ -22,8 +22,15 @@
 /tests/HEIC
 /tests/DNG
 /tests/ARW
+/tests/CR2
 /tests/HDR
 /tests/bug
+/tests/civitai
+/tests/example
+/tests/vedo
+
+# Original Python/Java sources kept locally as a porting reference (already ported)
+/covert to rust
 
 # Machine-specific local cargo config (e.g. the VLC lib path) — not portable.
 /.cargo

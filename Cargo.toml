@@ -7,7 +7,7 @@ edition = "2024"
 # "persistence" enables eframe's storage (saves settings to the OS data dir).
 eframe = { version = "0.34.2", features = ["persistence"] }
 serde = { version = "1", features = ["derive"] }
-image = { version = "0.25.10", features = ["png", "jpeg", "gif", "bmp", "webp", "ico", "tiff"] }
+image = { version = "0.25.10", features = ["png", "jpeg", "gif", "bmp", "webp", "ico", "tiff", "hdr"] }
 rfd = "0.17.2"
 sysinfo = "0.39.2"
 egui_extras = { version = "0.34.3", features = ["svg"] }
@@ -47,6 +47,13 @@ heic = { version = "0.1.6", optional = true }
 # (`Unstoppable`). Both optional, behind `avif`.
 zenraw = { version = "0.2.0", optional = true }
 enough = { version = "0.4.4", optional = true }
+# Inline color-emoji rendering (src/emoji.rs): twemoji-assets bundles the Twemoji
+# SVGs as static data (egui's text rasterizer can't draw color emoji from a font),
+# unicode-segmentation splits text into grapheme clusters so multi-codepoint emoji
+# are matched whole. We render emoji ourselves rather than via the `egui-twemoji`
+# crate, which is pinned to an older egui and won't build against ours.
+twemoji-assets = { version = "1.4.0", default-features = false, features = ["svg"] }
+unicode-segmentation = "1.13.3"
 
 [build-dependencies]
 # Embeds the Windows app icon (and version info) into the exe at build time.

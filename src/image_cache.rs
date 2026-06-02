@@ -416,6 +416,16 @@ fn worker_loop(queue: JobQueue, results: Sender<Decoded>, max_edge: Arc<AtomicU3
 /// `ImageReader.setSourceSubsampling`). Everything else, and any failure of the
 /// fast path, falls back to a full decode + downscale (memory-gated).
 fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::ColorImage> {
+    // Radiance HDR (.hdr) decodes to linear, scene-referred floats whose values
+    // exceed 1.0; the `image` crate's default 8-bit conversion just clamps, which
+    // blows out highlights and skips gamma. Route it through our tone-mapper so it
+    // displays well. Lightweight pure-Rust decoder, so always available (no gate).
+    if ext_eq(path, "hdr") {
+        let img = decode_hdr(path)?;
+        let img = image::DynamicImage::ImageRgba8(img).thumbnail(max_edge, max_edge);
+        return Some(color_image(&img.to_rgba8()));
+    }
+
     // AVIF/HEIC/HEIF go through the pure-Rust extended decoders (the `image`
     // crate can't handle them). Only compiled in with the `avif` feature;
     // downscale the result to fit like any other still.
@@ -424,7 +434,7 @@ fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::Co
         let is_extended = path
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "avif" | "heic" | "heif" | "dng" | "arw"))
+            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "avif" | "heic" | "heif" | "dng" | "arw" | "cr2"))
             .unwrap_or(false);
         if is_extended {
             let _gate = large_decode_permit(path, gate);
@@ -479,6 +489,66 @@ fn exif_orientation(path: &Path) -> image::metadata::Orientation {
         .and_then(|r| r.into_decoder().ok())
         .and_then(|mut d| d.orientation().ok())
         .unwrap_or(image::metadata::Orientation::NoTransforms)
+}
+
+/// Case-insensitive extension match (`ext` must be given lowercase).
+fn ext_eq(path: &Path, ext: &str) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+}
+
+/// Decode a Radiance HDR (`.hdr`, RGBE) file to a display-ready 8-bit sRGB image.
+///
+/// HDR files store *linear, scene-referred* radiance with values well above 1.0,
+/// so they can't be shown directly — we tone-map the high dynamic range down to
+/// the [0,1] display range (global Reinhard, `c / (1 + c)`) and then sRGB
+/// gamma-encode, the same two steps a viewer/photo app applies. A plain 8-bit
+/// cast (what `image`'s `to_rgba8()` does) would instead clip every highlight and
+/// skip gamma, giving a flat, blown-out result.
+pub fn decode_hdr(path: &Path) -> Option<image::RgbaImage> {
+    // `image`'s HDR decoder only accepts the `#?RADIANCE` signature, but the
+    // format equally permits `#?RGBE` (and other program-name tokens). Read the
+    // bytes, normalise the signature line, and decode from memory so those files
+    // aren't rejected as "signature invalid".
+    let bytes = normalize_hdr_signature(std::fs::read(path).ok()?);
+    let decoder = image::codecs::hdr::HdrDecoder::new(std::io::Cursor::new(&bytes)).ok()?;
+    let src = image::DynamicImage::from_decoder(decoder).ok()?.to_rgb32f();
+    let (w, h) = src.dimensions();
+    let mut out = image::RgbaImage::new(w, h);
+    for (dst, px) in out.pixels_mut().zip(src.pixels()) {
+        let [r, g, b] = px.0;
+        *dst = image::Rgba([tonemap_channel(r), tonemap_channel(g), tonemap_channel(b), 255]);
+    }
+    Some(out)
+}
+
+/// Rewrite a Radiance header's first line to the canonical `#?RADIANCE` signature
+/// when it uses another valid program-name token (e.g. `#?RGBE`). The identifier
+/// after `#?` is purely informational, so swapping it is lossless and lets the
+/// stricter `image` decoder accept the file. Leaves non-`#?` data untouched.
+fn normalize_hdr_signature(bytes: Vec<u8>) -> Vec<u8> {
+    const RADIANCE: &[u8] = b"#?RADIANCE";
+    if bytes.starts_with(b"#?") && !bytes.starts_with(RADIANCE) {
+        if let Some(nl) = bytes.iter().position(|&b| b == b'\n') {
+            let mut out = Vec::with_capacity(RADIANCE.len() + (bytes.len() - nl));
+            out.extend_from_slice(RADIANCE);
+            out.extend_from_slice(&bytes[nl..]); // keep the newline + remaining header/body
+            return out;
+        }
+    }
+    bytes
+}
+
+/// Reinhard tone-map + sRGB gamma encode for one linear HDR channel → 0..=255.
+fn tonemap_channel(c: f32) -> u8 {
+    let mapped = c.max(0.0) / (1.0 + c.max(0.0)); // Reinhard → [0,1)
+    let srgb = if mapped <= 0.003_130_8 {
+        12.92 * mapped
+    } else {
+        1.055 * mapped.powf(1.0 / 2.4) - 0.055
+    };
+    (srgb * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 /// Integer subsample factor that brings the long edge down to roughly `max_edge`,
@@ -749,5 +819,27 @@ mod tests {
         let (dw, dh) = oriented_dimensions(p).unwrap();
         println!("stored {sw}x{sh} -> displayed {dw}x{dh} (orientation {:?})", exif_orientation(p));
         assert_eq!((dw, dh), (sh, sw), "portrait photo should report swapped dims");
+    }
+
+    // Tone-map every Radiance HDR sample to a PNG so the result can be eyeballed.
+    // Skips cleanly when the local sample folder is absent.
+    // cargo test hdr_smoke -- --nocapture
+    #[test]
+    fn hdr_smoke() {
+        let dir = std::path::Path::new("tests/HDR");
+        if !dir.is_dir() {
+            eprintln!("skipping hdr: no tests/HDR folder");
+            return;
+        }
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = entry.path();
+            if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("hdr")) {
+                continue;
+            }
+            let img = decode_hdr(&p).unwrap_or_else(|| panic!("decode failed: {}", p.display()));
+            let out = p.with_extension("hdr.decoded.png");
+            img.save(&out).unwrap();
+            println!("OK {} -> {}x{} -> {}", p.display(), img.width(), img.height(), out.display());
+        }
     }
 }
