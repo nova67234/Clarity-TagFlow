@@ -25,9 +25,9 @@ const CORRUPTED_FOLDER: &str = "corrupted_files";
 const DUPLICATES_FOLDER: &str = "duplicates";
 
 /// Image extensions the corruption scan will try to decode.
-const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp", "ico"];
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp", "ico", "hdr"];
 /// Extended formats only decodable when built with `--features avif`.
-const EXTENDED_EXTS: &[&str] = &["avif", "heic", "heif", "dng", "arw"];
+const EXTENDED_EXTS: &[&str] = &["avif", "heic", "heif", "dng", "arw", "cr2"];
 /// Media we list but never decode-validate.
 const SKIP_EXTS: &[&str] = &["gif", "mp4", "webm", "avi", "mov", "mkv", "m4v", "wmv", "flv"];
 
@@ -202,7 +202,7 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 let folder_svg = egui::include_image!("../icons/folder.svg");
-                if crate::svg_button(ui, folder_svg, "Choose folder to scan", 32.0, MUTED()).clicked() {
+                if crate::svg_button(ui, folder_svg, "Choose folder to scan", 32.0, crate::theme::icon_tint(MUTED())).clicked() {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                         state.input_dir = dir.display().to_string();
                     }
@@ -280,8 +280,7 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
 fn console_box(ui: &mut egui::Ui, title: &str, lines: &[String], height: f32, salt: &str) {
     ui.label(egui::RichText::new(title).color(MUTED()).strong().size(11.0));
     ui.add_space(2.0);
-    let dark = crate::theme::current() != crate::theme::Theme::Light;
-    let bg = if dark { egui::Color32::from_rgb(15, 15, 17) } else { FIELD() };
+    let bg = if crate::theme::is_light() { FIELD() } else { egui::Color32::from_rgb(15, 15, 17) };
     egui::Frame::new()
         .fill(bg)
         .corner_radius(egui::CornerRadius::same(12))
@@ -486,6 +485,15 @@ fn validate_image(p: &Path) -> Result<(), String> {
     }
 
     let ext = ext_of(p);
+
+    // HDR goes through our tone-mapping decoder — `image`'s reader rejects the
+    // valid `#?RGBE` signature variant, which would wrongly flag good files.
+    if ext == "hdr" {
+        return match crate::image_cache::decode_hdr(p) {
+            Some(_) => Ok(()),
+            None => Err("Could not decode".to_string()),
+        };
+    }
 
     // Extended formats go through our own decoder.
     #[cfg(feature = "avif")]

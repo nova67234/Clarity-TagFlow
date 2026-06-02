@@ -206,7 +206,14 @@ pub fn run_job(
 /// Decode an image and flatten any alpha onto a white background (all three
 /// taggers were trained with white padding / `force_background='white'`).
 fn load_rgb_on_white(path: &Path) -> Result<RgbImage, String> {
-    let rgba = image::open(path).map_err(|e| format!("Read image: {e}"))?.to_rgba8();
+    // HDR can't be read by `image::open` directly (linear floats + strict
+    // signature check); tone-map it the same way the viewer does so the tagger
+    // sees the displayed image.
+    let rgba = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("hdr")) {
+        crate::image_cache::decode_hdr(path).ok_or_else(|| "Read image: HDR decode failed".to_string())?
+    } else {
+        image::open(path).map_err(|e| format!("Read image: {e}"))?.to_rgba8()
+    };
     let mut out = RgbImage::new(rgba.width(), rgba.height());
     for (x, y, p) in rgba.enumerate_pixels() {
         let a = p[3] as f32 / 255.0;

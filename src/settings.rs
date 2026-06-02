@@ -190,7 +190,7 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             );
             hint(
                 ui,
-                "Recognise .avif, .heic, and camera raw (.dng, .arw) files. These \
+                "Recognise .avif, .heic, and camera raw (.dng, .arw, .cr2) files. These \
                  use heavy decoders, so loading is slower.",
             );
         }
@@ -241,10 +241,17 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             Theme::Space,
             egui::RichText::new("Space").color(TEXT()),
         );
+        ui.add_space(2.0);
+        ui.radio_value(
+            &mut settings.theme,
+            Theme::Aurora,
+            egui::RichText::new("Aurora").color(TEXT()),
+        );
         hint(
             ui,
             "Dark and Light recolour the whole app. Space is dark with an animated \
-             starfield behind the panels and image. Applies instantly.",
+             starfield, and Aurora is light with a soft drifting glow behind the \
+             panels and image. Applies instantly.",
         );
     });
 }

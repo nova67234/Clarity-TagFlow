@@ -466,6 +466,10 @@ fn download_all(files: &[(String, String)], folder: &str, prog: &Progress) -> Re
         .tls_config(
             ureq::tls::TlsConfig::builder()
                 .provider(ureq::tls::TlsProvider::NativeTls)
+                // Validate against the OS cert store (with AIA intermediate
+                // fetching) rather than ureq's bundled webpki roots — see
+                // civitai.rs for the CDN incomplete-chain failure this avoids.
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
                 .build(),
         )
         .max_redirects(10)

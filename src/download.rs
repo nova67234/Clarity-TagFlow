@@ -229,7 +229,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
 
             // Console / log — a dark inset well with a small header.
             field_label(ui, "Log");
-            let log_bg = if crate::theme::current() == crate::theme::Theme::Light {
+            let log_bg = if crate::theme::is_light() {
                 FIELD()
             } else {
                 egui::Color32::from_rgb(15, 15, 17)
@@ -321,7 +321,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
                             let folder_svg = egui::include_image!("../icons/folder.svg");
-                            if crate::svg_button(ui, folder_svg, "Choose output folder", 34.0, MUTED())
+                            if crate::svg_button(ui, folder_svg, "Choose output folder", 34.0, crate::theme::icon_tint(MUTED()))
                                 .clicked()
                             {
                                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
@@ -447,6 +447,10 @@ fn start_api_monitor(status: Arc<AtomicU8>, ctx: egui::Context) {
             .tls_config(
                 ureq::tls::TlsConfig::builder()
                     .provider(ureq::tls::TlsProvider::NativeTls)
+                    // Validate against the OS cert store (with AIA intermediate
+                    // fetching) instead of ureq's bundled webpki roots — see
+                    // civitai.rs for the CDN incomplete-chain failure this avoids.
+                    .root_certs(ureq::tls::RootCerts::PlatformVerifier)
                     .build(),
             )
             .timeout_global(Some(Duration::from_secs(8)))
@@ -612,6 +616,9 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
         .tls_config(
             ureq::tls::TlsConfig::builder()
                 .provider(ureq::tls::TlsProvider::NativeTls)
+                // Use the OS cert store (with AIA intermediate fetching) rather
+                // than ureq's bundled webpki roots — see civitai.rs.
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
                 .build(),
         )
         .max_redirects(10)

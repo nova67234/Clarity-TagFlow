@@ -305,10 +305,12 @@ fn draw_tile(
     }
 
     if is_selected {
+        // Pink outline under Aurora to match its theme; grey elsewhere.
+        let sel_color = crate::theme::icon_tint(egui::Color32::GRAY);
         ui.painter().rect_stroke(
             rect,
             radius,
-            Stroke::new(3.0, egui::Color32::GRAY),
+            Stroke::new(3.0, sel_color),
             egui::StrokeKind::Inside,
         );
     }

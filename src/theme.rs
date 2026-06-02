@@ -13,6 +13,8 @@
 //! - **Space** — a dark theme whose gutters are transparent so an animated
 //!   starfield (painted by [`paint_background`] on the bottom layer) shows through
 //!   behind every panel and the image. Cards stay opaque so text stays readable.
+//! - **Aurora** — the light-mode counterpart to Space: light surfaces with
+//!   transparent gutters revealing a soft, slowly-drifting pastel aurora glow.
 
 use eframe::egui::{self, Color32, CornerRadius};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -24,10 +26,12 @@ pub enum Theme {
     Dark,
     Light,
     Space,
+    Aurora,
 }
 
 /// A full set of named UI colours. `is_dark` selects the egui base visuals;
-/// `starfield` enables the animated space background.
+/// `starfield` enables the animated space background; `aurora` enables the
+/// animated light aurora background.
 /// `field2`/`accent2` round out the palette for future use (not all are wired up
 /// to a widget yet), so allow them to be unread.
 #[allow(dead_code)]
@@ -43,6 +47,7 @@ struct Palette {
     edge: Color32,
     is_dark: bool,
     starfield: bool,
+    aurora: bool,
 }
 
 /// The original dark palette — identical values to the previous inline consts.
@@ -59,6 +64,7 @@ static DARK: Palette = Palette {
     edge: Color32::from_rgba_premultiplied(18, 18, 18, 20),
     is_dark: true,
     starfield: false,
+    aurora: false,
 };
 
 /// A soft light palette: off-white surfaces, dark ink text, deeper accents.
@@ -75,6 +81,7 @@ static LIGHT: Palette = Palette {
     edge: Color32::from_rgba_premultiplied(0, 0, 0, 26),
     is_dark: false,
     starfield: false,
+    aurora: false,
 };
 
 /// A space palette: identical to the Dark theme's panels (same colours and faint
@@ -94,9 +101,29 @@ static SPACE: Palette = Palette {
     edge: Color32::from_rgba_premultiplied(18, 18, 18, 20),
     is_dark: true,
     starfield: true,
+    aurora: false,
 };
 
-/// 0 = Dark, 1 = Light, 2 = Space.
+/// An aurora palette: the light-mode counterpart to Space. Identical to the Light
+/// theme's cards (opaque white, so text stays readable), but with transparent
+/// gutters so the animated aurora glow shows through behind everything. `bg` is
+/// fully transparent on purpose — see [`paint_background`].
+static AURORA: Palette = Palette {
+    bg: Color32::TRANSPARENT,
+    panel: Color32::from_rgb(255, 255, 255),
+    field: Color32::from_rgb(238, 240, 243),
+    field2: Color32::from_rgb(226, 229, 234),
+    text: Color32::from_rgb(28, 29, 32),
+    muted: Color32::from_rgb(110, 115, 122),
+    accent1: Color32::from_rgb(28, 110, 235),
+    accent2: Color32::from_rgb(20, 140, 200),
+    edge: Color32::from_rgba_premultiplied(0, 0, 0, 26),
+    is_dark: false,
+    starfield: false,
+    aurora: true,
+};
+
+/// 0 = Dark, 1 = Light, 2 = Space, 3 = Aurora.
 static ACTIVE: AtomicU8 = AtomicU8::new(0);
 
 /// Switch the active palette. Call [`apply`] afterwards to push the new visuals.
@@ -105,6 +132,7 @@ pub fn set(theme: Theme) {
         Theme::Dark => 0,
         Theme::Light => 1,
         Theme::Space => 2,
+        Theme::Aurora => 3,
     };
     ACTIVE.store(v, Ordering::Relaxed);
 }
@@ -116,7 +144,24 @@ pub fn current() -> Theme {
     match ACTIVE.load(Ordering::Relaxed) {
         1 => Theme::Light,
         2 => Theme::Space,
+        3 => Theme::Aurora,
         _ => Theme::Dark,
+    }
+}
+
+/// True for the light-surface themes (Light and Aurora). Lets call sites pick
+/// light-vs-dark styling (e.g. a console background) without enumerating themes.
+pub fn is_light() -> bool {
+    !palette().is_dark
+}
+
+/// Tint for icon buttons (e.g. the folder icon): a soft pink under Aurora so the
+/// icons match its warm glow, otherwise the caller's normal colour `fallback`.
+pub fn icon_tint(fallback: Color32) -> Color32 {
+    if palette().aurora {
+        Color32::from_rgb(235, 130, 175) // matches the Aurora pink buttons
+    } else {
+        fallback
     }
 }
 
@@ -124,6 +169,7 @@ fn palette() -> &'static Palette {
     match ACTIVE.load(Ordering::Relaxed) {
         1 => &LIGHT,
         2 => &SPACE,
+        3 => &AURORA,
         _ => &DARK,
     }
 }
@@ -187,7 +233,13 @@ pub fn apply(ctx: &egui::Context) {
     v.window_fill = p.panel;
     v.extreme_bg_color = p.field; // text-edit background
     v.override_text_color = Some(p.text);
-    v.selection.bg_fill = p.accent1.gamma_multiply(0.45);
+    // Selection highlight follows the theme accent, but Aurora uses its pink so
+    // selected items (tabs, menu entries, text selection) match the pink buttons.
+    v.selection.bg_fill = if p.aurora {
+        Color32::from_rgb(235, 130, 175).gamma_multiply(0.55)
+    } else {
+        p.accent1.gamma_multiply(0.45)
+    };
     for w in [
         &mut v.widgets.noninteractive,
         &mut v.widgets.inactive,
@@ -204,9 +256,21 @@ pub fn apply(ctx: &egui::Context) {
     // recolours buttons without turning every widget solid blue. Dark/Space keep
     // egui's default grey buttons untouched.
     if !p.is_dark {
-        let idle = p.accent1;
-        let hover = Color32::from_rgb(56, 132, 245); // a touch brighter
-        let down = Color32::from_rgb(20, 92, 200); // pressed, darker
+        // Aurora gets soft-pink buttons to match its warm pastel glow; plain Light
+        // keeps the accent blue.
+        let (idle, hover, down) = if p.aurora {
+            (
+                Color32::from_rgb(235, 130, 175), // light pink
+                Color32::from_rgb(245, 150, 190), // brighter on hover
+                Color32::from_rgb(210, 100, 150), // darker when pressed
+            )
+        } else {
+            (
+                p.accent1,
+                Color32::from_rgb(56, 132, 245), // a touch brighter
+                Color32::from_rgb(20, 92, 200),  // pressed, darker
+            )
+        };
         let white = Color32::WHITE;
 
         v.widgets.inactive.weak_bg_fill = idle;
@@ -250,11 +314,16 @@ fn hash01(i: u32, salt: u32) -> f32 {
     (h as f32) / (u32::MAX as f32)
 }
 
-/// Paint the active theme's full-window background. For [`Theme::Space`] this is
-/// a deep-space base plus a twinkling starfield, drawn on the bottom-most layer
-/// so every transparent-gutter region (and the image area) shows it through. For
-/// other themes it's a no-op. Call once per frame near the top of `update`.
+/// Paint the active theme's full-window background, drawn on the bottom-most
+/// layer so every transparent-gutter region (and the image area) shows it
+/// through. [`Theme::Space`] gets a twinkling starfield; [`Theme::Aurora`] gets a
+/// drifting pastel glow. Other themes are a no-op. Call once per frame near the
+/// top of `update`.
 pub fn paint_background(ctx: &egui::Context) {
+    if palette().aurora {
+        paint_aurora(ctx);
+        return;
+    }
     if !palette().starfield {
         return;
     }
@@ -296,4 +365,73 @@ pub fn paint_background(ctx: &egui::Context) {
 
     // Keep the twinkle animating (~30 fps) without spinning the CPU flat-out.
     ctx.request_repaint_after(std::time::Duration::from_millis(33));
+}
+
+/// Paint the Aurora background: a soft off-white base with a handful of large,
+/// blurred pastel blobs drifting slowly behind everything — the light-mode
+/// counterpart to the starfield. Kept very low-contrast so it never competes with
+/// the images or panels.
+fn paint_aurora(ctx: &egui::Context) {
+    let rect = ctx.content_rect();
+    let painter = ctx.layer_painter(egui::LayerId::background());
+
+    // A clearly-tinted soft-blue base. The visible background is mostly the thin
+    // gutters around the opaque panels (the blob *centres* hide behind the panels),
+    // so the base colour itself has to carry the look — a near-white base read as
+    // plain white.
+    painter.rect_filled(rect, 0.0, Color32::from_rgb(212, 222, 242));
+
+    let t = ctx.input(|i| i.time) as f32;
+
+    // Saturated pastel blobs, each drifting on its own slow ellipse. Anchored
+    // toward the window edges/corners so their strong cores land in the visible
+    // gutter strips rather than hiding behind the centre panel.
+    const BLOBS: &[(u8, u8, u8)] = &[
+        (150, 140, 255), // lavender
+        (95, 190, 255),  // sky blue
+        (110, 230, 190), // mint
+        (255, 185, 120), // peach
+        (255, 140, 190), // rose
+        (130, 175, 255), // pale blue
+    ];
+
+    let span = rect.width().min(rect.height()).max(1.0);
+    let radius = span * 0.5;
+
+    for (i, &(r, g, b)) in BLOBS.iter().enumerate() {
+        let i = i as u32;
+        // Bias anchors toward the edges: map [0,1) to the outer thirds so cores
+        // sit near the window border where the gutters are.
+        let hx = hash01(i, 11);
+        let hy = hash01(i, 12);
+        let edge = |h: f32| if h < 0.5 { 0.05 + h * 0.4 } else { 0.55 + (h - 0.5) * 0.4 };
+        let bx = rect.left() + edge(hx) * rect.width();
+        let by = rect.top() + edge(hy) * rect.height();
+        let speed = 0.04 + 0.05 * hash01(i, 13); // very slow
+        let phase = hash01(i, 14) * std::f32::consts::TAU;
+        let drift = span * 0.12;
+        let cx = bx + (t * speed + phase).cos() * drift;
+        let cy = by + (t * speed * 0.8 + phase).sin() * drift;
+
+        soft_blob(&painter, egui::pos2(cx, cy), radius, Color32::from_rgb(r, g, b));
+    }
+
+    // Animate gently — aurora drifts much slower than stars twinkle.
+    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+}
+
+/// Approximate a Gaussian-blurred blob by stacking concentric translucent
+/// circles (egui has no real blur). Many rings at a modest per-ring alpha build a
+/// soft falloff that's visible but still gentle.
+fn soft_blob(painter: &egui::Painter, center: egui::Pos2, radius: f32, color: Color32) {
+    const RINGS: usize = 24;
+    for k in 0..RINGS {
+        // Outer rings are larger and fainter; inner rings smaller and stronger,
+        // building up a soft falloff toward the centre.
+        let f = 1.0 - k as f32 / RINGS as f32; // 1.0 (outer) .. ~0.04 (inner)
+        let r = radius * (0.12 + 0.88 * f);
+        let alpha = 22.0_f32; // per-ring; accumulates to a clearly-visible centre
+        let col = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha as u8);
+        painter.circle_filled(center, r, col);
+    }
 }

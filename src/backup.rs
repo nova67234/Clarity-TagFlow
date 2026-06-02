@@ -592,6 +592,11 @@ fn ext_lower(p: &Path) -> String {
 /// Header-only decode check — true if the image's dimensions read back as valid.
 /// Mirrors Java's `reader.getWidth/getHeight > 0` without a full pixel decode.
 fn is_image_valid(path: &Path) -> bool {
+    // HDR's `#?RGBE` signature variant trips `image`'s header reader, so validate
+    // it through our own decoder instead of dropping good files from the backup.
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("hdr")) {
+        return crate::image_cache::decode_hdr(path).is_some();
+    }
     match image::image_dimensions(path) {
         Ok((w, h)) => w > 0 && h > 0,
         Err(_) => false,

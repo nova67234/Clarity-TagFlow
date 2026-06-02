@@ -64,6 +64,22 @@ pub fn read(path: &Path) -> Option<String> {
         }
     }
 
+    // Prefer the A1111 `parameters` block whenever it's a real param block (has
+    // the `Steps:` anchor). Civitai/A1111 embed this clean, human-readable summary
+    // — and many ComfyUI-saved images carry BOTH it AND the raw `prompt`/`workflow`
+    // node graph. The graph can use custom Set/Get-node rerouting and custom
+    // samplers that `format_comfyui` can't trace (yielding an empty/garbled result),
+    // so the clean `parameters` block wins when present. (Mirrors A1111's own
+    // `read_info_from_image`, which pops `parameters` before checking for ComfyUI.)
+    if let Some(p) = text.get("parameters") {
+        if has_steps_anchor(p) {
+            let formatted = format_a1111(p);
+            if !formatted.trim().is_empty() {
+                return Some(formatted);
+            }
+        }
+    }
+
     // ComfyUI workflows carry both `prompt` and `workflow`; format the node graph.
     if text.contains_key("prompt") && text.contains_key("workflow") {
         if let Some(formatted) = format_comfyui(text.get("prompt").unwrap()) {
@@ -209,6 +225,21 @@ fn inflate(compressed: &[u8]) -> Option<Vec<u8>> {
 /// stores it in the EXIF UserComment (commonly UTF-16), so the multi-encoding
 /// pass finds it without a full EXIF parser.
 fn scan_raw_for_parameters(bytes: &[u8]) -> Option<String> {
+    // EXIF stores the A1111 block in `UserComment`, prefixed by an 8-byte charset
+    // id ("UNICODE\0") and then UTF-16 text. Decoding the *whole* file as UTF-16
+    // drags that marker in as mojibake right before the prompt (e.g. a leading
+    // "啎䥃佄䔀"). So if the marker is present, decode only the text that follows it
+    // — that lands exactly on the prompt with no marker garbage. EXIF's text byte
+    // order varies, so try big- then little-endian.
+    if let Some(pos) = find_bytes(bytes, b"UNICODE\0") {
+        let after = &bytes[pos + 8..];
+        if let Some(s) = isolate_sd(&decode_utf16(after, true)) {
+            return Some(s);
+        }
+        if let Some(s) = isolate_sd(&decode_utf16(after, false)) {
+            return Some(s);
+        }
+    }
     if let Some(s) = isolate_sd(&String::from_utf8_lossy(bytes)) {
         return Some(s);
     }
@@ -219,6 +250,14 @@ fn scan_raw_for_parameters(bytes: &[u8]) -> Option<String> {
         return Some(s);
     }
     None
+}
+
+/// Index of the first occurrence of `needle` in `haystack` (raw bytes).
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn decode_utf16(bytes: &[u8], big_endian: bool) -> String {
@@ -309,6 +348,11 @@ fn format_a1111(raw: &str) -> String {
             .replace("Civitai metadata:", "\n\nCivitai metadata:\n")
             .trim()
             .to_string();
+        // The byte-scan can capture a few stray characters past the final `]`/`}`
+        // (image data decoded as text); clip the tail to the last JSON bracket.
+        if let Some(cut) = json_part.rfind([']', '}']) {
+            json_part.truncate(cut + 1);
+        }
         params_line = params_line[..j].trim().to_string();
         if params_line.ends_with(',') {
             params_line.pop();
@@ -402,6 +446,13 @@ fn parse_params(params: &str) -> Vec<(String, String)> {
 /// Case-insensitive substring search returning a byte index into `haystack`.
 fn index_of_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
     haystack.to_lowercase().find(&needle.to_lowercase())
+}
+
+/// True when `raw` looks like a genuine A1111 parameter block (it carries the
+/// `Steps:` key). Lets `read` distinguish a real `parameters` chunk from an empty
+/// or prompt-only one before preferring it over a ComfyUI node graph.
+fn has_steps_anchor(raw: &str) -> bool {
+    index_of_ignore_case(raw, "steps:").is_some()
 }
 
 // ---------------------------------------------------------------------------

@@ -9,17 +9,19 @@ use egui::{Color32, CornerRadius, Margin, Stroke};
 
 /// Always-available image extensions (pure-Rust decoders, no heavy deps).
 /// `jfif` is just JPEG with a different extension — the decoder content-sniffs it.
+/// `hdr` (Radiance RGBE) decodes via the `image` crate's lightweight HDR decoder
+/// and is tone-mapped for display (see `image_cache::decode_hdr`).
 const IMAGE_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "jfif", "gif", "bmp", "webp", "ico", "tif", "tiff",
+    "png", "jpg", "jpeg", "jfif", "gif", "bmp", "webp", "ico", "tif", "tiff", "hdr",
 ];
 
 /// "Extended" image extensions decoded via the heavier pure-Rust crates: AVIF
-/// (avif-parse + rav1d), HEIC/HEIF (heic), and camera raw — DNG and Sony ARW —
-/// (zenraw). Only recognised when the user enables them in Settings AND the app
-/// was built with the `avif` feature. Defined only in such builds so a stale
-/// persisted setting can't make a normal build list files it can't decode.
+/// (avif-parse + rav1d), HEIC/HEIF (heic), and camera raw — DNG, Sony ARW and
+/// Canon CR2 — (zenraw). Only recognised when the user enables them in Settings
+/// AND the app was built with the `avif` feature. Defined only in such builds so
+/// a stale persisted setting can't make a normal build list files it can't decode.
 #[cfg(feature = "avif")]
-const EXTENDED_IMAGE_EXTENSIONS: &[&str] = &["avif", "heic", "heif", "dng", "arw"];
+const EXTENDED_IMAGE_EXTENSIONS: &[&str] = &["avif", "heic", "heif", "dng", "arw", "cr2"];
 
 /// Runtime flag mirroring `Settings::enable_extended_formats`, so the free
 /// `is_image()` helper (called all over) can gate the extended formats without
@@ -50,6 +52,8 @@ mod ai_orb;
 #[cfg(feature = "avif")]
 mod avif;
 mod backup;
+mod civitai;
+mod emoji;
 mod image_cache;
 mod download;
 mod gif_info;
@@ -85,6 +89,12 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             // REQUIRED: Install the image loaders so egui can parse SVG bytes
             egui_extras::install_image_loaders(&cc.egui_ctx);
+
+            // egui's bundled fonts have no CJK glyphs, so Japanese / Chinese /
+            // Korean text (common in Civitai model names & tags, e.g. アルベド)
+            // renders as tofu boxes. Append the platform's system CJK fonts as
+            // fallbacks so those glyphs resolve app-wide.
+            install_cjk_fonts(&cc.egui_ctx);
 
             let mut app = ViewerApp::default();
             // Restore saved settings (if any) from eframe's persistent storage.
@@ -683,6 +693,93 @@ fn show_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle, is_loading: bool) {
             egui::Spinner::new().color(MUTED()).paint_at(ui, spinner_rect);
         }
     });
+}
+
+/// Load the platform's system CJK fonts and append them as fallbacks to egui's
+/// font families, so Japanese / Chinese / Korean glyphs (which the bundled fonts
+/// lack) render instead of showing as tofu boxes. Loading the OS fonts at runtime
+/// avoids bundling a multi-MB CJK font in the binary. Best-effort: any font that
+/// isn't present is simply skipped, and Latin/Cyrillic text keeps using egui's
+/// default fonts (these are appended *after* the defaults, so they're only
+/// consulted for glyphs the defaults can't draw).
+fn install_cjk_fonts(ctx: &egui::Context) {
+    // Candidate fonts grouped by language. Within each group we load only the
+    // FIRST file that exists (so we don't pull, say, three redundant Japanese
+    // fonts into memory); across groups we load one each so JP + KR + CN all
+    // resolve. `index` selects a face inside a TrueType Collection (.ttc).
+    #[cfg(target_os = "windows")]
+    let groups: &[&[(&str, u32)]] = &[
+        // Japanese (kana + kanji): Meiryo → Yu Gothic → MS Gothic.
+        &[
+            (r"C:\Windows\Fonts\meiryo.ttc", 0),
+            (r"C:\Windows\Fonts\YuGothM.ttc", 0),
+            (r"C:\Windows\Fonts\msgothic.ttc", 0),
+        ],
+        // Korean: Malgun Gothic.
+        &[(r"C:\Windows\Fonts\malgun.ttf", 0)],
+        // Chinese Simplified: MS YaHei → SimSun.
+        &[
+            (r"C:\Windows\Fonts\msyh.ttc", 0),
+            (r"C:\Windows\Fonts\simsun.ttc", 0),
+        ],
+    ];
+    #[cfg(target_os = "macos")]
+    let groups: &[&[(&str, u32)]] = &[
+        // PingFang covers CN/JP/KR; Hiragino is the JP fallback.
+        &[
+            ("/System/Library/Fonts/PingFang.ttc", 0),
+            ("/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", 0),
+        ],
+        &[("/System/Library/Fonts/AppleSDGothicNeo.ttc", 0)], // Korean
+    ];
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let groups: &[&[(&str, u32)]] = &[
+        // Noto Sans CJK (one .ttc) covers all of CJK; wqy is a fallback.
+        &[
+            ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+            ("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", 0),
+            ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", 0),
+            ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
+        ],
+    ];
+
+    let mut fonts = egui::FontDefinitions::default();
+    let mut added: Vec<String> = Vec::new();
+
+    for group in groups {
+        for (path, index) in *group {
+            let Ok(bytes) = std::fs::read(path) else { continue };
+            // Derive a stable family key from the file name.
+            let key = std::path::Path::new(path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("cjk")
+                .to_string();
+            if fonts.font_data.contains_key(&key) {
+                break;
+            }
+            let mut data = egui::FontData::from_owned(bytes);
+            data.index = *index;
+            fonts.font_data.insert(key.clone(), data.into());
+            added.push(key);
+            break; // one font per language group is enough
+        }
+    }
+
+    if added.is_empty() {
+        return; // no system CJK fonts found — leave egui's defaults untouched
+    }
+
+    // Append the CJK fonts after the existing fonts in both families, so they act
+    // purely as fallbacks for glyphs the default fonts can't render.
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        let list = fonts.families.entry(family).or_default();
+        for key in &added {
+            list.push(key.clone());
+        }
+    }
+
+    ctx.set_fonts(fonts);
 }
 
 /// A rounded panel with the PANEL() fill, faint edge, and a soft drop shadow.

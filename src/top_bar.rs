@@ -106,7 +106,7 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats) -> TopBarAction {
                     // LEFT: folder icon -> open a folder of images.
                     let folder_svg = egui::include_image!("../icons/folder.svg");
 
-                    if svg_button(ui, folder_svg, "Open folder", 37.0, Color32::GRAY).clicked() {
+                    if svg_button(ui, folder_svg, "Open folder", 37.0, icon_tint(Color32::GRAY)).clicked() {
                         action = TopBarAction::OpenFolder;
                     }
 
