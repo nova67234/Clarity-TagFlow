@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use crate::theme::{ACCENT1, EDGE, FIELD, MUTED, PANEL, TEXT};
+use crate::theme::{EDGE, FIELD, MUTED, PANEL, TEXT};
 
 const API_URL: &str = "https://gelbooru.com/index.php?page=dapi&s=post&q=index&json=1";
 const SITE_HOME: &str = "https://gelbooru.com/";
@@ -287,9 +287,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                 let size = egui::vec2(btn_w, 38.0);
 
                 let start = egui::Button::new(
-                    egui::RichText::new("⬇  Start Download").color(egui::Color32::WHITE).strong(),
+                    egui::RichText::new("Start Download").color(egui::Color32::WHITE).strong(),
                 )
-                .fill(ACCENT1());
+                .fill(egui::Color32::from_rgb(96, 99, 105));
                 if ui.add_enabled_ui(!state.running, |ui| ui.add_sized(size, start)).inner.clicked() {
                     start_download(state, ui.ctx());
                 }
@@ -333,7 +333,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                         });
                     });
 
-                    section(ui, "Account", |ui| {
+                    // Gelbooru disabled anonymous API access (mid-2025 ToS change):
+                    // a User ID + API key are now required — explained via the info
+                    // icon's hover next to the section title.
+                    section_with_info(ui, "Account",
+                        "Gelbooru no longer allows anonymous downloads — you must log in with \
+                         your account's User ID and API key. Get them from gelbooru.com → \
+                         Account → Options → 'API Access Credentials' (free account required).",
+                        |ui| {
                         field_label(ui, "User ID");
                         field_edit(ui, enabled, egui::TextEdit::singleline(&mut state.user_id)
                             .hint_text("Required"));
@@ -366,16 +373,22 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                             ui.add_enabled(
                                 enabled,
                                 egui::DragValue::new(&mut state.delay).range(MIN_DELAY..=60.0).speed(0.1),
-                            )
-                            .on_hover_text("Minimum 3s between downloads to avoid overloading Gelbooru.");
+                            );
+                            // Info icon explaining the enforced minimum delay.
+                            info_icon(
+                                ui,
+                                "The delay is the wait between downloads. It can't go below 3 \
+                                 seconds: Gelbooru rate-limits frequent requests, so a shorter \
+                                 delay risks being throttled or temporarily blocked.",
+                            );
                         });
                         ui.add_space(8.0);
                         field_label(ui, "File types");
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 14.0;
-                            ui.add_enabled(enabled, egui::Checkbox::new(&mut state.include_img, "Image"));
-                            ui.add_enabled(enabled, egui::Checkbox::new(&mut state.include_gif, "Gif"));
-                            ui.add_enabled(enabled, egui::Checkbox::new(&mut state.include_vid, "Video"));
+                            ui.add_enabled_ui(enabled, |ui| dot_checkbox(ui, &mut state.include_img, "Image"));
+                            ui.add_enabled_ui(enabled, |ui| dot_checkbox(ui, &mut state.include_gif, "Gif"));
+                            ui.add_enabled_ui(enabled, |ui| dot_checkbox(ui, &mut state.include_vid, "Video"));
                         });
                     });
                     ui.add_space(8.0);
@@ -383,11 +396,74 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
         });
 }
 
+/// The bundled info SVG at 16 px, tinted with the muted theme colour, with a
+/// hover tooltip. Returns the response so callers can lay it out alongside text.
+fn info_icon(ui: &mut egui::Ui, tooltip: &str) -> egui::Response {
+    ui.add(
+        egui::Image::new(egui::include_image!("../icons/info.svg"))
+            .fit_to_exact_size(egui::vec2(16.0, 16.0))
+            .tint(crate::theme::icon_tint(MUTED())),
+    )
+    .on_hover_text(tooltip)
+}
+
+/// A checkbox that shows a filled **dot** when on, instead of egui's checkmark.
+/// Behaves like `ui.checkbox`: clicking the box or its label toggles `checked`.
+/// egui's `Checkbox` only ever draws a tick, so we paint our own box + dot.
+fn dot_checkbox(ui: &mut egui::Ui, checked: &mut bool, text: &str) -> egui::Response {
+    let icon = ui.spacing().icon_width; // box edge length
+    let gap = ui.spacing().icon_spacing;
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Button,
+    );
+
+    let mut desired = egui::vec2(icon + gap + galley.size().x, galley.size().y.max(icon));
+    desired.y = desired.y.max(ui.spacing().interact_size.y);
+    let (rect, mut response) = ui.allocate_exact_size(desired, egui::Sense::click());
+    if response.clicked() {
+        *checked = !*checked;
+        response.mark_changed();
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *checked, text)
+    });
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        let center = egui::pos2(rect.left() + icon / 2.0, rect.center().y);
+        let outer = icon / 2.0;
+        // Round indicator: an outline circle, with a filled dot when checked.
+        ui.painter().circle(center, outer, visuals.bg_fill, visuals.bg_stroke);
+        if *checked {
+            ui.painter().circle_filled(center, outer * 0.5, visuals.fg_stroke.color);
+        }
+        let text_pos = egui::pos2(center.x + outer + gap, rect.center().y - galley.size().y / 2.0);
+        ui.painter().galley(text_pos, galley, visuals.text_color());
+    }
+    response
+}
+
 /// A titled, rounded group card holding related controls — mirrors the look of
 /// the Settings window's sections so the downloader feels native to the app.
 fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(8.0);
     ui.label(egui::RichText::new(title.to_uppercase()).color(MUTED()).strong().size(11.0));
+    ui.add_space(4.0);
+    section_body(ui, add);
+}
+
+/// Like [`section`], but draws an info icon next to the title whose hover tooltip
+/// shows `info`.
+fn section_with_info(ui: &mut egui::Ui, title: &str, info: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(egui::RichText::new(title.to_uppercase()).color(MUTED()).strong().size(11.0));
+        info_icon(ui, info);
+    });
     ui.add_space(4.0);
     section_body(ui, add);
 }
