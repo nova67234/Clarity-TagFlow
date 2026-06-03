@@ -111,24 +111,12 @@ fn invert_3x3(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
     out
 }
 
-/// Build the white-preserving camera-RGB → linear-sRGB matrix from the DNG's
-/// `xyz_to_cam` matrix (camera's XYZ→camera-RGB, 4×3, rows R/G/B/E). This is the
-/// dcraw `cam_xyz_coeff` algorithm: form `cam_rgb = xyz_to_cam · XYZ_RGB`
-/// (mapping linear-sRGB → camera), normalise each row so it sums to 1 (so a
-/// neutral camera pixel maps to a neutral sRGB pixel — the step zenraw's own
-/// develop skips, which is why its output has a magenta cast), then invert.
-fn camera_to_srgb_matrix(xyz_to_cam: [[f32; 3]; 4]) -> [[f64; 3]; 3] {
-    let mut cam_rgb = [[0.0f64; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            let mut s = 0.0;
-            for k in 0..3 {
-                s += xyz_to_cam[i][k] as f64 * XYZ_RGB[k][j];
-            }
-            cam_rgb[i][j] = s;
-        }
-    }
-    for row in cam_rgb.iter_mut() {
+/// Normalise each row of a 3×3 matrix so it sums to 1 (rows that sum to ~0 are
+/// left alone). When the *final* camera→sRGB matrix has rows summing to 1, a
+/// white-balanced neutral pixel `[n,n,n]` maps to a neutral sRGB `[n,n,n]` —
+/// i.e. the matrix is white-preserving.
+fn normalize_rows(mut m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    for row in m.iter_mut() {
         let sum: f64 = row.iter().sum();
         if sum.abs() > 1e-12 {
             for v in row.iter_mut() {
@@ -136,7 +124,48 @@ fn camera_to_srgb_matrix(xyz_to_cam: [[f32; 3]; 4]) -> [[f64; 3]; 3] {
             }
         }
     }
-    invert_3x3(cam_rgb)
+    m
+}
+
+/// Build the white-preserving camera-RGB → linear-sRGB matrix from the camera's
+/// `xyz_to_cam` matrix (XYZ→camera-RGB, 4×3, rows R/G/B/E; we use the top 3×3).
+///
+/// This mirrors a reference developer (zenraw's `compute_cam_to_output_matrix`):
+///   1. normalise the rows of `xyz_to_cam`,
+///   2. invert to get camera→XYZ,
+///   3. left-multiply by XYZ→sRGB (the inverse of the D65 [`XYZ_RGB`] matrix),
+///   4. normalise the rows of the *result* so they sum to 1.
+///
+/// Step 4 is the white-preservation step. An earlier version instead followed
+/// dcraw's `cam_xyz_coeff` literally — normalising the rows of `xyz_to_cam·XYZ_RGB`
+/// (the sRGB→cam matrix) *before* inverting. dcraw folds those per-row factors
+/// into its white-balance premultipliers (`pre_mul`); we apply only the green-
+/// normalised as-shot coeffs as WB, so skipping that left the final matrix with
+/// rows that didn't sum to 1 — a residual colour cast (e.g. a green tint on
+/// some Sony ARWs). Normalising the final matrix instead makes WB and matrix
+/// self-consistent. See `avif::tests::raw_compare`.
+fn camera_to_srgb_matrix(xyz_to_cam: [[f32; 3]; 4]) -> [[f64; 3]; 3] {
+    // Top 3×3 of xyz_to_cam (drop the E/emerald row), normalised, then inverted.
+    let xtc = [
+        [xyz_to_cam[0][0] as f64, xyz_to_cam[0][1] as f64, xyz_to_cam[0][2] as f64],
+        [xyz_to_cam[1][0] as f64, xyz_to_cam[1][1] as f64, xyz_to_cam[1][2] as f64],
+        [xyz_to_cam[2][0] as f64, xyz_to_cam[2][1] as f64, xyz_to_cam[2][2] as f64],
+    ];
+    let cam_to_xyz = invert_3x3(normalize_rows(xtc));
+    let xyz_to_srgb = invert_3x3(XYZ_RGB);
+
+    // cam→sRGB = (XYZ→sRGB) · (cam→XYZ).
+    let mut m = [[0.0f64; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            let mut s = 0.0;
+            for k in 0..3 {
+                s += xyz_to_srgb[i][k] * cam_to_xyz[k][j];
+            }
+            m[i][j] = s;
+        }
+    }
+    normalize_rows(m)
 }
 
 /// Encode a linear value [0,1] to 8-bit sRGB (standard sRGB transfer curve).
@@ -171,12 +200,124 @@ fn read_f32(row: &[u8], o: usize) -> f64 {
 /// camera-rendered JPEG preview embedded in the file ([`decode_raw_embedded_jpeg`]).
 /// The preview has correct colour and is usually full or near-full resolution, so
 /// the file still displays well even when we can't develop its raw sensor data.
+///
+/// When the develop succeeds **and** the file carries an embedded preview, we
+/// colour-match the full-resolution develop to that preview
+/// ([`color_match_to_preview`]). Our generic develop can't reproduce the camera's
+/// scene-adaptive colour science — e.g. mixed-lighting scenes (a sodium-lit
+/// tunnel) come out with a hue cast the camera's own JPEG doesn't have — so we
+/// fit a linear colour transform from develop→preview and apply it, keeping the
+/// develop's full resolution while adopting the camera's correct colour.
 fn decode_raw(path: &std::path::Path) -> Option<RgbaImage> {
     let bytes = std::fs::read(path).ok()?;
-    if let Some(img) = decode_raw_develop(&bytes) {
-        return Some(img);
+    if let Some(dev) = decode_raw_develop(&bytes) {
+        if let Some(prev) = decode_raw_embedded_jpeg(&bytes) {
+            if let Some(matched) = color_match_to_preview(&dev, &prev) {
+                return Some(matched);
+            }
+        }
+        return Some(dev);
     }
     decode_raw_embedded_jpeg(&bytes)
+}
+
+/// Recolour a full-resolution develop so its colours match the camera's embedded
+/// JPEG preview, while keeping the develop's resolution and detail.
+///
+/// The preview is the camera's own (correct) rendering but is low-resolution on
+/// some bodies (Sony ARW embeds only ~1.6 MP); the develop is full-resolution but
+/// colour-approximate. We fit a single affine colour transform `[r,g,b,1]·M` that
+/// best maps the (downscaled) develop onto the preview by least squares, then
+/// apply that 4×3 `M` to every full-resolution develop pixel. A global linear map
+/// can't capture tone-curve differences exactly, but it removes white-balance /
+/// hue casts well, which is what the camera's colour science mainly differs by.
+///
+/// Returns `None` (caller keeps the plain develop) if the preview is empty or its
+/// aspect ratio doesn't match the develop — the latter guards against an
+/// orientation mismatch between the two, which would otherwise fit garbage.
+fn color_match_to_preview(dev: &RgbaImage, prev: &RgbaImage) -> Option<RgbaImage> {
+    let (dw, dh) = (dev.width(), dev.height());
+    let (pw, ph) = (prev.width(), prev.height());
+    if pw == 0 || ph == 0 || dw == 0 || dh == 0 {
+        return None;
+    }
+    let (ra, rb) = (dw as f64 / dh as f64, pw as f64 / ph as f64);
+    if (ra - rb).abs() > 0.02 * ra.max(rb) {
+        return None;
+    }
+
+    // Fit at preview resolution: downscale the develop to match, then accumulate
+    // the normal equations for the least-squares solve (Aᵀ·A and Aᵀ·b) over every
+    // corresponding pixel pair, with A rows `[r,g,b,1]` and b the preview RGB.
+    let small = image::imageops::resize(dev, pw, ph, image::imageops::FilterType::Triangle);
+    let mut ata = [[0f64; 4]; 4];
+    let mut atb = [[0f64; 3]; 4];
+    for (sp, pp) in small.pixels().zip(prev.pixels()) {
+        let v = [sp[0] as f64 / 255.0, sp[1] as f64 / 255.0, sp[2] as f64 / 255.0, 1.0];
+        let t = [pp[0] as f64 / 255.0, pp[1] as f64 / 255.0, pp[2] as f64 / 255.0];
+        for i in 0..4 {
+            for j in 0..4 {
+                ata[i][j] += v[i] * v[j];
+            }
+            for c in 0..3 {
+                atb[i][c] += v[i] * t[c];
+            }
+        }
+    }
+    let m = solve4x3(ata, atb)?; // m[i][c]: contribution of channel i to output c
+
+    let to_u8 = |x: f64| (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    let mut out = RgbaImage::new(dw, dh);
+    for (o, d) in out.pixels_mut().zip(dev.pixels()) {
+        let (r, g, b) = (d[0] as f64 / 255.0, d[1] as f64 / 255.0, d[2] as f64 / 255.0);
+        let nr = r * m[0][0] + g * m[1][0] + b * m[2][0] + m[3][0];
+        let ng = r * m[0][1] + g * m[1][1] + b * m[2][1] + m[3][1];
+        let nb = r * m[0][2] + g * m[1][2] + b * m[2][2] + m[3][2];
+        *o = image::Rgba([to_u8(nr), to_u8(ng), to_u8(nb), 255]);
+    }
+    Some(out)
+}
+
+/// Solve the 4×4 system `a · x = b` (b and x have 3 columns) by Gauss-Jordan
+/// elimination with partial pivoting. Returns `None` if `a` is singular.
+fn solve4x3(mut a: [[f64; 4]; 4], mut b: [[f64; 3]; 4]) -> Option<[[f64; 3]; 4]> {
+    for col in 0..4 {
+        // Partial pivot: move the row with the largest |value| in this column up.
+        let mut piv = col;
+        for r in (col + 1)..4 {
+            if a[r][col].abs() > a[piv][col].abs() {
+                piv = r;
+            }
+        }
+        if a[piv][col].abs() < 1e-12 {
+            return None;
+        }
+        a.swap(col, piv);
+        b.swap(col, piv);
+        // Normalise the pivot row, then eliminate the column from all other rows.
+        let d = a[col][col];
+        for c in col..4 {
+            a[col][c] /= d;
+        }
+        for c in 0..3 {
+            b[col][c] /= d;
+        }
+        for r in 0..4 {
+            if r == col {
+                continue;
+            }
+            let f = a[r][col];
+            if f != 0.0 {
+                for c in col..4 {
+                    a[r][c] -= f * a[col][c];
+                }
+                for c in 0..3 {
+                    b[r][c] -= f * b[col][c];
+                }
+            }
+        }
+    }
+    Some(b)
 }
 
 /// Scan a raw file (DNG/ARW/TIFF-based) for embedded JPEG previews and decode the
@@ -300,14 +441,16 @@ fn decode_jpeg_oriented(bytes: &[u8], container_orientation: Option<u8>) -> Opti
 /// oriented camera-RGB as f32 in `[0,1]`, with no white balance or colour matrix
 /// — and run our own develop:
 ///
-/// 1. **Gray-world white balance.** The as-shot WB coefficients rawloader reads
-///    from older DNGs are unreliable (e.g. a Canon 350D file reports
-///    `[2.25, 1.0, 1.49]`, which over-boosts red/blue into a magenta cast).
-///    Rather than trust them, we scale R and B so the image's *mean* matches
-///    green — a metadata-independent estimate that reproduces the camera's own
-///    near-neutral average and generalises across cameras.
+/// 1. **As-shot white balance.** We use the camera's recorded WB multipliers
+///    (`wb_coeffs`, `[R, G, B, E]`) normalised by green, exactly as a reference
+///    raw developer does. An earlier version used gray-world WB instead (forcing
+///    each channel's mean to neutral) out of a concern that older WB coeffs were
+///    unreliable — but gray-world strips the scene's actual colour cast (golden
+///    hour goes drab, blue hour goes muddy, a warm sunset goes green), and on
+///    every test raw (ARW/CR2/NEF/DNG) the as-shot coeffs match the camera's own
+///    embedded preview far better. See `avif::tests::raw_compare`.
 /// 2. **White-preserving camera→sRGB matrix** (see [`camera_to_srgb_matrix`]),
-///    so a neutral (gray-world-balanced) pixel maps to neutral sRGB.
+///    so a neutral (WB-balanced) pixel maps to neutral sRGB.
 /// 3. **sRGB transfer curve.**
 fn decode_raw_develop(bytes: &[u8]) -> Option<RgbaImage> {
     let cfg = zenraw::RawDecodeConfig::new().with_output(zenraw::OutputMode::CameraRaw);
@@ -329,29 +472,20 @@ fn decode_raw_develop(bytes: &[u8]) -> Option<RgbaImage> {
     let slice = buf.as_slice();
     let bpp = channels * 4; // f32 samples
 
-    // Pass 1 — channel means for gray-world white balance.
-    let (mut mr, mut mg, mut mb, mut n) = (0f64, 0f64, 0f64, 0f64);
-    for y in 0..h {
-        let row = slice.row(y);
-        for x in 0..w as usize {
-            let o = x * bpp;
-            mr += read_f32(row, o);
-            mg += read_f32(row, o + 4);
-            mb += read_f32(row, o + 8);
-            n += 1.0;
-        }
-    }
-    // Scale R and B so their mean equals green's (green left unchanged).
-    let wb = [
-        if mr > 1e-9 { mg / mr } else { 1.0 },
-        1.0,
-        if mb > 1e-9 { mg / mb } else { 1.0 },
-    ];
-    let _ = (n, info.wb_coeffs); // (means already accumulated; as-shot WB intentionally unused)
+    // As-shot white balance: the camera's recorded multipliers normalised by
+    // green (so green is left unchanged). `wb_coeffs` is `[R, G, B, E]`; the E
+    // (emerald) channel can be NaN and is unused here. Fall back to no-op WB if
+    // green is missing/zero so a malformed file can't divide by zero.
+    let g = info.wb_coeffs[1] as f64;
+    let wb = if g.abs() > 1e-9 {
+        [info.wb_coeffs[0] as f64 / g, 1.0, info.wb_coeffs[2] as f64 / g]
+    } else {
+        [1.0, 1.0, 1.0]
+    };
 
     let m = camera_to_srgb_matrix(info.color_matrix);
 
-    // Pass 2 — apply WB, the camera→sRGB matrix, and the sRGB curve.
+    // Apply WB, the camera→sRGB matrix, and the sRGB curve.
     let mut rgba = Vec::with_capacity((w as usize) * (h as usize) * 4);
     for y in 0..h {
         let row = slice.row(y);
@@ -597,6 +731,73 @@ mod tests {
                     println!("OK {} -> {}x{} -> {out}", p.display(), img.width(), img.height());
                 }
                 None => println!("FAIL {}", p.display()),
+            }
+        }
+    }
+
+    // Compare our raw-develop output against the camera's own embedded JPEG
+    // preview (the reference "correct" colours) for every raw sample. Saves both
+    // as PNGs next to each source file and prints the mean RGB of each so colour
+    // drift (e.g. a wrong white-balance cast) is visible numerically and by eye.
+    // Skips cleanly when the local sample folders are absent.
+    // cargo test --no-default-features --features avif raw_compare -- --nocapture
+    #[test]
+    fn raw_compare() {
+        fn mean_rgb(img: &RgbaImage) -> (f64, f64, f64) {
+            let (mut r, mut g, mut b, mut n) = (0f64, 0f64, 0f64, 0f64);
+            for px in img.pixels() {
+                r += px[0] as f64;
+                g += px[1] as f64;
+                b += px[2] as f64;
+                n += 1.0;
+            }
+            (r / n, g / n, b / n)
+        }
+        let mut entries: Vec<std::path::PathBuf> = Vec::new();
+        for (d, ext) in [("tests/DNG", "dng"), ("tests/ARW", "arw"), ("tests/CR2", "cr2"), ("tests/NEF", "nef")] {
+            let dir = std::path::Path::new(d);
+            if !dir.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case(ext))
+                    == Some(true)
+                {
+                    entries.push(p);
+                }
+            }
+        }
+        for p in entries {
+            let bytes = std::fs::read(&p).unwrap();
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            let stem = p.with_extension("");
+            let stem = stem.to_string_lossy().to_string();
+            println!("\n=== {name} ===");
+            let dev = decode_raw_develop(&bytes);
+            let prev = decode_raw_embedded_jpeg(&bytes);
+            if let Some(dev) = &dev {
+                let (r, g, b) = mean_rgb(dev);
+                println!("  develop  {}x{}  mean RGB = ({r:.1}, {g:.1}, {b:.1})", dev.width(), dev.height());
+                dev.save(format!("{stem}.develop.png")).unwrap();
+            } else {
+                println!("  develop  FAILED");
+            }
+            if let Some(prev) = &prev {
+                let (r, g, b) = mean_rgb(prev);
+                println!("  preview  {}x{}  mean RGB = ({r:.1}, {g:.1}, {b:.1})", prev.width(), prev.height());
+                prev.save(format!("{stem}.preview.png")).unwrap();
+            } else {
+                println!("  preview  FAILED");
+            }
+            // The colour-matched result is what the app actually displays (see
+            // `decode_raw`): develop recoloured to the preview.
+            if let (Some(dev), Some(prev)) = (&dev, &prev) {
+                if let Some(matched) = color_match_to_preview(dev, prev) {
+                    let (r, g, b) = mean_rgb(&matched);
+                    println!("  matched  {}x{}  mean RGB = ({r:.1}, {g:.1}, {b:.1})", matched.width(), matched.height());
+                    matched.save(format!("{stem}.matched.png")).unwrap();
+                }
             }
         }
     }
