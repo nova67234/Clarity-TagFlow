@@ -4,7 +4,7 @@
 
 use eframe::egui;
 
-use crate::theme::{Theme, EDGE, FIELD, MUTED, PANEL, TEXT};
+use crate::theme::{Backdrop, Theme, EDGE, FIELD, MUTED, PANEL, TEXT};
 
 /// Key under which the settings are saved in eframe's persistent storage.
 pub const STORAGE_KEY: &str = "clarity_tagflow_settings";
@@ -54,6 +54,12 @@ pub struct Settings {
     /// The active app colour theme (Dark / Light). Applied on launch and live
     /// whenever changed from the Appearance tab.
     pub theme: Theme,
+    /// Background colour (sRGB) for the Glass theme — painted behind its
+    /// translucent panels. Independent of the panel colours, so changing it
+    /// recolours the background without restyling the glass.
+    pub glass_bg: [u8; 3],
+    /// Which animated backdrop the Glass theme paints over `glass_bg`.
+    pub glass_backdrop: Backdrop,
     /// Loop videos: restart playback from the beginning when a video reaches its
     /// end. Read by the embedded video player when a clip starts.
     pub loop_video: bool,
@@ -72,6 +78,9 @@ impl Default for Settings {
             enable_extended_formats: false,
             last_ai_model: "Select AI...".to_string(),
             theme: Theme::default(),
+            // A deep navy reads well behind the glass panels by default.
+            glass_bg: [20, 22, 34],
+            glass_backdrop: Backdrop::default(),
             loop_video: false,
         }
     }
@@ -247,13 +256,56 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             Theme::Aurora,
             egui::RichText::new("Aurora").color(TEXT()),
         );
+        ui.add_space(2.0);
+        ui.radio_value(
+            &mut settings.theme,
+            Theme::Glass,
+            egui::RichText::new("Glass").color(TEXT()),
+        );
         hint(
             ui,
             "Dark and Light recolour the whole app. Space is dark with an animated \
              starfield, and Aurora is light with a soft drifting glow behind the \
-             panels and image. Applies instantly.",
+             panels and image. Glass has translucent dark panels over a background \
+             you choose below. Applies instantly.",
         );
     });
+
+    // Background controls for the Glass theme: a colour picker plus the animated
+    // backdrop. Only shown when Glass is the active theme, since they don't apply
+    // to the other themes.
+    if settings.theme == Theme::Glass {
+        section(ui, "Glass background", |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Colour").color(TEXT()));
+                ui.add_space(6.0);
+                ui.color_edit_button_srgb(&mut settings.glass_bg);
+            });
+            hint(ui, "Shows through the translucent panels and fills the gutters.");
+
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Backdrop").color(TEXT()));
+            ui.add_space(4.0);
+            ui.radio_value(
+                &mut settings.glass_backdrop,
+                Backdrop::Solid,
+                egui::RichText::new("Solid").color(TEXT()),
+            );
+            ui.add_space(2.0);
+            ui.radio_value(
+                &mut settings.glass_backdrop,
+                Backdrop::Starfield,
+                egui::RichText::new("Starfield").color(TEXT()),
+            );
+            ui.add_space(2.0);
+            ui.radio_value(
+                &mut settings.glass_backdrop,
+                Backdrop::Aurora,
+                egui::RichText::new("Aurora glow").color(TEXT()),
+            );
+            hint(ui, "An optional animation painted over the background colour.");
+        });
+    }
 }
 
 /// A tab selector button across the top of the window. Highlights the active
