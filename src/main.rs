@@ -476,8 +476,13 @@ impl eframe::App for ViewerApp {
         self.thumbs.begin_frame(ui.ctx());
         self.viewer.begin_frame(ui.ctx());
 
+        // Push the Glass theme's user-configurable background (colour + backdrop)
+        // so the colour picker updates live; cheap, so done every frame.
+        theme::set_glass_config(self.settings.glass_bg, self.settings.glass_backdrop);
+
         // Paint the theme's full-window background (the Space theme's animated
-        // starfield) on the bottom layer, beneath every panel. No-op otherwise.
+        // starfield, the Glass theme's configured backdrop) on the bottom layer,
+        // beneath every panel. No-op otherwise.
         theme::paint_background(ui.ctx());
 
         // --- Toggle fullscreen on F12 ---

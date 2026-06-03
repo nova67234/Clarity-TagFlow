@@ -15,9 +15,15 @@
 //!   behind every panel and the image. Cards stay opaque so text stays readable.
 //! - **Aurora** — the light-mode counterpart to Space: light surfaces with
 //!   transparent gutters revealing a soft, slowly-drifting pastel aurora glow.
+//! - **Glass** — a dark theme with *translucent* panels (true frosted glass), so
+//!   the background bleeds through the cards themselves. Unlike Space/Aurora, the
+//!   background is user-configurable: a colour (picker) plus an optional animated
+//!   [`Backdrop`], both pushed in via [`set_glass_config`] and painted by
+//!   [`paint_background`]. The panel colours are fixed, so changing the background
+//!   recolours the gutters/backdrop without changing the glass tint itself.
 
 use eframe::egui::{self, Color32, CornerRadius};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 /// The available app themes. Persisted in `Settings` (defaults to `Dark`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -27,6 +33,33 @@ pub enum Theme {
     Light,
     Space,
     Aurora,
+    Glass,
+}
+
+/// The background style painted behind the [`Theme::Glass`] panels. Persisted in
+/// `Settings`. The chosen colour is painted as a flat base; `Starfield`/`Aurora`
+/// additionally animate the same effects the Space/Aurora themes use, over it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum Backdrop {
+    /// Just the flat background colour.
+    #[default]
+    Solid,
+    /// Twinkling starfield over the background colour.
+    Starfield,
+    /// Drifting pastel aurora blobs over the background colour.
+    Aurora,
+}
+
+/// Build a translucent [`Color32`] from straight (un-premultiplied) RGBA. egui
+/// stores premultiplied colours and its `from_rgba_unmultiplied` isn't `const`,
+/// so we premultiply here to keep the palette statics `const`.
+const fn glass(r: u8, g: u8, b: u8, a: u8) -> Color32 {
+    Color32::from_rgba_premultiplied(
+        (r as u16 * a as u16 / 255) as u8,
+        (g as u16 * a as u16 / 255) as u8,
+        (b as u16 * a as u16 / 255) as u8,
+        a,
+    )
 }
 
 /// A full set of named UI colours. `is_dark` selects the egui base visuals;
@@ -48,6 +81,9 @@ struct Palette {
     is_dark: bool,
     starfield: bool,
     aurora: bool,
+    /// Translucent panels with a user-configurable background (the Glass theme).
+    /// When set, [`paint_background`] paints the configured colour + backdrop.
+    glass: bool,
 }
 
 /// The original dark palette — identical values to the previous inline consts.
@@ -65,6 +101,7 @@ static DARK: Palette = Palette {
     is_dark: true,
     starfield: false,
     aurora: false,
+    glass: false,
 };
 
 /// A soft light palette: off-white surfaces, dark ink text, deeper accents.
@@ -82,6 +119,7 @@ static LIGHT: Palette = Palette {
     is_dark: false,
     starfield: false,
     aurora: false,
+    glass: false,
 };
 
 /// A space palette: identical to the Dark theme's panels (same colours and faint
@@ -102,6 +140,7 @@ static SPACE: Palette = Palette {
     is_dark: true,
     starfield: true,
     aurora: false,
+    glass: false,
 };
 
 /// An aurora palette: the light-mode counterpart to Space. Identical to the Light
@@ -121,10 +160,38 @@ static AURORA: Palette = Palette {
     is_dark: false,
     starfield: false,
     aurora: true,
+    glass: false,
 };
 
-/// 0 = Dark, 1 = Light, 2 = Space, 3 = Aurora.
+/// A glass palette: dark, but the panels are *translucent* (~70% opaque) so the
+/// background bleeds through the cards themselves. The background colour/backdrop
+/// is user-set (see [`set_glass_config`]); `bg` is transparent so the gutters
+/// reveal it fully, and the panel/field fills are semi-transparent so it shows
+/// through them too. Text/accents match Dark for readability.
+static GLASS: Palette = Palette {
+    bg: Color32::TRANSPARENT,
+    panel: glass(42, 44, 50, 180),
+    field: glass(60, 62, 68, 195),
+    field2: glass(72, 74, 80, 195),
+    text: Color32::from_rgb(235, 235, 235),
+    muted: Color32::from_rgb(178, 181, 187),
+    accent1: Color32::from_rgb(64, 140, 255),
+    accent2: Color32::from_rgb(90, 200, 245),
+    // No panel outline — the translucent fill carries the glass look on its own.
+    edge: Color32::TRANSPARENT,
+    is_dark: true,
+    starfield: false,
+    aurora: false,
+    glass: true,
+};
+
+/// 0 = Dark, 1 = Light, 2 = Space, 3 = Aurora, 4 = Glass.
 static ACTIVE: AtomicU8 = AtomicU8::new(0);
+
+/// The Glass theme's background, packed for atomic access: the low 24 bits are
+/// the RGB colour; the next 8 bits are the [`Backdrop`] discriminant. Updated by
+/// [`set_glass_config`] each frame from the persisted settings.
+static GLASS_CONFIG: AtomicU32 = AtomicU32::new(0);
 
 /// Switch the active palette. Call [`apply`] afterwards to push the new visuals.
 pub fn set(theme: Theme) {
@@ -133,8 +200,34 @@ pub fn set(theme: Theme) {
         Theme::Light => 1,
         Theme::Space => 2,
         Theme::Aurora => 3,
+        Theme::Glass => 4,
     };
     ACTIVE.store(v, Ordering::Relaxed);
+}
+
+/// Set the Glass theme's background: a flat `rgb` colour plus an animated
+/// `backdrop` painted over it. Cheap (a single atomic store) so callers push it
+/// every frame from the persisted settings, letting the colour picker update live.
+pub fn set_glass_config(rgb: [u8; 3], backdrop: Backdrop) {
+    let b = match backdrop {
+        Backdrop::Solid => 0u32,
+        Backdrop::Starfield => 1,
+        Backdrop::Aurora => 2,
+    };
+    let packed = (b << 24) | ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32;
+    GLASS_CONFIG.store(packed, Ordering::Relaxed);
+}
+
+/// Unpack the current Glass background into its colour and backdrop.
+fn glass_config() -> (Color32, Backdrop) {
+    let p = GLASS_CONFIG.load(Ordering::Relaxed);
+    let color = Color32::from_rgb((p >> 16) as u8, (p >> 8) as u8, p as u8);
+    let backdrop = match (p >> 24) & 0xff {
+        1 => Backdrop::Starfield,
+        2 => Backdrop::Aurora,
+        _ => Backdrop::Solid,
+    };
+    (color, backdrop)
 }
 
 /// The currently active theme. (Provided for completeness — the app drives theme
@@ -145,6 +238,7 @@ pub fn current() -> Theme {
         1 => Theme::Light,
         2 => Theme::Space,
         3 => Theme::Aurora,
+        4 => Theme::Glass,
         _ => Theme::Dark,
     }
 }
@@ -170,6 +264,7 @@ fn palette() -> &'static Palette {
         1 => &LIGHT,
         2 => &SPACE,
         3 => &AURORA,
+        4 => &GLASS,
         _ => &DARK,
     }
 }
@@ -317,24 +412,52 @@ fn hash01(i: u32, salt: u32) -> f32 {
 /// Paint the active theme's full-window background, drawn on the bottom-most
 /// layer so every transparent-gutter region (and the image area) shows it
 /// through. [`Theme::Space`] gets a twinkling starfield; [`Theme::Aurora`] gets a
-/// drifting pastel glow. Other themes are a no-op. Call once per frame near the
-/// top of `update`.
+/// drifting pastel glow; [`Theme::Glass`] gets the user's chosen colour plus an
+/// optional backdrop. Other themes are a no-op. Call once per frame near the top
+/// of `update`.
 pub fn paint_background(ctx: &egui::Context) {
-    if palette().aurora {
-        paint_aurora(ctx);
+    let p = palette();
+    if p.glass {
+        paint_glass(ctx);
         return;
     }
-    if !palette().starfield {
+    if p.aurora {
+        let rect = ctx.content_rect();
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        // A clearly-tinted soft-blue base; the visible gutters carry the look.
+        painter.rect_filled(rect, 0.0, Color32::from_rgb(212, 222, 242));
+        draw_aurora_blobs(ctx, &painter, rect);
         return;
     }
-
+    if !p.starfield {
+        return;
+    }
     let rect = ctx.content_rect();
     let painter = ctx.layer_painter(egui::LayerId::background());
-
     // Deep-space base — covers the framebuffer clear colour so transparent panels
     // reveal this rather than whatever eframe cleared to.
     painter.rect_filled(rect, 0.0, Color32::from_rgb(8, 9, 16));
+    draw_starfield(ctx, &painter, rect);
+}
 
+/// Paint the Glass theme's background: the user's flat colour, plus the chosen
+/// animated [`Backdrop`] over it. The translucent panels then let this show
+/// through. See [`set_glass_config`].
+fn paint_glass(ctx: &egui::Context) {
+    let (color, backdrop) = glass_config();
+    let rect = ctx.content_rect();
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    painter.rect_filled(rect, 0.0, color);
+    match backdrop {
+        Backdrop::Solid => {}
+        Backdrop::Starfield => draw_starfield(ctx, &painter, rect),
+        Backdrop::Aurora => draw_aurora_blobs(ctx, &painter, rect),
+    }
+}
+
+/// Draw the twinkling starfield over whatever base `painter` already has. Shared
+/// by the Space theme and the Glass theme's Starfield backdrop.
+fn draw_starfield(ctx: &egui::Context, painter: &egui::Painter, rect: egui::Rect) {
     let t = ctx.input(|i| i.time) as f32;
     // Scale star count to the window area (≈1 star per 5,500 px²), clamped.
     let area = (rect.width() * rect.height()).max(1.0);
@@ -363,24 +486,75 @@ pub fn paint_background(ctx: &egui::Context) {
         painter.circle_filled(egui::pos2(x, y), radius, col);
     }
 
+    draw_shooting_star(t, painter, rect);
+
     // Keep the twinkle animating (~30 fps) without spinning the CPU flat-out.
     ctx.request_repaint_after(std::time::Duration::from_millis(33));
 }
 
-/// Paint the Aurora background: a soft off-white base with a handful of large,
-/// blurred pastel blobs drifting slowly behind everything — the light-mode
-/// counterpart to the starfield. Kept very low-contrast so it never competes with
-/// the images or panels.
-fn paint_aurora(ctx: &egui::Context) {
-    let rect = ctx.content_rect();
-    let painter = ctx.layer_painter(egui::LayerId::background());
+/// Occasionally streak a shooting star across the field. Stateless: time is split
+/// into fixed-length epochs, and ~most epochs spawn one meteor whose start,
+/// direction and timing are hashed from the epoch index — so it animates smoothly
+/// and stays deterministic without any per-frame state. Roughly one every few
+/// seconds.
+fn draw_shooting_star(t: f32, painter: &egui::Painter, rect: egui::Rect) {
+    const PERIOD: f32 = 7.0; // seconds per epoch (a meteor "slot")
+    const DUR: f32 = 0.85; // how long a streak is visible
+    let epoch = (t / PERIOD).floor();
+    let seed = epoch.max(0.0) as u32;
 
-    // A clearly-tinted soft-blue base. The visible background is mostly the thin
-    // gutters around the opaque panels (the blob *centres* hide behind the panels),
-    // so the base colour itself has to carry the look — a near-white base read as
-    // plain white.
-    painter.rect_filled(rect, 0.0, Color32::from_rgb(212, 222, 242));
+    // Skip some epochs so the timing feels irregular rather than metronomic.
+    if hash01(seed, 20) > 0.7 {
+        return;
+    }
+    // Start the streak at a hashed offset within the epoch (not at its boundary).
+    let local = t - epoch * PERIOD - hash01(seed, 21) * (PERIOD - DUR);
+    if !(0.0..=DUR).contains(&local) {
+        return;
+    }
+    let p = local / DUR; // 0..1 progress along the streak
+    let env = (p * std::f32::consts::PI).sin(); // brightness fades in then out
 
+    // Direction: mostly downward, biased left or right; normalised.
+    let dir_x = if hash01(seed, 22) < 0.5 { -1.0 } else { 1.0 } * (0.45 + hash01(seed, 23) * 0.6);
+    let dir_y = 0.5 + hash01(seed, 24) * 0.5;
+    let dlen = (dir_x * dir_x + dir_y * dir_y).sqrt().max(1e-3);
+    let (ux, uy) = (dir_x / dlen, dir_y / dlen);
+
+    // Start on the side opposite the travel direction (and in the upper area,
+    // since it moves downward) so the streak crosses the visible field instead of
+    // immediately flying off an edge.
+    let span = rect.width().max(rect.height());
+    let frac = hash01(seed, 25);
+    let sx = if ux >= 0.0 {
+        rect.left() + frac * rect.width() * 0.45 // moving right → start left
+    } else {
+        rect.left() + rect.width() * (0.55 + frac * 0.45) // moving left → start right
+    };
+    let sy = rect.top() + hash01(seed, 26) * rect.height() * 0.4;
+    let hx = sx + ux * span * 0.6 * p;
+    let hy = sy + uy * span * 0.6 * p;
+
+    // Tail: short segments trailing the head, fading toward the tail end.
+    let tail = (span * 0.10).clamp(60.0, 200.0);
+    const SEG: usize = 10;
+    for k in 0..SEG {
+        let f0 = k as f32 / SEG as f32;
+        let f1 = (k + 1) as f32 / SEG as f32;
+        let a = egui::pos2(hx - ux * tail * f0, hy - uy * tail * f0);
+        let b = egui::pos2(hx - ux * tail * f1, hy - uy * tail * f1);
+        let alpha = (env * (1.0 - f0) * 230.0).clamp(0.0, 255.0) as u8;
+        let w = 2.0 * (1.0 - f0) + 0.4;
+        painter.line_segment([a, b], egui::Stroke::new(w, Color32::from_rgba_unmultiplied(255, 255, 255, alpha)));
+    }
+    // Bright head.
+    let ha = (env * 255.0).clamp(0.0, 255.0) as u8;
+    painter.circle_filled(egui::pos2(hx, hy), 1.8, Color32::from_rgba_unmultiplied(255, 255, 255, ha));
+}
+
+/// Draw the drifting pastel aurora blobs over whatever base `painter` already
+/// has. Shared by the Aurora theme and the Glass theme's Aurora backdrop.
+fn draw_aurora_blobs(ctx: &egui::Context, painter: &egui::Painter, rect: egui::Rect) {
     let t = ctx.input(|i| i.time) as f32;
 
     // Saturated pastel blobs, each drifting on its own slow ellipse. Anchored
@@ -413,7 +587,7 @@ fn paint_aurora(ctx: &egui::Context) {
         let cx = bx + (t * speed + phase).cos() * drift;
         let cy = by + (t * speed * 0.8 + phase).sin() * drift;
 
-        soft_blob(&painter, egui::pos2(cx, cy), radius, Color32::from_rgb(r, g, b));
+        soft_blob(painter, egui::pos2(cx, cy), radius, Color32::from_rgb(r, g, b));
     }
 
     // Animate gently — aurora drifts much slower than stars twinkle.
@@ -433,5 +607,28 @@ fn soft_blob(painter: &egui::Painter, center: egui::Pos2, radius: f32, color: Co
         let alpha = 22.0_f32; // per-ring; accumulates to a clearly-visible centre
         let col = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha as u8);
         painter.circle_filled(center, r, col);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glass_config_round_trips() {
+        for backdrop in [Backdrop::Solid, Backdrop::Starfield, Backdrop::Aurora] {
+            set_glass_config([10, 200, 255], backdrop);
+            let (c, b) = glass_config();
+            assert_eq!((c.r(), c.g(), c.b()), (10, 200, 255));
+            assert_eq!(b, backdrop);
+        }
+    }
+
+    #[test]
+    fn glass_panels_are_translucent() {
+        // The whole point of the Glass theme: panels let the background through.
+        assert!(GLASS.panel.a() < 255, "glass panel must be translucent");
+        assert!(GLASS.field.a() < 255, "glass field must be translucent");
+        assert_eq!(GLASS.bg, Color32::TRANSPARENT, "gutters reveal the backdrop");
     }
 }
