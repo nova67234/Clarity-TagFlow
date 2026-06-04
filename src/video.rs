@@ -36,6 +36,187 @@ pub fn loop_enabled() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// VLC availability — drives whether the viewer plays in-app, offers to install
+// VLC, or reports that this build has no video backend.
+// ---------------------------------------------------------------------------
+
+/// What the centre viewer should show for a video that has no running player.
+// Which variants are constructed depends on the build: the `vlc` build returns
+// `Available`/`NeedsInstall`, the stub build only `Unsupported` — so one variant
+// is always cfg-unused. All three are still matched in `video_notice`.
+#[allow(dead_code)]
+pub enum VideoSupport {
+    /// A libVLC runtime is available; playback should work (a `None` player then
+    /// means the clip itself failed to start).
+    Available,
+    /// This build can play video but no libVLC runtime was found — offer to
+    /// install VLC.
+    NeedsInstall,
+    /// This build has no video backend (compiled without the `vlc` feature).
+    Unsupported,
+}
+
+/// Where the "Install VLC" button sends the user.
+pub const VLC_DOWNLOAD_URL: &str = "https://www.videolan.org/vlc/";
+
+/// Whether this build can play video and, if so, whether a libVLC runtime is
+/// present. Cheap to call every frame (the Windows probe is memoised).
+pub fn support() -> VideoSupport {
+    #[cfg(not(feature = "vlc"))]
+    {
+        VideoSupport::Unsupported
+    }
+    #[cfg(feature = "vlc")]
+    {
+        if vlc_runtime_available() {
+            VideoSupport::Available
+        } else {
+            VideoSupport::NeedsInstall
+        }
+    }
+}
+
+/// Whether a usable libVLC runtime is present.
+///
+/// On Windows libVLC is *delay-loaded* (see `.cargo/config.toml`), so the app
+/// launches even when VLC isn't installed; we probe for a system/bundled install
+/// here and register its folder on the DLL search path *before* any libVLC call,
+/// so the delayed load (and `libvlccore.dll` / the `plugins\` folder beside it)
+/// resolves. On other platforms libVLC is linked at load time, so if the process
+/// is running it's necessarily present.
+#[cfg(all(feature = "vlc", windows))]
+fn vlc_runtime_available() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // Cache only *success*: while VLC is absent we keep re-probing (cheap — just a
+    // few path checks), so installing it mid-session is picked up without a
+    // restart. Once found, the DLL-dir setup has run and we stop probing.
+    static READY: AtomicBool = AtomicBool::new(false);
+    if READY.load(Ordering::Relaxed) {
+        return true;
+    }
+    if setup_windows_vlc() {
+        READY.store(true, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(all(feature = "vlc", not(windows)))]
+fn vlc_runtime_available() -> bool {
+    true
+}
+
+/// Locate a libVLC install, add its folder to the DLL search path, and pre-load
+/// `libvlc.dll` by full path so later delay-loaded calls reuse that module.
+/// Returns whether the load succeeded.
+#[cfg(all(feature = "vlc", windows))]
+fn setup_windows_vlc() -> bool {
+    use std::os::raw::c_void;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetDefaultDllDirectories(flags: u32) -> i32;
+        fn AddDllDirectory(path: *const u16) -> *mut c_void;
+        fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
+    }
+    const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
+    const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
+
+    let wide = |p: &std::path::Path| -> Vec<u16> {
+        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    };
+
+    let Some(dir) = find_vlc_dir() else { return false };
+    let dll = dir.join("libvlc.dll");
+    if !dll.exists() {
+        return false;
+    }
+    unsafe {
+        // Let the loader honour AddDllDirectory for dependency resolution.
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        AddDllDirectory(wide(&dir).as_ptr());
+        // Load by full path; ALTERED_SEARCH_PATH makes libvlccore.dll resolve from
+        // the same folder. Keep the handle (no FreeLibrary) so the delay-loaded
+        // by-name calls bind to this already-loaded module.
+        let h = LoadLibraryExW(wide(&dll).as_ptr(), std::ptr::null_mut(), LOAD_WITH_ALTERED_SEARCH_PATH);
+        !h.is_null()
+    }
+}
+
+/// Find a folder containing `libvlc.dll`: next to our exe (bundled / `build.rs`
+/// staged), then a `VLC_DIR` override, the standard install locations, and finally
+/// the registry's recorded install dir.
+#[cfg(all(feature = "vlc", windows))]
+fn find_vlc_dir() -> Option<std::path::PathBuf> {
+    let has_dll = |d: std::path::PathBuf| -> Option<std::path::PathBuf> {
+        if d.join("libvlc.dll").exists() { Some(d) } else { None }
+    };
+
+    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        if let Some(d) = has_dll(exe_dir) {
+            return Some(d);
+        }
+    }
+    if let Some(d) = std::env::var_os("VLC_DIR").map(std::path::PathBuf::from).and_then(has_dll) {
+        return Some(d);
+    }
+    for var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(base) = std::env::var_os(var) {
+            if let Some(d) = has_dll(std::path::Path::new(&base).join("VideoLAN").join("VLC")) {
+                return Some(d);
+            }
+        }
+    }
+    registry_vlc_dir()
+}
+
+/// Read `HKLM\SOFTWARE\VideoLAN\VLC\InstallDir` (the path the VLC installer
+/// records). Best-effort: any failure just yields `None`.
+#[cfg(all(feature = "vlc", windows))]
+fn registry_vlc_dir() -> Option<std::path::PathBuf> {
+    use std::os::raw::c_void;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegGetValueW(
+            hkey: *mut c_void,
+            subkey: *const u16,
+            value: *const u16,
+            flags: u32,
+            ptype: *mut u32,
+            pvdata: *mut c_void,
+            pcbdata: *mut u32,
+        ) -> i32;
+    }
+    const HKEY_LOCAL_MACHINE: *mut c_void = 0x8000_0002u32 as usize as *mut c_void;
+    const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+
+    let subkey: Vec<u16> = "SOFTWARE\\VideoLAN\\VLC".encode_utf16().chain(std::iter::once(0)).collect();
+    let value: Vec<u16> = "InstallDir".encode_utf16().chain(std::iter::once(0)).collect();
+    let mut buf = [0u16; 520];
+    let mut len = (buf.len() * 2) as u32; // capacity in bytes
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return None; // ERROR_SUCCESS == 0
+    }
+    let chars = (len as usize / 2).saturating_sub(1); // drop the trailing NUL
+    let dir = std::path::PathBuf::from(String::from_utf16_lossy(&buf[..chars]));
+    if dir.join("libvlc.dll").exists() { Some(dir) } else { None }
+}
+
+// ---------------------------------------------------------------------------
 // Stub used when the `vlc` feature is off — keeps the rest of the app building
 // with no VLC dependency. `start` returns `None`, so callers fall back to the
 // external VLC launcher.
@@ -333,6 +514,14 @@ mod backend {
             // that's the one that competes with the player. Its poster fills in
             // once playback stops.
             if self.busy.as_deref() == Some(path) {
+                return None;
+            }
+
+            // No libVLC runtime → don't spawn a decode (the delay-loaded call
+            // would fail); show the placeholder video icon instead. This also runs
+            // the one-time DLL-dir setup before the capture thread touches libVLC.
+            if !super::vlc_runtime_available() {
+                self.entries.insert(path.to_path_buf(), Thumb::Failed);
                 return None;
             }
 

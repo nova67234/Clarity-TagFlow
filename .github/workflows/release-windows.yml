@@ -24,10 +24,29 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
-      # Video playback (libVLC) needs the VLC SDK, which isn't on the runner, so
-      # build without it. The app's icon is still embedded by build.rs.
+      # Fetch the official libVLC build *only* for its import library (sdk\lib).
+      # We do NOT bundle the runtime: the app delay-loads libVLC and uses the
+      # user's installed VLC at runtime (prompting to install it if missing).
+      - name: Fetch libVLC import library
+        shell: pwsh
+        run: |
+          $ver = "3.0.21"
+          Invoke-WebRequest -Uri "https://get.videolan.org/vlc/$ver/win64/vlc-$ver-win64.7z" -OutFile vlc.7z
+          7z x vlc.7z -ovlc_sdk | Out-Null
+          $lib = (Get-ChildItem -Path vlc_sdk -Recurse -Directory -Filter lib | Where-Object { Test-Path (Join-Path $_.FullName 'libvlc.lib') } | Select-Object -First 1).FullName
+          if (-not $lib) { throw "libvlc.lib not found in the VLC archive" }
+          # The crate links `vlc`, so MSVC needs vlc.lib (the SDK ships libvlc.lib).
+          Copy-Item (Join-Path $lib 'libvlc.lib') (Join-Path $lib 'vlc.lib') -Force
+          "VLC_LIB=$lib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # Build with the vlc feature. RUSTFLAGS overrides the machine-specific paths
+      # in .cargo/config.toml: point the linker at the import lib above and
+      # delay-load libvlc.dll so the exe still launches when VLC isn't installed.
       - name: Build
-        run: cargo build --release --no-default-features
+        shell: pwsh
+        env:
+          RUSTFLAGS: -L native=${{ env.VLC_LIB }} -C link-arg=/DELAYLOAD:libvlc.dll -C link-arg=delayimp.lib
+        run: cargo build --release --no-default-features --features vlc
 
       - name: Package into a .zip
         shell: pwsh
