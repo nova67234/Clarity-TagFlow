@@ -206,11 +206,34 @@ pub fn run_job(
 /// Decode an image and flatten any alpha onto a white background (all three
 /// taggers were trained with white padding / `force_background='white'`).
 fn load_rgb_on_white(path: &Path) -> Result<RgbImage, String> {
-    // HDR can't be read by `image::open` directly (linear floats + strict
-    // signature check); tone-map it the same way the viewer does so the tagger
-    // sees the displayed image.
-    let rgba = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("hdr")) {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let rgba = if ext == "hdr" {
+        // HDR can't be read by `image::open` directly (linear floats + strict
+        // signature check); tone-map it the same way the viewer does so the tagger
+        // sees the displayed image.
         crate::image_cache::decode_hdr(path).ok_or_else(|| "Read image: HDR decode failed".to_string())?
+    } else if is_extended_format(&ext) {
+        // AVIF/HEIC and camera raw (DNG/ARW/CR2/NEF) can't be read by
+        // `image::open`; decode them through the same pure-Rust path the viewer
+        // uses so these files can be AI-tagged too.
+        decode_extended(path)?
+    } else if matches!(ext.as_str(), "tif" | "tiff") {
+        // Most TIFFs decode normally, but raw/JPEG-compressed ones (rendered image
+        // JPEG-compressed in IFD0, raw CFA in a sub-IFD) make `image` bail with
+        // "unknown photometric interpretation"; recover the embedded camera JPEG
+        // so these files can be tagged too — the same fallback the viewer uses.
+        match image::open(path) {
+            Ok(img) => img.to_rgba8(),
+            Err(e) => std::fs::read(path)
+                .ok()
+                .and_then(|b| crate::raw_preview::largest_embedded_jpeg(&b))
+                .ok_or_else(|| format!("Read image: {e}"))?,
+        }
     } else {
         image::open(path).map_err(|e| format!("Read image: {e}"))?.to_rgba8()
     };
@@ -221,6 +244,33 @@ fn load_rgb_on_white(path: &Path) -> Result<RgbImage, String> {
         out.put_pixel(x, y, Rgb([blend(p[0]), blend(p[1]), blend(p[2])]));
     }
     Ok(out)
+}
+
+/// Extended formats (AVIF/HEIC + camera raw) that need the pure-Rust decoders in
+/// `crate::avif` rather than `image::open`. Always `false` in builds without the
+/// `avif` feature (those files aren't recognised as images anyway).
+fn is_extended_format(ext: &str) -> bool {
+    #[cfg(feature = "avif")]
+    {
+        matches!(ext, "avif" | "heic" | "heif" | "dng" | "arw" | "cr2" | "nef")
+    }
+    #[cfg(not(feature = "avif"))]
+    {
+        let _ = ext;
+        false
+    }
+}
+
+/// Decode an extended-format file (see [`is_extended_format`]) to RGBA via the
+/// shared `crate::avif` decoders. Only reachable with the `avif` feature.
+#[cfg(feature = "avif")]
+fn decode_extended(path: &Path) -> Result<image::RgbaImage, String> {
+    crate::avif::decode_avif(path).ok_or_else(|| "Read image: extended-format decode failed".to_string())
+}
+
+#[cfg(not(feature = "avif"))]
+fn decode_extended(_path: &Path) -> Result<image::RgbaImage, String> {
+    Err("Read image: extended formats need the `avif` build feature".to_string())
 }
 
 /// WD14: aspect-preserving resize centred on a white pad; BGR 0–255, NHWC.

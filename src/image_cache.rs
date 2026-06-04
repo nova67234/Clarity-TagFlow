@@ -465,16 +465,30 @@ fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::Co
     // spike RAM and freeze the UI (small images skip the gate inside the helper).
     let _gate = large_decode_permit(path, gate);
 
-    let mut img = image::ImageReader::open(path)
+    match image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
         .ok()?
         .decode()
-        .ok()?;
-    img.apply_orientation(orientation);
-    // `thumbnail` only ever downscales (small images pass through) and keeps aspect.
-    let img = img.thumbnail(max_edge, max_edge);
-    Some(color_image(&img.to_rgba8()))
+    {
+        Ok(mut img) => {
+            img.apply_orientation(orientation);
+            // `thumbnail` only ever downscales (small images pass through) and keeps aspect.
+            let img = img.thumbnail(max_edge, max_edge);
+            Some(color_image(&img.to_rgba8()))
+        }
+        // Some "raw" TIFFs store the rendered image JPEG-compressed inside the TIFF
+        // (raw CFA data in a sub-IFD), which the `image` crate can't decode ("unknown
+        // photometric interpretation"). Recover the embedded camera JPEG instead.
+        Err(_) if matches!(path.extension().and_then(|e| e.to_str()), Some(e) if e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff")) =>
+        {
+            let bytes = std::fs::read(path).ok()?;
+            let rgba = crate::raw_preview::largest_embedded_jpeg(&bytes)?;
+            let img = image::DynamicImage::ImageRgba8(rgba).thumbnail(max_edge, max_edge);
+            Some(color_image(&img.to_rgba8()))
+        }
+        Err(_) => None,
+    }
 }
 
 /// Read a file's EXIF orientation tag (defaulting to no-op). `image`'s decoders

@@ -197,7 +197,8 @@ fn read_f32(row: &[u8], o: usize) -> f64 {
 /// here. Tries a full raw develop first ([`decode_raw_develop`]); if that fails —
 /// e.g. the camera model isn't supported by the backend (DJI drones, some newer
 /// Sony bodies, exotic compression all report `Unsupported`) — falls back to the
-/// camera-rendered JPEG preview embedded in the file ([`decode_raw_embedded_jpeg`]).
+/// camera-rendered JPEG preview embedded in the file
+/// ([`crate::raw_preview::largest_embedded_jpeg`]).
 /// The preview has correct colour and is usually full or near-full resolution, so
 /// the file still displays well even when we can't develop its raw sensor data.
 ///
@@ -211,14 +212,14 @@ fn read_f32(row: &[u8], o: usize) -> f64 {
 fn decode_raw(path: &std::path::Path) -> Option<RgbaImage> {
     let bytes = std::fs::read(path).ok()?;
     if let Some(dev) = decode_raw_develop(&bytes) {
-        if let Some(prev) = decode_raw_embedded_jpeg(&bytes) {
+        if let Some(prev) = crate::raw_preview::largest_embedded_jpeg(&bytes) {
             if let Some(matched) = color_match_to_preview(&dev, &prev) {
                 return Some(matched);
             }
         }
         return Some(dev);
     }
-    decode_raw_embedded_jpeg(&bytes)
+    crate::raw_preview::largest_embedded_jpeg(&bytes)
 }
 
 /// Recolour a full-resolution develop so its colours match the camera's embedded
@@ -318,115 +319,6 @@ fn solve4x3(mut a: [[f64; 4]; 4], mut b: [[f64; 3]; 4]) -> Option<[[f64; 3]; 4]>
         }
     }
     Some(b)
-}
-
-/// Scan a raw file (DNG/ARW/TIFF-based) for embedded JPEG previews and decode the
-/// largest one.
-///
-/// Every such file carries at least one camera-rendered JPEG (a small thumbnail,
-/// and usually a larger preview). We byte-scan for JPEG start markers (`FF D8 FF`),
-/// decode each candidate, and keep the one with the most pixels. Used as the
-/// fallback when the raw develop can't run.
-///
-/// The previews are stored in *sensor* orientation; the rotation/flip needed to
-/// view them upright lives in the container's TIFF `Orientation` tag (274), not
-/// inside each preview JPEG — so we read that once and apply it (falling back to
-/// the JPEG's own EXIF orientation if the container has none).
-fn decode_raw_embedded_jpeg(bytes: &[u8]) -> Option<RgbaImage> {
-    let container_orientation = tiff_orientation(bytes);
-
-    let mut best: Option<RgbaImage> = None;
-    let mut best_px = 0u64;
-    let mut attempts = 0u32;
-    let mut i = 0usize;
-    while i + 3 < bytes.len() {
-        if bytes[i] == 0xFF && bytes[i + 1] == 0xD8 && bytes[i + 2] == 0xFF {
-            if let Some(img) = decode_jpeg_oriented(&bytes[i..], container_orientation) {
-                let px = img.width() as u64 * img.height() as u64;
-                if px > best_px {
-                    best_px = px;
-                    best = Some(img);
-                }
-            }
-            // Count every JPEG-marker candidate (not just successful decodes) so a
-            // run of false `FF D8 FF` byte coincidences can't make us scan forever.
-            attempts += 1;
-            if attempts >= 64 {
-                break;
-            }
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    best
-}
-
-/// Read the TIFF `Orientation` tag (274) from IFD0 of a DNG/TIFF container.
-/// Returns the raw EXIF orientation value (1–8), or `None` if absent/malformed.
-///
-/// A DNG begins with a TIFF header: byte-order mark (`II`=little / `MM`=big),
-/// magic `42`, then the offset to IFD0. IFD0 is a count followed by 12-byte
-/// entries (tag, type, count, value); for a SHORT the value sits in the first two
-/// bytes of the value field. We only need tag 274, so we do a tiny hand parse
-/// rather than pulling in a full TIFF reader.
-fn tiff_orientation(bytes: &[u8]) -> Option<u8> {
-    if bytes.len() < 8 {
-        return None;
-    }
-    let le = match &bytes[0..2] {
-        b"II" => true,
-        b"MM" => false,
-        _ => return None,
-    };
-    let u16a = |b: &[u8]| -> u16 {
-        if le { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) }
-    };
-    let u32a = |b: &[u8]| -> u32 {
-        if le {
-            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-        } else {
-            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
-        }
-    };
-    if u16a(&bytes[2..4]) != 42 {
-        return None;
-    }
-    let ifd = u32a(&bytes[4..8]) as usize;
-    if ifd + 2 > bytes.len() {
-        return None;
-    }
-    let count = u16a(&bytes[ifd..ifd + 2]) as usize;
-    for e in 0..count {
-        let off = ifd + 2 + e * 12;
-        if off + 12 > bytes.len() {
-            break;
-        }
-        if u16a(&bytes[off..off + 2]) == 274 {
-            let v = u16a(&bytes[off + 8..off + 10]);
-            if (1..=8).contains(&v) {
-                return Some(v as u8);
-            }
-        }
-    }
-    None
-}
-
-/// Decode a JPEG and apply orientation. `container_orientation` is the DNG's
-/// TIFF orientation tag (preferred, since DNG previews carry no EXIF of their
-/// own); if it's `None` we fall back to the JPEG's own EXIF orientation. The
-/// `image` crate doesn't honour either automatically, so we rotate/flip here.
-fn decode_jpeg_oriented(bytes: &[u8], container_orientation: Option<u8>) -> Option<RgbaImage> {
-    use image::ImageDecoder;
-    let mut decoder =
-        image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(bytes)).ok()?;
-    let orientation = container_orientation
-        .and_then(image::metadata::Orientation::from_exif)
-        .or_else(|| decoder.orientation().ok())
-        .unwrap_or(image::metadata::Orientation::NoTransforms);
-    let mut img = image::DynamicImage::from_decoder(decoder).ok()?;
-    img.apply_orientation(orientation);
-    Some(img.into_rgba8())
 }
 
 /// Full raw develop of a camera-raw file (DNG/ARW/…) via zenraw. Returns `None`
@@ -775,7 +667,7 @@ mod tests {
             let stem = stem.to_string_lossy().to_string();
             println!("\n=== {name} ===");
             let dev = decode_raw_develop(&bytes);
-            let prev = decode_raw_embedded_jpeg(&bytes);
+            let prev = crate::raw_preview::largest_embedded_jpeg(&bytes);
             if let Some(dev) = &dev {
                 let (r, g, b) = mean_rgb(dev);
                 println!("  develop  {}x{}  mean RGB = ({r:.1}, {g:.1}, {b:.1})", dev.width(), dev.height());

@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use crate::theme::{EDGE, FIELD, MUTED, PANEL, TEXT};
+use crate::theme::{ACCENT1, EDGE, FIELD, MUTED, PANEL, TEXT};
 
 const API_URL: &str = "https://gelbooru.com/index.php?page=dapi&s=post&q=index&json=1";
 const SITE_HOME: &str = "https://gelbooru.com/";
@@ -180,13 +180,17 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                 DlMsg::Log(line) => state.push_log(line),
                 DlMsg::Progress(done, total) => {
                     state.progress = (done, total);
-                    state.status = format!("{done} / {total}");
+                    // The count is shown by the percentage label in the Log header,
+                    // so keep the status word generic rather than duplicating it.
+                    state.status = "Downloading".to_string();
                 }
                 DlMsg::Done => {
                     state.running = false;
                     state.rx = None;
+                    // A cancel leaves the status at the in-progress "Cancelling…";
+                    // flip it to the finished "Cancelled" so it doesn't look stuck.
                     if state.status.starts_with("Cancel") {
-                        // keep the cancel label
+                        state.status = "Cancelled".to_string();
                     } else {
                         state.status = "Done".to_string();
                     }
@@ -227,8 +231,31 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
         .show_inside(ui, |ui| {
             ui.add_space(8.0);
 
-            // Console / log — a dark inset well with a small header.
-            field_label(ui, "Log");
+            // Console / log — a dark inset well with a small header. The header
+            // carries the live progress: a percentage (blue while downloading) and
+            // a download glyph wrapped in a spinning ring whenever a run is active.
+            let frac = if state.progress.1 > 0 {
+                (state.progress.0 as f32 / state.progress.1 as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Log").color(MUTED()).size(12.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if state.running || state.progress.1 > 0 {
+                        let pct = (frac * 100.0).round() as u32;
+                        let pct_color = if state.running { ACCENT1() } else { MUTED() };
+                        ui.label(
+                            egui::RichText::new(format!("{pct}%")).color(pct_color).size(12.0).strong(),
+                        );
+                    }
+                    download_indicator(ui, state.running);
+                    if !state.status.is_empty() {
+                        ui.label(egui::RichText::new(&state.status).color(MUTED()).size(11.0));
+                    }
+                });
+            });
+            ui.add_space(2.0);
             let log_bg = if crate::theme::is_light() {
                 FIELD()
             } else {
@@ -264,20 +291,6 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                 });
 
             ui.add_space(10.0);
-
-            // Progress bar.
-            let frac = if state.progress.1 > 0 {
-                (state.progress.0 as f32 / state.progress.1 as f32).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            ui.add(
-                egui::ProgressBar::new(frac)
-                    .text(egui::RichText::new(state.status.clone()).size(12.0))
-                    .corner_radius(8)
-                    .desired_height(18.0),
-            );
-            ui.add_space(8.0);
 
             // Start / Cancel buttons.
             ui.horizontal(|ui| {
@@ -560,6 +573,42 @@ fn field_label(ui: &mut egui::Ui, label: &str) {
     ui.add_space(2.0);
 }
 
+/// The Log-header download glyph: the Arrow Downward Alt icon, tinted blue and
+/// wrapped in an animated blue ring while `running`. When idle it's just the muted
+/// arrow. The ring is a rotating arc (a spinner), so it reads as "working" even at
+/// 0% — the exact progress is shown by the percentage label beside it.
+fn download_indicator(ui: &mut egui::Ui, running: bool) {
+    let size = 20.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let painter = ui.painter().clone();
+    let center = rect.center();
+
+    if running {
+        let radius = size * 0.5 - 1.0;
+        let t = ui.input(|i| i.time) as f32;
+        // Faint full ring underneath, then a brighter rotating arc on top.
+        painter.circle_stroke(center, radius, egui::Stroke::new(2.0, ACCENT1().gamma_multiply(0.25)));
+        let start = (t * 3.0) % std::f32::consts::TAU;
+        let sweep = std::f32::consts::PI * 0.6;
+        let pts: Vec<egui::Pos2> = (0..=24)
+            .map(|k| {
+                let a = start + sweep * (k as f32 / 24.0);
+                center + radius * egui::vec2(a.cos(), a.sin())
+            })
+            .collect();
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0, ACCENT1())));
+        ui.ctx().request_repaint(); // keep the spinner animating
+    }
+
+    // Arrow glyph in the centre (blue while downloading, muted otherwise).
+    let tint = if running { ACCENT1() } else { MUTED() };
+    let icon = size * 0.6;
+    let icon_rect = egui::Rect::from_center_size(center, egui::vec2(icon, icon));
+    egui::Image::new(egui::include_image!("../icons/Arrow Downward Alt.svg"))
+        .tint(tint)
+        .paint_at(ui, icon_rect);
+}
+
 /// A full-width text field with an inset (PANEL) background so it stands out
 /// against the lighter section card.
 fn field_edit(ui: &mut egui::Ui, enabled: bool, edit: egui::TextEdit<'_>) {
@@ -699,6 +748,16 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
         )
         .max_redirects(10)
         .http_status_as_error(false)
+        // Bound the request-setup phases (DNS, connect, sending the request, and
+        // waiting for response headers). Those are blocking calls that can't see the
+        // cancel flag, so without a cap a Cancel pressed while one is in flight would
+        // hang until the server replied. We intentionally leave `timeout_global` and
+        // `timeout_recv_body` unset so a large file/video body isn't capped — the
+        // body stream is read in 64 KB chunks that poll the cancel flag themselves.
+        .timeout_resolve(Some(Duration::from_secs(10)))
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_send_request(Some(Duration::from_secs(15)))
+        .timeout_recv_response(Some(Duration::from_secs(20)))
         .build()
         .into();
 

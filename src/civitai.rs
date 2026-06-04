@@ -758,7 +758,7 @@ fn get_formatted_model_data(
     let has_video_only = has_video && !has_image;
 
     let image = image_url.and_then(|u| {
-        let sized = format!("{u}?width=200");
+        let sized = sized_image_url(&u, 200);
         get_bytes(agent, &sized).and_then(|b| decode_thumb(&b))
     });
 
@@ -785,6 +785,33 @@ fn get_formatted_model_data(
         has_video_only,
         resource_type,
     })
+}
+
+/// Rewrite a Civitai image URL to request a width-limited render from the CDN.
+///
+/// Civitai media URLs carry their transform as a *path* segment
+/// (`…/<bucket>/<uuid>/<transform>/<file>`), e.g. `original=true` or `width=450`.
+/// A `?width=` *query* (what the API examples and the Java original use) is
+/// silently ignored by the CDN, which then redirects to the full-size original —
+/// for large previews that can be many MB (one CyberRealistic Z-Image preview is a
+/// 12 MB PNG), blowing past [`get_bytes`]'s read cap so the truncated bytes fail to
+/// decode and no thumbnail appears. Replacing the transform path segment instead
+/// makes the CDN resize server-side (a ~50 KB JPEG).
+fn sized_image_url(url: &str, width: u32) -> String {
+    let mut parts: Vec<String> = url.split('/').map(|s| s.to_string()).collect();
+    if parts.len() < 2 {
+        return url.to_string();
+    }
+    let last = parts.len() - 1;
+    let transform = format!("width={width}");
+    // The transform sits just before the filename and always contains '='; if the
+    // URL has none (older form `…/<uuid>/<file>`), insert one before the filename.
+    if parts[last - 1].contains('=') {
+        parts[last - 1] = transform;
+    } else {
+        parts.insert(last, transform);
+    }
+    parts.join("/")
 }
 
 /// Decode downloaded preview bytes into a small `ColorImage` (max ~200px).
@@ -1216,4 +1243,28 @@ fn hashes_block(metadata: &str) -> Option<Vec<(String, String)>> {
 /// Like [`as_text`] but as a free function usable in `Option::and_then`.
 fn as_text_opt(v: &serde_json::Value) -> Option<String> {
     as_text(v)
+}
+
+#[cfg(test)]
+mod sized_url_tests {
+    use super::sized_image_url;
+
+    #[test]
+    fn rewrites_transform_segment() {
+        // original=true -> width=200 (the failing CyberRealistic case)
+        assert_eq!(
+            sized_image_url("https://image.civitai.com/abc/uuid/original=true/130909706.jpeg", 200),
+            "https://image.civitai.com/abc/uuid/width=200/130909706.jpeg"
+        );
+        // existing width=450 -> width=200
+        assert_eq!(
+            sized_image_url("https://image.civitai.com/abc/uuid/width=450/x.jpeg", 200),
+            "https://image.civitai.com/abc/uuid/width=200/x.jpeg"
+        );
+        // no transform segment -> insert one before the filename
+        assert_eq!(
+            sized_image_url("https://image.civitai.com/abc/uuid/x.jpeg", 200),
+            "https://image.civitai.com/abc/uuid/width=200/x.jpeg"
+        );
+    }
 }
