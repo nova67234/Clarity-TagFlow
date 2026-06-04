@@ -652,6 +652,32 @@ fn sha256_file(path: &Path) -> Option<String> {
     Some(h.finish_hex())
 }
 
+/// A *fast* content fingerprint: SHA-256 over the file size plus its first and
+/// last 4 KiB. It reads at most 8 KiB regardless of file size, so it's cheap even
+/// for huge media, yet stable across moves/renames — which is what lets favorites
+/// be tracked by content rather than by path (see `crate::favorites`, ported from
+/// terminus2's `HeartManager`). `None` on I/O error.
+pub(crate) fn fast_content_hash(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let size = f.metadata().ok()?.len();
+    let mut h = Sha256::new();
+    h.update(&size.to_le_bytes());
+
+    let mut buf = [0u8; 4096];
+    let n = f.read(&mut buf).ok()?;
+    h.update(&buf[..n]);
+
+    // Mix in the tail too, so files sharing a header (e.g. the same camera/JPEG
+    // preamble) don't collide. Only when the file is larger than the head read.
+    if size > 4096 {
+        f.seek(SeekFrom::Start(size - 4096)).ok()?;
+        let n = f.read(&mut buf).ok()?;
+        h.update(&buf[..n]);
+    }
+    Some(h.finish_hex())
+}
+
 /// A small, dependency-free SHA-256 implementation (FIPS 180-4).
 struct Sha256 {
     state: [u32; 8],
@@ -772,6 +798,40 @@ impl Sha256 {
         }
         for i in 0..8 {
             self.state[i] = self.state[i].wrapping_add(h[i]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod fast_hash_tests {
+    use super::fast_content_hash;
+    use std::io::Write;
+
+    fn tmp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("clarity_fav_test_{name}"));
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn stable_and_distinct() {
+        let small = tmp("small", b"hello world");
+        let big_a = tmp("big_a", &vec![7u8; 100_000]);
+        let mut tail = vec![7u8; 100_000];
+        *tail.last_mut().unwrap() = 9; // differs only in the last byte
+        let big_b = tmp("big_b", &tail);
+
+        // Deterministic.
+        assert_eq!(fast_content_hash(&small), fast_content_hash(&small));
+        assert_eq!(fast_content_hash(&big_a), fast_content_hash(&big_a));
+        // The tail is mixed in, so a last-byte change is detected.
+        assert_ne!(fast_content_hash(&big_a), fast_content_hash(&big_b));
+        // Missing file -> None.
+        assert!(fast_content_hash(std::path::Path::new("does_not_exist_xyz")).is_none());
+
+        for p in [small, big_a, big_b] {
+            let _ = std::fs::remove_file(p);
         }
     }
 }

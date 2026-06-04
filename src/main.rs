@@ -54,11 +54,13 @@ mod avif;
 mod backup;
 mod civitai;
 mod emoji;
+mod favorites;
 mod image_cache;
 mod download;
 mod gif_info;
 mod left_browser;
 mod mp4;
+mod raw_preview;
 mod right_details;
 mod scan;
 mod sd_metadata;
@@ -90,11 +92,12 @@ fn main() -> eframe::Result {
             // REQUIRED: Install the image loaders so egui can parse SVG bytes
             egui_extras::install_image_loaders(&cc.egui_ctx);
 
-            // egui's bundled fonts have no CJK glyphs, so Japanese / Chinese /
-            // Korean text (common in Civitai model names & tags, e.g. アルベド)
-            // renders as tofu boxes. Append the platform's system CJK fonts as
-            // fallbacks so those glyphs resolve app-wide.
-            install_cjk_fonts(&cc.egui_ctx);
+            // egui's bundled fonts have no CJK glyphs (Japanese / Chinese / Korean,
+            // common in Civitai model names & tags, e.g. アルベド) nor the fancy
+            // "Fraktur"/math letters & symbols people put in SD prompts (e.g. 𝔗ℜ𝔊),
+            // so both render as tofu boxes. Append the platform's system CJK and
+            // math/symbol fonts as fallbacks so those glyphs resolve app-wide.
+            install_fallback_fonts(&cc.egui_ctx);
 
             let mut app = ViewerApp::default();
             // Restore saved settings (if any) from eframe's persistent storage.
@@ -161,6 +164,9 @@ struct ViewerApp {
     filtered: Vec<usize>,
     selected: Option<usize>,
     search: String,
+    /// Favorited ("hearted") files, tracked by content hash so they survive
+    /// moves/renames. Shown as a heart badge on the browser thumbnails.
+    favorites: favorites::Favorites,
     stats: top_bar::SystemStats,
 
     // Panel States
@@ -200,6 +206,7 @@ impl Default for ViewerApp {
             filtered: Vec::new(),
             selected: None,
             search: String::new(),
+            favorites: favorites::Favorites::load(),
             stats: top_bar::SystemStats::default(),
             right_state: right_details::RightPanelState::default(),
             settings: settings::Settings::default(),
@@ -530,6 +537,7 @@ impl eframe::App for ViewerApp {
             &mut self.selected,
             &mut self.thumbs,
             &mut self.video_thumbs,
+            &mut self.favorites,
             self.settings.thumbnail_size,
         );
 
@@ -700,18 +708,21 @@ fn show_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle, is_loading: bool) {
     });
 }
 
-/// Load the platform's system CJK fonts and append them as fallbacks to egui's
-/// font families, so Japanese / Chinese / Korean glyphs (which the bundled fonts
-/// lack) render instead of showing as tofu boxes. Loading the OS fonts at runtime
-/// avoids bundling a multi-MB CJK font in the binary. Best-effort: any font that
-/// isn't present is simply skipped, and Latin/Cyrillic text keeps using egui's
-/// default fonts (these are appended *after* the defaults, so they're only
-/// consulted for glyphs the defaults can't draw).
-fn install_cjk_fonts(ctx: &egui::Context) {
-    // Candidate fonts grouped by language. Within each group we load only the
+/// Load the platform's system CJK and math/symbol fonts and append them as
+/// fallbacks to egui's font families, so glyphs the bundled fonts lack — CJK
+/// (Japanese / Chinese / Korean) and the Mathematical Alphanumeric Symbols /
+/// Letterlike "fancy font" letters people use in SD prompts (𝔗 ℜ 𝔊 …) — render
+/// instead of showing as tofu boxes. Loading the OS fonts at runtime avoids
+/// bundling multi-MB fonts in the binary. Best-effort: any font that isn't present
+/// is simply skipped, and Latin/Cyrillic text keeps using egui's default fonts
+/// (these are appended *after* the defaults, so they're only consulted for glyphs
+/// the defaults can't draw).
+fn install_fallback_fonts(ctx: &egui::Context) {
+    // Candidate fonts grouped by coverage. Within each group we load only the
     // FIRST file that exists (so we don't pull, say, three redundant Japanese
-    // fonts into memory); across groups we load one each so JP + KR + CN all
-    // resolve. `index` selects a face inside a TrueType Collection (.ttc).
+    // fonts into memory); across groups we load one each so JP + KR + CN + math
+    // all resolve. `index` selects a face inside a TrueType Collection (.ttc) —
+    // e.g. Cambria Math is face 1 of CAMBRIA.TTC (face 0 is plain Cambria).
     #[cfg(target_os = "windows")]
     let groups: &[&[(&str, u32)]] = &[
         // Japanese (kana + kanji): Meiryo → Yu Gothic → MS Gothic.
@@ -727,6 +738,10 @@ fn install_cjk_fonts(ctx: &egui::Context) {
             (r"C:\Windows\Fonts\msyh.ttc", 0),
             (r"C:\Windows\Fonts\simsun.ttc", 0),
         ],
+        // Mathematical Alphanumeric Symbols + Letterlike (𝔗 ℜ 𝔊 …): Cambria Math.
+        &[(r"C:\Windows\Fonts\CAMBRIA.TTC", 1)],
+        // Broader symbols / dingbats / arrows people drop in prompts.
+        &[(r"C:\Windows\Fonts\seguisym.ttf", 0)],
     ];
     #[cfg(target_os = "macos")]
     let groups: &[&[(&str, u32)]] = &[
@@ -736,6 +751,9 @@ fn install_cjk_fonts(ctx: &egui::Context) {
             ("/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", 0),
         ],
         &[("/System/Library/Fonts/AppleSDGothicNeo.ttc", 0)], // Korean
+        // Math alphanumerics: STIX Two Math if present; Apple Symbols for the rest.
+        &[("/System/Library/Fonts/Supplemental/STIXTwoMath.otf", 0)],
+        &[("/System/Library/Fonts/Apple Symbols.ttf", 0)],
     ];
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     let groups: &[&[(&str, u32)]] = &[
@@ -745,6 +763,12 @@ fn install_cjk_fonts(ctx: &egui::Context) {
             ("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", 0),
             ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", 0),
             ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
+        ],
+        // Math alphanumerics + symbols: Noto Sans Math.
+        &[
+            ("/usr/share/fonts/truetype/noto/NotoSansMath-Regular.ttf", 0),
+            ("/usr/share/fonts/opentype/noto/NotoSansMath-Regular.ttf", 0),
+            ("/usr/share/fonts/noto/NotoSansMath-Regular.ttf", 0),
         ],
     ];
 

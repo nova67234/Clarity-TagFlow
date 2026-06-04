@@ -31,6 +31,7 @@ const DEFAULT_ASPECT: f32 = 1.0;
 ///
 /// Returns `true` if the search query changed this frame so the main app
 /// knows to re-filter the list.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut egui::Ui,
     images: &[PathBuf],
@@ -39,6 +40,7 @@ pub fn show(
     selected: &mut Option<usize>,
     thumbs: &mut ImageCache,
     video_thumbs: &mut crate::video::VideoThumbs,
+    favorites: &mut crate::favorites::Favorites,
     thumb_max_h: f32,
 ) -> bool {
     let mut search_changed = false;
@@ -105,7 +107,7 @@ pub fn show(
                     return;
                 }
 
-                thumbnail_list(ui, images, filtered, selected, thumbs, video_thumbs, thumb_max_h);
+                thumbnail_list(ui, images, filtered, selected, thumbs, video_thumbs, favorites, thumb_max_h);
             });
         });
 
@@ -113,6 +115,7 @@ pub fn show(
 }
 
 /// The scrollable, hand-virtualized column of bare-image tiles.
+#[allow(clippy::too_many_arguments)]
 fn thumbnail_list(
     ui: &mut egui::Ui,
     images: &[PathBuf],
@@ -120,6 +123,7 @@ fn thumbnail_list(
     selected: &mut Option<usize>,
     thumbs: &mut ImageCache,
     video_thumbs: &mut crate::video::VideoThumbs,
+    favorites: &mut crate::favorites::Favorites,
     thumb_max_h: f32,
 ) {
     // When the displayed set changes (a new folder is loaded, or the filter
@@ -213,13 +217,17 @@ fn thumbnail_list(
 
                 let id = ui.id().with(("thumb", i));
 
-                // Interact strictly for clicks, hover text removed.
+                // Sense both buttons: left-click selects, right-click toggles favorite.
                 let resp = ui.interact(rect, id, egui::Sense::click());
 
-                draw_tile(ui, thumbs, video_thumbs, &images[i], rect, *selected == Some(i));
+                let is_favorite = favorites.is_favorite(&images[i]);
+                draw_tile(ui, thumbs, video_thumbs, &images[i], rect, *selected == Some(i), is_favorite);
 
                 if resp.clicked() {
                     *selected = Some(i);
+                }
+                if resp.secondary_clicked() {
+                    favorites.toggle(&images[i]);
                 }
             }
         });
@@ -249,6 +257,7 @@ fn draw_tile(
     path: &Path,
     rect: egui::Rect,
     is_selected: bool,
+    is_favorite: bool,
 ) {
     let radius = CornerRadius::same(CORNER);
 
@@ -304,6 +313,11 @@ fn draw_tile(
         }
     }
 
+    // A heart in the top-right corner marks favorited files (right-click toggles).
+    if is_favorite {
+        heart_badge(ui, rect);
+    }
+
     if is_selected {
         // Pink outline under Aurora to match its theme; grey elsewhere.
         let sel_color = crate::theme::icon_tint(egui::Color32::GRAY);
@@ -314,6 +328,28 @@ fn draw_tile(
             egui::StrokeKind::Inside,
         );
     }
+}
+
+/// Draw the favorite heart in the tile's top-right corner (no backdrop — just the
+/// heart glyph), with a gentle "heartbeat" pulse, ported from terminus2's
+/// `ThumbnailToggleButton`: the glyph scales 1.0→1.2→1.0 over a 2-second cycle.
+fn heart_badge(ui: &egui::Ui, rect: egui::Rect) {
+    const BASE: f32 = 18.0;
+    let center = egui::pos2(rect.max.x - 18.0, rect.min.y + 18.0);
+
+    // t in [0,1) over 2s; scale = 1 + 0.1·(1 − cos(2πt)) eases 1.0↔1.2 smoothly.
+    let t = (ui.input(|i| i.time) % 2.0) / 2.0;
+    let scale = 1.0 + 0.1 * (1.0 - (t * std::f64::consts::TAU).cos()) as f32;
+    let size = BASE * scale;
+
+    let badge = egui::Rect::from_center_size(center, egui::vec2(size, size));
+    // No tint — show the heart SVG's own colour (`#FF5FA0`). Tinting multiplies,
+    // which would darken the pink toward red.
+    let icon = egui::include_image!("../icons/heart.svg");
+    egui::Image::new(icon).paint_at(ui, badge);
+
+    // Keep animating while a heart is on screen.
+    ui.ctx().request_repaint();
 }
 
 /// True if `path` has a `.gif` extension.

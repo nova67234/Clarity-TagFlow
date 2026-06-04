@@ -283,6 +283,13 @@ pub fn show(
                                 ui.close(); // Fixed deprecation
                             }
                             if ui
+                                .selectable_label(state.view == RightView::Civitai, "Civitai Resources")
+                                .clicked()
+                            {
+                                state.view = RightView::Civitai;
+                                ui.close();
+                            }
+                            if ui
                                 .selectable_label(state.view == RightView::TagManager, "Tag Manager")
                                 .clicked()
                             {
@@ -294,13 +301,6 @@ pub fn show(
                                 .clicked()
                             {
                                 state.view = RightView::Downloader;
-                                ui.close();
-                            }
-                            if ui
-                                .selectable_label(state.view == RightView::Civitai, "Civitai Resources")
-                                .clicked()
-                            {
-                                state.view = RightView::Civitai;
                                 ui.close();
                             }
                         });
@@ -757,10 +757,9 @@ fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
 
         let unknown = value == "---" || value == "Loading...";
         let color = if unknown { MUTED() } else { TEXT() };
-        let resp = ui.add(egui::Label::new(egui::RichText::new(value).color(color)).truncate());
-        if !unknown {
-            resp.on_hover_text(value);
-        }
+        // A truncated `Label` already shows the full text as a tooltip on hover, so
+        // don't add a second `on_hover_text` — that produced two stacked tooltips.
+        ui.add(egui::Label::new(egui::RichText::new(value).color(color)).truncate());
     });
     ui.add_space(DETAIL_ROW_VPAD);
 }
@@ -862,6 +861,16 @@ fn load_meta(path: &Path) -> ImageMeta {
             .unwrap_or_default();
         if ext == "hdr" {
             crate::image_cache::decode_hdr(path).map(image::DynamicImage::ImageRgba8)
+        } else if matches!(ext.as_str(), "tif" | "tiff") && image::image_dimensions(path).is_err() {
+            // A raw/JPEG-compressed TIFF the `image` crate can't read (rendered
+            // image JPEG-compressed in IFD0, raw CFA in a sub-IFD). Recover the
+            // embedded camera JPEG so the dimensions and colour palette still show.
+            // Normal TIFFs pass `image_dimensions` and skip this (they use the fast
+            // header/`open` paths below).
+            std::fs::read(path)
+                .ok()
+                .and_then(|b| crate::raw_preview::largest_embedded_jpeg(&b))
+                .map(image::DynamicImage::ImageRgba8)
         } else {
             #[cfg(feature = "avif")]
             {
