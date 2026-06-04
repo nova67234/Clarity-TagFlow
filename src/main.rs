@@ -358,58 +358,47 @@ impl ViewerApp {
                 let now = ui.input(|i| i.time);
                 let path = self.images[idx].clone();
 
-                // Videos play in-app via embedded libVLC (the default build).
+                // Videos play in-app via libVLC. Only touch the player when a
+                // libVLC runtime is actually available — otherwise we'd trigger the
+                // delay-loaded DLL and crash; the notice below offers to install it.
                 if is_video(&path) {
-                    // Start/refresh the embedded player when the selection changes.
-                    // start() only returns None in a --no-default-features build
-                    // (or if libVLC fails to init), handled by the notice below.
-                    // Push the current loop preference so the player picks it up
-                    // when it (re)starts this clip.
-                    video::set_loop(self.settings.loop_video);
-                    if self.last_video_path.as_deref() != Some(path.as_path()) {
-                        self.last_video_path = Some(path.clone());
-                        self.video_player = video::VideoPlayer::start(&path, ui.ctx());
-                    }
-                    if let Some(player) = &mut self.video_player {
-                        match player.frame(ui.ctx()) {
-                            Some(tex) => show_fitted(ui, &tex, false),
-                            None => {
-                                ui.centered_and_justified(|ui| {
-                                    ui.add(egui::Spinner::new().size(48.0).color(MUTED()));
-                                });
-                            }
+                    let support = video::support();
+
+                    if matches!(support, video::VideoSupport::Available) {
+                        // Push the current loop preference so the player picks it up
+                        // when it (re)starts this clip.
+                        video::set_loop(self.settings.loop_video);
+                        if self.last_video_path.as_deref() != Some(path.as_path()) {
+                            self.last_video_path = Some(path.clone());
+                            self.video_player = video::VideoPlayer::start(&path, ui.ctx());
                         }
-                        // Keep pulling frames, but cap the UI to ~60 Hz instead
-                        // of repainting as fast as the monitor allows (e.g. 144
-                        // Hz) — a full-app relayout every refresh steals CPU from
-                        // decoding. New frames still wake us instantly via the
-                        // player's display callback (request_repaint).
-                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
-                        return;
+                        if let Some(player) = &mut self.video_player {
+                            match player.frame(ui.ctx()) {
+                                Some(tex) => show_fitted(ui, &tex, false),
+                                None => {
+                                    ui.centered_and_justified(|ui| {
+                                        ui.add(egui::Spinner::new().size(48.0).color(MUTED()));
+                                    });
+                                }
+                            }
+                            // Keep pulling frames, but cap the UI to ~60 Hz instead
+                            // of repainting as fast as the monitor allows (e.g. 144
+                            // Hz) — a full-app relayout every refresh steals CPU from
+                            // decoding. New frames still wake us instantly via the
+                            // player's display callback (request_repaint).
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+                            return;
+                        }
+                    } else {
+                        // No runtime (or unsupported build): drop any stale player so
+                        // that, once VLC is installed, reselecting the clip restarts.
+                        self.video_player = None;
+                        self.last_video_path = None;
                     }
 
-                    // The embedded player couldn't start (only happens in a
-                    // --no-default-features build, or if libVLC fails to init at
-                    // runtime). Show a plain notice — no external launcher.
-                    ui.vertical_centered(|ui| {
-                        let avail_h = ui.available_height();
-                        ui.add_space((avail_h * 0.5 - 72.0).max(8.0));
-
-                        let icon = egui::include_image!("../icons/video.svg");
-                        ui.add(
-                            egui::Image::new(icon)
-                                .fit_to_exact_size(egui::vec2(84.0, 84.0))
-                                .tint(MUTED()),
-                        );
-                        ui.add_space(10.0);
-                        ui.label(egui::RichText::new(file_name(&path)).color(TEXT()).strong().size(15.0));
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("Couldn't start video playback.")
-                                .color(MUTED())
-                                .size(13.0),
-                        );
-                    });
+                    // No running player — show the appropriate notice (couldn't
+                    // start / install VLC / unsupported build).
+                    video_notice(ui, &path, support);
                     return;
                 }
 
@@ -677,6 +666,54 @@ impl eframe::App for ViewerApp {
 // ---------------------------------------------------------------------------
 
 /// Show a texture centred and scaled to fit the available space, aspect-preserved.
+/// Centred placeholder for a video that isn't playing: the video glyph, the file
+/// name, and a message that depends on why there's no player — playback failed,
+/// VLC needs installing (with a button), or this build has no video backend.
+fn video_notice(ui: &mut egui::Ui, path: &std::path::Path, support: video::VideoSupport) {
+    ui.vertical_centered(|ui| {
+        let avail_h = ui.available_height();
+        ui.add_space((avail_h * 0.5 - 84.0).max(8.0));
+
+        let icon = egui::include_image!("../icons/video.svg");
+        ui.add(egui::Image::new(icon).fit_to_exact_size(egui::vec2(84.0, 84.0)).tint(MUTED()));
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new(file_name(path)).color(TEXT()).strong().size(15.0));
+        ui.add_space(8.0);
+
+        match support {
+            video::VideoSupport::Available => {
+                ui.label(egui::RichText::new("Couldn't start video playback.").color(MUTED()).size(13.0));
+            }
+            video::VideoSupport::NeedsInstall => {
+                ui.label(
+                    egui::RichText::new("In-app video playback needs VLC, which isn't installed.")
+                        .color(MUTED())
+                        .size(13.0),
+                );
+                ui.add_space(10.0);
+                let install = egui::Button::new(
+                    egui::RichText::new("Install VLC").color(egui::Color32::WHITE).strong(),
+                )
+                .fill(ACCENT1());
+                if ui.add(install).clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(video::VLC_DOWNLOAD_URL));
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("After installing, select the video again.")
+                        .color(MUTED())
+                        .size(11.0),
+                );
+            }
+            video::VideoSupport::Unsupported => {
+                ui.label(
+                    egui::RichText::new("This build has no video player.").color(MUTED()).size(13.0),
+                );
+            }
+        }
+    });
+}
+
 fn show_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle, is_loading: bool) {
     let avail = ui.available_size();
     let tex_size = tex.size_vec2();
