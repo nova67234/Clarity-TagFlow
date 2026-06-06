@@ -161,9 +161,14 @@ impl Inner {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            let ambient = AmbientLight::new(&ctx, 0.5, Srgba::WHITE);
-            let key = DirectionalLight::new(&ctx, 2.4, Srgba::WHITE, vec3(-0.5, -1.0, -0.7));
-            let fill = DirectionalLight::new(&ctx, 1.0, Srgba::WHITE, vec3(0.6, -0.3, 0.5));
+            // Image-based lighting: Pixal3D models are fully metallic, so their
+            // colour comes from environment reflections — with no environment they
+            // render near-black. A simple studio cubemap (bright top, mid sides,
+            // dark floor) gives believable metal without bundling an HDR.
+            let env = studio_cubemap(&ctx);
+            let ambient = AmbientLight::new_with_environment(&ctx, 1.0, Srgba::WHITE, &env);
+            let key = DirectionalLight::new(&ctx, 1.4, Srgba::WHITE, vec3(-0.5, -1.0, -0.7));
+            let fill = DirectionalLight::new(&ctx, 0.6, Srgba::WHITE, vec3(0.6, -0.3, 0.5));
             self.gpu = Some(Gpu { ctx, gl, model: None, ambient, key, fill });
         }
         let gpu = self.gpu.as_mut().unwrap();
@@ -174,28 +179,29 @@ impl Inner {
                 .map_err(|e| e.to_string())
                 .and_then(|cpu| Model::<PhysicalMaterial>::new(&gpu.ctx, &cpu).map_err(|e| e.to_string()))
             {
-                Ok(model) => gpu.model = Some(model),
+                Ok(mut model) => {
+                    // Force every part into the OPAQUE rendering pass. Pixal3D
+                    // models are solid, but their PNG albedo often carries a stray
+                    // alpha channel (a feathering byproduct of background removal),
+                    // which makes three-d classify the material as transparent.
+                    // Transparent materials disable depth writing and fall back to
+                    // CPU back-to-front triangle sorting — so on this dense,
+                    // self-intersecting AI geometry the back faces draw over the
+                    // front while orbiting, making the model look see-through.
+                    // Disabling blend + enabling depth write/test fixes that (the
+                    // GL context also needs a depth buffer; see NativeOptions).
+                    for part in model.iter_mut() {
+                        part.material.is_transparent = false;
+                        part.material.render_states.blend = Blend::Disabled;
+                        part.material.render_states.write_mask = WriteMask::COLOR_AND_DEPTH;
+                        part.material.render_states.depth_test = DepthTest::Less;
+                    }
+                    gpu.model = Some(model);
+                }
                 Err(e) => {
-                    eprintln!("[scene3d] GLB load failed: {e}");
+                    eprintln!("[scene3d] GLB parse/upload failed: {e}");
                     gpu.model = None;
                 }
-            }
-        }
-
-        // Frame the camera to the model bounds, once.
-        if self.needs_framing {
-            if let Some(model) = &gpu.model {
-                let mut aabb = AxisAlignedBoundingBox::EMPTY;
-                for part in model {
-                    aabb.expand_with_aabb(part.aabb());
-                }
-                if !aabb.is_empty() {
-                    self.target = aabb.center();
-                    let radius = (aabb.size().magnitude() * 0.5).max(1.0e-3);
-                    // Pull back so the bounding sphere fits a 45° vertical FOV, with margin.
-                    self.distance = radius / (std::f32::consts::FRAC_PI_8).tan() * 1.1;
-                }
-                self.needs_framing = false;
             }
         }
 
@@ -210,6 +216,30 @@ impl Inner {
         };
         if viewport.width == 0 || viewport.height == 0 {
             return;
+        }
+
+        const FOV_Y: f32 = std::f32::consts::FRAC_PI_4; // 45° vertical field of view
+
+        // Frame the camera to the model bounds, once. Fit the bounding sphere into
+        // whichever axis is tighter (a tall, narrow panel is limited horizontally),
+        // with margin, so the model never clips the panel edges.
+        if self.needs_framing {
+            if let Some(model) = &gpu.model {
+                let mut aabb = AxisAlignedBoundingBox::EMPTY;
+                for part in model {
+                    aabb.expand_with_aabb(part.aabb());
+                }
+                if !aabb.is_empty() {
+                    self.target = aabb.center();
+                    let radius = (aabb.size().magnitude() * 0.5).max(1.0e-3);
+                    let aspect = viewport.width as f32 / viewport.height as f32;
+                    let half_y = FOV_Y * 0.5;
+                    let half_x = (half_y.tan() * aspect).atan();
+                    let half = half_x.min(half_y); // tighter axis governs the fit
+                    self.distance = radius / half.sin() * 1.2; // 20% breathing room
+                }
+                self.needs_framing = false;
+            }
         }
 
         // Orbit camera from spherical coords (three-d's Camera has no setters, so
@@ -228,7 +258,7 @@ impl Inner {
             eye,
             self.target,
             vec3(0.0, 1.0, 0.0),
-            degrees(45.0),
+            radians(FOV_Y),
             z_near,
             z_far,
         );
@@ -259,6 +289,31 @@ fn placeholder(ui: &mut egui::Ui, msg: &str) {
     ui.centered_and_justified(|ui| {
         ui.label(egui::RichText::new(msg).size(15.0).color(MUTED()));
     });
+}
+
+/// A minimal "studio" environment cubemap for image-based lighting: bright top
+/// (key light from above), neutral mid-grey sides, dark floor. Uniform per face,
+/// so it's orientation-independent and gives metallic surfaces a natural top-lit
+/// reflection without bundling an HDR file.
+fn studio_cubemap(ctx: &Context) -> TextureCubeMap {
+    const N: usize = 16;
+    let face = |c: [u8; 3]| three_d_asset::Texture2D {
+        data: three_d_asset::TextureData::RgbaU8(vec![[c[0], c[1], c[2], 255]; N * N]),
+        width: N as u32,
+        height: N as u32,
+        mipmap: None,
+        ..Default::default()
+    };
+    let side = face([165, 170, 180]);
+    TextureCubeMap::new(
+        ctx,
+        &side,             // right
+        &side,             // left
+        &face([250, 250, 255]), // top (key)
+        &face([45, 46, 52]),    // bottom (floor)
+        &side,             // front
+        &side,             // back
+    )
 }
 
 /// Viewport clear colour, matched loosely to the active theme.
