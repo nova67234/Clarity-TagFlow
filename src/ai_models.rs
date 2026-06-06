@@ -41,7 +41,10 @@ pub struct ModelInfo {
     desc: &'static str,
     note: &'static str,
     repo: &'static str,
-    kind: crate::tagger::TaggerKind,
+    /// The tagger family this model belongs to, or `None` for non-tagger models
+    /// (e.g. the depth estimator that powers Spatial Scene). `None` keeps the
+    /// model out of the tagger dropdown while still listing it in Get Models.
+    kind: Option<crate::tagger::TaggerKind>,
     files: &'static [(&'static str, &'static str)],
 }
 
@@ -52,7 +55,7 @@ impl ModelInfo {
     pub fn folder(&self) -> &'static str {
         self.folder
     }
-    pub fn kind(&self) -> crate::tagger::TaggerKind {
+    pub fn kind(&self) -> Option<crate::tagger::TaggerKind> {
         self.kind
     }
     /// The tag-list file for this model (the catalog entry's non-`model.onnx` file).
@@ -65,9 +68,11 @@ impl ModelInfo {
     }
 }
 
-/// Catalog models whose files are present on disk (checked live).
+/// Catalog **tagger** models whose files are present on disk (checked live).
+/// Non-tagger models (`kind == None`, e.g. the depth estimator) are excluded so
+/// they never appear in the tagger dropdown.
 pub fn installed_models() -> Vec<&'static ModelInfo> {
-    CATALOG.iter().filter(|m| check_installed(m)).collect()
+    CATALOG.iter().filter(|m| m.kind.is_some() && check_installed(m)).collect()
 }
 
 /// Find a catalog model by its display name.
@@ -84,7 +89,7 @@ const CATALOG: &[ModelInfo] = &[
                character/series recognition. Recommended.",
         note: "Downloads model.onnx (~1.3 GB) & selected_tags.csv (DeepGHS ONNX export).",
         repo: "https://huggingface.co/pixai-labs/pixai-tagger-v0.9",
-        kind: crate::tagger::TaggerKind::Pixai,
+        kind: Some(crate::tagger::TaggerKind::Pixai),
         files: &[
             ("model.onnx", "https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx/resolve/main/model.onnx"),
             ("selected_tags.csv", "https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx/resolve/main/selected_tags.csv"),
@@ -97,7 +102,7 @@ const CATALOG: &[ModelInfo] = &[
         desc: "State-of-the-Art (2024). Huge vocabulary (5k+ tags). Best for general use.",
         note: "Downloads model.onnx & top_tags.txt.",
         repo: "https://huggingface.co/fancyfeast/joytag",
-        kind: crate::tagger::TaggerKind::JoyTag,
+        kind: Some(crate::tagger::TaggerKind::JoyTag),
         files: &[
             ("model.onnx", "https://huggingface.co/fancyfeast/joytag/resolve/main/model.onnx"),
             ("top_tags.txt", "https://huggingface.co/fancyfeast/joytag/resolve/main/top_tags.txt"),
@@ -110,7 +115,7 @@ const CATALOG: &[ModelInfo] = &[
         desc: "Highest Accuracy WD14. Slower but very smart.",
         note: "Downloads model.onnx & selected_tags.csv.",
         repo: "https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3",
-        kind: crate::tagger::TaggerKind::Wd14,
+        kind: Some(crate::tagger::TaggerKind::Wd14),
         files: &[
             ("model.onnx", "https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3/resolve/main/model.onnx"),
             ("selected_tags.csv", "https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3/resolve/main/selected_tags.csv"),
@@ -123,7 +128,7 @@ const CATALOG: &[ModelInfo] = &[
         desc: "Newer EVA02 architecture. Very high accuracy, similar to SwinV2.",
         note: "Downloads model.onnx & selected_tags.csv.",
         repo: "https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3",
-        kind: crate::tagger::TaggerKind::Wd14,
+        kind: Some(crate::tagger::TaggerKind::Wd14),
         files: &[
             ("model.onnx", "https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/model.onnx"),
             ("selected_tags.csv", "https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/selected_tags.csv"),
@@ -136,7 +141,7 @@ const CATALOG: &[ModelInfo] = &[
         desc: "Balanced WD14. Faster than Swin, better than v2.",
         note: "Downloads model.onnx & selected_tags.csv.",
         repo: "https://huggingface.co/SmilingWolf/wd-convnext-tagger-v3",
-        kind: crate::tagger::TaggerKind::Wd14,
+        kind: Some(crate::tagger::TaggerKind::Wd14),
         files: &[
             ("model.onnx", "https://huggingface.co/SmilingWolf/wd-convnext-tagger-v3/resolve/main/model.onnx"),
             ("selected_tags.csv", "https://huggingface.co/SmilingWolf/wd-convnext-tagger-v3/resolve/main/selected_tags.csv"),
@@ -149,10 +154,28 @@ const CATALOG: &[ModelInfo] = &[
         desc: "Legacy Standard WD14. Fast and lightweight.",
         note: "Downloads model.onnx & selected_tags.csv.",
         repo: "https://huggingface.co/SmilingWolf/wd-v1-4-convnext-tagger-v2",
-        kind: crate::tagger::TaggerKind::Wd14,
+        kind: Some(crate::tagger::TaggerKind::Wd14),
         files: &[
             ("model.onnx", "https://huggingface.co/SmilingWolf/wd-v1-4-convnext-tagger-v2/resolve/main/model.onnx"),
             ("selected_tags.csv", "https://huggingface.co/SmilingWolf/wd-v1-4-convnext-tagger-v2/resolve/main/selected_tags.csv"),
+        ],
+    },
+    ModelInfo {
+        name: "Depth Anything V2 Base",
+        tab: "Depth",
+        folder: "depth-anything-v2-base-onnx",
+        desc: "Monocular depth estimation (Base — sharper than Small). Powers the \
+               Spatial Scene 3D parallax viewer (right-click an image → Spatial \
+               Scene). Not a tagger.",
+        note: "Downloads model.onnx + weights (~370 MB).",
+        repo: "https://huggingface.co/onnx-community/depth-anything-v2-base-ONNX",
+        kind: None,
+        // The onnx-community export stores weights in an external-data sidecar
+        // (`model.onnx` graph + `model.onnx_data` weights); both must land in the
+        // same folder so ONNX Runtime can resolve the weights.
+        files: &[
+            ("model.onnx", "https://huggingface.co/onnx-community/depth-anything-v2-base-ONNX/resolve/main/onnx/model.onnx"),
+            ("model.onnx_data", "https://huggingface.co/onnx-community/depth-anything-v2-base-ONNX/resolve/main/onnx/model.onnx_data"),
         ],
     },
 ];
