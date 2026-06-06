@@ -90,8 +90,9 @@ pub enum TopBarAction {
     FindIssues(egui::Pos2),
 }
 
-/// Render the top bar. Returns any action the app should perform.
-pub fn show(ui: &mut egui::Ui, stats: &SystemStats) -> TopBarAction {
+/// Render the top bar. Returns any action the app should perform. `show_stats`
+/// toggles the centre CPU/RAM graphs.
+pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool) -> TopBarAction {
     let mut action = TopBarAction::None;
 
     egui::Panel::top("topbar")
@@ -132,6 +133,8 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats) -> TopBarAction {
                             ui.add_space(14.0);
 
                             // CENTRE: CPU / RAM live graphs in the leftover space.
+                            // Hidden when the user disables stats in Settings.
+                            if show_stats {
                             ui.with_layout(
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
@@ -168,6 +171,7 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats) -> TopBarAction {
                                     );
                                 },
                             );
+                            }
                         },
                     );
                 });
