@@ -320,9 +320,12 @@ impl ViewerApp {
     /// full-resolution original from disk so the crop isn't limited to the
     /// (possibly downscaled) on-screen texture. A port of ViewerPanel.cropTo().
     fn crop_current(&mut self, src: &std::path::Path, frac: zoom::CropFraction) {
-        // `image::open` covers the common formats (PNG/JPG/WEBP/…). Extended
-        // formats decoded by our own pipeline (AVIF/RAW) aren't croppable here.
-        let Ok(full) = image::open(src) else { return };
+        // `decode_full_rgba` covers common formats via `image::open` plus the
+        // extended formats (AVIF/HEIC/RAW) through our own decoder, so cropping
+        // works on everything the viewer can display.
+        let Some(full) = decode_full_rgba(src).map(image::DynamicImage::ImageRgba8) else {
+            return;
+        };
         let (iw, ih) = (full.width(), full.height());
         if iw == 0 || ih == 0 {
             return;
@@ -336,8 +339,39 @@ impl ViewerApp {
         let cropped = full.crop_imm(cx, cy, cw, ch);
         let dest = crop_destination(src);
         if cropped.save(&dest).is_ok() {
-            // Adds the new file, selects it, and re-filters the browser list.
-            self.add_paths(std::iter::once(dest));
+            // Place the crop directly beneath the image it came from in the
+            // browser (rather than at the end of the list), then select it.
+            if self.images.contains(&dest) {
+                return;
+            }
+            let insert_at = self
+                .images
+                .iter()
+                .position(|p| p == src)
+                .map(|i| i + 1)
+                .unwrap_or(self.images.len());
+            self.images.insert(insert_at, dest);
+            self.selected = Some(insert_at);
+            self.update_filtered();
+        }
+    }
+
+    /// Copy `src`'s pixels to the system clipboard. Re-reads the full-resolution
+    /// original from disk (like cropping) so the clipboard gets full quality, not
+    /// the downscaled on-screen texture. Extended formats (AVIF/HEIC/RAW) are
+    /// routed to our own decoder first — same extension check as the display path
+    /// in image_cache — since `image::open` can't handle them (and would mis-read
+    /// TIFF-based raws like DNG).
+    fn copy_current(&mut self, src: &std::path::Path) {
+        let Some(rgba) = decode_full_rgba(src) else { return };
+        let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+        let img = arboard::ImageData {
+            width: w,
+            height: h,
+            bytes: std::borrow::Cow::Owned(rgba.into_raw()),
+        };
+        if let Ok(mut clip) = arboard::Clipboard::new() {
+            let _ = clip.set_image(img);
         }
     }
 
@@ -479,6 +513,7 @@ impl ViewerApp {
                                 self.favorites.toggle(&path);
                             }
                             zoom::ViewerAction::Crop(frac) => self.crop_current(&path, frac),
+                            zoom::ViewerAction::CopyImage => self.copy_current(&path),
                             zoom::ViewerAction::None => {}
                         }
                     }
@@ -1014,6 +1049,25 @@ fn images_in_dir(dir: &std::path::Path) -> Vec<PathBuf> {
         .collect();
     found.sort();
     found
+}
+
+/// Decode `src` to a full-resolution RGBA image for the clipboard. Extended
+/// formats (AVIF/HEIC/HEIF + TIFF-based raws) are routed to our own decoder by
+/// extension — matching the display path — since `image::open` can't handle them.
+/// Everything else goes through `image::open`. Returns `None` on any failure.
+fn decode_full_rgba(src: &std::path::Path) -> Option<image::RgbaImage> {
+    #[cfg(feature = "avif")]
+    {
+        let is_extended = src
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "avif" | "heic" | "heif" | "dng" | "arw" | "cr2" | "nef"))
+            .unwrap_or(false);
+        if is_extended {
+            return avif::decode_avif(src);
+        }
+    }
+    image::open(src).ok().map(|img| img.to_rgba8())
 }
 
 /// Where a crop of `src` is saved: `<name>_crop.png` next to the original, with a

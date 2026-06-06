@@ -35,6 +35,8 @@ pub enum ViewerAction {
     /// Save a cropped copy of the current image (the original is kept). The rect
     /// is given as fractions (0..1) of the full image's width/height.
     Crop(CropFraction),
+    /// Copy the current image's pixels to the system clipboard.
+    CopyImage,
 }
 
 /// A crop region as fractions (0..1) of the source image's width/height.
@@ -211,13 +213,18 @@ impl ZoomState {
             });
         }
 
-        // --- Right-click menu: favorite the image, or start a crop ---
+        // --- Right-click menu: favorite the image, copy it, or start a crop ---
         let mut want_favorite = false;
         let mut want_crop = false;
+        let mut want_copy = false;
         resp.context_menu(|ui| {
             let fav_label = if is_favorite { "Remove favorite" } else { "Favorite" };
             if ui.button(fav_label).clicked() {
                 want_favorite = true;
+                ui.close();
+            }
+            if ui.button("Copy image").clicked() {
+                want_copy = true;
                 ui.close();
             }
             if ui.button("Crop image…").clicked() {
@@ -228,6 +235,8 @@ impl ZoomState {
         let mut action = ViewerAction::None;
         if want_favorite {
             action = ViewerAction::ToggleFavorite;
+        } else if want_copy {
+            action = ViewerAction::CopyImage;
         } else if want_crop {
             // Enter crop mode; the actual crop is emitted once the drag finishes.
             self.crop_mode = true;
