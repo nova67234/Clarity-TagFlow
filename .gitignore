@@ -41,3 +41,6 @@
 /.idea
 /.claude
 /.vscode
+
+# Local Pixal3D / debug logs (not part of the project)
+errors/
