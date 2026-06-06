@@ -62,6 +62,13 @@ mod gif_info;
 mod left_browser;
 mod left_panel_settings;
 mod mp4;
+// Pixal3D image->3D requirement setup — Linux/Windows only (compiled out on macOS).
+#[cfg(not(target_os = "macos"))]
+mod pixal3d;
+// Interactive 3D viewer for Pixal3D's GLB output (centre panel). Linux/Windows
+// only, like Pixal3D — pulls in three-d, which is a not-macOS dependency.
+#[cfg(not(target_os = "macos"))]
+mod scene3d;
 mod raw_preview;
 mod right_details;
 mod scan;
@@ -209,6 +216,11 @@ struct ViewerApp {
 
     /// Zoom + pan state for the centre image viewer (resets per selection).
     zoom: zoom::ZoomState,
+
+    /// Interactive 3D viewer shown in the centre when the Pixal3D view is active
+    /// (displays the generated GLB instead of the selected image).
+    #[cfg(not(target_os = "macos"))]
+    scene3d: scene3d::Scene3D,
 }
 
 impl Default for ViewerApp {
@@ -238,6 +250,8 @@ impl Default for ViewerApp {
             video_player: None,
             last_video_path: None,
             zoom: zoom::ZoomState::default(),
+            #[cfg(not(target_os = "macos"))]
+            scene3d: scene3d::Scene3D::new(),
         }
     }
 }
@@ -441,6 +455,15 @@ impl ViewerApp {
             // top bar and is the same height as the left/right panels.
             .frame(egui::Frame::new().fill(BG()).inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 10 }))
             .show_inside(ui, |ui| {
+                // When the Pixal3D view is active, the centre shows the generated
+                // 3D model (orbit viewer) instead of the selected image/video.
+                #[cfg(not(target_os = "macos"))]
+                if self.right_state.view == right_details::RightView::Pixal3D {
+                    let glb = self.right_state.pixal3d.last_glb.clone();
+                    self.scene3d.show(ui, glb.as_deref());
+                    return;
+                }
+
                 let Some(idx) = self.selected else {
                     ui.centered_and_justified(|ui| {
                         ui.label(

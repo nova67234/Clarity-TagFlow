@@ -28,6 +28,10 @@ pub enum RightView {
     Downloader,
     /// The Civitai resource-info UI (replaces the details view).
     Civitai,
+    /// The Pixal3D image->3D requirement setup UI. Linux/Windows only — the
+    /// variant doesn't exist on macOS so the whole feature is compiled out.
+    #[cfg(not(target_os = "macos"))]
+    Pixal3D,
 }
 
 /// Read-only file metadata shown in the bottom "Image Details" card. A Rust
@@ -85,6 +89,9 @@ pub struct RightPanelState {
     pub downloader: crate::download::DownloaderState,
     /// State for the Civitai resource-info view.
     pub civitai: crate::civitai::CivitaiState,
+    /// State for the Pixal3D requirement-setup view (Linux/Windows only).
+    #[cfg(not(target_os = "macos"))]
+    pub pixal3d: crate::pixal3d::Pixal3DState,
     pub is_editing: bool,
 
     /// Which view the panel currently shows (Details vs Tag Manager).
@@ -123,6 +130,8 @@ impl Default for RightPanelState {
             showing_meta: false,
             downloader: crate::download::DownloaderState::default(),
             civitai: crate::civitai::CivitaiState::default(),
+            #[cfg(not(target_os = "macos"))]
+            pixal3d: crate::pixal3d::Pixal3DState::default(),
             is_editing: false,
             view: RightView::default(),
             show_delete_confirm: false,
@@ -307,12 +316,31 @@ pub fn show(
                                 state.view = RightView::Downloader;
                                 ui.close();
                             }
+                            // Pixal3D — Linux/Windows only (hidden on macOS).
+                            #[cfg(not(target_os = "macos"))]
+                            if ui
+                                .selectable_label(state.view == RightView::Pixal3D, "Pixal3D")
+                                .clicked()
+                            {
+                                state.view = RightView::Pixal3D;
+                                ui.close();
+                            }
                         });
 
                     // --- Swap Views ---
                     // The Tag Manager view completely replaces the Details & Actions UI,
                     // but stays constrained perfectly within the 420px width and 22px rounded box.
-                    if state.view == RightView::TagManager {
+                    // Pixal3D is Linux/Windows only; on macOS the variant/field don't
+                    // exist, so gate the check behind a platform-safe boolean.
+                    #[cfg(not(target_os = "macos"))]
+                    let show_pixal3d = state.view == RightView::Pixal3D;
+                    #[cfg(target_os = "macos")]
+                    let show_pixal3d = false;
+
+                    if show_pixal3d {
+                        #[cfg(not(target_os = "macos"))]
+                        crate::pixal3d::show(ui, &mut state.pixal3d, current_image);
+                    } else if state.view == RightView::TagManager {
                         crate::tag_manager::show(ui, tag_manager, current_image, &mut state.current_tags, all_images);
                     } else if state.view == RightView::Downloader {
                         crate::download::show(ui, &mut state.downloader);

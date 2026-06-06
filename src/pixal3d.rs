@@ -12,7 +12,7 @@
 //! folder and Generate logs the request. Running real inference + viewing the GLB
 //! is future work.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::SystemTime;
 
@@ -29,6 +29,8 @@ enum RunnerMsg {
     Line(String),
     /// Update the header status text.
     Status(String),
+    /// A generation finished and wrote this GLB — show it in the centre viewer.
+    Output(PathBuf),
     Done(bool),
 }
 
@@ -60,6 +62,9 @@ pub struct Pixal3DState {
     rx: Option<Receiver<RunnerMsg>>,
     running: bool,
     orb: crate::ai_orb::AiOrb,
+    /// The most recently generated GLB, shown in the centre 3D viewer. Seeded on
+    /// startup with the newest model already in the outputs dir (if any).
+    pub last_glb: Option<PathBuf>,
 }
 
 impl Default for Pixal3DState {
@@ -87,8 +92,21 @@ impl Default for Pixal3DState {
             rx: None,
             running: false,
             orb: crate::ai_orb::AiOrb::default(),
+            last_glb: latest_glb(),
         }
     }
+}
+
+/// Newest `.glb` in the Pixal3D outputs dir, so a previously generated model is
+/// shown in the centre viewer when the app restarts.
+fn latest_glb() -> Option<PathBuf> {
+    let dir = crate::tagger::models_root().join("pixal3d").join("outputs");
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("glb")))
+        .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
 }
 
 /// Render the Pixal3D generation view into the right panel.
@@ -100,6 +118,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&
             match msg {
                 RunnerMsg::Line(line) => state.log.push(line),
                 RunnerMsg::Status(s) => state.status = s,
+                RunnerMsg::Output(path) => state.last_glb = Some(path),
                 RunnerMsg::Done(ok) => {
                     state.running = false;
                     finished = true;
@@ -424,6 +443,7 @@ fn start_generate(state: &mut Pixal3DState, ctx: &egui::Context, current_image: 
 
         if ok {
             send(format!("== Done. GLB saved to {}", out.display()));
+            let _ = tx.send(RunnerMsg::Output(out.clone()));
             let _ = tx.send(RunnerMsg::Status("3D generated".into()));
         } else {
             send("== Generation failed — see errors above.".into());
@@ -620,6 +640,18 @@ fn run_setup(tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context) -> bool {
         let patch_s = patch_py.to_string_lossy().to_string();
         let icp_s = icp.to_string_lossy().to_string();
         run_streamed(tx, ctx, &base, &py, &[&patch_s, &icp_s], &[]);
+    }
+
+    // Embed PNG textures in the exported GLB instead of WebP: the in-app 3D
+    // viewer (three-d) can't decode the glTF EXT_texture_webp extension, so a
+    // WebP-textured model would render untextured. PNG is a bit larger but
+    // universally readable.
+    let inf = src.join("inference.py");
+    if let Ok(s) = std::fs::read_to_string(&inf) {
+        let s2 = s.replace("extension_webp=True", "extension_webp=False");
+        if s2 != s && std::fs::write(&inf, s2).is_ok() {
+            send("== Set GLB export to PNG textures (in-app viewer can't read WebP)".into());
+        }
     }
 
     let src = src.to_string_lossy().to_string();
