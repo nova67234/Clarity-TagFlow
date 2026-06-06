@@ -59,6 +59,21 @@ unicode-segmentation = "1.13.3"
 # here as a direct dep adds no extra build cost.
 arboard = "3.6.1"
 
+# Interactive 3D viewer for Pixal3D's generated GLB models (src/scene3d.rs),
+# shown in the centre panel. Renders into eframe's existing glow (OpenGL) context
+# via an egui paint callback. three-d 0.19 pins glow 0.17 + egui_glow 0.34 — the
+# same versions eframe 0.34 uses — so the GL context type unifies. GLB/glTF
+# loading lives in three-d-asset (gltf feature); png/jpeg decode embedded
+# textures. Linux/Windows only, matching Pixal3D (NVIDIA-only, compiled out on
+# macOS), so mac builds don't pull this in.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+three-d = { version = "0.19", default-features = false }
+three-d-asset = { version = "0.10", default-features = false, features = ["gltf", "png", "jpeg"] }
+# Paint-callback type (CallbackFn) + raw GL access for rendering three-d into
+# eframe's context. Pinned to the same versions eframe 0.34 already uses.
+egui_glow = "0.34"
+glow = "0.17"
+
 [build-dependencies]
 # Embeds the Windows app icon (and version info) into the exe at build time.
 winresource = "0.1.31"

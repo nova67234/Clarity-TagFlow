@@ -1,0 +1,357 @@
+== Install dir: C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d
+== Python already present, skipping download
+$ C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\python.exe --version
+Python 3.12.13
+== Source already present, skipping download
+== [3/6] Upgrading pip
+$ C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\python.exe -m pip install --upgrade pip setuptools wheel
+Requirement already satisfied: pip in .\python\Lib\site-packages (26.1.2)
+Requirement already satisfied: setuptools in .\python\Lib\site-packages (82.0.1)
+Requirement already satisfied: wheel in .\python\Lib\site-packages (0.47.0)
+Requirement already satisfied: packaging>=24.0 in .\python\Lib\site-packages (from wheel) (26.2)
+== [3/6] Installing PyTorch (CUDA 12.4)
+$ C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+Looking in indexes: https://download.pytorch.org/whl/cu124
+Requirement already satisfied: torch in .\python\Lib\site-packages (2.6.0+cu124)
+Requirement already satisfied: torchvision in .\python\Lib\site-packages (0.21.0+cu124)
+Requirement already satisfied: filelock in .\python\Lib\site-packages (from torch) (3.29.0)
+Requirement already satisfied: typing-extensions>=4.10.0 in .\python\Lib\site-packages (from torch) (4.15.0)
+Requirement already satisfied: networkx in .\python\Lib\site-packages (from torch) (3.6.1)
+Requirement already satisfied: jinja2 in .\python\Lib\site-packages (from torch) (3.1.6)
+Requirement already satisfied: fsspec in .\python\Lib\site-packages (from torch) (2026.4.0)
+Requirement already satisfied: setuptools in .\python\Lib\site-packages (from torch) (82.0.1)
+Requirement already satisfied: sympy==1.13.1 in .\python\Lib\site-packages (from torch) (1.13.1)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in .\python\Lib\site-packages (from sympy==1.13.1->torch) (1.3.0)
+Requirement already satisfied: numpy in .\python\Lib\site-packages (from torchvision) (2.2.6)
+Requirement already satisfied: pillow!=8.3.*,>=5.3.0 in .\python\Lib\site-packages (from torchvision) (12.0.0)
+Requirement already satisfied: MarkupSafe>=2.0 in .\python\Lib\site-packages (from jinja2->torch) (3.0.3)
+== [4/6] Installing Pixal3D requirements
+$ C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\python.exe -m pip install -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt
+Collecting git+https://github.com/microsoft/MoGe.git (from -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1))
+  Cloning https://github.com/microsoft/MoGe.git to C:\Users\Freebro\AppData\Local\Temp\pip-req-build-fm9n4jte
+  Running command git clone --filter=blob:none --quiet https://github.com/microsoft/MoGe.git 'C:\Users\Freebro\AppData\Local\Temp\pip-req-build-fm9n4jte'
+  Resolved https://github.com/microsoft/MoGe.git to commit 07444410f1e33f402353b99d6ccd26bd31e469e8
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: pillow==12.0.0 in .\python\Lib\site-packages (from -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 2)) (12.0.0)
+Requirement already satisfied: imageio==2.37.2 in .\python\Lib\site-packages (from -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 3)) (2.37.2)
+Requirement already satisfied: imageio-ffmpeg==0.6.0 in .\python\Lib\site-packages (from -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 4)) (0.6.0)
+Requirement already satisfied: tqdm==4.67.1 in .\python\Lib\site-packages (from -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 5)) (4.67.1)
+Requirement already satisfied: easydict==1.13 in .\python\Lib\site-packages (from -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 6)) (1.13)
+Requirement already satisfied: opencv-python-headless==4.12.0.88 in .\python\Lib\site-packages (from -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 7)) (4.12.0.88)
+Requirement already satisfied: trimesh==4.10.1 in .\python\Lib\site-packages (from -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 8)) (4.10.1)
+Requirement already satisfied: transformers==4.57.3 in .\python\Lib\site-packages (from -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 9)) (4.57.3)
+Requirement already satisfied: zstandard==0.25.0 in .\python\Lib\site-packages (from -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 10)) (0.25.0)
+Requirement already satisfied: kornia==0.8.2 in .\python\Lib\site-packages (from -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 11)) (0.8.2)
+Requirement already satisfied: timm==1.0.22 in .\python\Lib\site-packages (from -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 12)) (1.0.22)
+Requirement already satisfied: diffusers==0.37.1 in .\python\Lib\site-packages (from -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 13)) (0.37.1)
+Requirement already satisfied: accelerate==1.13.0 in .\python\Lib\site-packages (from -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 14)) (1.13.0)
+Requirement already satisfied: gradio in .\python\Lib\site-packages (from -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (6.16.0)
+Requirement already satisfied: plyfile==1.1.3 in .\python\Lib\site-packages (from -r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 16)) (1.1.3)
+Requirement already satisfied: click in .\python\Lib\site-packages (from moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (8.4.1)
+Requirement already satisfied: opencv-python in .\python\Lib\site-packages (from moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (4.13.0.92)
+Requirement already satisfied: scipy in .\python\Lib\site-packages (from moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (1.17.1)
+Requirement already satisfied: matplotlib in .\python\Lib\site-packages (from moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (3.10.9)
+Requirement already satisfied: huggingface_hub in .\python\Lib\site-packages (from moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (0.36.2)
+Requirement already satisfied: numpy in .\python\Lib\site-packages (from moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (2.2.6)
+Requirement already satisfied: torch>=2.0.0 in .\python\Lib\site-packages (from moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (2.6.0+cu124)
+Requirement already satisfied: torchvision in .\python\Lib\site-packages (from moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (0.21.0+cu124)
+Collecting utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3fab839f0be9931dac7c8488eb0e1600c236e183 (from moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1))
+  Using cached utils3d-1.3-py3-none-any.whl
+Collecting pipeline @ git+https://github.com/EasternJournalist/pipeline.git@866f059d2a05cde05e4a52211ec5051fd5f276d6 (from moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1))
+  Using cached pipeline-1.0.0-py3-none-any.whl
+Requirement already satisfied: moderngl in .\python\Lib\site-packages (from utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3fab839f0be9931dac7c8488eb0e1600c236e183->moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (5.12.0)
+Requirement already satisfied: colorama in .\python\Lib\site-packages (from tqdm==4.67.1->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 5)) (0.4.6)
+Requirement already satisfied: filelock in .\python\Lib\site-packages (from transformers==4.57.3->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 9)) (3.29.0)
+Requirement already satisfied: packaging>=20.0 in .\python\Lib\site-packages (from transformers==4.57.3->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 9)) (26.2)
+Requirement already satisfied: pyyaml>=5.1 in .\python\Lib\site-packages (from transformers==4.57.3->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 9)) (6.0.3)
+Requirement already satisfied: regex!=2019.12.17 in .\python\Lib\site-packages (from transformers==4.57.3->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 9)) (2026.5.9)
+Requirement already satisfied: requests in .\python\Lib\site-packages (from transformers==4.57.3->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 9)) (2.34.2)
+Requirement already satisfied: tokenizers<=0.23.0,>=0.22.0 in .\python\Lib\site-packages (from transformers==4.57.3->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 9)) (0.22.2)
+Requirement already satisfied: safetensors>=0.4.3 in .\python\Lib\site-packages (from transformers==4.57.3->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 9)) (0.7.0)
+Requirement already satisfied: kornia_rs>=0.1.9 in .\python\Lib\site-packages (from kornia==0.8.2->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 11)) (0.1.14)
+Requirement already satisfied: importlib-metadata in .\python\Lib\site-packages (from diffusers==0.37.1->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 13)) (9.0.0)
+Requirement already satisfied: httpx<1.0.0 in .\python\Lib\site-packages (from diffusers==0.37.1->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 13)) (0.28.1)
+Requirement already satisfied: psutil in .\python\Lib\site-packages (from accelerate==1.13.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 14)) (7.2.2)
+Requirement already satisfied: anyio in .\python\Lib\site-packages (from httpx<1.0.0->diffusers==0.37.1->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 13)) (4.13.0)
+Requirement already satisfied: certifi in .\python\Lib\site-packages (from httpx<1.0.0->diffusers==0.37.1->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 13)) (2026.5.20)
+Requirement already satisfied: httpcore==1.* in .\python\Lib\site-packages (from httpx<1.0.0->diffusers==0.37.1->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 13)) (1.0.9)
+Requirement already satisfied: idna in .\python\Lib\site-packages (from httpx<1.0.0->diffusers==0.37.1->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 13)) (3.18)
+Requirement already satisfied: h11>=0.16 in .\python\Lib\site-packages (from httpcore==1.*->httpx<1.0.0->diffusers==0.37.1->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 13)) (0.16.0)
+Requirement already satisfied: fsspec>=2023.5.0 in .\python\Lib\site-packages (from huggingface_hub->moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (2026.4.0)
+Requirement already satisfied: typing-extensions>=3.7.4.3 in .\python\Lib\site-packages (from huggingface_hub->moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (4.15.0)
+Requirement already satisfied: brotli>=1.1.0 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (1.2.0)
+Requirement already satisfied: fastapi<1.0,>=0.115.2 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (0.136.3)
+Requirement already satisfied: gradio-client==2.5.0 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (2.5.0)
+Requirement already satisfied: groovy~=0.1 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (0.1.2)
+Requirement already satisfied: hf-gradio<1.0,>=0.4.1 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (0.4.1)
+Requirement already satisfied: jinja2<4.0 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (3.1.6)
+Requirement already satisfied: markupsafe<4.0,>=2.0 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (3.0.3)
+Requirement already satisfied: orjson~=3.0 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (3.11.9)
+Requirement already satisfied: pandas<4.0,>=1.0 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (3.0.3)
+Requirement already satisfied: pydantic<=3.0,>=2.0 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (2.13.4)
+Requirement already satisfied: pydub<1.0 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (0.25.1)
+Requirement already satisfied: python-multipart<1.0,>=0.0.18 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (0.0.32)
+Requirement already satisfied: pytz>=2017.2 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (2026.2)
+Requirement already satisfied: safehttpx<0.2.0,>=0.1.7 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (0.1.7)
+Requirement already satisfied: semantic-version~=2.0 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (2.10.0)
+Requirement already satisfied: starlette<2.0,>=1.0.1 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (1.2.1)
+Requirement already satisfied: tomlkit<0.15.0,>=0.12.0 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (0.14.0)
+Requirement already satisfied: typer<1.0,>=0.12 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (0.26.7)
+Requirement already satisfied: uvicorn>=0.14.0 in .\python\Lib\site-packages (from gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (0.49.0)
+Requirement already satisfied: typing-inspection>=0.4.2 in .\python\Lib\site-packages (from fastapi<1.0,>=0.115.2->gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (0.4.2)
+Requirement already satisfied: annotated-doc>=0.0.2 in .\python\Lib\site-packages (from fastapi<1.0,>=0.115.2->gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (0.0.4)
+Requirement already satisfied: python-dateutil>=2.8.2 in .\python\Lib\site-packages (from pandas<4.0,>=1.0->gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (2.9.0.post0)
+Requirement already satisfied: tzdata in .\python\Lib\site-packages (from pandas<4.0,>=1.0->gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (2026.2)
+Requirement already satisfied: annotated-types>=0.6.0 in .\python\Lib\site-packages (from pydantic<=3.0,>=2.0->gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (0.7.0)
+Requirement already satisfied: pydantic-core==2.46.4 in .\python\Lib\site-packages (from pydantic<=3.0,>=2.0->gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (2.46.4)
+Requirement already satisfied: shellingham>=1.3.0 in .\python\Lib\site-packages (from typer<1.0,>=0.12->gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (1.5.4)
+Requirement already satisfied: rich>=13.8.0 in .\python\Lib\site-packages (from typer<1.0,>=0.12->gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (15.0.0)
+Requirement already satisfied: six>=1.5 in .\python\Lib\site-packages (from python-dateutil>=2.8.2->pandas<4.0,>=1.0->gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (1.17.0)
+Requirement already satisfied: markdown-it-py>=2.2.0 in .\python\Lib\site-packages (from rich>=13.8.0->typer<1.0,>=0.12->gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (4.2.0)
+Requirement already satisfied: pygments<3.0.0,>=2.13.0 in .\python\Lib\site-packages (from rich>=13.8.0->typer<1.0,>=0.12->gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (2.20.0)
+Requirement already satisfied: mdurl~=0.1 in .\python\Lib\site-packages (from markdown-it-py>=2.2.0->rich>=13.8.0->typer<1.0,>=0.12->gradio->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 15)) (0.1.2)
+Requirement already satisfied: networkx in .\python\Lib\site-packages (from torch>=2.0.0->moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (3.6.1)
+Requirement already satisfied: setuptools in .\python\Lib\site-packages (from torch>=2.0.0->moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (82.0.1)
+Requirement already satisfied: sympy==1.13.1 in .\python\Lib\site-packages (from torch>=2.0.0->moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (1.13.1)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in .\python\Lib\site-packages (from sympy==1.13.1->torch>=2.0.0->moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (1.3.0)
+Requirement already satisfied: zipp>=3.20 in .\python\Lib\site-packages (from importlib-metadata->diffusers==0.37.1->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 13)) (4.1.0)
+Requirement already satisfied: contourpy>=1.0.1 in .\python\Lib\site-packages (from matplotlib->moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (1.3.3)
+Requirement already satisfied: cycler>=0.10 in .\python\Lib\site-packages (from matplotlib->moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (0.12.1)
+Requirement already satisfied: fonttools>=4.22.0 in .\python\Lib\site-packages (from matplotlib->moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (4.63.0)
+Requirement already satisfied: kiwisolver>=1.3.1 in .\python\Lib\site-packages (from matplotlib->moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (1.5.0)
+Requirement already satisfied: pyparsing>=3 in .\python\Lib\site-packages (from matplotlib->moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (3.3.2)
+Requirement already satisfied: glcontext>=3.0.0 in .\python\Lib\site-packages (from moderngl->utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3fab839f0be9931dac7c8488eb0e1600c236e183->moge==2.0.0->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 1)) (3.0.0)
+Requirement already satisfied: charset_normalizer<4,>=2 in .\python\Lib\site-packages (from requests->transformers==4.57.3->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 9)) (3.4.7)
+Requirement already satisfied: urllib3<3,>=1.26 in .\python\Lib\site-packages (from requests->transformers==4.57.3->-r C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/requirements.txt (line 9)) (2.7.0)
+Installing collected packages: utils3d
+  Attempting uninstall: utils3d
+    Found existing installation: utils3d 0.0.2
+    Uninstalling utils3d-0.0.2:
+      Successfully uninstalled utils3d-0.0.2
+Successfully installed utils3d-1.3
+== [5/6] Installing utils3d
+$ C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\python.exe -m pip install https://github.com/LDYang694/Storages/releases/download/20260430/utils3d-0.0.2-py3-none-any.whl
+Collecting utils3d==0.0.2
+  Downloading utils3d-0.0.2-py3-none-any.whl (191 kB)
+Requirement already satisfied: moderngl in .\python\Lib\site-packages (from utils3d==0.0.2) (5.12.0)
+Requirement already satisfied: numpy in .\python\Lib\site-packages (from utils3d==0.0.2) (2.2.6)
+Requirement already satisfied: plyfile in .\python\Lib\site-packages (from utils3d==0.0.2) (1.1.3)
+Requirement already satisfied: scipy in .\python\Lib\site-packages (from utils3d==0.0.2) (1.17.1)
+Requirement already satisfied: glcontext>=3.0.0 in .\python\Lib\site-packages (from moderngl->utils3d==0.0.2) (3.0.0)
+Installing collected packages: utils3d
+  Attempting uninstall: utils3d
+    Found existing installation: utils3d 1.3
+    Uninstalling utils3d-1.3:
+      Successfully uninstalled utils3d-1.3
+Successfully installed utils3d-0.0.2
+== [5/6] Installing NATTEN (compiles — needs CUDA Toolkit)
+$ C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\python.exe -m pip install natten==0.21.0 --no-build-isolation
+Collecting natten==0.21.0
+  Using cached natten-0.21.0.tar.gz (2.7 MB)
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: torch in .\python\Lib\site-packages (from natten==0.21.0) (2.6.0+cu124)
+Requirement already satisfied: filelock in .\python\Lib\site-packages (from torch->natten==0.21.0) (3.29.0)
+Requirement already satisfied: typing-extensions>=4.10.0 in .\python\Lib\site-packages (from torch->natten==0.21.0) (4.15.0)
+Requirement already satisfied: networkx in .\python\Lib\site-packages (from torch->natten==0.21.0) (3.6.1)
+Requirement already satisfied: jinja2 in .\python\Lib\site-packages (from torch->natten==0.21.0) (3.1.6)
+Requirement already satisfied: fsspec in .\python\Lib\site-packages (from torch->natten==0.21.0) (2026.4.0)
+Requirement already satisfied: setuptools in .\python\Lib\site-packages (from torch->natten==0.21.0) (82.0.1)
+Requirement already satisfied: sympy==1.13.1 in .\python\Lib\site-packages (from torch->natten==0.21.0) (1.13.1)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in .\python\Lib\site-packages (from sympy==1.13.1->torch->natten==0.21.0) (1.3.0)
+Requirement already satisfied: MarkupSafe>=2.0 in .\python\Lib\site-packages (from jinja2->torch->natten==0.21.0) (3.0.3)
+Building wheels for collected packages: natten
+  Building wheel for natten (pyproject.toml): started
+  Building wheel for natten (pyproject.toml): finished with status 'error'
+  error: subprocess-exited-with-error
+  
+  Building wheel for natten (pyproject.toml) did not run successfully.
+  exit code: 1
+  
+  [149 lines of output]
+  C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\torch\cuda\__init__.py:235: UserWarning:
+  NVIDIA GeForce RTX 5080 Laptop GPU with CUDA capability sm_120 is not compatible with the current PyTorch installation.
+  The current PyTorch install supports CUDA capabilities sm_50 sm_60 sm_61 sm_70 sm_75 sm_80 sm_86 sm_90.
+  If you want to use the NVIDIA GeForce RTX 5080 Laptop GPU GPU with PyTorch, please check the instructions at https://pytorch.org/get-started/locally/
+  
+    warnings.warn(
+  `NATTEN_CUDA_ARCH` not set, but detected CUDA driver with PyTorch. Building for CUDA_ARCH='12.0'.
+  WARNING: Torch cmake will likely fail on Windows with CUDA 12.X. Please refer to NATTEN documentation to read more about the issue and how to get around it until the issue is fixed in torch.
+  PyTorch was built with CUDA Toolkit 124
+  Building NATTEN for the following architecture(s): 12.0
+  Number of workers: 4
+  running bdist_wheel
+  running build
+  running build_py
+  creating build\lib.win-amd64-cpython-312\natten
+  copying src\natten\attn_merge.py -> build\lib.win-amd64-cpython-312\natten
+  copying src\natten\context.py -> build\lib.win-amd64-cpython-312\natten
+  copying src\natten\functional.py -> build\lib.win-amd64-cpython-312\natten
+  copying src\natten\modules.py -> build\lib.win-amd64-cpython-312\natten
+  copying src\natten\profiler.py -> build\lib.win-amd64-cpython-312\natten
+  copying src\natten\token_permute.py -> build\lib.win-amd64-cpython-312\natten
+  copying src\natten\types.py -> build\lib.win-amd64-cpython-312\natten
+  copying src\natten\version.py -> build\lib.win-amd64-cpython-312\natten
+  copying src\natten\_environment.py -> build\lib.win-amd64-cpython-312\natten
+  copying src\natten\_libnatten.py -> build\lib.win-amd64-cpython-312\natten
+  copying src\natten\__init__.py -> build\lib.win-amd64-cpython-312\natten
+  creating build\lib.win-amd64-cpython-312\natten\profiling_utils
+  copying src\natten/profiling_utils\dry_run.py -> build\lib.win-amd64-cpython-312\natten/profiling_utils
+  copying src\natten/profiling_utils\formatting.py -> build\lib.win-amd64-cpython-312\natten/profiling_utils
+  copying src\natten/profiling_utils\ops.py -> build\lib.win-amd64-cpython-312\natten/profiling_utils
+  copying src\natten/profiling_utils\pretty_printer.py -> build\lib.win-amd64-cpython-312\natten/profiling_utils
+  copying src\natten/profiling_utils\problem.py -> build\lib.win-amd64-cpython-312\natten/profiling_utils
+  copying src\natten/profiling_utils\profiling.py -> build\lib.win-amd64-cpython-312\natten/profiling_utils
+  copying src\natten/profiling_utils\__init__.py -> build\lib.win-amd64-cpython-312\natten/profiling_utils
+  creating build\lib.win-amd64-cpython-312\natten\utils
+  copying src\natten/utils\checks.py -> build\lib.win-amd64-cpython-312\natten/utils
+  copying src\natten/utils\device.py -> build\lib.win-amd64-cpython-312\natten/utils
+  copying src\natten/utils\log.py -> build\lib.win-amd64-cpython-312\natten/utils
+  copying src\natten/utils\tensor.py -> build\lib.win-amd64-cpython-312\natten/utils
+  copying src\natten/utils\testing.py -> build\lib.win-amd64-cpython-312\natten/utils
+  copying src\natten/utils\tuples.py -> build\lib.win-amd64-cpython-312\natten/utils
+  copying src\natten/utils\__init__.py -> build\lib.win-amd64-cpython-312\natten/utils
+  creating build\lib.win-amd64-cpython-312\natten\backends
+  copying src\natten/backends\blackwell_fmha.py -> build\lib.win-amd64-cpython-312\natten/backends
+  copying src\natten/backends\blackwell_fna.py -> build\lib.win-amd64-cpython-312\natten/backends
+  copying src\natten/backends\flex.py -> build\lib.win-amd64-cpython-312\natten/backends
+  copying src\natten/backends\fmha.py -> build\lib.win-amd64-cpython-312\natten/backends
+  copying src\natten/backends\fna.py -> build\lib.win-amd64-cpython-312\natten/backends
+  copying src\natten/backends\hopper_fmha.py -> build\lib.win-amd64-cpython-312\natten/backends
+  copying src\natten/backends\hopper_fna.py -> build\lib.win-amd64-cpython-312\natten/backends
+  copying src\natten/backends\reference.py -> build\lib.win-amd64-cpython-312\natten/backends
+  copying src\natten/backends\__init__.py -> build\lib.win-amd64-cpython-312\natten/backends
+  creating build\lib.win-amd64-cpython-312\natten\backends\configs
+  copying src\natten/backends/configs\checks.py -> build\lib.win-amd64-cpython-312\natten/backends/configs
+  copying src\natten/backends/configs\__init__.py -> build\lib.win-amd64-cpython-312\natten/backends/configs
+  creating build\lib.win-amd64-cpython-312\natten\backends\configs\cutlass
+  copying src\natten/backends/configs/cutlass\fna_backward_128x128.py -> build\lib.win-amd64-cpython-312\natten/backends/configs/cutlass
+  copying src\natten/backends/configs/cutlass\fna_backward_128x64.py -> build\lib.win-amd64-cpython-312\natten/backends/configs/cutlass
+  copying src\natten/backends/configs/cutlass\fna_backward_64x64.py -> build\lib.win-amd64-cpython-312\natten/backends/configs/cutlass
+  copying src\natten/backends/configs/cutlass\fna_forward_32x128.py -> build\lib.win-amd64-cpython-312\natten/backends/configs/cutlass
+  copying src\natten/backends/configs/cutlass\fna_forward_64x128.py -> build\lib.win-amd64-cpython-312\natten/backends/configs/cutlass
+  copying src\natten/backends/configs/cutlass\fna_forward_64x64.py -> build\lib.win-amd64-cpython-312\natten/backends/configs/cutlass
+  copying src\natten/backends/configs/cutlass\__init__.py -> build\lib.win-amd64-cpython-312\natten/backends/configs/cutlass
+  creating build\lib.win-amd64-cpython-312\natten\backends\configs\cutlass_blackwell
+  copying src\natten/backends/configs/cutlass_blackwell\__init__.py -> build\lib.win-amd64-cpython-312\natten/backends/configs/cutlass_blackwell
+  creating build\lib.win-amd64-cpython-312\natten\backends\configs\cutlass_hopper
+  copying src\natten/backends/configs/cutlass_hopper\__init__.py -> build\lib.win-amd64-cpython-312\natten/backends/configs/cutlass_hopper
+  creating build\lib.win-amd64-cpython-312\natten\backends\configs\flex
+  copying src\natten/backends/configs/flex\__init__.py -> build\lib.win-amd64-cpython-312\natten/backends/configs/flex
+  running build_ext
+  Traceback (most recent call last):
+    File "<string>", line 180, in build_extension
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\subprocess.py", line 466, in check_output
+      return run(*popenargs, stdout=PIPE, timeout=timeout, check=True,
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\subprocess.py", line 548, in run
+      with Popen(*popenargs, **kwargs) as process:
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\subprocess.py", line 1026, in __init__
+      self._execute_child(args, executable, preexec_fn, close_fds,
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\subprocess.py", line 1538, in _execute_child
+      hp, ht, pid, tid = _winapi.CreateProcess(executable, args,
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  FileNotFoundError: [WinError 2] The system cannot find the file specified
+  
+  During handling of the above exception, another exception occurred:
+  
+  Traceback (most recent call last):
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\pip\_vendor\pyproject_hooks\_in_process\_in_process.py", line 389, in <module>
+      main()
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\pip\_vendor\pyproject_hooks\_in_process\_in_process.py", line 373, in main
+      json_out["return_val"] = hook(**hook_input["kwargs"])
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\pip\_vendor\pyproject_hooks\_in_process\_in_process.py", line 280, in build_wheel
+      return _build_backend().build_wheel(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\build_meta.py", line 441, in build_wheel
+      return _build(['bdist_wheel', '--dist-info-dir', str(metadata_directory)])
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\build_meta.py", line 429, in _build
+      return self._build_with_temp_dir(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\build_meta.py", line 410, in _build_with_temp_dir
+      self.run_setup()
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\build_meta.py", line 520, in run_setup
+      super().run_setup(setup_script=setup_script)
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\build_meta.py", line 317, in run_setup
+      exec(code, locals())
+    File "<string>", line 287, in <module>
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\__init__.py", line 117, in setup
+      return distutils.core.setup(**attrs)  # type: ignore[return-value]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\_distutils\core.py", line 186, in setup
+      return run_commands(dist)
+             ^^^^^^^^^^^^^^^^^^
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\_distutils\core.py", line 202, in run_commands
+      dist.run_commands()
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\_distutils\dist.py", line 1000, in run_commands
+      self.run_command(cmd)
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\dist.py", line 1107, in run_command
+      super().run_command(command)
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\_distutils\dist.py", line 1019, in run_command
+      cmd_obj.run()
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\command\bdist_wheel.py", line 370, in run
+      self.run_command("build")
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\_distutils\cmd.py", line 341, in run_command
+      self.distribution.run_command(command)
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\dist.py", line 1107, in run_command
+      super().run_command(command)
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\_distutils\dist.py", line 1019, in run_command
+      cmd_obj.run()
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\_distutils\command\build.py", line 135, in run
+      self.run_command(cmd_name)
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\_distutils\cmd.py", line 341, in run_command
+      self.distribution.run_command(command)
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\dist.py", line 1107, in run_command
+      super().run_command(command)
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\_distutils\dist.py", line 1019, in run_command
+      cmd_obj.run()
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\command\build_ext.py", line 97, in run
+      _build_ext.run(self)
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\_distutils\command\build_ext.py", line 367, in run
+      self.build_extensions()
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\_distutils\command\build_ext.py", line 483, in build_extensions
+      self._build_extensions_serial()
+    File "C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\Lib\site-packages\setuptools\_distutils\command\build_ext.py", line 509, in _build_extensions_serial
+      self.build_extension(ext)
+    File "<string>", line 182, in build_extension
+  RuntimeError: Cannot find CMake executable
+  [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+  ERROR: Failed building wheel for natten
+Failed to build natten
+error: failed-wheel-build-for-install
+
+Failed to build installable wheels for some pyproject.toml based projects
+
+natten
+WARNING: step failed: [5/6] Installing NATTEN (compiles — needs CUDA Toolkit)
+== [6/6] Installing huggingface_hub
+$ C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\python.exe -m pip install huggingface_hub
+Requirement already satisfied: huggingface_hub in .\python\Lib\site-packages (0.36.2)
+Requirement already satisfied: filelock in .\python\Lib\site-packages (from huggingface_hub) (3.29.0)
+Requirement already satisfied: fsspec>=2023.5.0 in .\python\Lib\site-packages (from huggingface_hub) (2026.4.0)
+Requirement already satisfied: packaging>=20.9 in .\python\Lib\site-packages (from huggingface_hub) (26.2)
+Requirement already satisfied: pyyaml>=5.1 in .\python\Lib\site-packages (from huggingface_hub) (6.0.3)
+Requirement already satisfied: requests in .\python\Lib\site-packages (from huggingface_hub) (2.34.2)
+Requirement already satisfied: tqdm>=4.42.1 in .\python\Lib\site-packages (from huggingface_hub) (4.67.1)
+Requirement already satisfied: typing-extensions>=3.7.4.3 in .\python\Lib\site-packages (from huggingface_hub) (4.15.0)
+Requirement already satisfied: colorama in .\python\Lib\site-packages (from tqdm>=4.42.1->huggingface_hub) (0.4.6)
+Requirement already satisfied: charset_normalizer<4,>=2 in .\python\Lib\site-packages (from requests->huggingface_hub) (3.4.7)
+Requirement already satisfied: idna<4,>=2.5 in .\python\Lib\site-packages (from requests->huggingface_hub) (3.18)
+Requirement already satisfied: urllib3<3,>=1.26 in .\python\Lib\site-packages (from requests->huggingface_hub) (2.7.0)
+Requirement already satisfied: certifi>=2023.5.7 in .\python\Lib\site-packages (from requests->huggingface_hub) (2026.5.20)
+== [6/6] Downloading model weights
+$ C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\python\python.exe -c from huggingface_hub import snapshot_download; snapshot_download('TencentARC/Pixal3D', local_dir=r'C:\Users\Freebro\AppData\Roaming\Clarity TagFlow\tools\pixal3d\Pixal3D-master/weights')
+
+Fetching 19 files:   0%|          | 0/19 [00:00<?, ?it/s]
+Fetching 19 files: 100%|##########| 19/19 [00:00<00:00, 486.33it/s]
+== Setup finished with warnings — see failures above (GPU/CUDA-Toolkit needed for kernel builds).
