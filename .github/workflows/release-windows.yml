@@ -39,7 +39,7 @@ jobs:
           $ok = $false
           for ($i = 1; $i -le 6; $i++) {
             try {
-              Write-Host "Attempt $i: $url"
+              Write-Host "Attempt ${i}: $url"
               Invoke-WebRequest -Uri $url -OutFile vlc.7z -UseBasicParsing -MaximumRedirection 10 -TimeoutSec 180
             } catch {
               Write-Host "  download failed: $($_.Exception.Message)"
