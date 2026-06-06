@@ -31,7 +31,40 @@ jobs:
         shell: pwsh
         run: |
           $ver = "3.0.21"
-          Invoke-WebRequest -Uri "https://get.videolan.org/vlc/$ver/win64/vlc-$ver-win64.7z" -OutFile vlc.7z
+          $url = "https://get.videolan.org/vlc/$ver/win64/vlc-$ver-win64.7z"
+          # get.videolan.org load-balances across mirrors; some occasionally serve
+          # an HTML error page instead of the archive (7z then reports "Is not
+          # archive"). Retry and validate the 7z magic bytes so a flaky mirror
+          # response doesn't fail the release.
+          $ok = $false
+          for ($i = 1; $i -le 6; $i++) {
+            try {
+              Write-Host "Attempt $i: $url"
+              Invoke-WebRequest -Uri $url -OutFile vlc.7z -UseBasicParsing -MaximumRedirection 10 -TimeoutSec 180
+            } catch {
+              Write-Host "  download failed: $($_.Exception.Message)"
+              Start-Sleep -Seconds 6
+              continue
+            }
+            $size = (Get-Item vlc.7z -ErrorAction SilentlyContinue).Length
+            $magic = ""
+            if ($size) {
+              $fs = [System.IO.File]::OpenRead((Resolve-Path vlc.7z))
+              $buf = New-Object byte[] 6
+              [void]$fs.Read($buf, 0, 6)
+              $fs.Close()
+              $magic = ($buf | ForEach-Object { $_.ToString('X2') }) -join ''
+            }
+            # 7z magic = 37 7A BC AF 27 1C; the real archive is ~38 MB.
+            if ($size -gt 20MB -and $magic -eq '377ABCAF271C') {
+              Write-Host "  ok: valid 7z, $size bytes"
+              $ok = $true
+              break
+            }
+            Write-Host "  not a 7z archive (size=$size magic=$magic), retrying..."
+            Start-Sleep -Seconds 6
+          }
+          if (-not $ok) { throw "Could not download a valid VLC archive after retries" }
           7z x vlc.7z -ovlc_sdk | Out-Null
           $lib = (Get-ChildItem -Path vlc_sdk -Recurse -Directory -Filter lib | Where-Object { Test-Path (Join-Path $_.FullName 'libvlc.lib') } | Select-Object -First 1).FullName
           if (-not $lib) { throw "libvlc.lib not found in the VLC archive" }
