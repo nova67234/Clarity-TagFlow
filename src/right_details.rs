@@ -181,7 +181,11 @@ pub fn show(
             // Read embedded SD generation metadata (PNG text chunks / EXIF
             // UserComment). Cheap relative to the full-res decode below.
             state.sd_metadata = crate::sd_metadata::read(path);
-            state.showing_meta = false;
+            // Default to the .txt tags, but when the image has no tags yet *and*
+            // carries embedded generation metadata, open straight to the metadata
+            // view so it isn't hidden behind a manual switch. With both present,
+            // tags win and the user switches manually.
+            state.showing_meta = state.current_tags.trim().is_empty() && state.sd_metadata.is_some();
 
             // Set temporary loading state for the card
             state.meta = ImageMeta {
@@ -388,10 +392,22 @@ pub fn show(
                                         }
                                     }
 
-                                    // The metadata view is read-only, so Edit is a
-                                    // no-op there (switch back to Tags to edit).
-                                    if ui.add_sized(size, edit_btn).clicked() && !state.showing_meta {
-                                        if state.is_editing {
+                                    if ui.add_sized(size, edit_btn).clicked() {
+                                        if state.showing_meta {
+                                            // The metadata view is read-only. Clicking
+                                            // Edit Text here drops to the .txt tags view,
+                                            // creating the sidecar file if it doesn't
+                                            // exist yet, and enters edit mode so tags can
+                                            // be added to a metadata-only image.
+                                            let txt_path = sidecar_txt(img_path);
+                                            if !txt_path.exists() {
+                                                let _ = std::fs::write(&txt_path, &state.current_tags);
+                                            }
+                                            state.showing_meta = false;
+                                            state.is_editing = true;
+                                            state.edit_flash_start = Some(Instant::now());
+                                            state.save_flash = None;
+                                        } else if state.is_editing {
                                             let txt_path = sidecar_txt(img_path);
                                             let ok = std::fs::write(&txt_path, &state.current_tags).is_ok();
                                             if ok {
@@ -461,7 +477,14 @@ pub fn show(
                                     let title = if state.showing_meta { "Metadata:" } else { "Tags:" };
                                     ui.label(egui::RichText::new(title).color(TEXT()).strong());
 
-                                    if state.sd_metadata.is_some() {
+                                    // Only offer the switch when there are two views to
+                                    // flip between — i.e. the image has both .txt tags
+                                    // and embedded metadata. With only one (or neither),
+                                    // the box already shows the right thing and there's
+                                    // nothing to switch to, so the button is hidden.
+                                    let has_tags = !state.current_tags.trim().is_empty();
+                                    let has_meta = state.sd_metadata.is_some();
+                                    if has_tags && has_meta {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {

@@ -54,6 +54,10 @@ enough = { version = "0.4.4", optional = true }
 # crate, which is pinned to an older egui and won't build against ours.
 twemoji-assets = { version = "1.4.0", default-features = false, features = ["svg"] }
 unicode-segmentation = "1.13.3"
+# Image-capable clipboard (egui's own clipboard is text-only) for the viewer's
+# "Copy image" right-click action. Already in the tree via eframe, so pinning it
+# here as a direct dep adds no extra build cost.
+arboard = "3.6.1"
 
 [build-dependencies]
 # Embeds the Windows app icon (and version info) into the exe at build time.
