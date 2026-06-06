@@ -1,0 +1,982 @@
+//! Pixal3D — image→3D generation panel, Linux/Windows only (this whole module is
+//! compiled out on macOS via `#[cfg(not(target_os = "macos"))]` on its `mod`
+//! declaration, since Pixal3D needs an NVIDIA CUDA GPU).
+//!
+//! UI mirrors TencentARC's Pixal3D web app (the controls map to its `/generate_3d`
+//! and `/extract_glb` API params): a source image, generation settings (seed,
+//! resolution, sparse-structure / shape / texture guidance + steps), a
+//! Generate 3D button, and GLB extraction settings. Styled after the Tag Manager.
+//!
+//! Backend status: the actual Pixal3D runtime (Python venv + CUDA wheels + model
+//! weights) isn't wired yet — "Setup Requirements" scaffolds the environment
+//! folder and Generate logs the request. Running real inference + viewing the GLB
+//! is future work.
+
+use std::path::Path;
+use std::sync::mpsc::{self, Receiver};
+use std::time::SystemTime;
+
+use eframe::egui;
+use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText};
+
+use crate::theme::{ACCENT1, EDGE, FIELD, MUTED, PANEL, TEXT};
+
+const GREEN: Color32 = Color32::from_rgb(46, 160, 67);
+const RED: Color32 = Color32::from_rgb(220, 70, 70);
+
+/// Messages streamed from a background runner (setup / generate) to the UI.
+enum RunnerMsg {
+    Line(String),
+    /// Update the header status text.
+    Status(String),
+    Done(bool),
+}
+
+pub struct Pixal3DState {
+    // --- Generation settings (match the Pixal3D /generate_3d API) ---
+    seed: i64,
+    randomize_seed: bool,
+    resolution: i32,
+    ss_guidance: f32,
+    ss_steps: i32,
+    shape_guidance: f32,
+    shape_steps: i32,
+    tex_guidance: f32,
+    tex_steps: i32,
+    // --- GLB extraction (match /extract_glb) ---
+    decimation: i32,
+    texture_size: i32,
+    /// Hugging Face token (for gated models like briaai/RMBG-2.0). Session-only.
+    hf_token: String,
+    /// Low-VRAM mode (loads models on-demand; ~fits 16 GB vs ~18 GB standard).
+    low_vram: bool,
+    // --- Section toggles ---
+    show_gen_settings: bool,
+    show_glb_settings: bool,
+    // --- Status / background runner ---
+    status: String,
+    status_err: bool,
+    log: Vec<String>,
+    rx: Option<Receiver<RunnerMsg>>,
+    running: bool,
+    orb: crate::ai_orb::AiOrb,
+}
+
+impl Default for Pixal3DState {
+    fn default() -> Self {
+        Self {
+            // Defaults from the Pixal3D space.
+            seed: 0,
+            randomize_seed: true,
+            resolution: 1024,
+            ss_guidance: 7.5,
+            ss_steps: 12,
+            shape_guidance: 7.5,
+            shape_steps: 12,
+            tex_guidance: 1.0,
+            tex_steps: 12,
+            decimation: 50_000,
+            texture_size: 1024,
+            hf_token: String::new(),
+            low_vram: true,
+            show_gen_settings: true,
+            show_glb_settings: false,
+            status: "Ready".to_string(),
+            status_err: false,
+            log: Vec::new(),
+            rx: None,
+            running: false,
+            orb: crate::ai_orb::AiOrb::default(),
+        }
+    }
+}
+
+/// Render the Pixal3D generation view into the right panel.
+pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&Path>) {
+    // Drain any background-runner messages (the Setup Requirements job).
+    if let Some(rx) = &state.rx {
+        let mut finished = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                RunnerMsg::Line(line) => state.log.push(line),
+                RunnerMsg::Status(s) => state.status = s,
+                RunnerMsg::Done(ok) => {
+                    state.running = false;
+                    finished = true;
+                    state.status_err = !ok;
+                }
+            }
+        }
+        if finished {
+            state.rx = None;
+        }
+        if state.running {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    // --- Header bar (title + status + orb), mirroring the Tag Manager. ---
+    egui::Frame::new()
+        .fill(FIELD())
+        .corner_radius(CornerRadius::same(18))
+        .inner_margin(Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            ui.set_height(40.0);
+            ui.horizontal_centered(|ui| {
+                ui.label(RichText::new("Pixal3D").color(TEXT()).strong().size(14.0));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let color = if state.status_err { RED } else if state.running { ACCENT1() } else { GREEN };
+                    ui.label(RichText::new(&state.status).color(color).size(12.0));
+                    ui.add_space(6.0);
+                    state.orb.set_state(if state.running {
+                        crate::ai_orb::OrbState::Thinking
+                    } else {
+                        crate::ai_orb::OrbState::Idle
+                    });
+                    state.orb.show(ui, 30.0, None);
+                });
+            });
+        });
+
+    ui.add_space(8.0);
+
+    // --- Utility row: Setup Requirements. ---
+    ui.horizontal(|ui| {
+        let setup = egui::Button::new(RichText::new("Setup Requirements").color(Color32::WHITE))
+            .fill(Color32::from_rgb(96, 99, 105))
+            .corner_radius(CornerRadius::same(12));
+        if ui.add_enabled_ui(!state.running, |ui| ui.add_sized(egui::vec2(150.0, 28.0), setup)).inner.clicked() {
+            start_setup(state, ui.ctx());
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(RichText::new("NVIDIA GPU required").color(MUTED()).size(11.0));
+        });
+    });
+
+    ui.add_space(6.0);
+
+    // --- HF token (for the gated background-removal model RMBG-2.0). ---
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("HF token").color(MUTED()).size(11.0));
+        ui.add(
+            egui::TextEdit::singleline(&mut state.hf_token)
+                .password(true)
+                .hint_text("for gated models (RMBG-2.0)")
+                .desired_width(f32::INFINITY),
+        );
+    });
+
+    ui.add_space(8.0);
+
+    // --- Source image card. ---
+    section(ui, "Source Image", |ui| {
+        match current_image {
+            Some(p) => {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("<unknown>");
+                ui.label(RichText::new(name).color(TEXT()).size(12.5));
+            }
+            None => {
+                ui.label(RichText::new("No image selected — pick one in the browser.").color(MUTED()).size(12.0));
+            }
+        }
+    });
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut state.low_vram, "");
+        ui.label(RichText::new("Low VRAM mode").color(TEXT()).size(12.0));
+        ui.label(RichText::new("(recommended for ≤16 GB)").color(MUTED()).size(11.0));
+    });
+
+    ui.add_space(8.0);
+
+    // --- Generate button (primary). ---
+    let gen_btn = egui::Button::new(RichText::new("Generate 3D").color(Color32::WHITE).strong())
+        .fill(ACCENT1())
+        .corner_radius(CornerRadius::same(12));
+    let enabled = !state.running && current_image.is_some();
+    if ui.add_enabled_ui(enabled, |ui| ui.add_sized(egui::vec2(ui.available_width(), 38.0), gen_btn)).inner.clicked() {
+        start_generate(state, ui.ctx(), current_image);
+    }
+
+    ui.add_space(8.0);
+
+    // --- Generation settings (collapsible). ---
+    egui::CollapsingHeader::new(RichText::new("Generation Settings").color(TEXT()))
+        .default_open(state.show_gen_settings)
+        .show(ui, |ui| {
+            labeled(ui, "Seed", |ui| {
+                ui.add_enabled(!state.randomize_seed, egui::DragValue::new(&mut state.seed).range(0..=i64::MAX));
+            });
+            labeled(ui, "Randomize seed", |ui| {
+                ui.checkbox(&mut state.randomize_seed, "");
+            });
+            labeled(ui, "Resolution", |ui| {
+                egui::ComboBox::from_id_salt("pixal3d_res")
+                    .selected_text(state.resolution.to_string())
+                    .show_ui(ui, |ui| {
+                        for r in [512, 1024, 1536] {
+                            ui.selectable_value(&mut state.resolution, r, r.to_string());
+                        }
+                    });
+            });
+            ui.add_space(4.0);
+            ui.label(RichText::new("Sparse structure").color(MUTED()).size(11.0));
+            slider(ui, "Guidance", &mut state.ss_guidance, 0.0..=12.0);
+            int_slider(ui, "Steps", &mut state.ss_steps, 1..=50);
+            ui.add_space(2.0);
+            ui.label(RichText::new("Shape").color(MUTED()).size(11.0));
+            slider(ui, "Guidance", &mut state.shape_guidance, 0.0..=12.0);
+            int_slider(ui, "Steps", &mut state.shape_steps, 1..=50);
+            ui.add_space(2.0);
+            ui.label(RichText::new("Texture").color(MUTED()).size(11.0));
+            slider(ui, "Guidance", &mut state.tex_guidance, 0.0..=12.0);
+            int_slider(ui, "Steps", &mut state.tex_steps, 1..=50);
+        });
+
+    // --- GLB extraction settings (collapsible). ---
+    egui::CollapsingHeader::new(RichText::new("GLB Extraction").color(TEXT()))
+        .default_open(state.show_glb_settings)
+        .show(ui, |ui| {
+            int_slider(ui, "Simplify (tris)", &mut state.decimation, 5_000..=200_000);
+            labeled(ui, "Texture size", |ui| {
+                egui::ComboBox::from_id_salt("pixal3d_texsize")
+                    .selected_text(state.texture_size.to_string())
+                    .show_ui(ui, |ui| {
+                        for t in [512, 1024, 2048] {
+                            ui.selectable_value(&mut state.texture_size, t, t.to_string());
+                        }
+                    });
+            });
+            let extract = egui::Button::new(RichText::new("Extract GLB").color(TEXT()))
+                .corner_radius(CornerRadius::same(10));
+            if ui.add_enabled(!state.running, extract).clicked() {
+                state.status = "Pixal3D runtime not installed — Extract GLB unavailable".into();
+                state.status_err = true;
+            }
+        });
+
+    ui.add_space(8.0);
+
+    // --- Log header with a Copy button (the panel text isn't selectable). ---
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Log").color(MUTED()).size(11.0));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let copy = egui::Button::new(RichText::new("Copy").size(11.0))
+                .corner_radius(CornerRadius::same(8));
+            if ui.add_enabled(!state.log.is_empty(), copy).clicked() {
+                ui.ctx().copy_text(state.log.join("\n"));
+            }
+        });
+    });
+    ui.add_space(2.0);
+
+    // --- Log (setup / generate output). ---
+    let log_bg = if crate::theme::is_light() { FIELD() } else { Color32::from_rgb(15, 15, 17) };
+    egui::Frame::new()
+        .fill(log_bg)
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::same(10))
+        .stroke(egui::Stroke::new(1.0, EDGE()))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::ScrollArea::vertical()
+                .id_salt("pixal3d_log")
+                .max_height(140.0)
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    if state.log.is_empty() {
+                        ui.label(RichText::new("Output will appear here.").color(MUTED()).monospace().size(12.0));
+                    } else {
+                        for line in &state.log {
+                            ui.label(RichText::new(line).color(TEXT()).monospace().size(12.0));
+                        }
+                    }
+                });
+        });
+}
+
+/// A titled card (PANEL fill, rounded) wrapping `contents`.
+fn section(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
+    ui.label(RichText::new(title).color(MUTED()).size(11.0));
+    ui.add_space(2.0);
+    egui::Frame::new()
+        .fill(PANEL())
+        .corner_radius(CornerRadius::same(12))
+        .stroke(egui::Stroke::new(1.0, EDGE()))
+        .inner_margin(Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            contents(ui);
+        });
+}
+
+/// A label on the left, a right-aligned control on the right.
+fn labeled(ui: &mut egui::Ui, label: &str, contents: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).color(TEXT()).size(12.0));
+        ui.with_layout(Layout::right_to_left(Align::Center), contents);
+    });
+}
+
+fn slider(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).color(MUTED()).size(11.5));
+        ui.add(egui::Slider::new(value, range).fixed_decimals(1));
+    });
+}
+
+fn int_slider(ui: &mut egui::Ui, label: &str, value: &mut i32, range: std::ops::RangeInclusive<i32>) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).color(MUTED()).size(11.5));
+        ui.add(egui::Slider::new(value, range));
+    });
+}
+
+/// Run Pixal3D inference on the selected image: `inference.py --image … --output
+/// …`, streaming output to the log. Produces a GLB under `tools/pixal3d/outputs`.
+/// `ATTN_BACKEND=sdpa` avoids the flash-attn dependency.
+fn start_generate(state: &mut Pixal3DState, ctx: &egui::Context, current_image: Option<&Path>) {
+    let Some(img) = current_image else {
+        state.status = "No image selected".into();
+        state.status_err = true;
+        return;
+    };
+    let base = crate::tagger::models_root().join("pixal3d");
+    let src = base.join("Pixal3D-master");
+    let py = if cfg!(windows) {
+        base.join("python").join("python.exe")
+    } else {
+        base.join("python").join("bin").join("python3")
+    };
+    if !src.join("inference.py").exists() || !py.exists() {
+        state.status = "Requirements not installed — click Setup Requirements".into();
+        state.status_err = true;
+        return;
+    }
+
+    if state.randomize_seed {
+        // Derive a fresh seed; no rng crate, so fold the wall clock.
+        let n = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0);
+        state.seed = (n.unsigned_abs() % 1_000_000) as i64;
+    }
+    let seed = state.seed;
+    let resolution = state.resolution;
+    let low_vram = state.low_vram;
+    let token = state.hf_token.trim().to_string();
+    let img = img.to_path_buf();
+    let weights = src.join("weights");
+    let out_dir = base.join("outputs");
+    let _ = std::fs::create_dir_all(&out_dir);
+    let stem = img.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    let out = out_dir.join(format!("{stem}_{seed}.glb"));
+
+    let (tx, rx) = mpsc::channel();
+    state.rx = Some(rx);
+    state.running = true;
+    state.status = "Generating 3D…".into();
+    state.status_err = false;
+    state.log.clear();
+
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let send = |line: String| {
+            let _ = tx.send(RunnerMsg::Line(line));
+            ctx.request_repaint();
+        };
+        send(format!("Generating 3D from {}", img.display()));
+        send(format!("Output: {}", out.display()));
+
+        let py = py.to_string_lossy().to_string();
+        let img_s = img.to_string_lossy().to_string();
+        let out_s = out.to_string_lossy().to_string();
+        let res_s = resolution.to_string();
+        let seed_s = seed.to_string();
+        let weights_s = weights.to_string_lossy().to_string();
+
+        let mut env: Vec<(&str, &str)> = vec![("ATTN_BACKEND", "sdpa")];
+        if !token.is_empty() {
+            env.push(("HF_TOKEN", &token));
+        }
+        let mut args: Vec<&str> = vec![
+            "inference.py",
+            "--image", &img_s,
+            "--output", &out_s,
+            "--seed", &seed_s,
+            "--resolution", &res_s,
+            "--model_path", &weights_s,
+        ];
+        if low_vram {
+            args.push("--low_vram");
+        }
+        let ok = run_streamed(&tx, &ctx, &src, &py, &args, &env);
+
+        if ok {
+            send(format!("== Done. GLB saved to {}", out.display()));
+            let _ = tx.send(RunnerMsg::Status("3D generated".into()));
+        } else {
+            send("== Generation failed — see errors above.".into());
+            let _ = tx.send(RunnerMsg::Status("Generation failed — see log".into()));
+        }
+        let _ = tx.send(RunnerMsg::Done(ok));
+        ctx.request_repaint();
+    });
+}
+
+// --- Real setup pipeline ---------------------------------------------------
+
+/// Standalone Python (astral-sh/python-build-standalone), pinned to a verified
+/// release. The "install_only" tarball extracts to a `python/` dir with pip.
+const PY_TAG: &str = "20260602";
+const PY_VER: &str = "3.12.13";
+/// Pixal3D source (GitHub zip — extracts to `Pixal3D-master/`).
+const SRC_ZIP: &str = "https://github.com/TencentARC/Pixal3D/archive/refs/heads/master.zip";
+/// PyTorch CUDA wheel index. cu128 (PyTorch 2.7+) is required for Blackwell
+/// (RTX 50-series, sm_120); older cu124 maxes out at sm_90.
+const TORCH_INDEX: &str = "https://download.pytorch.org/whl/cu128";
+/// utils3d wheel required by Pixal3D (per its README).
+const UTILS3D_WHL: &str =
+    "https://github.com/LDYang694/Storages/releases/download/20260430/utils3d-0.0.2-py3-none-any.whl";
+
+/// Prebuilt Pixal3D CUDA-kernel wheels (cumesh, o_voxel, drtk, flex_gemm) from
+/// PozzettiAndrea/cuda-wheels — the set the official ComfyUI installer uses,
+/// matched to Python 3.12 + torch 2.8 + cu128. Prebuilt = no local CUDA compile.
+/// `%2B` is the URL-encoded `+` local-version separator.
+fn cuda_kernel_wheels() -> [&'static str; 4] {
+    let plat = if cfg!(windows) { "win_amd64" } else { "linux_x86_64" };
+    // Leak the formatted URLs to get `'static` strs (called once per setup run).
+    let url = |pkg: &str, file: &str| -> &'static str {
+        Box::leak(
+            format!("https://github.com/PozzettiAndrea/cuda-wheels/releases/download/{pkg}-latest/{file}")
+                .into_boxed_str(),
+        )
+    };
+    [
+        url("flex_gemm_ap", &format!("flex_gemm_ap-1.0.0%2Bcu128torch2.8-cp312-cp312-{plat}.whl")),
+        url("cumesh_vb", &format!("cumesh_vb-1.0%2Bcu128torch2.8-cp312-cp312-{plat}.whl")),
+        url("o_voxel_vb_ap", &format!("o_voxel_vb_ap-0.0.1%2Bcu128torch2.8-cp312-cp312-{plat}.whl")),
+        url("drtk", &format!("drtk-0.1.0%2Bcu128torch2.8-cp312-cp312-{plat}.whl")),
+    ]
+}
+
+/// Python patch: make the NAF upsampler fall back to the low-res projection when
+/// NATTEN is unavailable (no Windows NATTEN wheel exists), so inference runs.
+/// Run as `python patch_naf.py <image_conditioned_proj.py>`. Idempotent.
+const NAF_PATCH_PY: &str = r#"import io, sys
+f = sys.argv[1]
+s = io.open(f, encoding='utf-8').read()
+changed = False
+# Guard: _load_naf returns early (naf_model=None) when NATTEN isn't importable,
+# instead of crashing in torch.hub.load -> NAF -> import natten.
+g_need = "        if self.naf_model is None:\n            import torch.hub\n"
+g_repl = ("        if self.naf_model is None:\n"
+"            try:\n"
+"                import natten  # NAF load patch\n"
+"            except Exception:\n"
+"                self.naf_model = None\n"
+"                return\n"
+"            import torch.hub\n")
+if 'NAF load patch' not in s and g_need in s:
+    s = s.replace(g_need, g_repl); changed = True
+# Forward: reuse the low-res projection for the hr branch when NAF is unavailable.
+if 'NAF fallback patch' not in s:
+    needle = "            if self.use_naf_upsample:\n                self._load_naf()\n"
+    i = s.find(needle)
+    if i >= 0:
+        endmark = "z_proj = torch.cat([z_proj_lr, z_proj_hr], dim=-1)"
+        j = s.find(endmark, i) + len(endmark)
+        repl = (
+"            if self.use_naf_upsample:  # NAF fallback patch (no NATTEN -> reuse lr)\n"
+"                z_proj_hr = z_proj_lr\n"
+"                try:\n"
+"                    self._load_naf()\n"
+"                    lr_features_bchw = z_patchtokens_spatial.permute(0, 3, 1, 2)\n"
+"                    hr_features = self.naf_model(image_for_naf, lr_features_bchw, self.naf_target_size)\n"
+"                    z_proj_hr = self.proj_grid(hr_features, camera_angle_x, distance, mesh_scale, transform_matrix, BHWC=False)\n"
+"                except Exception as _naf_exc:\n"
+"                    print('[Pixal3D] NAF unavailable (%s: %s); using lr fallback.' % (type(_naf_exc).__name__, _naf_exc))\n"
+"                z_proj = torch.cat([z_proj_lr, z_proj_hr], dim=-1)"
+)
+        s = s[:i] + repl + s[j:]; changed = True
+io.open(f, 'w', encoding='utf-8').write(s)
+print('NAF patched OK' if changed else 'NAF already patched')
+"#;
+
+fn py_tarball_url() -> String {
+    let triple = if cfg!(windows) {
+        "x86_64-pc-windows-msvc"
+    } else {
+        "x86_64-unknown-linux-gnu"
+    };
+    format!(
+        "https://github.com/astral-sh/python-build-standalone/releases/download/{PY_TAG}/\
+         cpython-{PY_VER}+{PY_TAG}-{triple}-install_only.tar.gz"
+    )
+}
+
+/// Spawn the real setup pipeline on a background thread, streaming every line of
+/// output to the panel log. Bootstrap steps (Python, source) are fatal; the
+/// GPU-dependent pip steps are best-effort (logged, but don't abort) since they
+/// need the user's NVIDIA GPU + CUDA Toolkit.
+fn start_setup(state: &mut Pixal3DState, ctx: &egui::Context) {
+    let (tx, rx) = mpsc::channel();
+    state.rx = Some(rx);
+    state.running = true;
+    state.status = "Setting up…".into();
+    state.status_err = false;
+    state.log.clear();
+
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let ok = run_setup(&tx, &ctx);
+        let _ = tx.send(RunnerMsg::Done(ok));
+        ctx.request_repaint();
+    });
+}
+
+fn run_setup(tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context) -> bool {
+    let send = |line: String| {
+        let _ = tx.send(RunnerMsg::Line(line));
+        ctx.request_repaint();
+    };
+
+    let base = crate::tagger::models_root().join("pixal3d");
+    if let Err(e) = std::fs::create_dir_all(&base) {
+        send(format!("ERROR: could not create {}: {e}", base.display()));
+        return false;
+    }
+    send(format!("== Install dir: {}", base.display()));
+
+    // Step 1 — standalone Python (fatal if it fails).
+    let py = if cfg!(windows) {
+        base.join("python").join("python.exe")
+    } else {
+        base.join("python").join("bin").join("python3")
+    };
+    if py.exists() {
+        send("== Python already present, skipping download".into());
+    } else {
+        send("== [1/6] Downloading standalone Python…".into());
+        let tarball = base.join("python.tar.gz");
+        if let Err(e) = download(&py_tarball_url(), &tarball, tx, ctx) {
+            send(format!("ERROR: Python download failed: {e}"));
+            return false;
+        }
+        send("== Extracting Python…".into());
+        if !run_streamed(tx, ctx, &base, "tar", &["-xzf", "python.tar.gz"], &[]) {
+            send("ERROR: failed to extract Python".into());
+            return false;
+        }
+        let _ = std::fs::remove_file(&tarball);
+    }
+    if !run_streamed(tx, ctx, &base, py.to_str().unwrap_or("python"), &["--version"], &[]) {
+        send("ERROR: standalone Python is not runnable".into());
+        return false;
+    }
+    let py = py.to_string_lossy().to_string();
+
+    // Step 2 — Pixal3D source (fatal if it fails).
+    let src = base.join("Pixal3D-master");
+    if src.join("requirements.txt").exists() {
+        send("== Source already present, skipping download".into());
+    } else {
+        send("== [2/6] Downloading Pixal3D source…".into());
+        let zip = base.join("src.zip");
+        if let Err(e) = download(SRC_ZIP, &zip, tx, ctx) {
+            send(format!("ERROR: source download failed: {e}"));
+            return false;
+        }
+        send("== Extracting source…".into());
+        if let Err(e) = unzip(&zip, &base) {
+            send(format!("ERROR: failed to extract source: {e}"));
+            return false;
+        }
+        let _ = std::fs::remove_file(&zip);
+    }
+
+    // Patch the NAF upsampler to fall back to low-res features when NATTEN is
+    // unavailable (no Windows NATTEN wheel), so inference runs without it.
+    send("== Patching NAF for no-NATTEN fallback".into());
+    let patch_py = base.join("patch_naf.py");
+    let icp = base
+        .join("Pixal3D-master")
+        .join("pixal3d")
+        .join("trainers")
+        .join("flow_matching")
+        .join("mixins")
+        .join("image_conditioned_proj.py");
+    if std::fs::write(&patch_py, NAF_PATCH_PY).is_ok() {
+        let patch_s = patch_py.to_string_lossy().to_string();
+        let icp_s = icp.to_string_lossy().to_string();
+        run_streamed(tx, ctx, &base, &py, &[&patch_s, &icp_s], &[]);
+    }
+
+    let src = src.to_string_lossy().to_string();
+
+    // Steps 3–6 — pip installs (best-effort: log failures, keep going so the user
+    // sees every error in one run). These need an NVIDIA GPU + CUDA Toolkit.
+    // `required` steps mark the run failed; "optional" GPU-kernel steps only warn
+    // (they need a system CUDA Toolkit + compiler we can't bundle), so the core
+    // install + weights still report success.
+    let mut core_ok = true;
+    let mut step = |label: &str, args: &[&str], env: &[(&str, &str)], required: bool| {
+        send(format!("== {label}"));
+        if !run_streamed(tx, ctx, &base, &py, args, env) {
+            send(format!("WARNING: step failed: {label}"));
+            if required {
+                core_ok = false;
+            }
+        }
+    };
+
+    step("[3/6] Upgrading pip", &["-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"], &[], true);
+    step(
+        "[3/6] Installing PyTorch 2.8 (CUDA 12.8)",
+        &["-m", "pip", "install", "--upgrade", "torch==2.8.0", "torchvision", "--index-url", TORCH_INDEX],
+        &[],
+        true,
+    );
+    step(
+        "[4/6] Installing Pixal3D requirements",
+        &["-m", "pip", "install", "-r", &format!("{src}/requirements.txt")],
+        &[],
+        true,
+    );
+    // Extra deps not pinned in requirements.txt but needed at runtime (e.g. the
+    // BiRefNet remote modeling code imports einops).
+    step("[4/6] Installing extra deps (einops)", &["-m", "pip", "install", "einops"], &[], true);
+    step("[5/6] Installing utils3d", &["-m", "pip", "install", UTILS3D_WHL], &[], true);
+
+    // Prebuilt Pixal3D CUDA kernels (cumesh, o_voxel, drtk, flex_gemm). `--no-deps`
+    // so pip doesn't try to swap the pinned cu128 torch for a PyPI build.
+    let wheels = cuda_kernel_wheels();
+    let mut wheel_args: Vec<&str> = vec!["-m", "pip", "install", "--no-deps"];
+    wheel_args.extend_from_slice(&wheels);
+    step("[5/6] Installing Pixal3D CUDA kernels", &wheel_args, &[], true);
+
+    // Triton — the kernels' triton path needs it. Windows uses the triton-windows
+    // build; Linux uses upstream triton.
+    let triton_pkg = if cfg!(windows) { "triton-windows" } else { "triton" };
+    step("[5/6] Installing Triton", &["-m", "pip", "install", triton_pkg], &[], true);
+
+    // Alias shims: the wheels install as cumesh_vb / o_voxel_vb_ap / flex_gemm_ap,
+    // but Pixal3D imports them as cumesh / o_voxel / flex_gemm.
+    send("== Creating kernel import aliases (cumesh, o_voxel, flex_gemm)".into());
+    if let Err(e) = write_kernel_shims(&base) {
+        send(format!("WARNING: could not create import aliases: {e}"));
+    }
+
+    // NATTEN compiles from source (CUDA Toolkit + MSVC) — best-effort, and only
+    // needed if a neighborhood-attention backend is selected (we use sdpa).
+    step("[5/6] Installing build tools (cmake, ninja)", &["-m", "pip", "install", "cmake", "ninja"], &[], false);
+    step(
+        "[5/6] Installing NATTEN (compiles — needs CUDA Toolkit + MSVC)",
+        &["-m", "pip", "install", "natten==0.21.0", "--no-build-isolation"],
+        &[],
+        false,
+    );
+    step("[6/6] Installing huggingface_hub", &["-m", "pip", "install", "huggingface_hub"], &[], true);
+    let dl = format!(
+        "from huggingface_hub import snapshot_download; \
+         snapshot_download('TencentARC/Pixal3D', local_dir=r'{src}/weights')"
+    );
+    step("[6/6] Downloading model weights", &["-c", &dl], &[], true);
+
+    // Swap the gated background-removal model (briaai/RMBG-2.0) for the open,
+    // non-gated ZhengPeng7/BiRefNet so that piece needs no Hugging Face login.
+    // (DINOv3, the image encoder, is gated by Meta and has no open swap — it
+    // still needs a one-time token, then caches locally.)
+    let pj = base.join("Pixal3D-master").join("weights").join("pipeline.json");
+    if let Ok(s) = std::fs::read_to_string(&pj) {
+        let s2 = s.replace("briaai/RMBG-2.0", "ZhengPeng7/BiRefNet");
+        if s2 != s && std::fs::write(&pj, s2).is_ok() {
+            send("== Set background-removal model to open ZhengPeng7/BiRefNet".into());
+        }
+    }
+
+    if core_ok {
+        send("== Core install + weights complete. (NATTEN, if it failed, needs the CUDA Toolkit + MSVC Build Tools.)".into());
+        let _ = tx.send(RunnerMsg::Status("Requirements installed".into()));
+    } else {
+        send("== Setup failed — see the errors above.".into());
+        let _ = tx.send(RunnerMsg::Status("Setup failed — see log".into()));
+    }
+    core_ok
+}
+
+/// Run a command in `cwd`, streaming stdout+stderr line-by-line to the log.
+/// Returns true on a zero exit status.
+fn run_streamed(
+    tx: &mpsc::Sender<RunnerMsg>,
+    ctx: &egui::Context,
+    cwd: &Path,
+    program: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> bool {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let _ = tx.send(RunnerMsg::Line(format!("$ {program} {}", args.join(" "))));
+    ctx.request_repaint();
+
+    // Make sure this child (and anything it spawns) is bound to the app's
+    // lifetime, so closing Clarity_TagFlow can't orphan a running Python/CUDA job.
+    #[cfg(windows)]
+    ensure_kill_on_exit_job();
+
+    let mut cmd = Command::new(program);
+    cmd.args(args).current_dir(cwd).stdout(Stdio::piped()).stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    hide_window(&mut cmd);
+    kill_on_parent_exit(&mut cmd);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(RunnerMsg::Line(format!("ERROR: cannot run {program}: {e}")));
+            ctx.request_repaint();
+            return false;
+        }
+    };
+
+    // stderr on its own thread; stdout on this one.
+    let stderr = child.stderr.take();
+    let err_handle = stderr.map(|err| {
+        let txe = tx.clone();
+        let cte = ctx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                let _ = txe.send(RunnerMsg::Line(line));
+                cte.request_repaint();
+            }
+        })
+    });
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            let _ = tx.send(RunnerMsg::Line(line));
+            ctx.request_repaint();
+        }
+    }
+    if let Some(h) = err_handle {
+        let _ = h.join();
+    }
+    matches!(child.wait(), Ok(s) if s.success())
+}
+
+/// Stream a URL to `dest` (via `.part` then rename), logging periodic progress.
+fn download(url: &str, dest: &Path, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context) -> Result<(), String> {
+    use std::io::{Read, Write};
+
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .max_redirects(10)
+        .build()
+        .into();
+
+    let resp = agent.get(url).call().map_err(|e| e.to_string())?;
+    let total: u64 = resp
+        .headers()
+        .get("Content-Length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let tmp = dest.with_extension("part");
+    let mut out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    let mut reader = resp.into_body().into_reader();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut got: u64 = 0;
+    let mut last_pct = 0u64;
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        got += n as u64;
+        if total > 0 {
+            let pct = got * 100 / total;
+            if pct >= last_pct + 5 {
+                last_pct = pct;
+                let _ = tx.send(RunnerMsg::Line(format!(
+                    "   {pct}%  ({:.1}/{:.1} MB)",
+                    got as f64 / 1e6,
+                    total as f64 / 1e6
+                )));
+                ctx.request_repaint();
+            }
+        }
+    }
+    out.flush().ok();
+    drop(out);
+    std::fs::rename(&tmp, dest).map_err(|e| e.to_string())
+}
+
+/// Create alias shim packages so Pixal3D's `import cumesh` / `o_voxel` /
+/// `flex_gemm` resolve to the installed `*_vb` / `*_ap` wheels.
+fn write_kernel_shims(base: &Path) -> std::io::Result<()> {
+    let site = if cfg!(windows) {
+        base.join("python").join("Lib").join("site-packages")
+    } else {
+        base.join("python").join("lib").join("python3.12").join("site-packages")
+    };
+    for (alias, target) in [
+        ("cumesh", "cumesh_vb"),
+        ("o_voxel", "o_voxel_vb_ap"),
+        ("flex_gemm", "flex_gemm_ap"),
+    ] {
+        let dir = site.join(alias);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("__init__.py"),
+            format!("import sys\nimport {target} as _m\nsys.modules[__name__] = _m\n"),
+        )?;
+    }
+    Ok(())
+}
+
+/// Extract a zip archive into `dest_dir` using the `zip` crate.
+fn unzip(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        let Some(rel) = entry.enclosed_name() else { continue };
+        let out_path = dest_dir.join(rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut out = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
+            std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// On Windows, don't pop a console window for each spawned child process.
+#[cfg(windows)]
+fn hide_window(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+}
+#[cfg(not(windows))]
+fn hide_window(_cmd: &mut std::process::Command) {}
+
+/// Tie every process this module spawns to the app's lifetime, so closing
+/// Clarity_TagFlow (or it crashing) can never leave an orphaned Python/CUDA job
+/// running. Pixal3D inference holds gigabytes of GPU + system memory; without
+/// this, closing the app mid-generation leaks it all until the machine falls over.
+///
+/// Windows: assign the *current* process to a Job Object flagged
+/// `KILL_ON_JOB_CLOSE`. Child processes spawned afterwards inherit the job, so
+/// when the app's last handle to the job closes — on a clean exit OR a crash, the
+/// OS tears down the handle table either way — the whole job tree (the Python
+/// child and all its worker grandchildren) is terminated. Runs once; the job
+/// handle is intentionally never closed so it stays open for the process lifetime.
+#[cfg(windows)]
+fn ensure_kill_on_exit_job() {
+    use std::ffi::c_void;
+    use std::sync::Once;
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        type Handle = *mut c_void;
+        const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+        const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+
+        #[repr(C)]
+        struct BasicLimit {
+            per_process_user_time_limit: i64,
+            per_job_user_time_limit: i64,
+            limit_flags: u32,
+            minimum_working_set_size: usize,
+            maximum_working_set_size: usize,
+            active_process_limit: u32,
+            affinity: usize,
+            priority_class: u32,
+            scheduling_class: u32,
+        }
+        #[repr(C)]
+        struct IoCounters {
+            read_op: u64,
+            write_op: u64,
+            other_op: u64,
+            read_xfer: u64,
+            write_xfer: u64,
+            other_xfer: u64,
+        }
+        #[repr(C)]
+        struct ExtendedLimit {
+            basic: BasicLimit,
+            io: IoCounters,
+            process_memory_limit: usize,
+            job_memory_limit: usize,
+            peak_process_memory_used: usize,
+            peak_job_memory_used: usize,
+        }
+
+        // SAFETY: standard kernel32 Job Object signatures; all pointers below are
+        // valid for the duration of each call.
+        unsafe extern "system" {
+            fn CreateJobObjectW(attrs: *mut c_void, name: *const u16) -> Handle;
+            fn SetInformationJobObject(job: Handle, class: i32, info: *const c_void, len: u32) -> i32;
+            fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+            fn GetCurrentProcess() -> Handle;
+        }
+
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+            if job.is_null() {
+                return;
+            }
+            let mut info: ExtendedLimit = std::mem::zeroed();
+            info.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(
+                job,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                std::ptr::addr_of!(info) as *const c_void,
+                std::mem::size_of::<ExtendedLimit>() as u32,
+            );
+            // If the app is already inside a no-breakaway job this can fail; in
+            // that case we simply degrade to the prior (unprotected) behaviour.
+            AssignProcessToJobObject(job, GetCurrentProcess());
+            // `job` is deliberately not closed — its open handle is what ties the
+            // job's lifetime (and the kill-on-close trigger) to this process.
+        }
+    });
+}
+
+/// Linux: best-effort — ask the kernel to SIGKILL the child if the spawning
+/// process dies (`PR_SET_PDEATHSIG`), so a closed/crashed app doesn't orphan the
+/// Python inference child. Set in the child via `pre_exec` (post-fork).
+#[cfg(target_os = "linux")]
+fn kill_on_parent_exit(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: prctl is async-signal-safe, which is all pre_exec permits.
+    unsafe {
+        cmd.pre_exec(|| {
+            unsafe extern "C" {
+                fn prctl(option: i32, arg2: usize, arg3: usize, arg4: usize, arg5: usize) -> i32;
+            }
+            const PR_SET_PDEATHSIG: i32 = 1;
+            const SIGKILL: usize = 9;
+            prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+            Ok(())
+        });
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn kill_on_parent_exit(_cmd: &mut std::process::Command) {}
