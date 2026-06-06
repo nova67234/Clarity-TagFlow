@@ -5,7 +5,11 @@ edition = "2024"
 
 [dependencies]
 # "persistence" enables eframe's storage (saves settings to the OS data dir).
-eframe = { version = "0.34.2", features = ["persistence"] }
+# "glow" enables the OpenGL backend: eframe 0.34 defaults to wgpu, but the
+# Pixal3D 3D viewer (src/scene3d.rs) renders via three-d, which needs an OpenGL
+# context — so we select the glow renderer in NativeOptions. wgpu stays compiled
+# but unused.
+eframe = { version = "0.34.2", features = ["persistence", "glow"] }
 serde = { version = "1", features = ["derive"] }
 image = { version = "0.25.10", features = ["png", "jpeg", "gif", "bmp", "webp", "ico", "tiff", "hdr"] }
 rfd = "0.17.2"

@@ -92,6 +92,14 @@ fn main() -> eframe::Result {
             .with_min_inner_size([920.0, 460.0])
             .with_icon(load_app_icon()) // taskbar / title-bar icon
             .with_drag_and_drop(true),
+        // Use the OpenGL backend: the Pixal3D 3D viewer (src/scene3d.rs) renders
+        // with three-d into eframe's GL context. eframe 0.34 defaults to wgpu,
+        // which would silently drop the glow paint callback.
+        renderer: eframe::Renderer::Glow,
+        // Request a depth buffer: egui itself doesn't need one, but the 3D viewer
+        // does — without it three-d can't depth-test, so the model renders
+        // see-through (back faces show through the front) while orbiting.
+        depth_buffer: 24,
         ..Default::default()
     };
 
