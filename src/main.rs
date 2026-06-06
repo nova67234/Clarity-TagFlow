@@ -53,6 +53,7 @@ mod ai_orb;
 mod avif;
 mod backup;
 mod civitai;
+mod depth;
 mod emoji;
 mod favorites;
 mod image_cache;

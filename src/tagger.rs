@@ -204,8 +204,10 @@ pub fn run_job(
 // ---------------------------------------------------------------------------
 
 /// Decode an image and flatten any alpha onto a white background (all three
-/// taggers were trained with white padding / `force_background='white'`).
-fn load_rgb_on_white(path: &Path) -> Result<RgbImage, String> {
+/// taggers were trained with white padding / `force_background='white'`). Shared
+/// with the depth estimator (`src/depth.rs`) so Spatial Scene depth works on the
+/// same broad format range (AVIF/RAW/HDR included).
+pub(crate) fn load_rgb_on_white(path: &Path) -> Result<RgbImage, String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())

@@ -593,7 +593,13 @@ fn start_tag_job(state: &mut TagManagerState, current_image: Option<&Path>) {
 
     let image = image.to_path_buf();
     let threshold = state.settings.default_threshold;
-    let kind = info.kind();
+    // Only tagger models reach here (the dropdown lists `installed_models()`,
+    // which excludes non-taggers like the depth estimator).
+    let Some(kind) = info.kind() else {
+        state.status_msg = "That model can't be used for tagging".to_string();
+        state.status_is_error = true;
+        return;
+    };
     let folder = info.folder().to_string();
 
     let (tx, rx) = std::sync::mpsc::channel();

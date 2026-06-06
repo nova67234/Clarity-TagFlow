@@ -16,7 +16,11 @@
 // feel native there.
 
 use eframe::egui::{self, Color32, CornerRadius, Key, Pos2, Rect, Sense, Stroke, Vec2};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 
 // Matches the Java ImageCanvas limits.
 const MIN_SCALE: f32 = 0.05;
@@ -47,6 +51,77 @@ pub struct CropFraction {
     pub h: f32,
 }
 
+// --- Spatial Scene (Apple-style depth parallax) ---------------------------
+
+/// Model folder for the depth estimator (see the catalog in `ai_models.rs`).
+const DEPTH_FOLDER: &str = "depth-anything-v2-base-onnx";
+/// Shown when the depth model hasn't been downloaded yet.
+const MODEL_MISSING_MSG: &str =
+    "Depth model not installed — open the AI panel → Get Models → Depth (~27 MB).";
+/// Max screen-space shift (px) of the most-displaced depth layer. Kept small so
+/// the single-mesh warp reads as gentle depth rather than a stretchy rubber sheet
+/// (this mesh warps the texture; it can't move rigid layers like Apple's does).
+const PARALLAX_PX: f32 = 10.0;
+/// Parallax mesh grid resolution (cells); vertices are `(GX+1)*(GY+1)`.
+const GX: usize = 96;
+const GY: usize = 64;
+/// Box-blur passes over the coarse depth-layer grid. Spreads the displacement
+/// gradient across many cells so the subject moves more as a unit and silhouettes
+/// shear softly instead of stretching — the main lever against the "stretchy" look.
+const BLUR_PASSES: usize = 6;
+
+/// State for the Spatial Scene depth-parallax viewer mode. The depth map for the
+/// current image is computed on a background thread, cached per path, and turned
+/// into a per-vertex displaced mesh that follows the mouse (with an idle sway).
+pub struct SpatialScene {
+    /// Whether the parallax mode is currently engaged.
+    pub active: bool,
+    /// Per-image depth cache so re-entry / revisits are instant.
+    cache: HashMap<PathBuf, Arc<crate::depth::DepthMap>>,
+    /// In-flight depth job result for the current image.
+    rx: Option<Receiver<Result<crate::depth::DepthMap, String>>>,
+    /// Generation counter — bumped when the selection changes so a stale
+    /// finishing thread is ignored (mirrors `right_details.rs`).
+    generation: Arc<AtomicUsize>,
+    /// Last depth/inference error, shown as a banner with a flat-image fallback.
+    error: Option<String>,
+    /// Transient notice over the normal viewer (text, time-to-hide), e.g. when
+    /// the model isn't installed.
+    notice: Option<(String, f64)>,
+    /// Spinner shown while a depth map is being generated.
+    orb: crate::ai_orb::AiOrb,
+    /// Exp-smoothed parallax offset in [-1,1] per axis (mouse or idle sway).
+    smoothed: Vec2,
+    /// Cached per-vertex depth "layer" `(d-0.5)` for the current image, so the
+    /// per-frame mesh rebuild doesn't re-sample the depth map 6k× a frame.
+    layers: Vec<f32>,
+    layers_key: Option<PathBuf>,
+}
+
+impl Default for SpatialScene {
+    fn default() -> Self {
+        Self {
+            active: false,
+            cache: HashMap::new(),
+            rx: None,
+            generation: Arc::new(AtomicUsize::new(0)),
+            error: None,
+            notice: None,
+            orb: crate::ai_orb::AiOrb::default(),
+            smoothed: Vec2::ZERO,
+            layers: Vec::new(),
+            layers_key: None,
+        }
+    }
+}
+
+/// A slow Lissajous drift used when the mouse is idle, so the scene keeps a
+/// gentle "living photo" motion.
+fn idle_sway(now: f64) -> Vec2 {
+    let t = now as f32;
+    Vec2::new((t * 0.45).sin() * 0.35, (t * 0.32).cos() * 0.25)
+}
+
 pub struct ZoomState {
     /// Pixels per image pixel. 1.0 == 100% (1:1).
     scale: f32,
@@ -67,6 +142,8 @@ pub struct ZoomState {
     crop_start: Option<Pos2>,
     /// Current crop selection rectangle (screen coords).
     crop_rect: Option<Rect>,
+    /// Apple-style depth-parallax "Spatial Scene" mode.
+    spatial: SpatialScene,
 }
 
 /// The scale at which the image exactly fits inside the viewport (the larger of
@@ -93,6 +170,7 @@ impl Default for ZoomState {
             crop_mode: false,
             crop_start: None,
             crop_rect: None,
+            spatial: SpatialScene::default(),
         }
     }
 }
@@ -119,6 +197,14 @@ impl ZoomState {
             self.crop_mode = false;
             self.crop_start = None;
             self.crop_rect = None;
+            // Spatial Scene: drop any in-flight depth job for the previous image
+            // and clear its per-image render state. The mode itself persists; the
+            // new image's depth is recomputed (or served instantly from cache).
+            self.spatial.generation.fetch_add(1, Ordering::SeqCst);
+            self.spatial.rx = None;
+            self.spatial.error = None;
+            self.spatial.layers.clear();
+            self.spatial.layers_key = None;
         }
 
         let viewport = ui.available_rect_before_wrap();
@@ -137,6 +223,12 @@ impl ZoomState {
         let resp = ui.interact(viewport, ui.id().with("zoom_viewer"), Sense::click_and_drag());
         let now = ui.input(|i| i.time);
         let pointer = resp.hover_pos();
+
+        // --- Spatial Scene: depth-parallax mode takes over the viewer entirely
+        //     (no zoom/pan/crop while engaged). ---
+        if self.spatial.active {
+            return self.show_spatial(ui, &resp, viewport, img, tex, path, is_favorite, now, pointer);
+        }
 
         // --- Crop tool: drag out a selection, then hand the fractional rect back ---
         if self.crop_mode {
@@ -213,10 +305,11 @@ impl ZoomState {
             });
         }
 
-        // --- Right-click menu: favorite the image, copy it, or start a crop ---
+        // --- Right-click menu: favorite the image, copy it, crop, or go spatial ---
         let mut want_favorite = false;
         let mut want_crop = false;
         let mut want_copy = false;
+        let mut want_spatial = false;
         resp.context_menu(|ui| {
             let fav_label = if is_favorite { "Remove favorite" } else { "Favorite" };
             if ui.button(fav_label).clicked() {
@@ -231,6 +324,10 @@ impl ZoomState {
                 want_crop = true;
                 ui.close();
             }
+            if ui.button("Spatial Scene").clicked() {
+                want_spatial = true;
+                ui.close();
+            }
         });
         let mut action = ViewerAction::None;
         if want_favorite {
@@ -242,6 +339,8 @@ impl ZoomState {
             self.crop_mode = true;
             self.crop_start = None;
             self.crop_rect = None;
+        } else if want_spatial {
+            self.enter_spatial(now);
         }
 
         // --- Paint ---
@@ -251,6 +350,16 @@ impl ZoomState {
         if now < self.overlay_until {
             self.paint_overlay(ui, viewport);
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
+        }
+
+        // --- Transient Spatial Scene notice (e.g. depth model not installed) ---
+        if let Some((msg, until)) = self.spatial.notice.clone() {
+            if now < until {
+                self.paint_banner(ui, viewport, &msg);
+                ui.ctx().request_repaint();
+            } else {
+                self.spatial.notice = None;
+            }
         }
 
         action
@@ -428,6 +537,309 @@ impl ZoomState {
         let center = Pos2::new(viewport.center().x, viewport.max.y - size.y * 0.5 - 14.0);
         let bg = Rect::from_center_size(center, size);
         painter.rect_filled(bg, CornerRadius::same(8), Color32::from_black_alpha(170));
+        painter.galley(bg.min + pad, galley, Color32::from_gray(235));
+    }
+
+    // --- Spatial Scene (depth parallax) ----------------------------------
+
+    /// Engage Spatial Scene for the current image. If the depth model isn't
+    /// installed, shows a transient notice instead of entering. The depth job is
+    /// kicked lazily by `show_spatial` once the mode is active.
+    fn enter_spatial(&mut self, now: f64) {
+        if crate::tagger::resolve(DEPTH_FOLDER, "model.onnx").is_none() {
+            self.spatial.notice = Some((MODEL_MISSING_MSG.to_string(), now + 6.0));
+            return;
+        }
+        self.spatial.active = true;
+        self.spatial.error = None;
+        self.crop_mode = false;
+        self.fit_to_view();
+    }
+
+    /// Drive the Spatial Scene mode for one frame: handle exit, poll/kick the
+    /// depth job, and paint either the parallax mesh (ready) or a flat image with
+    /// a spinner/error banner. Always repaints so parallax + idle sway stay live.
+    #[allow(clippy::too_many_arguments)]
+    fn show_spatial(
+        &mut self,
+        ui: &mut egui::Ui,
+        resp: &egui::Response,
+        viewport: Rect,
+        img: Vec2,
+        tex: &egui::TextureHandle,
+        path: &Path,
+        is_favorite: bool,
+        now: f64,
+        pointer: Option<Pos2>,
+    ) -> ViewerAction {
+        // Esc leaves the mode.
+        if ui.input(|i| i.key_pressed(Key::Escape)) {
+            self.spatial.active = false;
+            return ViewerAction::None;
+        }
+
+        // Right-click menu: exit, plus the usual favorite / copy.
+        let mut want_exit = false;
+        let mut want_favorite = false;
+        let mut want_copy = false;
+        resp.context_menu(|ui| {
+            if ui.button("Exit Spatial Scene").clicked() {
+                want_exit = true;
+                ui.close();
+            }
+            let fav_label = if is_favorite { "Remove favorite" } else { "Favorite" };
+            if ui.button(fav_label).clicked() {
+                want_favorite = true;
+                ui.close();
+            }
+            if ui.button("Copy image").clicked() {
+                want_copy = true;
+                ui.close();
+            }
+        });
+        if want_exit {
+            self.spatial.active = false;
+            return ViewerAction::None;
+        }
+
+        // Keep animating for smooth parallax / idle sway / the loading spinner.
+        ui.ctx().request_repaint();
+
+        // Poll the in-flight depth job.
+        if let Some(rx) = &self.spatial.rx {
+            match rx.try_recv() {
+                Ok(Ok(map)) => {
+                    self.spatial.cache.insert(path.to_path_buf(), Arc::new(map));
+                    self.spatial.rx = None;
+                }
+                Ok(Err(e)) => {
+                    self.spatial.error = Some(e);
+                    self.spatial.rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.spatial.rx = None;
+                    if self.spatial.error.is_none() {
+                        self.spatial.error = Some("Depth job ended unexpectedly".to_string());
+                    }
+                }
+            }
+        }
+
+        // Serve from cache, or start a job if we have neither a result nor an error.
+        let depth = self.spatial.cache.get(path).cloned();
+        if depth.is_none() && self.spatial.rx.is_none() && self.spatial.error.is_none() {
+            self.spawn_depth_job(ui, path);
+        }
+
+        match depth {
+            Some(map) => {
+                let m = self.spatial_offset(ui, viewport, img, pointer, now);
+                self.paint_spatial(ui, viewport, img, tex, map.as_ref(), m);
+            }
+            None => {
+                // Still generating, or it failed — show the flat image underneath.
+                self.paint_image(ui, viewport, img, tex);
+                if let Some(err) = self.spatial.error.clone() {
+                    self.paint_banner(ui, viewport, &format!("Depth unavailable — {err}"));
+                } else {
+                    self.paint_loading(ui, viewport);
+                }
+            }
+        }
+
+        if want_favorite {
+            ViewerAction::ToggleFavorite
+        } else if want_copy {
+            ViewerAction::CopyImage
+        } else {
+            ViewerAction::None
+        }
+    }
+
+    /// Spawn the background depth-estimation thread for `path` (generation-guarded
+    /// so a stale finish is ignored). Mirrors the tag-job pattern.
+    fn spawn_depth_job(&mut self, ui: &egui::Ui, path: &Path) {
+        let Some(model) = crate::tagger::resolve(DEPTH_FOLDER, "model.onnx") else {
+            // Model was removed after entering — back out with a notice.
+            self.spatial.active = false;
+            self.spatial.notice =
+                Some((MODEL_MISSING_MSG.to_string(), ui.input(|i| i.time) + 6.0));
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.spatial.rx = Some(rx);
+        let generation = self.spatial.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation_handle = Arc::clone(&self.spatial.generation);
+        let img_path = path.to_path_buf();
+        let ctx = ui.ctx().clone();
+        std::thread::spawn(move || {
+            if generation_handle.load(Ordering::SeqCst) != generation {
+                return; // selection already moved on
+            }
+            let result = crate::depth::run_depth_job(model, img_path);
+            if generation_handle.load(Ordering::SeqCst) == generation && tx.send(result).is_ok() {
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Compute the smoothed parallax offset in [-1,1] per axis. While the mouse is
+    /// over the image it follows the cursor (relative to the image centre); when
+    /// the pointer leaves the image it eases into a gentle idle sway. (It does not
+    /// drift while the cursor rests on the image — that read as buggy.)
+    fn spatial_offset(
+        &mut self,
+        ui: &egui::Ui,
+        viewport: Rect,
+        img: Vec2,
+        pointer: Option<Pos2>,
+        now: f64,
+    ) -> Vec2 {
+        let rect = self.image_rect(viewport, img);
+        let center = rect.center();
+        let target = match pointer {
+            Some(p) => Vec2::new(
+                ((p.x - center.x) / (rect.width() * 0.5)).clamp(-1.0, 1.0),
+                ((p.y - center.y) / (rect.height() * 0.5)).clamp(-1.0, 1.0),
+            ),
+            None => idle_sway(now),
+        };
+
+        // Frame-rate-aware exponential smoothing toward the target.
+        let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.1);
+        let f = (dt * 60.0).min(1.0);
+        self.spatial.smoothed += (target - self.spatial.smoothed) * (0.12 * f);
+        self.spatial.smoothed
+    }
+
+    /// (Re)build the per-vertex depth-layer cache `(d - 0.5)` for the current
+    /// image, pinning the outer border ring to 0 so the image edges stay anchored
+    /// (no torn edges), then box-blurring the grid to soften silhouettes.
+    fn rebuild_layers(&mut self, depth: &crate::depth::DepthMap) {
+        let cols = GX + 1;
+        let mut layers = vec![0.0f32; cols * (GY + 1)];
+        for j in 0..=GY {
+            let v = j as f32 / GY as f32;
+            for i in 0..=GX {
+                let u = i as f32 / GX as f32;
+                layers[j * cols + i] = if i == 0 || i == GX || j == 0 || j == GY {
+                    0.0
+                } else {
+                    depth.sample(u, v) - 0.5
+                };
+            }
+        }
+        // Soften depth transitions so hard silhouettes shear gently rather than
+        // tearing. The border ring stays pinned (its neighbours pull toward 0).
+        for _ in 0..BLUR_PASSES {
+            let src = layers.clone();
+            for j in 1..GY {
+                for i in 1..GX {
+                    let mut s = 0.0;
+                    for dj in -1i32..=1 {
+                        for di in -1i32..=1 {
+                            let x = (i as i32 + di) as usize;
+                            let y = (j as i32 + dj) as usize;
+                            s += src[y * cols + x];
+                        }
+                    }
+                    layers[j * cols + i] = s / 9.0;
+                }
+            }
+        }
+        self.spatial.layers = layers;
+        self.spatial.layers_key = self.current.clone();
+    }
+
+    /// Paint the image as a depth-displaced parallax mesh. Near pixels (`layer`
+    /// > 0) and far pixels (`layer` < 0) shift in opposite directions about the
+    /// mid-plane, anchored so the scene doesn't drift, producing the "peek
+    /// around" depth effect as `m` (the smoothed mouse/sway offset) changes.
+    fn paint_spatial(
+        &mut self,
+        ui: &egui::Ui,
+        viewport: Rect,
+        img: Vec2,
+        tex: &egui::TextureHandle,
+        depth: &crate::depth::DepthMap,
+        m: Vec2,
+    ) {
+        let cols = GX + 1;
+        if self.spatial.layers_key.as_deref() != self.current.as_deref()
+            || self.spatial.layers.len() != cols * (GY + 1)
+        {
+            self.rebuild_layers(depth);
+        }
+
+        let rect = self.image_rect(viewport, img);
+        let mut mesh = egui::epaint::Mesh::with_texture(tex.id());
+        for j in 0..=GY {
+            let v = j as f32 / GY as f32;
+            for i in 0..=GX {
+                let u = i as f32 / GX as f32;
+                let base = Pos2::new(rect.min.x + u * rect.width(), rect.min.y + v * rect.height());
+                let layer = self.spatial.layers[j * cols + i];
+                let disp = Vec2::new(
+                    -m.x * layer * 2.0 * PARALLAX_PX,
+                    -m.y * layer * 2.0 * PARALLAX_PX,
+                );
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: base + disp,
+                    uv: Pos2::new(u, v),
+                    color: Color32::WHITE,
+                });
+            }
+        }
+        for j in 0..GY {
+            for i in 0..GX {
+                let a = (j * cols + i) as u32;
+                let b = a + 1;
+                let c = a + cols as u32;
+                let d = c + 1;
+                mesh.indices.extend_from_slice(&[a, b, c, b, d, c]);
+            }
+        }
+        ui.painter().with_clip_rect(viewport).add(egui::Shape::mesh(mesh));
+    }
+
+    /// Dim the viewport and show the breathing orb + "Generating depth…" caption
+    /// while the depth map is computed.
+    fn paint_loading(&mut self, ui: &mut egui::Ui, viewport: Rect) {
+        ui.painter()
+            .with_clip_rect(viewport)
+            .rect_filled(viewport, CornerRadius::same(22), Color32::from_black_alpha(90));
+
+        let orb_size = 72.0;
+        let orb_rect = Rect::from_center_size(viewport.center(), Vec2::splat(orb_size));
+        {
+            let orb = &mut self.spatial.orb;
+            orb.set_state(crate::ai_orb::OrbState::Thinking);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(orb_rect), |ui| {
+                orb.show(ui, orb_size, None);
+            });
+        }
+
+        let painter = ui.painter().with_clip_rect(viewport);
+        let font = egui::FontId::proportional(13.0);
+        let galley = painter.layout_no_wrap("Generating depth…".to_owned(), font, Color32::from_gray(235));
+        let pad = egui::vec2(10.0, 6.0);
+        let center = Pos2::new(viewport.center().x, viewport.center().y + orb_size * 0.5 + 18.0);
+        let bg = Rect::from_center_size(center, galley.size() + pad * 2.0);
+        painter.rect_filled(bg, CornerRadius::same(8), Color32::from_black_alpha(170));
+        painter.galley(bg.min + pad, galley, Color32::from_gray(235));
+    }
+
+    /// A small top-of-viewport banner (shared by the model-missing notice and the
+    /// depth-failure fallback).
+    fn paint_banner(&self, ui: &egui::Ui, viewport: Rect, text: &str) {
+        let painter = ui.painter().with_clip_rect(viewport);
+        let font = egui::FontId::proportional(13.0);
+        let galley = painter.layout_no_wrap(text.to_owned(), font, Color32::from_gray(235));
+        let pad = egui::vec2(12.0, 7.0);
+        let center = Pos2::new(viewport.center().x, viewport.min.y + galley.size().y * 0.5 + 16.0);
+        let bg = Rect::from_center_size(center, galley.size() + pad * 2.0);
+        painter.rect_filled(bg, CornerRadius::same(8), Color32::from_black_alpha(190));
         painter.galley(bg.min + pad, galley, Color32::from_gray(235));
     }
 }
