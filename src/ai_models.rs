@@ -441,6 +441,57 @@ impl ModelManager {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Headless download — lets the Spatial Scene viewer fetch the depth model on
+// first use, without opening the Model Manager dropdown. Reuses the same
+// streaming downloader (`download_all`) and `Progress` as the manager.
+// ---------------------------------------------------------------------------
+
+/// A pollable handle to a background model download started by
+/// [`start_model_download`]. Poll it each frame; it never blocks.
+pub struct DownloadHandle {
+    progress: Arc<Progress>,
+}
+
+impl DownloadHandle {
+    /// Overall progress across all of the model's files, 0..100.
+    pub fn pct(&self) -> u32 {
+        self.progress.pct.load(Relaxed)
+    }
+    /// True once the download has finished (successfully or not).
+    pub fn done(&self) -> bool {
+        self.progress.done.load(Relaxed)
+    }
+    /// True if it finished successfully (all files present).
+    pub fn ok(&self) -> bool {
+        self.progress.ok.load(Relaxed)
+    }
+    /// The error message if it failed.
+    pub fn error(&self) -> Option<String> {
+        self.progress.err.lock().unwrap().clone()
+    }
+}
+
+/// Start downloading the catalog model in `folder` on a background thread,
+/// returning a handle to poll. `None` if no catalog entry has that folder.
+pub fn start_model_download(folder: &str) -> Option<DownloadHandle> {
+    let info = CATALOG.iter().find(|m| m.folder == folder)?;
+    let shared = Arc::new(Progress::default());
+    shared.set_label("Connecting…".to_string());
+    let files: Vec<(String, String)> =
+        info.files.iter().map(|(n, u)| (n.to_string(), u.to_string())).collect();
+    let folder = info.folder.to_string();
+    let worker = shared.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = download_all(&files, &folder, &worker) {
+            worker.finish_err(e);
+        } else {
+            worker.finish_ok();
+        }
+    });
+    Some(DownloadHandle { progress: shared })
+}
+
 /// A small rounded status pill: translucent tinted fill with matching text,
 /// optionally preceded by a (tinted) icon.
 fn badge(ui: &mut egui::Ui, color: Color32, text: &str, icon: Option<egui::ImageSource<'_>>) {

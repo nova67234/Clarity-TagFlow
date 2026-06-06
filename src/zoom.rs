@@ -85,8 +85,11 @@ pub struct SpatialScene {
     generation: Arc<AtomicUsize>,
     /// Last depth/inference error, shown as a banner with a flat-image fallback.
     error: Option<String>,
-    /// Transient notice over the normal viewer (text, time-to-hide), e.g. when
-    /// the model isn't installed.
+    /// In-flight depth-model download (kicked on first use when the model isn't
+    /// installed). While set, the viewer shows download progress instead of depth.
+    download: Option<crate::ai_models::DownloadHandle>,
+    /// Transient notice over the normal viewer (text, time-to-hide), e.g. as a
+    /// fallback if the model can't be located or downloaded.
     notice: Option<(String, f64)>,
     /// Spinner shown while a depth map is being generated.
     orb: crate::ai_orb::AiOrb,
@@ -109,6 +112,7 @@ impl Default for SpatialScene {
             notice: None,
             orb: crate::ai_orb::AiOrb::default(),
             smoothed: Vec2::ZERO,
+            download: None,
             layers: Vec::new(),
             layers_key: None,
         }
@@ -543,17 +547,23 @@ impl ZoomState {
     // --- Spatial Scene (depth parallax) ----------------------------------
 
     /// Engage Spatial Scene for the current image. If the depth model isn't
-    /// installed, shows a transient notice instead of entering. The depth job is
-    /// kicked lazily by `show_spatial` once the mode is active.
+    /// installed yet, this auto-starts its download (shown with progress) so the
+    /// user never hits a dead-end; the depth job kicks off automatically once the
+    /// model lands. The depth job itself is started lazily by `show_spatial`.
     fn enter_spatial(&mut self, now: f64) {
-        if crate::tagger::resolve(DEPTH_FOLDER, "model.onnx").is_none() {
-            self.spatial.notice = Some((MODEL_MISSING_MSG.to_string(), now + 6.0));
-            return;
-        }
         self.spatial.active = true;
         self.spatial.error = None;
         self.crop_mode = false;
         self.fit_to_view();
+
+        if crate::tagger::resolve(DEPTH_FOLDER, "model.onnx").is_none() {
+            self.spatial.download = crate::ai_models::start_model_download(DEPTH_FOLDER);
+            if self.spatial.download.is_none() {
+                // Catalog somehow lacks the entry — fall back to a notice.
+                self.spatial.notice = Some((MODEL_MISSING_MSG.to_string(), now + 6.0));
+                self.spatial.active = false;
+            }
+        }
     }
 
     /// Drive the Spatial Scene mode for one frame: handle exit, poll/kick the
@@ -604,6 +614,30 @@ impl ZoomState {
 
         // Keep animating for smooth parallax / idle sway / the loading spinner.
         ui.ctx().request_repaint();
+
+        // --- Model download phase (first use): show progress until it lands. ---
+        let dl = self.spatial.download.as_ref().map(|d| (d.done(), d.ok(), d.pct(), d.error()));
+        if let Some((done, ok, pct, err)) = dl {
+            if done {
+                self.spatial.download = None;
+                if !ok {
+                    self.spatial.error =
+                        Some(format!("model download failed — {}", err.unwrap_or_else(|| "unknown".into())));
+                }
+                // On success, fall through — the depth job starts below now that
+                // the model is on disk.
+            } else {
+                self.paint_image(ui, viewport, img, tex);
+                self.paint_download(ui, viewport, pct);
+                return if want_favorite {
+                    ViewerAction::ToggleFavorite
+                } else if want_copy {
+                    ViewerAction::CopyImage
+                } else {
+                    ViewerAction::None
+                };
+            }
+        }
 
         // Poll the in-flight depth job.
         if let Some(rx) = &self.spatial.rx {
@@ -828,6 +862,46 @@ impl ZoomState {
         let bg = Rect::from_center_size(center, galley.size() + pad * 2.0);
         painter.rect_filled(bg, CornerRadius::same(8), Color32::from_black_alpha(170));
         painter.galley(bg.min + pad, galley, Color32::from_gray(235));
+    }
+
+    /// While the depth model downloads on first use: dim the viewport, show the
+    /// orb, a caption with the percentage, and a progress bar.
+    fn paint_download(&mut self, ui: &mut egui::Ui, viewport: Rect, pct: u32) {
+        ui.painter()
+            .with_clip_rect(viewport)
+            .rect_filled(viewport, CornerRadius::same(22), Color32::from_black_alpha(110));
+
+        let orb_size = 72.0;
+        let orb_center = Pos2::new(viewport.center().x, viewport.center().y - 18.0);
+        let orb_rect = Rect::from_center_size(orb_center, Vec2::splat(orb_size));
+        {
+            let orb = &mut self.spatial.orb;
+            orb.set_state(crate::ai_orb::OrbState::Thinking);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(orb_rect), |ui| {
+                orb.show(ui, orb_size, None);
+            });
+        }
+
+        let painter = ui.painter().with_clip_rect(viewport);
+        let font = egui::FontId::proportional(13.0);
+        let caption = format!("Downloading depth model…  {pct}%");
+        let galley = painter.layout_no_wrap(caption, font, Color32::from_gray(235));
+        let cap_y = orb_center.y + orb_size * 0.5 + 4.0;
+        let pad = egui::vec2(10.0, 6.0);
+        let bg = Rect::from_center_size(Pos2::new(viewport.center().x, cap_y), galley.size() + pad * 2.0);
+        painter.rect_filled(bg, CornerRadius::same(8), Color32::from_black_alpha(170));
+        painter.galley(bg.min + pad, galley, Color32::from_gray(235));
+
+        // Progress bar under the caption.
+        let (bar_w, bar_h) = (240.0, 6.0);
+        let track = Rect::from_center_size(
+            Pos2::new(viewport.center().x, bg.max.y + 12.0),
+            Vec2::new(bar_w, bar_h),
+        );
+        painter.rect_filled(track, CornerRadius::same(3), Color32::from_white_alpha(38));
+        let fill_w = bar_w * (pct as f32 / 100.0).clamp(0.0, 1.0);
+        let fill = Rect::from_min_size(track.min, Vec2::new(fill_w, bar_h));
+        painter.rect_filled(fill, CornerRadius::same(3), Color32::from_rgb(96, 165, 250));
     }
 
     /// A small top-of-viewport banner (shared by the model-missing notice and the
