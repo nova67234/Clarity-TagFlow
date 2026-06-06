@@ -77,7 +77,7 @@ impl Default for Pixal3DState {
             tex_steps: 12,
             decimation: 50_000,
             texture_size: 1024,
-            hf_token: String::new(),
+            hf_token: load_hf_token(),
             low_vram: true,
             show_gen_settings: true,
             show_glb_settings: false,
@@ -158,12 +158,17 @@ pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&
     // --- HF token (for the gated background-removal model RMBG-2.0). ---
     ui.horizontal(|ui| {
         ui.label(RichText::new("HF token").color(MUTED()).size(11.0));
-        ui.add(
+        let resp = ui.add(
             egui::TextEdit::singleline(&mut state.hf_token)
                 .password(true)
-                .hint_text("for gated models (RMBG-2.0)")
+                .hint_text("for gated models (DINOv3)")
                 .desired_width(f32::INFINITY),
         );
+        // Persist (encrypted) once the user finishes editing, so it survives
+        // restarts and doesn't have to be pasted every session.
+        if resp.lost_focus() {
+            save_hf_token(&state.hf_token);
+        }
     });
 
     ui.add_space(8.0);
@@ -362,6 +367,10 @@ fn start_generate(state: &mut Pixal3DState, ctx: &egui::Context, current_image: 
         let n = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0);
         state.seed = (n.unsigned_abs() % 1_000_000) as i64;
     }
+    // Persist the token (encrypted) whenever a run starts, in case it was typed
+    // and the user hit Generate without the field losing focus first.
+    save_hf_token(&state.hf_token);
+
     let seed = state.seed;
     let resolution = state.resolution;
     let low_vram = state.low_vram;
@@ -668,6 +677,28 @@ fn run_setup(tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context) -> bool {
         send(format!("WARNING: could not create import aliases: {e}"));
     }
 
+    // GLB export needs o_voxel.postprocess (TRELLIS.2's texture-baking GLB
+    // exporter), which the prebuilt o_voxel *kernel* wheel doesn't ship, plus
+    // nvdiffrast (its differentiable rasterizer). nvdiffrast isn't on PyPI; its
+    // build needs `--no-build-isolation` to see the installed torch, and it
+    // JIT-compiles a CUDA plugin on first use (needs the CUDA Toolkit + MSVC,
+    // like NATTEN), so it's best-effort. `--no-deps` keeps pip from swapping the
+    // pinned cu128 torch. Without these, generation runs but fails at the final
+    // "Extracting GLB" step.
+    step(
+        "[5/6] Installing nvdiffrast (GLB export — compiles on first use, needs CUDA Toolkit + MSVC)",
+        &[
+            "-m", "pip", "install", "--no-deps", "--no-build-isolation",
+            "https://github.com/NVlabs/nvdiffrast/archive/refs/heads/main.zip",
+        ],
+        &[],
+        false,
+    );
+    send("== Adding o_voxel.postprocess (the GLB exporter) to the kernel package".into());
+    if let Err(e) = vendor_o_voxel_postprocess(&base, tx, ctx) {
+        send(format!("WARNING: could not add o_voxel.postprocess: {e}"));
+    }
+
     // NATTEN compiles from source (CUDA Toolkit + MSVC) — best-effort, and only
     // needed if a neighborhood-attention backend is selected (we use sdpa).
     step("[5/6] Installing build tools (cmake, ninja)", &["-m", "pip", "install", "cmake", "ninja"], &[], false);
@@ -845,6 +876,39 @@ fn write_kernel_shims(base: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Vendor TRELLIS.2's `o_voxel.postprocess` (the GLB exporter, `to_glb`) onto the
+/// installed `o_voxel_vb_ap` kernel package, which ships only the CUDA kernels
+/// (`convert` / `io` / `serialize`) and omits the pure-Python postprocess module.
+/// Drops `postprocess.py` into the package and rewrites its `__init__.py` to
+/// expose it, so `import o_voxel; o_voxel.postprocess.to_glb(...)` resolves.
+fn vendor_o_voxel_postprocess(base: &Path, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context) -> Result<(), String> {
+    let site = if cfg!(windows) {
+        base.join("python").join("Lib").join("site-packages")
+    } else {
+        base.join("python").join("lib").join("python3.12").join("site-packages")
+    };
+    let pkg = site.join("o_voxel_vb_ap");
+    if !pkg.exists() {
+        return Err("o_voxel_vb_ap is not installed".into());
+    }
+
+    // postprocess.py from TRELLIS.2 (the upstream o_voxel source).
+    const PP_URL: &str =
+        "https://raw.githubusercontent.com/microsoft/TRELLIS.2/main/o-voxel/o_voxel/postprocess.py";
+    download(PP_URL, &pkg.join("postprocess.py"), tx, ctx)?;
+
+    // Rewrite __init__.py so `import o_voxel` also imports postprocess. Guard that
+    // import: a missing/uncompilable nvdiffrast must not break the (working)
+    // sampling stages — it then fails later at to_glb with a clear nvdiffrast
+    // error instead of crashing the whole run at `import o_voxel`.
+    let init_body = "from . import (\n    convert,\n    io,\n    serialize,\n)\n\
+        try:\n    from . import postprocess  # GLB exporter (needs nvdiffrast)\n\
+        except Exception as _e:\n    import sys as _sys\n\
+        \x20\x20\x20\x20print('[Pixal3D] o_voxel.postprocess unavailable: %r' % (_e,), file=_sys.stderr)\n";
+    std::fs::write(pkg.join("__init__.py"), init_body).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Extract a zip archive into `dest_dir` using the `zip` crate.
 fn unzip(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
     let file = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
@@ -864,6 +928,38 @@ fn unzip(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// --- Hugging Face token persistence ----------------------------------------
+//
+// Stored encrypted at rest (DPAPI on Windows, via src/secret.rs — same scheme as
+// the Gelbooru API key) so it isn't kept as plaintext and survives restarts.
+
+fn hf_token_path() -> std::path::PathBuf {
+    crate::tagger::models_root().join("pixal3d").join("hf_token.dat")
+}
+
+/// Load the saved HF token (decrypted). Returns "" if none is stored or it was
+/// protected by a different user/machine.
+fn load_hf_token() -> String {
+    std::fs::read_to_string(hf_token_path())
+        .ok()
+        .map(|s| crate::secret::unprotect(s.trim()))
+        .unwrap_or_default()
+}
+
+/// Save the HF token, encrypted. An empty token removes the stored file.
+fn save_hf_token(token: &str) {
+    let path = hf_token_path();
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, crate::secret::protect(trimmed));
 }
 
 /// On Windows, don't pop a console window for each spawned child process.
