@@ -42,6 +42,7 @@ pub fn show(
     video_thumbs: &mut crate::video::VideoThumbs,
     favorites: &mut crate::favorites::Favorites,
     thumb_max_h: f32,
+    media_filter: &mut crate::left_panel_settings::MediaFilter,
 ) -> bool {
     let mut search_changed = false;
 
@@ -58,6 +59,11 @@ pub fn show(
                 // the card shrinks to its content and looks tiny when the list is empty.
                 ui.set_min_height(ui.available_height());
 
+                // Top of the card's content; the Filter Settings popup is anchored to
+                // this (minus the card's 12px inner margin) so it lines up with the
+                // panel's top edge rather than dropping from the lower gear row.
+                let card_top = ui.min_rect().top() - 12.0;
+
                 // --- Filter bar: search fills the row, gear embedded inside ---
                 let search_frame = egui::Frame::default()
                     .fill(ui.visuals().extreme_bg_color)
@@ -65,15 +71,16 @@ pub fn show(
                     .corner_radius(CornerRadius::same(16))
                     .inner_margin(Margin::symmetric(10, 3));
 
+                let mut gear_resp = None;
                 search_frame.show(ui, |ui| {
                     // 1. WRAP in horizontal to restrict the height to a single line!
                     ui.horizontal(|ui| {
                         // 2. Lay out from right-to-left inside that single line
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
 
-                            // Draw the button on the far right
+                            // Draw the button on the far right — opens Filter Settings.
                             let settings_svg = egui::include_image!("../icons/settings.svg");
-                            svg_button(ui, settings_svg, "Filter Settings", 20.0, MUTED());
+                            gear_resp = Some(svg_button(ui, settings_svg, "Filter Settings", 20.0, MUTED()));
 
                             // The text field consumes exactly the remaining space to the left
                             let resp = ui.add(
@@ -91,6 +98,34 @@ pub fn show(
                         });
                     });
                 });
+
+                // Filter Settings: a floating popup anchored to the gear (a port of
+                // the Java SettingsLeftPanel). `from_toggle_button_response` opens/
+                // closes it on each gear click; it also dismisses on a click outside.
+                // `RIGHT_START` opens it to the right of the gear so it sits next to
+                // the left browser rather than dropping down over the thumbnail list.
+                // The app's card frame gives it the same rounded (22px) panel look.
+                if let Some(gear) = gear_resp {
+                    // Anchor to a rect at the gear's right edge but lifted to the
+                    // panel's top, so the popup opens level with the left browser.
+                    let gr = gear.rect;
+                    let anchor = egui::Rect::from_min_max(
+                        egui::pos2(gr.left(), card_top),
+                        egui::pos2(gr.right(), card_top),
+                    );
+                    egui::Popup::from_toggle_button_response(&gear)
+                        .anchor(anchor)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .align(egui::RectAlign::RIGHT_START)
+                        // Push it clear of the gear/panel edge so it sits in the
+                        // gutter beside the left browser rather than overlapping it.
+                        .gap(34.0)
+                        .frame(crate::card_frame(22))
+                        .width(232.0)
+                        .show(|ui| {
+                            crate::left_panel_settings::panel(ui, media_filter);
+                        });
+                }
 
                 ui.add_space(6.0);
 
@@ -319,8 +354,13 @@ fn draw_tile(
     }
 
     if is_selected {
-        // Pink outline under Aurora to match its theme; grey elsewhere.
-        let sel_color = crate::theme::icon_tint(egui::Color32::GRAY);
+        // Blue outline in the dark themes (Dark / Space / Glass); pink under Aurora
+        // to match its warm glow; grey under Light.
+        let sel_color = if crate::theme::is_light() {
+            crate::theme::icon_tint(egui::Color32::GRAY)
+        } else {
+            crate::theme::ACCENT1()
+        };
         ui.painter().rect_stroke(
             rect,
             radius,

@@ -249,7 +249,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                             egui::RichText::new(format!("{pct}%")).color(pct_color).size(12.0).strong(),
                         );
                     }
-                    download_indicator(ui, state.running);
+                    download_indicator(ui, state.running, state.status == "Done");
                     if !state.status.is_empty() {
                         ui.label(egui::RichText::new(&state.status).color(MUTED()).size(11.0));
                     }
@@ -577,11 +577,21 @@ fn field_label(ui: &mut egui::Ui, label: &str) {
 /// wrapped in an animated blue ring while `running`. When idle it's just the muted
 /// arrow. The ring is a rotating arc (a spinner), so it reads as "working" even at
 /// 0% — the exact progress is shown by the percentage label beside it.
-fn download_indicator(ui: &mut egui::Ui, running: bool) {
+fn download_indicator(ui: &mut egui::Ui, running: bool, done: bool) {
     let size = 20.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     let painter = ui.painter().clone();
     let center = rect.center();
+
+    // Finished (and not mid-run): a green check-circle in place of the download
+    // glyph, signalling the run completed successfully.
+    if done && !running {
+        let green = egui::Color32::from_rgb(80, 200, 120);
+        egui::Image::new(egui::include_image!("../icons/check_circle.svg"))
+            .tint(green)
+            .paint_at(ui, rect);
+        return;
+    }
 
     if running {
         let radius = size * 0.5 - 1.0;

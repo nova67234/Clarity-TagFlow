@@ -4,6 +4,7 @@
 
 use eframe::egui;
 
+use crate::left_panel_settings::MediaFilter;
 use crate::theme::{Backdrop, Theme, EDGE, FIELD, MUTED, PANEL, TEXT};
 
 /// Key under which the settings are saved in eframe's persistent storage.
@@ -63,6 +64,14 @@ pub struct Settings {
     /// Loop videos: restart playback from the beginning when a video reaches its
     /// end. Read by the embedded video player when a clip starts.
     pub loop_video: bool,
+    /// Show the live CPU / RAM graphs in the top bar. Off gives a cleaner bar (and
+    /// skips the periodic system sampling).
+    pub show_stats: bool,
+    /// Which media type the browser is narrowed to (Filter tab). Not persisted —
+    /// resets to `All` each launch, matching the Java filter dialog, so a stored
+    /// "Favorites" can't make the browser look empty after a restart.
+    #[serde(skip)]
+    pub media_filter: MediaFilter,
 }
 
 impl Default for Settings {
@@ -82,6 +91,8 @@ impl Default for Settings {
             glass_bg: [20, 22, 34],
             glass_backdrop: Backdrop::default(),
             loop_video: false,
+            show_stats: true,
+            media_filter: MediaFilter::default(),
         }
     }
 }
@@ -121,10 +132,20 @@ pub fn show(ctx: &egui::Context, settings: &mut Settings) {
             });
             ui.add_space(8.0);
 
-            match settings.tab {
-                SettingsTab::General => general_tab(ui, settings),
-                SettingsTab::Appearance => appearance_tab(ui, settings),
-            }
+            // Scroll the tab body so a long tab (e.g. General) doesn't make the
+            // window tall. The tabs above stay pinned. Kept compact (≈430px), but
+            // shrinks further on very short screens so it never exceeds the window.
+            let max_h = (ui.ctx().content_rect().height() - 120.0).clamp(240.0, 430.0);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, true])
+                .max_height(max_h)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    match settings.tab {
+                        SettingsTab::General => general_tab(ui, settings),
+                        SettingsTab::Appearance => appearance_tab(ui, settings),
+                    }
+                });
         });
 
     // The title-bar close button flips `open` to false.
@@ -133,6 +154,18 @@ pub fn show(ctx: &egui::Context, settings: &mut Settings) {
 
 /// The General tab: the original viewer / browser / files / about sections.
 fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
+    section(ui, "Interface", |ui| {
+        ui.checkbox(
+            &mut settings.show_stats,
+            egui::RichText::new("Show CPU / RAM stats").color(TEXT()),
+        );
+        hint(
+            ui,
+            "The live CPU and memory graphs in the top bar. Turn off for a cleaner \
+             bar (and to skip the periodic system sampling).",
+        );
+    });
+
     section(ui, "Viewer", |ui| {
         // Stack vertically to center nicely
         ui.label(egui::RichText::new("Prefetch radius").color(TEXT()));
@@ -332,7 +365,7 @@ fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 
     egui::Frame::new()
         .fill(FIELD())
-        .corner_radius(egui::CornerRadius::same(12)) // Shrunk to match the tighter UI
+        .corner_radius(egui::CornerRadius::same(22)) // 22px to match the app's panels/viewer
         .inner_margin(egui::Margin::symmetric(12, 10))
         .stroke(egui::Stroke::new(1.0, EDGE()))
         .show(ui, |ui| {
@@ -355,7 +388,7 @@ fn hint(ui: &mut egui::Ui, text: &str) {
 fn window_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(PANEL())
-        .corner_radius(egui::CornerRadius::same(16)) // Shrunk to match a more compact window
+        .corner_radius(egui::CornerRadius::same(22)) // 22px to match the app's panels/viewer
         .inner_margin(egui::Margin::same(12)) // Tighter padding
         .stroke(egui::Stroke::new(1.0, EDGE()))
         .shadow(egui::epaint::Shadow {

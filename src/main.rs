@@ -59,6 +59,7 @@ mod image_cache;
 mod download;
 mod gif_info;
 mod left_browser;
+mod left_panel_settings;
 mod mp4;
 mod raw_preview;
 mod right_details;
@@ -71,6 +72,7 @@ mod tag_manager_settings;
 mod tagger;
 mod top_bar;
 mod video; // embedded VLC playback (real backend only under --features vlc)
+mod zoom; // zoom + pan for the centre image viewer
 
 fn main() -> eframe::Result {
     // libVLC playback needs its DLLs + plugins beside the exe; build.rs stages
@@ -91,6 +93,12 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             // REQUIRED: Install the image loaders so egui can parse SVG bytes
             egui_extras::install_image_loaders(&cc.egui_ctx);
+
+            // Ctrl +/-/0 drive the image viewer's zoom (see src/zoom.rs), so turn
+            // off egui's built-in keyboard zoom that would otherwise scale the whole
+            // UI on those shortcuts. Ctrl+scroll / pinch still reach us via
+            // zoom_delta(); we just don't want egui to also rescale the interface.
+            cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
             // egui's bundled fonts have no CJK glyphs (Japanese / Chinese / Korean,
             // common in Civitai model names & tags, e.g. アルベド) nor the fancy
@@ -160,6 +168,9 @@ struct ViewerApp {
     /// Last-applied colour theme, so we re-push the egui visuals only when the
     /// user actually changes it in the Appearance tab.
     last_theme: theme::Theme,
+    /// Last-applied media-type filter (Filter tab), so we re-filter the browser
+    /// only when the user actually changes it.
+    last_media_filter: left_panel_settings::MediaFilter,
     /// CACHED list of indexes mapping into `self.images` after the search string is applied
     filtered: Vec<usize>,
     selected: Option<usize>,
@@ -194,6 +205,9 @@ struct ViewerApp {
     /// Path the current `video_player` was started for, so we only (re)start it
     /// when the selection actually changes — and don't retry on failure.
     last_video_path: Option<PathBuf>,
+
+    /// Zoom + pan state for the centre image viewer (resets per selection).
+    zoom: zoom::ZoomState,
 }
 
 impl Default for ViewerApp {
@@ -203,6 +217,7 @@ impl Default for ViewerApp {
             current_folder: None,
             last_extended_formats: settings::Settings::default().enable_extended_formats,
             last_theme: theme::Theme::default(),
+            last_media_filter: left_panel_settings::MediaFilter::default(),
             filtered: Vec::new(),
             selected: None,
             search: String::new(),
@@ -221,6 +236,7 @@ impl Default for ViewerApp {
             video_thumbs: video::VideoThumbs::new(),
             video_player: None,
             last_video_path: None,
+            zoom: zoom::ZoomState::default(),
         }
     }
 }
@@ -228,10 +244,31 @@ impl Default for ViewerApp {
 impl ViewerApp {
     /// Update the cached list of filtered indices based on the search string
     fn update_filtered(&mut self) {
+        use left_panel_settings::MediaFilter;
         let query = self.search.trim().to_lowercase();
-        self.filtered = (0..self.images.len())
-            .filter(|&i| query.is_empty() || file_name(&self.images[i]).to_lowercase().contains(&query))
-            .collect();
+        let filter = self.settings.media_filter;
+        let mut filtered = Vec::with_capacity(self.images.len());
+        for i in 0..self.images.len() {
+            // Clone the path so the favorite look-up (which needs `&mut favorites`)
+            // doesn't clash with borrowing `self.images`.
+            let path = self.images[i].clone();
+            if !query.is_empty() && !file_name(&path).to_lowercase().contains(&query) {
+                continue;
+            }
+            let keep = match filter {
+                MediaFilter::All => true,
+                // `is_image` counts GIFs as images, so exclude them here to keep
+                // the "Images" and "GIFs" buckets distinct (matching the Java filter).
+                MediaFilter::Images => is_image(&path) && !is_gif(&path),
+                MediaFilter::Videos => is_video(&path),
+                MediaFilter::Gifs => is_gif(&path),
+                MediaFilter::Favorites => self.favorites.is_favorite(&path),
+            };
+            if keep {
+                filtered.push(i);
+            }
+        }
+        self.filtered = filtered;
     }
 
     /// Pick a folder and show every image in it (replacing the current list).
@@ -274,6 +311,33 @@ impl ViewerApp {
         } else if self.selected.is_none() && !self.images.is_empty() {
             self.selected = Some(0);
             self.update_filtered();
+        }
+    }
+
+    /// Save a cropped copy of `src` to `<name>_crop.png` next to the original
+    /// (the original is left untouched), then add it to the browser and select it.
+    /// `frac` is the crop region as fractions (0..1) of the full image. Re-reads the
+    /// full-resolution original from disk so the crop isn't limited to the
+    /// (possibly downscaled) on-screen texture. A port of ViewerPanel.cropTo().
+    fn crop_current(&mut self, src: &std::path::Path, frac: zoom::CropFraction) {
+        // `image::open` covers the common formats (PNG/JPG/WEBP/…). Extended
+        // formats decoded by our own pipeline (AVIF/RAW) aren't croppable here.
+        let Ok(full) = image::open(src) else { return };
+        let (iw, ih) = (full.width(), full.height());
+        if iw == 0 || ih == 0 {
+            return;
+        }
+        let (iwf, ihf) = (iw as f32, ih as f32);
+        let cx = (frac.x * iwf).round().clamp(0.0, iwf - 1.0) as u32;
+        let cy = (frac.y * ihf).round().clamp(0.0, ihf - 1.0) as u32;
+        let cw = (frac.w * iwf).round().clamp(1.0, iwf - cx as f32) as u32;
+        let ch = (frac.h * ihf).round().clamp(1.0, ihf - cy as f32) as u32;
+
+        let cropped = full.crop_imm(cx, cy, cw, ch);
+        let dest = crop_destination(src);
+        if cropped.save(&dest).is_ok() {
+            // Adds the new file, selects it, and re-filters the browser list.
+            self.add_paths(std::iter::once(dest));
         }
     }
 
@@ -408,7 +472,16 @@ impl ViewerApp {
                 self.last_video_path = None;
 
                 match self.viewer.request(&path, now) {
-                    image_cache::Cached::Ready(tex) => show_fitted(ui, &tex, false),
+                    image_cache::Cached::Ready(tex) => {
+                        let is_fav = self.favorites.is_favorite(&path);
+                        match self.zoom.show(ui, &tex, &path, is_fav) {
+                            zoom::ViewerAction::ToggleFavorite => {
+                                self.favorites.toggle(&path);
+                            }
+                            zoom::ViewerAction::Crop(frac) => self.crop_current(&path, frac),
+                            zoom::ViewerAction::None => {}
+                        }
+                    }
                     image_cache::Cached::Animated(frame) => {
                         show_fitted(ui, &frame, false);
                         // Keep playing the GIF, but cap to ~60 Hz instead of
@@ -460,7 +533,10 @@ impl ViewerApp {
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_dropped_files(ui.ctx());
-        self.stats.update();
+        // Only sample CPU/RAM when the top-bar graphs are actually shown.
+        if self.settings.show_stats {
+            self.stats.update();
+        }
 
         // Apply the HD-thumbnail setting (cheap; only clears the cache on change).
         self.thumbs.set_max_edge(if self.settings.hd_thumbnails {
@@ -501,7 +577,7 @@ impl eframe::App for ViewerApp {
             self.step_selection(delta);
         }
 
-        match top_bar::show(ui, &self.stats) {
+        match top_bar::show(ui, &self.stats, self.settings.show_stats) {
             top_bar::TopBarAction::OpenFolder => self.open_dialog(),
             top_bar::TopBarAction::OpenSettings => self.settings.open = !self.settings.open,
             top_bar::TopBarAction::CreateBackup => self.start_backup(),
@@ -528,10 +604,13 @@ impl eframe::App for ViewerApp {
             &mut self.video_thumbs,
             &mut self.favorites,
             self.settings.thumbnail_size,
+            &mut self.settings.media_filter,
         );
 
-        // Recompute the cached indices list ONLY if the user actually typed a letter
-        if search_changed {
+        // Recompute the cached indices list if the user typed in the search box or
+        // changed the media-type filter in the Filter Settings panel.
+        if search_changed || self.settings.media_filter != self.last_media_filter {
+            self.last_media_filter = self.settings.media_filter;
             self.update_filtered();
         }
 
@@ -730,7 +809,7 @@ fn show_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle, is_loading: bool) {
     ui.centered_and_justified(|ui| {
         let mut img = egui::Image::from_texture(tex)
             .fit_to_exact_size(fit_size)
-            .corner_radius(CornerRadius::same(12));
+            .corner_radius(CornerRadius::same(22));
 
         if is_loading {
             img = img.tint(Color32::from_gray(180));
@@ -910,6 +989,15 @@ pub(crate) fn is_video(p: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// True if `path` is a GIF (used by the media-type filter to keep GIFs in their
+/// own bucket, separate from still images).
+pub(crate) fn is_gif(p: &std::path::Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("gif"))
+        .unwrap_or(false)
+}
+
 /// Any media file we list in the browser (image or video).
 fn is_media(p: &std::path::Path) -> bool {
     is_image(p) || is_video(p)
@@ -926,6 +1014,20 @@ fn images_in_dir(dir: &std::path::Path) -> Vec<PathBuf> {
         .collect();
     found.sort();
     found
+}
+
+/// Where a crop of `src` is saved: `<name>_crop.png` next to the original, with a
+/// ` (n)` suffix if that already exists. Mirrors ViewerPanel.resolveCropDestination.
+fn crop_destination(src: &std::path::Path) -> PathBuf {
+    let dir = src.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let base = src.file_stem().and_then(|s| s.to_str()).unwrap_or("crop");
+    let mut dest = dir.join(format!("{base}_crop.png"));
+    let mut n = 1;
+    while dest.exists() {
+        dest = dir.join(format!("{base}_crop ({n}).png"));
+        n += 1;
+    }
+    dest
 }
 
 pub(crate) fn file_name(p: &std::path::Path) -> String {
