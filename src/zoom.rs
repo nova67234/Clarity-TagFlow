@@ -41,6 +41,8 @@ pub enum ViewerAction {
     Crop(CropFraction),
     /// Copy the current image's pixels to the system clipboard.
     CopyImage,
+    /// Remove the background, saving a transparent-PNG cutout beside the original.
+    RemoveBackground,
 }
 
 /// A crop region as fractions (0..1) of the source image's width/height.
@@ -314,6 +316,7 @@ impl ZoomState {
         let mut want_crop = false;
         let mut want_copy = false;
         let mut want_spatial = false;
+        let mut want_bgremove = false;
         resp.context_menu(|ui| {
             let (fav_icon, fav_label) = if is_favorite {
                 (egui::include_image!("../icons/heart_minus.svg"), "Remove favorite")
@@ -332,6 +335,10 @@ impl ZoomState {
                 want_crop = true;
                 ui.close();
             }
+            if menu_item(ui, egui::include_image!("../icons/background_remove.svg"), "Remove Background") {
+                want_bgremove = true;
+                ui.close();
+            }
             if menu_item(ui, egui::include_image!("../icons/spatial_scene.svg"), "Spatial Scene") {
                 want_spatial = true;
                 ui.close();
@@ -342,6 +349,8 @@ impl ZoomState {
             action = ViewerAction::ToggleFavorite;
         } else if want_copy {
             action = ViewerAction::CopyImage;
+        } else if want_bgremove {
+            action = ViewerAction::RemoveBackground;
         } else if want_crop {
             // Enter crop mode; the actual crop is emitted once the drag finishes.
             self.crop_mode = true;
