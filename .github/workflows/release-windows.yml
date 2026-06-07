@@ -86,6 +86,14 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force ClarityTagFlow-windows | Out-Null
           Copy-Item target/release/Clarity_TagFlow.exe ClarityTagFlow-windows/
+          # Bundle the Visual C++ runtime DLLs alongside the exe (app-local
+          # deployment) so users never need the Visual C++ Redistributable
+          # installed. We can't statically link the CRT because the prebuilt
+          # ONNX Runtime is built against the dynamic CRT (/MD), which conflicts
+          # with +crt-static — shipping the DLLs is the equivalent guarantee.
+          foreach ($dll in 'vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll') {
+            Copy-Item "$env:SystemRoot\System32\$dll" ClarityTagFlow-windows/ -ErrorAction Stop
+          }
           Compress-Archive -Path ClarityTagFlow-windows/* -DestinationPath ClarityTagFlow-windows.zip -Force
 
       - name: Upload .zip artifact
