@@ -72,13 +72,16 @@ jobs:
           Copy-Item (Join-Path $lib 'libvlc.lib') (Join-Path $lib 'vlc.lib') -Force
           "VLC_LIB=$lib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      # Build with the vlc feature. RUSTFLAGS overrides the machine-specific paths
-      # in .cargo/config.toml: point the linker at the import lib above and
-      # delay-load libvlc.dll so the exe still launches when VLC isn't installed.
+      # Build with the vlc feature. RUSTFLAGS overrides the machine-specific path
+      # in .cargo/config.toml, pointing the linker at the import lib fetched above.
+      # The /DELAYLOAD:libvlc.dll + delayimp.lib link args are emitted by build.rs
+      # (so the exe still launches when VLC isn't installed) and need not be repeated
+      # here — repeating them in RUSTFLAGS is what previously left libvlc as a
+      # load-time import in some builds.
       - name: Build
         shell: pwsh
         env:
-          RUSTFLAGS: -L native=${{ env.VLC_LIB }} -C link-arg=/DELAYLOAD:libvlc.dll -C link-arg=delayimp.lib
+          RUSTFLAGS: -L native=${{ env.VLC_LIB }}
         run: cargo build --release --no-default-features --features vlc
 
       - name: Package into a .zip
