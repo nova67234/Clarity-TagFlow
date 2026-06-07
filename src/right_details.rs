@@ -32,6 +32,12 @@ pub enum RightView {
     /// variant doesn't exist on macOS so the whole feature is compiled out.
     #[cfg(not(target_os = "macos"))]
     Pixal3D,
+    /// The Flux text-to-image generation (ComfyUI) view. NVIDIA-only, like Pixal3D.
+    #[cfg(not(target_os = "macos"))]
+    Generate,
+    /// The Z-Image Turbo generation view (same ComfyUI backend).
+    #[cfg(not(target_os = "macos"))]
+    ZImage,
 }
 
 /// Read-only file metadata shown in the bottom "Image Details" card. A Rust
@@ -107,6 +113,12 @@ pub struct RightPanelState {
     /// State for the Pixal3D requirement-setup view (Linux/Windows only).
     #[cfg(not(target_os = "macos"))]
     pub pixal3d: crate::pixal3d::Pixal3DState,
+    /// State for the Flux/ComfyUI generation view (Linux/Windows only).
+    #[cfg(not(target_os = "macos"))]
+    pub generate: crate::generate::GenerateState,
+    /// State for the Z-Image generation view (same backend, different model).
+    #[cfg(not(target_os = "macos"))]
+    pub zimage: crate::generate::GenerateState,
     pub is_editing: bool,
 
     /// Which view the panel currently shows (Details vs Tag Manager).
@@ -149,6 +161,10 @@ impl Default for RightPanelState {
             civitai: crate::civitai::CivitaiState::default(),
             #[cfg(not(target_os = "macos"))]
             pixal3d: crate::pixal3d::Pixal3DState::default(),
+            #[cfg(not(target_os = "macos"))]
+            generate: crate::generate::GenerateState::default(),
+            #[cfg(not(target_os = "macos"))]
+            zimage: crate::generate::GenerateState::new(crate::generate::GenFamily::ZImage),
             is_editing: false,
             view: RightView::default(),
             show_delete_confirm: false,
@@ -346,6 +362,22 @@ pub fn show(
                                 state.view = RightView::Pixal3D;
                                 ui.close();
                             }
+                            #[cfg(not(target_os = "macos"))]
+                            if ui
+                                .selectable_label(state.view == RightView::Generate, "Generate (Flux)")
+                                .clicked()
+                            {
+                                state.view = RightView::Generate;
+                                ui.close();
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            if ui
+                                .selectable_label(state.view == RightView::ZImage, "Generate (Z-Image)")
+                                .clicked()
+                            {
+                                state.view = RightView::ZImage;
+                                ui.close();
+                            }
                         });
 
                     // --- Swap Views ---
@@ -358,9 +390,25 @@ pub fn show(
                     #[cfg(target_os = "macos")]
                     let show_pixal3d = false;
 
+                    #[cfg(not(target_os = "macos"))]
+                    let show_generate = state.view == RightView::Generate;
+                    #[cfg(target_os = "macos")]
+                    let show_generate = false;
+
+                    #[cfg(not(target_os = "macos"))]
+                    let show_zimage = state.view == RightView::ZImage;
+                    #[cfg(target_os = "macos")]
+                    let show_zimage = false;
+
                     if show_pixal3d {
                         #[cfg(not(target_os = "macos"))]
                         crate::pixal3d::show(ui, &mut state.pixal3d, current_image);
+                    } else if show_generate {
+                        #[cfg(not(target_os = "macos"))]
+                        crate::generate::show(ui, &mut state.generate);
+                    } else if show_zimage {
+                        #[cfg(not(target_os = "macos"))]
+                        crate::generate::show(ui, &mut state.zimage);
                     } else if state.view == RightView::TagManager {
                         crate::tag_manager::show(ui, tag_manager, current_image, &mut state.current_tags, all_images);
                     } else if state.view == RightView::Downloader {
