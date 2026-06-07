@@ -269,6 +269,9 @@ struct ViewerApp {
     bg_job: Option<BgRemoveJob>,
     /// Transient status/result message for background removal (text, hide-time).
     bg_toast: Option<(String, f64)>,
+    /// Screen rect of the centre (image) panel, captured each frame so overlays
+    /// can be positioned over the image rather than the whole window.
+    last_center_rect: Option<egui::Rect>,
 }
 
 impl Default for ViewerApp {
@@ -302,6 +305,7 @@ impl Default for ViewerApp {
             scene3d: scene3d::Scene3D::new(),
             bg_job: None,
             bg_toast: None,
+            last_center_rect: None,
         }
     }
 }
@@ -559,9 +563,14 @@ impl ViewerApp {
         } else {
             return;
         };
-        egui::Area::new(egui::Id::new("bg_status_overlay"))
-            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 64.0))
-            .interactable(false)
+        let mut area = egui::Area::new(egui::Id::new("bg_status_overlay")).interactable(false);
+        // Centre over the image panel if we know its rect; else fall back to the
+        // window centre.
+        area = match self.last_center_rect {
+            Some(rect) => area.pivot(egui::Align2::CENTER_CENTER).fixed_pos(rect.center()),
+            None => area.anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)),
+        };
+        area
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -634,6 +643,9 @@ impl ViewerApp {
 
     // ---- Center: the image display ------------------------------------
     fn center(&mut self, ui: &mut egui::Ui) {
+        // Remember the centre-panel rect so overlays (e.g. the background-removal
+        // loader) can be centred over the image rather than the whole window.
+        self.last_center_rect = Some(ui.available_rect_before_wrap());
         egui::CentralPanel::default()
             // Match the side panels' margins (top: 0) so the viewer rises to the
             // top bar and is the same height as the left/right panels.
