@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "Clarity_TagFlow"
-version = "0.5.0"
+version = "5.1.2"
 dependencies = [
  "arboard",
  "avif-parse",
