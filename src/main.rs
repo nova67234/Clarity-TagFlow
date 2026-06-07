@@ -386,16 +386,24 @@ impl ViewerApp {
     /// in image_cache — since `image::open` can't handle them (and would mis-read
     /// TIFF-based raws like DNG).
     fn copy_current(&mut self, src: &std::path::Path) {
-        let Some(rgba) = decode_full_rgba(src) else { return };
-        let (w, h) = (rgba.width() as usize, rgba.height() as usize);
-        let img = arboard::ImageData {
-            width: w,
-            height: h,
-            bytes: std::borrow::Cow::Owned(rgba.into_raw()),
-        };
-        if let Ok(mut clip) = arboard::Clipboard::new() {
-            let _ = clip.set_image(img);
-        }
+        // Decoding the full-resolution original and having arboard convert it to
+        // the clipboard's DIB/PNG formats is heavy — on a large image it takes
+        // seconds. Do it on a background thread so the UI never freezes; the
+        // clipboard is populated a moment later. (arboard sets image data
+        // immediately, so a short-lived thread is fine.)
+        let src = src.to_path_buf();
+        std::thread::spawn(move || {
+            let Some(rgba) = decode_full_rgba(&src) else { return };
+            let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+            let img = arboard::ImageData {
+                width: w,
+                height: h,
+                bytes: std::borrow::Cow::Owned(rgba.into_raw()),
+            };
+            if let Ok(mut clip) = arboard::Clipboard::new() {
+                let _ = clip.set_image(img);
+            }
+        });
     }
 
     fn step_selection(&mut self, delta: i32) {
