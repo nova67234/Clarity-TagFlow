@@ -332,9 +332,16 @@ pub fn show(
         ui.heading(egui::RichText::new("Civitai Resources").color(TEXT()).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             api_pill(ui, state.api_status.load(Ordering::Relaxed));
-            // Settings gear next to the status: opens the API-key popup.
+            // Settings gear next to the status: opens the API-key popup. Nudged up
+            // ~3px (negative top margin) so it optically centres with the text/dot.
             let gear = egui::include_image!("../icons/settings.svg");
-            if crate::svg_button(ui, gear, "Civitai API key", 18.0, crate::theme::icon_tint(MUTED())).clicked() {
+            let gear_clicked = egui::Frame::new()
+                .inner_margin(egui::Margin { left: 0, right: 0, top: -3, bottom: 0 })
+                .show(ui, |ui| {
+                    crate::svg_button(ui, gear, "Civitai API key", 18.0, crate::theme::icon_tint(MUTED())).clicked()
+                })
+                .inner;
+            if gear_clicked {
                 state.show_settings = !state.show_settings;
             }
         });
@@ -457,23 +464,12 @@ fn resource_card(
                 video_placeholder(ui);
             }
 
-            ui.vertical(|ui| {
-                crate::emoji::label(ui, &data.name, TEXT(), 12.0, true);
-                if !data.triggers.is_empty() {
-                    ui.add_space(2.0);
-                    crate::emoji::label(
-                        ui,
-                        &format!("Triggers: {}", data.triggers.join(", ")),
-                        MUTED(),
-                        11.0,
-                        false,
-                    );
-                }
-            });
-
-            // Right side, vertically centred. The slot reflects the download state:
-            //   downloading → percentage · done → green check · failed → red
-            //   warning (instant hover shows the error) · idle → download arrow.
+            // The right slot is added FIRST (so it reserves its space); the
+            // name/triggers then fill and WRAP in the remaining width. Otherwise a
+            // long resource name lays out on one line and pushes the whole panel
+            // wider than the other right-panel views. The slot reflects the
+            // download state: downloading → % · done/installed → green check ·
+            // failed → orange warning (instant hover error) · idle → download arrow.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(2.0);
                 match dl {
@@ -521,12 +517,40 @@ fn resource_card(
                         .on_hover_text("Already in your models folder");
                     }
                     None => {
-                        // Blue download arrow.
+                        // Blue download arrow — a 20px clickable Image (NOT a
+                        // button) so it occupies the exact same footprint as the
+                        // check/warning icons and the slot doesn't jump on state
+                        // change. The click is detected by position (below).
                         let arrow = egui::include_image!("../icons/arrow_circle_down.svg");
-                        let r = crate::svg_button(ui, arrow, "Download into your models folder", 22.0, crate::theme::ACCENT1());
+                        let r = ui
+                            .add(
+                                egui::Image::new(arrow)
+                                    .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                                    .tint(crate::theme::ACCENT1())
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("Download into your models folder");
+                        if r.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
                         dl_rect = Some(r.rect);
                     }
                 }
+                // Remaining width → name + triggers, left-aligned and wrapped.
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(ui.available_width());
+                    crate::emoji::label(ui, &data.name, TEXT(), 12.0, true);
+                    if !data.triggers.is_empty() {
+                        ui.add_space(2.0);
+                        crate::emoji::label(
+                            ui,
+                            &format!("Triggers: {}", data.triggers.join(", ")),
+                            MUTED(),
+                            11.0,
+                            false,
+                        );
+                    }
+                });
             });
         });
     });
@@ -971,23 +995,21 @@ fn save_civitai_key(key: &str) {
 }
 
 fn api_pill(ui: &mut egui::Ui, api: u8) {
-    let (text, bg) = match api {
-        API_ONLINE => ("Online", egui::Color32::from_rgb(35, 137, 58)),
-        API_OFFLINE => ("Offline", egui::Color32::from_rgb(160, 60, 60)),
-        _ => ("Checking…", egui::Color32::from_rgb(120, 120, 120)),
+    let (text, dot) = match api {
+        API_ONLINE => ("Online", egui::Color32::from_rgb(46, 160, 67)),
+        API_OFFLINE => ("Offline", egui::Color32::from_rgb(210, 70, 70)),
+        _ => ("Checking…", egui::Color32::from_rgb(150, 150, 150)),
     };
-    egui::Frame::new()
-        .fill(bg)
-        .corner_radius(egui::CornerRadius::same(8))
-        .inner_margin(egui::Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(format!("API: {text}"))
-                    .color(egui::Color32::WHITE)
-                    .size(11.0)
-                    .strong(),
-            );
-        });
+    // The header is a right-to-left layout and `ui.horizontal` inherits it (this
+    // keeps the group sized-to-content and right-aligned). So add the label FIRST
+    // (it lands rightmost) and the dot SECOND (to its left) to read "● Online".
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        ui.label(egui::RichText::new(text).color(MUTED()).size(11.0).strong());
+        // A small status dot painted to a fixed box so it stays crisp and centred.
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 4.0, dot);
+    });
 }
 
 fn open_url(ctx: &egui::Context, url: &str) {

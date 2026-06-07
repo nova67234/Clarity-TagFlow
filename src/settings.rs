@@ -5,7 +5,7 @@
 use eframe::egui;
 
 use crate::left_panel_settings::MediaFilter;
-use crate::theme::{Backdrop, Theme, EDGE, FIELD, MUTED, PANEL, TEXT};
+use crate::theme::{Backdrop, Theme, EDGE, MUTED, PANEL, TEXT};
 
 /// Key under which the settings are saved in eframe's persistent storage.
 pub const STORAGE_KEY: &str = "clarity_tagflow_settings";
@@ -104,19 +104,20 @@ pub fn show(ctx: &egui::Context, settings: &mut Settings) {
         return;
     }
 
-    let mut open = true;
+    let mut want_close = false;
     egui::Window::new("Settings")
-        .open(&mut open)
+        .id(egui::Id::new("settings_window"))
+        .title_bar(false) // custom header inside (matches the other popups)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .frame(window_frame())
         .show(ctx, |ui| {
-            // Shrink the UI smaller horizontally
-            ui.set_width(260.0);
+            ui.set_width(360.0);
+            ui.set_max_width(360.0);
 
-            // Force check boxes to be square with round edges.
-            // This overrides heavy corner radiuses from the global theme that cause circular checkboxes.
+            // Square-but-rounded checkboxes (the global theme rounds them into
+            // pills otherwise).
             let square_radius = egui::CornerRadius::same(4);
             let visuals = ui.visuals_mut();
             visuals.widgets.noninteractive.corner_radius = square_radius;
@@ -125,17 +126,37 @@ pub fn show(ctx: &egui::Context, settings: &mut Settings) {
             visuals.widgets.active.corner_radius = square_radius;
             visuals.widgets.open.corner_radius = square_radius;
 
-            // Tabs across the top of the window.
+            // Title row: settings icon + "Settings" + close.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add(
+                    egui::Image::new(egui::include_image!("../icons/settings.svg"))
+                        .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                        .tint(TEXT()),
+                );
+                ui.heading(egui::RichText::new("Settings").color(TEXT()).strong().size(17.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("✕").size(14.0)).frame(false))
+                        .on_hover_text("Close")
+                        .clicked()
+                    {
+                        want_close = true;
+                    }
+                });
+            });
+            ui.add_space(12.0);
+
+            // Tabs.
             ui.horizontal(|ui| {
                 tab_button(ui, settings, SettingsTab::General, "General");
                 tab_button(ui, settings, SettingsTab::Appearance, "Appearance");
             });
             ui.add_space(8.0);
 
-            // Scroll the tab body so a long tab (e.g. General) doesn't make the
-            // window tall. The tabs above stay pinned. Kept compact (≈430px), but
-            // shrinks further on very short screens so it never exceeds the window.
-            let max_h = (ui.ctx().content_rect().height() - 120.0).clamp(240.0, 430.0);
+            // Scroll the tab body so a long tab doesn't make the window tall; the
+            // header + tabs stay pinned.
+            let max_h = (ui.ctx().content_rect().height() - 140.0).clamp(240.0, 460.0);
             egui::ScrollArea::vertical()
                 .auto_shrink([false, true])
                 .max_height(max_h)
@@ -148,8 +169,7 @@ pub fn show(ctx: &egui::Context, settings: &mut Settings) {
                 });
         });
 
-    // The title-bar close button flips `open` to false.
-    settings.open = open;
+    settings.open = !want_close;
 }
 
 /// The General tab: the original viewer / browser / files / about sections.
@@ -312,7 +332,37 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Colour").color(TEXT()));
                 ui.add_space(6.0);
-                ui.color_edit_button_srgb(&mut settings.glass_bg);
+
+                // A pill-shaped colour swatch. egui's own colour button hard-caps
+                // its corner radius at 2px (the alpha checker grid can't round), so
+                // we paint our own pill and open the picker in a popup on click.
+                let mut col = {
+                    let [r, g, b] = settings.glass_bg;
+                    egui::Color32::from_rgb(r, g, b)
+                };
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(46.0, 18.0), egui::Sense::click());
+                let radius = rect.height() / 2.0;
+                ui.painter().rect_filled(rect, radius, col);
+                ui.painter().rect_stroke(
+                    rect,
+                    radius,
+                    egui::Stroke::new(1.0, EDGE()),
+                    egui::StrokeKind::Inside,
+                );
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                egui::Popup::from_toggle_button_response(&resp).show(|ui| {
+                    ui.set_min_width(220.0);
+                    if egui::widgets::color_picker::color_picker_color32(
+                        ui,
+                        &mut col,
+                        egui::widgets::color_picker::Alpha::Opaque,
+                    ) {
+                        settings.glass_bg = [col.r(), col.g(), col.b()];
+                    }
+                });
             });
             hint(ui, "Shows through the translucent panels and fills the gutters.");
 
@@ -354,28 +404,17 @@ fn tab_button(ui: &mut egui::Ui, settings: &mut Settings, tab: SettingsTab, labe
     }
 }
 
-/// A titled, rounded group card holding a few related controls.
+/// A flat section: an uppercase muted label with its controls directly below,
+/// left-aligned (matches the Civitai / Backup popups — no bordered card).
 fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(6.0);
-    // Center the section title
-    ui.vertical_centered(|ui| {
-        ui.label(egui::RichText::new(title).color(MUTED()).strong().size(12.0));
-    });
     ui.add_space(4.0);
-
-    egui::Frame::new()
-        .fill(FIELD())
-        .corner_radius(egui::CornerRadius::same(22)) // 22px to match the app's panels/viewer
-        .inner_margin(egui::Margin::symmetric(12, 10))
-        .stroke(egui::Stroke::new(1.0, EDGE()))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            // Center the inner controls
-            ui.vertical_centered(|ui| {
-                add(ui);
-            });
-        });
-    ui.add_space(2.0);
+    ui.label(egui::RichText::new(title.to_uppercase()).color(MUTED()).strong().size(11.0));
+    ui.add_space(6.0);
+    ui.scope(|ui| {
+        ui.set_width(ui.available_width());
+        add(ui);
+    });
+    ui.add_space(12.0);
 }
 
 /// A small muted explanatory line, shown under a control.
@@ -384,17 +423,18 @@ fn hint(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).color(MUTED()).size(11.0));
 }
 
-/// A themed frame for the settings window body (rounded, soft drop shadow).
+/// A themed frame for the settings window body (matches the Civitai / Backup
+/// popups: rounded-16 card with a soft drop shadow).
 fn window_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(PANEL())
-        .corner_radius(egui::CornerRadius::same(22)) // 22px to match the app's panels/viewer
-        .inner_margin(egui::Margin::same(12)) // Tighter padding
+        .corner_radius(egui::CornerRadius::same(16))
+        .inner_margin(egui::Margin::same(18))
         .stroke(egui::Stroke::new(1.0, EDGE()))
         .shadow(egui::epaint::Shadow {
-            offset: [0, 4], // Softened shadow depth
-            blur: 16,
+            offset: [0, 6],
+            blur: 20,
             spread: 0,
-            color: egui::Color32::from_black_alpha(140),
+            color: egui::Color32::from_black_alpha(150),
         })
 }
