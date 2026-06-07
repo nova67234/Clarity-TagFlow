@@ -61,6 +61,9 @@ mod image_cache;
 mod download;
 mod gallery;
 mod gallery_detail;
+// Flux text-to-image generation (ComfyUI backend) — NVIDIA-only, like Pixal3D.
+#[cfg(not(target_os = "macos"))]
+mod generate;
 mod gif_info;
 mod left_browser;
 mod left_panel_settings;
@@ -240,6 +243,13 @@ struct ViewerApp {
     scan: scan::ScanState,
     /// Gallery-view image detail popup.
     detail_popup: gallery_detail::DetailPopup,
+    /// While the Generate (Flux) view is open, the browser/viewer show the session's
+    /// generated images; these remember the real folder list to restore on exit.
+    flux_active: bool,
+    images_backup: Option<(Vec<PathBuf>, Option<usize>)>,
+    /// (is_zimage, count) of the gen list currently shown, so switching between the
+    /// Flux/Z-Image tabs or a new render refreshes the browser.
+    flux_sig: (bool, usize),
     /// The "Create Backup" dialog (top bar).
     backup: backup::BackupState,
     /// Tag Manager view state, shown in the right panel when selected from its
@@ -295,6 +305,9 @@ impl Default for ViewerApp {
             settings: settings::Settings::default(),
             scan: scan::ScanState::default(),
             detail_popup: gallery_detail::DetailPopup::default(),
+            flux_active: false,
+            images_backup: None,
+            flux_sig: (false, 0),
             backup: backup::BackupState::default(),
             tag_manager: tag_manager::TagManagerState::default(),
             // Separate large-decode gates: the viewer gets a dedicated permit so
@@ -598,6 +611,50 @@ impl ViewerApp {
     }
 
     /// Delete the selected image and its `.txt` sidecar, then fix up the list.
+    /// While the Generate (Flux) view is open, show the session's generated images
+    /// in the browser + viewer; restore the real folder list when it closes.
+    fn sync_flux_browser(&mut self, in_flux: bool) {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = in_flux;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if in_flux {
+                let is_zimage = self.right_state.view == right_details::RightView::ZImage;
+                let gen_list = if is_zimage {
+                    self.right_state.zimage.gen_images().to_vec()
+                } else {
+                    self.right_state.generate.gen_images().to_vec()
+                };
+                let sig = (is_zimage, gen_list.len());
+                if !self.flux_active {
+                    // Entering: stash the folder list, show the generated images.
+                    self.images_backup = Some((std::mem::take(&mut self.images), self.selected.take()));
+                    self.images = gen_list;
+                    self.selected = if self.images.is_empty() { None } else { Some(self.images.len() - 1) };
+                    self.update_filtered();
+                    self.flux_active = true;
+                    self.flux_sig = sig;
+                } else if self.flux_sig != sig {
+                    // Switched gen tab or a new image arrived — refresh + select newest.
+                    self.images = gen_list;
+                    self.selected = if self.images.is_empty() { None } else { Some(self.images.len() - 1) };
+                    self.update_filtered();
+                    self.flux_sig = sig;
+                }
+            } else if self.flux_active {
+                // Leaving: restore the real folder list.
+                if let Some((imgs, sel)) = self.images_backup.take() {
+                    self.images = imgs;
+                    self.selected = sel;
+                    self.update_filtered();
+                }
+                self.flux_active = false;
+            }
+        }
+    }
+
     /// Move the selected image (and its `.txt` sidecar) to a folder the user picks,
     /// then drop it from the list. Shared by the right panel and the gallery popup.
     fn move_selected(&mut self) {
@@ -880,6 +937,18 @@ impl eframe::App for ViewerApp {
             }
             top_bar::TopBarAction::None => {}
         }
+
+        // While the Generate (Flux) view is open, swap the browser/viewer over to
+        // the session's generated images (restored on exit).
+        #[cfg(not(target_os = "macos"))]
+        let in_flux = self.settings.layout == settings::Layout::Panels
+            && matches!(
+                self.right_state.view,
+                right_details::RightView::Generate | right_details::RightView::ZImage
+            );
+        #[cfg(target_os = "macos")]
+        let in_flux = false;
+        self.sync_flux_browser(in_flux);
 
         // When the Gallery layout is active, replace the three panels with a
         // full-window masonry grid of the open folder's images.

@@ -151,7 +151,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&
                     let color = if state.status_err { RED } else if state.running { ACCENT1() } else { GREEN };
                     ui.label(RichText::new(&state.status).color(color).size(12.0));
                     ui.add_space(6.0);
-                    state.orb.set_state(if state.running {
+                    state.orb.set_state(if state.status_err {
+                        crate::ai_orb::OrbState::Error
+                    } else if state.running {
                         crate::ai_orb::OrbState::Thinking
                     } else {
                         crate::ai_orb::OrbState::Idle
@@ -555,7 +557,7 @@ io.open(f, 'w', encoding='utf-8').write(s)
 print('NAF patched OK' if changed else 'NAF already patched')
 "#;
 
-fn py_tarball_url() -> String {
+pub(crate) fn py_tarball_url() -> String {
     let triple = if cfg!(windows) {
         "x86_64-pc-windows-msvc"
     } else {
@@ -995,7 +997,7 @@ fn hf_token_path() -> std::path::PathBuf {
 
 /// Load the saved HF token (decrypted). Returns "" if none is stored or it was
 /// protected by a different user/machine.
-fn load_hf_token() -> String {
+pub(crate) fn load_hf_token() -> String {
     std::fs::read_to_string(hf_token_path())
         .ok()
         .map(|s| crate::secret::unprotect(s.trim()))
@@ -1003,7 +1005,7 @@ fn load_hf_token() -> String {
 }
 
 /// Save the HF token, encrypted. An empty token removes the stored file.
-fn save_hf_token(token: &str) {
+pub(crate) fn save_hf_token(token: &str) {
     let path = hf_token_path();
     let trimmed = token.trim();
     if trimmed.is_empty() {
@@ -1018,7 +1020,7 @@ fn save_hf_token(token: &str) {
 
 /// On Windows, don't pop a console window for each spawned child process.
 #[cfg(windows)]
-fn hide_window(cmd: &mut std::process::Command) {
+pub(crate) fn hide_window(cmd: &mut std::process::Command) {
     use std::os::windows::process::CommandExt;
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 }
@@ -1037,7 +1039,7 @@ fn hide_window(_cmd: &mut std::process::Command) {}
 /// child and all its worker grandchildren) is terminated. Runs once; the job
 /// handle is intentionally never closed so it stays open for the process lifetime.
 #[cfg(windows)]
-fn ensure_kill_on_exit_job() {
+pub(crate) fn ensure_kill_on_exit_job() {
     use std::ffi::c_void;
     use std::sync::Once;
 
@@ -1113,7 +1115,7 @@ fn ensure_kill_on_exit_job() {
 /// process dies (`PR_SET_PDEATHSIG`), so a closed/crashed app doesn't orphan the
 /// Python inference child. Set in the child via `pre_exec` (post-fork).
 #[cfg(target_os = "linux")]
-fn kill_on_parent_exit(cmd: &mut std::process::Command) {
+pub(crate) fn kill_on_parent_exit(cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: prctl is async-signal-safe, which is all pre_exec permits.
     unsafe {
@@ -1129,4 +1131,4 @@ fn kill_on_parent_exit(cmd: &mut std::process::Command) {
     }
 }
 #[cfg(not(target_os = "linux"))]
-fn kill_on_parent_exit(_cmd: &mut std::process::Command) {}
+pub(crate) fn kill_on_parent_exit(_cmd: &mut std::process::Command) {}
