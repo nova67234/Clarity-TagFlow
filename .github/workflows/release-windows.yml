@@ -86,6 +86,12 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force ClarityTagFlow-windows | Out-Null
           Copy-Item target/release/Clarity_TagFlow.exe ClarityTagFlow-windows/
+          # Bundle the runtime DLLs that `cargo build` stages next to the exe —
+          # the ONNX Runtime DirectML provider (DirectML.dll) and any
+          # onnxruntime*.dll — or the app fails to launch with a missing-DLL error.
+          $staged = Get-ChildItem target/release -Filter *.dll -ErrorAction SilentlyContinue
+          if ($staged) { Copy-Item $staged.FullName ClarityTagFlow-windows/ -Force }
+          Write-Host "Staged DLLs: $((Get-ChildItem ClarityTagFlow-windows -Filter *.dll).Name -join ', ')"
           # Bundle the Visual C++ runtime DLLs alongside the exe (app-local
           # deployment) so users never need the Visual C++ Redistributable
           # installed. We can't statically link the CRT because the prebuilt
