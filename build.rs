@@ -42,6 +42,14 @@ fn main() {
         return;
     }
 
+    // Delay-load libVLC so the exe launches even when no libVLC runtime is present
+    // (src/video.rs probes for one at runtime and only then calls into it). Emitting
+    // this here — rather than only via RUSTFLAGS / .cargo/config.toml — guarantees it
+    // is applied in every build, including CI where RUSTFLAGS is overridden and would
+    // otherwise leave libvlc.dll as a load-time import (app fails to start without it).
+    println!("cargo:rustc-link-arg=/DELAYLOAD:libvlc.dll");
+    println!("cargo:rustc-link-arg=delayimp.lib");
+
     let vlc_dir = PathBuf::from(
         std::env::var("VLC_RUNTIME_DIR")
             .unwrap_or_else(|_| r"C:\Program Files\VideoLAN\VLC".to_string()),
