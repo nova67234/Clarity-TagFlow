@@ -76,10 +76,21 @@ impl Default for ImageMeta {
     }
 }
 
+/// Artist (username) + character tag names for the current image, loaded from the
+/// downloader's `{md5}.json` sidecar. Used to colour those tags in the tag box.
+#[derive(Default)]
+struct TagRoles {
+    artist: std::collections::HashSet<String>,
+    character: std::collections::HashSet<String>,
+}
+
 /// Maintains the UI state for the right panel, such as the loaded text buffer
 /// and whether the user is currently in edit mode.
 pub struct RightPanelState {
     pub current_tags: String,
+    /// Artist/character tags for the current image (from its `{md5}.json`), so the
+    /// tag box can colour the artist orange and the character green.
+    tag_roles: TagRoles,
     /// Embedded Stable-Diffusion generation metadata for the selected image,
     /// or `None` when the image carries none. Read by `crate::sd_metadata`.
     pub sd_metadata: Option<String>,
@@ -126,6 +137,7 @@ impl Default for RightPanelState {
     fn default() -> Self {
         Self {
             current_tags: String::new(),
+            tag_roles: TagRoles::default(),
             sd_metadata: None,
             showing_meta: false,
             downloader: crate::download::DownloaderState::default(),
@@ -187,6 +199,9 @@ pub fn show(
         if let Some(path) = current_image {
             let txt_path = sidecar_txt(path);
             state.current_tags = std::fs::read_to_string(&txt_path).unwrap_or_default();
+            // Load the downloader's `{md5}.json` (artist/character roles), if any,
+            // so the tag box can colour those tags.
+            state.tag_roles = load_tag_roles(path);
             // Read embedded SD generation metadata (PNG text chunks / EXIF
             // UserComment). Cheap relative to the full-res decode below.
             state.sd_metadata = crate::sd_metadata::read(path);
@@ -230,6 +245,7 @@ pub fn show(
 
         } else {
             state.current_tags.clear();
+            state.tag_roles = TagRoles::default();
             state.sd_metadata = None;
             state.showing_meta = false;
             state.meta = ImageMeta::default();
@@ -551,6 +567,14 @@ pub fn show(
                                     state.current_tags.clone()
                                 };
 
+                                // Artist/character colouring for the tag view (not
+                                // the metadata view). Cloned for the layouter closure.
+                                let artist_set = state.tag_roles.artist.clone();
+                                let character_set = state.tag_roles.character.clone();
+                                let highlight_roles = !showing_meta
+                                    && !(artist_set.is_empty() && character_set.is_empty());
+                                let role_color = if editable { TEXT() } else { TEXT().gamma_multiply(0.8) };
+
                                 // The box is a FIXED-size rounded frame that always
                                 // fills the remaining panel height — it never resizes
                                 // and never moves. Long text (e.g. SD metadata) scrolls
@@ -604,6 +628,15 @@ pub fn show(
 
                                                 if !editable {
                                                     text_edit = text_edit.text_color(TEXT().gamma_multiply(0.8));
+                                                }
+
+                                                // Colour artist (orange) / character
+                                                // (green) tags via a custom layouter.
+                                                let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+                                                    highlight_tags(ui, buf.as_str(), &artist_set, &character_set, role_color, wrap)
+                                                };
+                                                if highlight_roles {
+                                                    text_edit = text_edit.layouter(&mut layouter);
                                                 }
 
                                                 ui.add(text_edit);
@@ -1157,6 +1190,60 @@ fn human_bytes(bytes: u64) -> String {
 
 pub(crate) fn sidecar_txt(img_path: &Path) -> PathBuf {
     img_path.with_extension("txt")
+}
+
+/// Tag-role highlight colours (Danbooru-style): artist orange, character green.
+const ARTIST_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 150, 50);
+const CHARACTER_COLOR: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
+
+/// Load the downloader's `{md5}.json` sidecar (artist + character tag names) for
+/// an image, if present. Returns empty roles when there's no sidecar.
+fn load_tag_roles(img_path: &Path) -> TagRoles {
+    let Ok(body) = std::fs::read_to_string(img_path.with_extension("json")) else {
+        return TagRoles::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return TagRoles::default();
+    };
+    let set = |key: &str| -> std::collections::HashSet<String> {
+        v.get(key)
+            .and_then(|x| x.as_array())
+            .map(|arr| arr.iter().filter_map(|e| e.as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    };
+    TagRoles { artist: set("artist"), character: set("character") }
+}
+
+/// Build a colour-highlighted layout for the (comma-separated) tag text: artist
+/// tags orange, character tags green, everything else `default_color`.
+fn highlight_tags(
+    ui: &egui::Ui,
+    text: &str,
+    artist: &std::collections::HashSet<String>,
+    character: &std::collections::HashSet<String>,
+    default_color: egui::Color32,
+    wrap_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    // Keep the commas with their token so spacing/positions are preserved exactly.
+    for piece in text.split_inclusive(',') {
+        let name = piece.trim().trim_end_matches(',').trim();
+        let color = if artist.contains(name) {
+            ARTIST_COLOR
+        } else if character.contains(name) {
+            CHARACTER_COLOR
+        } else {
+            default_color
+        };
+        job.append(
+            piece,
+            0.0,
+            egui::TextFormat { font_id: font_id.clone(), color, ..Default::default() },
+        );
+    }
+    ui.fonts_mut(|f| f.layout_job(job))
 }
 
 fn format_time(t: SystemTime) -> String {

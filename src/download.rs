@@ -20,6 +20,10 @@ use eframe::egui;
 use crate::theme::{ACCENT1, EDGE, FIELD, MUTED, PANEL, TEXT};
 
 const API_URL: &str = "https://gelbooru.com/index.php?page=dapi&s=post&q=index&json=1";
+/// Tag-info endpoint: returns each tag's `type` (0 general, 1 artist, 3 copyright,
+/// 4 character, 5 metadata). Used to split a post's flat tag list into artist /
+/// character roles for the `{md5}.json` sidecar.
+const TAG_API_URL: &str = "https://gelbooru.com/index.php?page=dapi&s=tag&q=index&json=1";
 const SITE_HOME: &str = "https://gelbooru.com/";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -771,6 +775,10 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
         .build()
         .into();
 
+    // Session cache of tag name -> Gelbooru type, so common tags are only looked
+    // up once across the whole run (most tags repeat across posts).
+    let mut tag_types: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+
     // Enforce the daily cap: today's remaining allowance bounds this run.
     let mut used_today = quota_used_today();
     let remaining_today = DAILY_CAP.saturating_sub(used_today);
@@ -862,6 +870,38 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
             let formatted = format_gelbooru_tags(&post.raw_tags);
             if let Err(e) = std::fs::write(&txt_path, formatted) {
                 log(format!("Warning: could not write tags for {}: {e}", post.md5));
+            }
+
+            // Sidecar `{md5}.json` with the artist (username) + character tags, so
+            // the viewer can colour them. Resolve each tag's type via the tag API,
+            // caching results across the run to minimise extra requests.
+            let names: Vec<&str> = post.raw_tags.split_whitespace().collect();
+            let unknown: Vec<String> = names
+                .iter()
+                .filter(|n| !tag_types.contains_key(**n))
+                .map(|n| n.to_string())
+                .collect();
+            if !unknown.is_empty() {
+                let fetched = fetch_tag_types(&agent, &unknown, &cfg.user_id, &cfg.api_key);
+                for (k, v) in fetched {
+                    tag_types.insert(k, v);
+                }
+                // Mark any tag the API didn't return as general (0), so we don't
+                // re-query it for every subsequent post.
+                for n in &unknown {
+                    tag_types.entry(n.clone()).or_insert(0);
+                }
+            }
+            let artist: Vec<String> =
+                names.iter().filter(|n| tag_types.get(**n) == Some(&1)).map(|n| n.to_string()).collect();
+            let character: Vec<String> =
+                names.iter().filter(|n| tag_types.get(**n) == Some(&4)).map(|n| n.to_string()).collect();
+            if !artist.is_empty() || !character.is_empty() {
+                let roles = TagRoles { artist, character };
+                let json_path = cfg.output_dir.join(format!("{}.json", post.md5));
+                if let Ok(s) = serde_json::to_string_pretty(&roles) {
+                    let _ = std::fs::write(&json_path, s);
+                }
             }
 
             append_download_log(&post.md5, &mut downloaded_log);
@@ -1078,6 +1118,71 @@ fn is_allowed_by_selection(ext: &str, img: bool, gif: bool, vid: bool) -> bool {
         return vid;
     }
     false
+}
+
+/// Artist (username) + character tags for one image, written as `{md5}.json`
+/// beside the file so the viewer can colour them.
+#[derive(serde::Serialize)]
+struct TagRoles {
+    artist: Vec<String>,
+    character: Vec<String>,
+}
+
+/// Look up each tag's Gelbooru `type` via the tag endpoint, returning name->type
+/// (0 general · 1 artist · 3 copyright · 4 character · 5 metadata). Chunked, since
+/// the endpoint takes space-separated `names`. Best-effort: any network/parse
+/// failure just yields fewer entries (those tags fall back to "general").
+fn fetch_tag_types(
+    agent: &ureq::Agent,
+    names: &[String],
+    user_id: &str,
+    api_key: &str,
+) -> std::collections::HashMap<String, i64> {
+    let mut out = std::collections::HashMap::new();
+    let add = |t: &serde_json::Value, out: &mut std::collections::HashMap<String, i64>| {
+        let name = t.get("name").and_then(|v| v.as_str());
+        // `type` is an integer with json=1, but tolerate a stringified form too.
+        let ty = t
+            .get("type")
+            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+        if let (Some(name), Some(ty)) = (name, ty) {
+            out.insert(name.to_string(), ty);
+        }
+    };
+    for chunk in names.chunks(100) {
+        let mut url = format!("{TAG_API_URL}&names={}", percent_encode(&chunk.join(" ")));
+        if !user_id.trim().is_empty() {
+            url.push_str("&user_id=");
+            url.push_str(&percent_encode(user_id.trim()));
+        }
+        if !api_key.trim().is_empty() {
+            url.push_str("&api_key=");
+            url.push_str(&percent_encode(api_key.trim()));
+        }
+        let resp = agent
+            .get(&url)
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "application/json,text/plain,*/*")
+            .call();
+        let Ok(mut resp) = resp else { continue };
+        if resp.status().as_u16() != 200 {
+            continue;
+        }
+        let Ok(body) = resp.body_mut().read_to_string() else { continue };
+        let Ok(root) = serde_json::from_str::<serde_json::Value>(&body) else { continue };
+        // { "@attributes": {...}, "tag": [ {name,type,...}, ... ] } — "tag" can be a
+        // single object instead of an array when there's one result.
+        match root.get("tag") {
+            Some(serde_json::Value::Array(arr)) => {
+                for t in arr {
+                    add(t, &mut out);
+                }
+            }
+            Some(obj @ serde_json::Value::Object(_)) => add(obj, &mut out),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn build_api_url(final_tags: &str, per_page: u32, pid: u32, user_id: &str, api_key: &str) -> String {
