@@ -31,11 +31,11 @@ jobs:
         shell: pwsh
         run: |
           $ver = "3.0.21"
-          $url = "https://get.videolan.org/vlc/$ver/win64/vlc-$ver-win64.7z"
-          # get.videolan.org load-balances across mirrors; some occasionally serve
-          # an HTML error page instead of the archive (7z then reports "Is not
-          # archive"). Retry and validate the 7z magic bytes so a flaky mirror
-          # response doesn't fail the release.
+          # Use the canonical origin (download.videolan.org), NOT get.videolan.org:
+          # the latter load-balances across mirrors and was redirecting CI to a
+          # mirror that served an HTML error page instead of the 7z. The retry +
+          # 7z-magic validation below stays as a guard against transient blips.
+          $url = "https://download.videolan.org/pub/videolan/vlc/$ver/win64/vlc-$ver-win64.7z"
           $ok = $false
           for ($i = 1; $i -le 6; $i++) {
             try {
