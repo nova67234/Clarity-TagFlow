@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use crate::theme::{EDGE, FIELD, MUTED, TEXT};
+use crate::theme::{EDGE, FIELD, MUTED, PANEL, TEXT};
 
 const USER_AGENT: &str = "Clarity TagFlow (Civitai resource lookup)";
 const API_PING: &str = "https://civitai.com/api/v1/models?limit=1";
@@ -91,6 +91,10 @@ struct Fetched {
     /// The Civitai `type` ("LORA" / "LoCon" / "DoRA" / …), used to split LoRAs
     /// from LyCORIS-style models into separate sections.
     resource_type: String,
+    /// API download URL for the resolved version's primary file (for in-app
+    /// download), and the file's suggested name.
+    download_url: String,
+    download_filename: Option<String>,
 }
 
 struct FetchedSection {
@@ -108,6 +112,30 @@ enum CivMsg {
     Done(Box<CivResult>),
 }
 
+/// What the Download button asks for (collected during render, acted on after).
+struct DownloadRequest {
+    name: String,
+    download_url: String,
+    filename: Option<String>,
+}
+
+/// Progress from a model-download worker thread.
+enum DlMsg {
+    Progress(u64, u64), // received, total (total = 0 if unknown)
+    Done(std::path::PathBuf),
+    Error(String),
+}
+
+/// One in-flight / finished model download, shown as a progress row.
+struct Download {
+    name: String,
+    rx: Option<Receiver<DlMsg>>,
+    received: u64,
+    total: u64,
+    status: String,
+    ok: bool,
+}
+
 // ---------------------------------------------------------------------------
 // UI-side resolved state (textures live here)
 // ---------------------------------------------------------------------------
@@ -118,6 +146,8 @@ struct UiResource {
     triggers: Vec<String>,
     tex: Option<egui::TextureHandle>,
     has_video_only: bool,
+    download_url: String,
+    download_filename: Option<String>,
 }
 
 struct UiSection {
@@ -151,6 +181,17 @@ pub struct CivitaiState {
     /// Civitai reachability: 0 = checking, 1 = online, 2 = offline.
     api_status: Arc<AtomicU8>,
     monitor_started: bool,
+
+    /// Civitai API key (plaintext in memory; stored encrypted on disk). Used for
+    /// authenticated model downloads. Loaded once on first show.
+    api_key: String,
+    /// Folder downloaded models are saved into (like the Gelbooru downloader).
+    download_dir: String,
+    key_loaded: bool,
+    /// Whether the API-key / download settings popup is open.
+    show_settings: bool,
+    /// In-flight / finished model downloads (progress rows).
+    downloads: Vec<Download>,
 }
 
 impl Default for CivitaiState {
@@ -163,6 +204,11 @@ impl Default for CivitaiState {
             cancel: Arc::new(AtomicBool::new(false)),
             api_status: Arc::new(AtomicU8::new(API_CHECKING)),
             monitor_started: false,
+            api_key: String::new(),
+            download_dir: String::new(),
+            key_loaded: false,
+            show_settings: false,
+            downloads: Vec::new(),
         }
     }
 }
@@ -183,6 +229,50 @@ pub fn show(
     if !state.monitor_started {
         state.monitor_started = true;
         start_api_monitor(Arc::clone(&state.api_status), ui.ctx().clone());
+    }
+    // Load the saved (encrypted) API key + download folder once.
+    if !state.key_loaded {
+        state.key_loaded = true;
+        state.api_key = load_civitai_key();
+        state.download_dir = load_download_dir();
+    }
+
+    // Drain model-download progress.
+    let mut any_active = false;
+    for d in &mut state.downloads {
+        // Drain into a Vec first so the `&d.rx` borrow ends before we mutate `d`.
+        let msgs: Vec<DlMsg> = match &d.rx {
+            Some(rx) => std::iter::from_fn(|| rx.try_recv().ok()).collect(),
+            None => Vec::new(),
+        };
+        for msg in msgs {
+            match msg {
+                DlMsg::Progress(r, t) => {
+                    d.received = r;
+                    d.total = t;
+                    d.status = "Downloading…".into();
+                }
+                DlMsg::Done(path) => {
+                    d.rx = None;
+                    d.ok = true;
+                    d.status = format!(
+                        "Saved to {}",
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
+                    );
+                }
+                DlMsg::Error(e) => {
+                    d.rx = None;
+                    d.ok = false;
+                    d.status = format!("Failed: {e}");
+                }
+            }
+        }
+        if d.rx.is_some() {
+            any_active = true;
+        }
+    }
+    if any_active {
+        ui.ctx().request_repaint_after(Duration::from_millis(150));
     }
 
     // Drain worker messages.
@@ -242,17 +332,28 @@ pub fn show(
         ui.heading(egui::RichText::new("Civitai Resources").color(TEXT()).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             api_pill(ui, state.api_status.load(Ordering::Relaxed));
+            // Settings gear next to the status: opens the API-key popup.
+            let gear = egui::include_image!("../icons/settings.svg");
+            if crate::svg_button(ui, gear, "Civitai API key", 18.0, crate::theme::icon_tint(MUTED())).clicked() {
+                state.show_settings = !state.show_settings;
+            }
         });
     });
     ui.add_space(8.0);
 
-    // Body.
+    // API-key / download settings popup.
+    if state.show_settings {
+        api_key_popup(ui.ctx(), state);
+    }
+
+    // Body. The Download buttons set `download_req`, acted on after rendering.
+    let mut download_req: Option<DownloadRequest> = None;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             match &state.result {
-                Some(res) => render_result(ui, res),
+                Some(res) => render_result(ui, res, &state.downloads, &state.download_dir, &mut download_req),
                 None => {
                     ui.add_space(24.0);
                     ui.vertical_centered(|ui| {
@@ -265,9 +366,18 @@ pub fn show(
                 }
             }
         });
+    if let Some(req) = download_req {
+        start_download(state, req, ui.ctx());
+    }
 }
 
-fn render_result(ui: &mut egui::Ui, res: &UiResult) {
+fn render_result(
+    ui: &mut egui::Ui,
+    res: &UiResult,
+    downloads: &[Download],
+    download_dir: &str,
+    download_req: &mut Option<DownloadRequest>,
+) {
     if let Some(url) = &res.source_url {
         section_label(ui, "Original Upload");
         source_link_card(ui, url);
@@ -278,7 +388,7 @@ fn render_result(ui: &mut egui::Ui, res: &UiResult) {
         }
         section_label(ui, &section.title);
         for item in &section.items {
-            resource_card(ui, item);
+            resource_card(ui, item, downloads, download_dir, download_req);
         }
     }
 }
@@ -311,7 +421,25 @@ fn source_link_card(ui: &mut egui::Ui, url: &str) {
 
 /// A single resource card: preview thumbnail (or video placeholder) on the left,
 /// name + trigger words on the right. The whole card is clickable.
-fn resource_card(ui: &mut egui::Ui, data: &UiResource) {
+fn resource_card(
+    ui: &mut egui::Ui,
+    data: &UiResource,
+    downloads: &[Download],
+    download_dir: &str,
+    download_req: &mut Option<DownloadRequest>,
+) {
+    // Latest download for this resource (any state), driving the right-slot icon.
+    let dl = downloads.iter().rev().find(|d| d.name == data.name);
+    // Already installed? Check whether its file exists in the models folder.
+    let installed = !download_dir.is_empty()
+        && data
+            .download_filename
+            .as_deref()
+            .map(|f| Path::new(download_dir).join(sanitize_filename(f)).exists())
+            .unwrap_or(false);
+    // Rect of the Download button, so a click there starts a download instead of
+    // opening the page (the card-level interact below would otherwise win).
+    let mut dl_rect: Option<egui::Rect> = None;
     let inner = card_body(ui, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
@@ -342,6 +470,64 @@ fn resource_card(ui: &mut egui::Ui, data: &UiResource) {
                     );
                 }
             });
+
+            // Right side, vertically centred. The slot reflects the download state:
+            //   downloading → percentage · done → green check · failed → red
+            //   warning (instant hover shows the error) · idle → download arrow.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(2.0);
+                match dl {
+                    Some(d) if d.rx.is_some() => {
+                        let pct = if d.total > 0 {
+                            (d.received as f64 / d.total as f64 * 100.0).round() as u32
+                        } else {
+                            0
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("{pct}%"))
+                                .color(crate::theme::ACCENT1())
+                                .strong()
+                                .size(13.0),
+                        );
+                    }
+                    Some(d) if d.ok => {
+                        ui.add(
+                            egui::Image::new(egui::include_image!("../icons/checkmark.svg"))
+                                .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                                .tint(egui::Color32::from_rgb(46, 160, 67)),
+                        )
+                        .on_hover_text(&d.status);
+                    }
+                    Some(d) => {
+                        // Failed — orange warning with an immediately-shown tooltip.
+                        ui.scope(|ui| {
+                            ui.style_mut().interaction.tooltip_delay = 0.0;
+                            ui.add(
+                                egui::Image::new(egui::include_image!("../icons/warning.svg"))
+                                    .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                                    .sense(egui::Sense::hover())
+                                    .tint(egui::Color32::from_rgb(235, 150, 45)),
+                            )
+                            .on_hover_text(&d.status);
+                        });
+                    }
+                    None if installed => {
+                        // Already downloaded — green check.
+                        ui.add(
+                            egui::Image::new(egui::include_image!("../icons/checkmark.svg"))
+                                .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                                .tint(egui::Color32::from_rgb(46, 160, 67)),
+                        )
+                        .on_hover_text("Already in your models folder");
+                    }
+                    None => {
+                        // Blue download arrow.
+                        let arrow = egui::include_image!("../icons/arrow_circle_down.svg");
+                        let r = crate::svg_button(ui, arrow, "Download into your models folder", 22.0, crate::theme::ACCENT1());
+                        dl_rect = Some(r.rect);
+                    }
+                }
+            });
         });
     });
 
@@ -350,7 +536,22 @@ fn resource_card(ui: &mut egui::Ui, data: &UiResource) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     if resp.clicked() {
-        open_url(ui.ctx(), &data.url);
+        // A click on the Download button starts a download; anywhere else on the
+        // card opens the resource page. We test by click position because the
+        // card's interact can swallow the button's own click event.
+        let on_download = matches!(
+            (resp.interact_pointer_pos(), dl_rect),
+            (Some(p), Some(r)) if r.contains(p)
+        );
+        if on_download {
+            *download_req = Some(DownloadRequest {
+                name: data.name.clone(),
+                download_url: data.download_url.clone(),
+                filename: data.download_filename.clone(),
+            });
+        } else {
+            open_url(ui.ctx(), &data.url);
+        }
     }
 }
 
@@ -391,6 +592,384 @@ fn card_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Respon
 }
 
 /// Draw the coloured "API: …" status pill (same look as the downloader's).
+/// The Civitai settings popup: API key (stored encrypted via src/secret.rs) and a
+/// download folder for models. A modern, sectioned card.
+fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
+    egui::Window::new("")
+        .id(egui::Id::new("civitai_settings"))
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .frame(
+            egui::Frame::new()
+                .fill(PANEL())
+                .corner_radius(egui::CornerRadius::same(16))
+                .inner_margin(egui::Margin::same(18))
+                .stroke(egui::Stroke::new(1.0, EDGE()))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 6],
+                    blur: 20,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(150),
+                }),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(380.0);
+            let radius = egui::CornerRadius::same(10);
+            {
+                let v = ui.visuals_mut();
+                v.widgets.inactive.corner_radius = radius;
+                v.widgets.hovered.corner_radius = radius;
+                v.widgets.active.corner_radius = radius;
+                v.extreme_bg_color = FIELD();
+            }
+
+            // Title row.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add(
+                    egui::Image::new(egui::include_image!("../icons/civitai.svg"))
+                        .fit_to_exact_size(egui::vec2(20.0, 20.0)),
+                );
+                ui.heading(egui::RichText::new("Civitai Settings").color(TEXT()).strong().size(17.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("✕").size(14.0)).frame(false))
+                        .on_hover_text("Close")
+                        .clicked()
+                    {
+                        state.show_settings = false;
+                    }
+                });
+            });
+            ui.add_space(14.0);
+
+            // API key section.
+            ui.label(egui::RichText::new("API KEY").color(MUTED()).strong().size(11.0));
+            ui.add_space(4.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut state.api_key)
+                    .password(true)
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::Margin::symmetric(10, 8))
+                    .hint_text("Paste your Civitai API key"),
+            );
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Stored encrypted on this device.").color(MUTED()).size(10.5),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.hyperlink_to(
+                        egui::RichText::new("Get a key →").size(10.5),
+                        "https://civitai.com/user/account",
+                    );
+                });
+            });
+
+            ui.add_space(14.0);
+
+            // Download folder section.
+            ui.label(egui::RichText::new("MODELS FOLDER").color(MUTED()).strong().size(11.0));
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let folder = egui::include_image!("../icons/folder.svg");
+                if crate::svg_button(ui, folder, "Choose folder", 30.0, crate::theme::icon_tint(MUTED())).clicked() {
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        state.download_dir = dir.display().to_string();
+                    }
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.download_dir)
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::Margin::symmetric(10, 8))
+                        .hint_text("Where downloaded models are saved"),
+                );
+            });
+
+            ui.add_space(18.0);
+
+            // Actions.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let save = egui::Button::new(
+                    egui::RichText::new("Save").color(egui::Color32::WHITE).strong(),
+                )
+                .fill(crate::theme::ACCENT1());
+                if ui.add_sized(egui::vec2(90.0, 32.0), save).clicked() {
+                    save_civitai_key(&state.api_key);
+                    save_download_dir(&state.download_dir);
+                    state.show_settings = false;
+                }
+                if ui.add_sized(egui::vec2(80.0, 32.0), egui::Button::new("Clear key")).clicked() {
+                    state.api_key.clear();
+                    save_civitai_key("");
+                }
+            });
+        });
+}
+
+/// Validate + start a model download on a worker thread.
+fn start_download(state: &mut CivitaiState, req: DownloadRequest, ctx: &egui::Context) {
+    let dir = state.download_dir.trim().to_string();
+    if dir.is_empty() {
+        // No folder yet — open settings so the user can pick one.
+        state.show_settings = true;
+        state.downloads.push(Download {
+            name: req.name,
+            rx: None,
+            received: 0,
+            total: 0,
+            status: "Failed: set a models folder in settings".into(),
+            ok: false,
+        });
+        return;
+    }
+    let key = state.api_key.trim().to_string();
+    let (tx, rx) = mpsc::channel();
+    state.downloads.push(Download {
+        name: req.name.clone(),
+        rx: Some(rx),
+        received: 0,
+        total: 0,
+        status: "Starting…".into(),
+        ok: false,
+    });
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        run_download(req.download_url, req.filename, key, std::path::PathBuf::from(dir), tx, ctx);
+    });
+}
+
+/// Stream a Civitai model file to `dir`, reporting progress. The token goes in the
+/// query string (not a header), since Civitai 302-redirects to S3 and strips
+/// headers on the cross-domain hop.
+fn run_download(
+    mut url: String,
+    filename_hint: Option<String>,
+    key: String,
+    dir: std::path::PathBuf,
+    tx: Sender<DlMsg>,
+    ctx: egui::Context,
+) {
+    use std::io::{Read, Write};
+
+    if !key.is_empty() {
+        url.push(if url.contains('?') { '&' } else { '?' });
+        url.push_str("token=");
+        url.push_str(&key);
+    }
+
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .max_redirects(10)
+        .http_status_as_error(false)
+        // No global/body timeout — model files are large; only bound setup phases.
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_send_request(Some(Duration::from_secs(15)))
+        .timeout_recv_response(Some(Duration::from_secs(30)))
+        .build()
+        .into();
+
+    let send_err = |e: String| {
+        let _ = tx.send(DlMsg::Error(e));
+        ctx.request_repaint();
+    };
+
+    let resp = match agent.get(&url).header("User-Agent", USER_AGENT).call() {
+        Ok(r) => r,
+        Err(e) => return send_err(format!("request failed: {e}")),
+    };
+    let mut resp = resp;
+    let status = resp.status().as_u16();
+    if status != 200 {
+        return send_err(if status == 401 || status == 403 {
+            "unauthorized — check your API key".into()
+        } else {
+            format!("HTTP {status}")
+        });
+    }
+
+    // Prefer the server-suggested filename, then the API file name, then a default.
+    let cd = resp
+        .headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .and_then(filename_from_content_disposition);
+    let name = cd
+        .or(filename_hint)
+        .unwrap_or_else(|| "civitai-model.safetensors".to_string());
+    let total: u64 = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return send_err(format!("cannot create folder: {e}"));
+    }
+    let dest = unique_path(&dir, &sanitize_filename(&name));
+    let tmp = dest.with_extension("part");
+    let mut out = match std::fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(e) => return send_err(format!("cannot write file: {e}")),
+    };
+
+    let mut reader = resp.body_mut().as_reader();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut got: u64 = 0;
+    let mut last_sent = 0u64;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => return send_err(format!("download error: {e}")),
+        };
+        if out.write_all(&buf[..n]).is_err() {
+            return send_err("write error".into());
+        }
+        got += n as u64;
+        if got - last_sent >= 1 << 20 {
+            last_sent = got;
+            let _ = tx.send(DlMsg::Progress(got, total));
+            ctx.request_repaint();
+        }
+    }
+    out.flush().ok();
+    drop(out);
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        return send_err(format!("could not finalize: {e}"));
+    }
+    let _ = tx.send(DlMsg::Done(dest));
+    ctx.request_repaint();
+}
+
+/// Extract a filename from a `Content-Disposition` header value.
+fn filename_from_content_disposition(cd: &str) -> Option<String> {
+    // filename*=UTF-8''name takes priority over filename="name".
+    if let Some(i) = cd.to_ascii_lowercase().find("filename*=") {
+        let rest = &cd[i + "filename*=".len()..];
+        let val = rest.split(';').next().unwrap_or(rest).trim();
+        let val = val.rsplit("''").next().unwrap_or(val);
+        let decoded = percent_decode(val.trim_matches('"'));
+        if !decoded.is_empty() {
+            return Some(decoded);
+        }
+    }
+    if let Some(i) = cd.to_ascii_lowercase().find("filename=") {
+        let rest = &cd[i + "filename=".len()..];
+        let val = rest.split(';').next().unwrap_or(rest).trim().trim_matches('"');
+        if !val.is_empty() {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+/// Minimal percent-decoding for Content-Disposition filenames.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Strip path separators / illegal characters from a download filename.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() { "civitai-model.safetensors".to_string() } else { cleaned.to_string() }
+}
+
+/// A non-clashing path in `dir`, appending " (n)" before the extension if needed.
+fn unique_path(dir: &Path, name: &str) -> std::path::PathBuf {
+    let base = dir.join(name);
+    if !base.exists() {
+        return base;
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) => (&name[..i], &name[i..]),
+        None => (name, ""),
+    };
+    for i in 1..100_000 {
+        let cand = dir.join(format!("{stem} ({i}){ext}"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    base
+}
+
+/// Path of the saved download-folder setting (plaintext — not sensitive).
+fn download_dir_path() -> std::path::PathBuf {
+    dirs::config_dir()
+        .map(|p| p.join("Clarity TagFlow").join("civitai_download_dir.txt"))
+        .unwrap_or_else(|| std::path::PathBuf::from("civitai_download_dir.txt"))
+}
+
+fn load_download_dir() -> String {
+    std::fs::read_to_string(download_dir_path()).map(|s| s.trim().to_string()).unwrap_or_default()
+}
+
+fn save_download_dir(dir: &str) {
+    let path = download_dir_path();
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(&path, dir.trim());
+}
+
+/// Path of the encrypted Civitai API key file in the app config dir.
+fn civitai_key_path() -> std::path::PathBuf {
+    dirs::config_dir()
+        .map(|p| p.join("Clarity TagFlow").join("civitai_api_key.dat"))
+        .unwrap_or_else(|| std::path::PathBuf::from("civitai_api_key.dat"))
+}
+
+/// Load the saved Civitai API key (decrypted), or "" if none/unreadable.
+fn load_civitai_key() -> String {
+    std::fs::read_to_string(civitai_key_path())
+        .ok()
+        .map(|s| crate::secret::unprotect(s.trim()))
+        .unwrap_or_default()
+}
+
+/// Save the Civitai API key encrypted. An empty key removes the file.
+fn save_civitai_key(key: &str) {
+    let path = civitai_key_path();
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, crate::secret::protect(trimmed));
+}
+
 fn api_pill(ui: &mut egui::Ui, api: u8) {
     let (text, bg) = match api {
         API_ONLINE => ("Online", egui::Color32::from_rgb(35, 137, 58)),
@@ -439,6 +1018,8 @@ fn resolve(ctx: &egui::Context, res: CivResult) -> UiResult {
                         triggers: f.triggers,
                         tex,
                         has_video_only: f.has_video_only,
+                        download_url: f.download_url,
+                        download_filename: f.download_filename,
                     }
                 })
                 .collect(),
@@ -738,6 +1319,24 @@ fn get_formatted_model_data(
     let vid = as_text(version.get("id").unwrap_or(&serde_json::Value::Null)).unwrap_or_default();
     let page_url = format!("https://civitai.com/models/{model_id}?modelVersionId={vid}");
 
+    // Pick the primary file for download (its own downloadUrl + name), falling
+    // back to the version-level download endpoint.
+    let primary_file = version
+        .get("files")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|f| f.get("primary").and_then(|v| v.as_bool()).unwrap_or(false))
+                .or_else(|| arr.first())
+        });
+    let download_url = primary_file
+        .and_then(|f| f.get("downloadUrl").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("https://civitai.com/api/download/models/{vid}"));
+    let download_filename = primary_file
+        .and_then(|f| f.get("name").and_then(|v| v.as_str()))
+        .map(|s| s.to_string());
+
     // Pick the first still-image preview; note if the version only has videos.
     let mut image_url: Option<String> = None;
     let mut has_video = false;
@@ -784,6 +1383,8 @@ fn get_formatted_model_data(
         image,
         has_video_only,
         resource_type,
+        download_url,
+        download_filename,
     })
 }
 
