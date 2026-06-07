@@ -52,6 +52,7 @@ mod ai_orb;
 #[cfg(feature = "avif")]
 mod avif;
 mod backup;
+mod bgremove;
 mod civitai;
 mod depth;
 mod emoji;
@@ -170,6 +171,40 @@ fn apply_theme(ctx: &egui::Context) {
 }
 
 // ---------------------------------------------------------------------------
+// Background removal (BiRefNet) — async right-click action
+// ---------------------------------------------------------------------------
+
+/// Catalog folder for the BiRefNet background-removal model (see ai_models.rs).
+const BG_FOLDER: &str = "birefnet-lite-onnx";
+
+/// In-flight background-removal job for one image. First downloads the model if
+/// missing (best-effort progress), then runs inference on a worker thread.
+struct BgRemoveJob {
+    src: PathBuf,
+    /// Set while the model is downloading on first use.
+    download: Option<ai_models::DownloadHandle>,
+    /// Set while inference runs; yields the written cutout path (or an error).
+    rx: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
+    /// Status line shown in the floating overlay.
+    status: String,
+}
+
+/// Spawn BiRefNet inference for `src` on a worker thread, returning the result
+/// channel. The model path is resolved on the worker (it may have just landed).
+fn spawn_bg_inference(src: PathBuf, ctx: egui::Context) -> std::sync::mpsc::Receiver<Result<PathBuf, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let res = match tagger::resolve(BG_FOLDER, "model.onnx") {
+            Some(model) => bgremove::run_bgremove_job(model, src),
+            None => Err("Background model file is missing".to_string()),
+        };
+        let _ = tx.send(res);
+        ctx.request_repaint();
+    });
+    rx
+}
+
+// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 struct ViewerApp {
@@ -229,6 +264,11 @@ struct ViewerApp {
     /// (displays the generated GLB instead of the selected image).
     #[cfg(not(target_os = "macos"))]
     scene3d: scene3d::Scene3D,
+
+    /// In-flight background-removal job (right-click → Remove Background).
+    bg_job: Option<BgRemoveJob>,
+    /// Transient status/result message for background removal (text, hide-time).
+    bg_toast: Option<(String, f64)>,
 }
 
 impl Default for ViewerApp {
@@ -260,6 +300,8 @@ impl Default for ViewerApp {
             zoom: zoom::ZoomState::default(),
             #[cfg(not(target_os = "macos"))]
             scene3d: scene3d::Scene3D::new(),
+            bg_job: None,
+            bg_toast: None,
         }
     }
 }
@@ -404,6 +446,132 @@ impl ViewerApp {
                 let _ = clip.set_image(img);
             }
         });
+    }
+
+    /// Start removing the background of `src` (right-click action). Downloads the
+    /// BiRefNet model first if it isn't installed. One job at a time.
+    fn start_bgremove(&mut self, src: &std::path::Path, ctx: &egui::Context) {
+        if self.bg_job.is_some() {
+            return;
+        }
+        let src = src.to_path_buf();
+        let mut job = BgRemoveJob { src: src.clone(), download: None, rx: None, status: String::new() };
+        if tagger::resolve(BG_FOLDER, "model.onnx").is_none() {
+            job.download = ai_models::start_model_download(BG_FOLDER);
+            if job.download.is_some() {
+                job.status = "Downloading background model…".to_string();
+            } else {
+                self.bg_toast = Some(("Background model unavailable".to_string(), ctx.input(|i| i.time) + 5.0));
+                return;
+            }
+        } else {
+            job.status = "Removing background…".to_string();
+            job.rx = Some(spawn_bg_inference(src, ctx.clone()));
+        }
+        self.bg_job = Some(job);
+    }
+
+    /// Advance the background-removal job each frame: poll the model download,
+    /// kick inference once it's ready, and handle the result. Also expires the
+    /// transient toast.
+    fn drive_bg_job(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        if let Some((_, until)) = &self.bg_toast {
+            if now >= *until {
+                self.bg_toast = None;
+            }
+        }
+
+        // Result of this frame's polling, applied after the &mut borrow ends.
+        let mut done: Option<Result<PathBuf, String>> = None;
+        if let Some(job) = &mut self.bg_job {
+            if let Some(dl) = &job.download {
+                if dl.done() {
+                    if dl.ok() {
+                        job.download = None;
+                        job.status = "Removing background…".to_string();
+                        job.rx = Some(spawn_bg_inference(job.src.clone(), ctx.clone()));
+                    } else {
+                        done = Some(Err(format!(
+                            "Model download failed: {}",
+                            dl.error().unwrap_or_else(|| "unknown error".into())
+                        )));
+                    }
+                } else {
+                    job.status = format!("Downloading background model… {}%", dl.pct());
+                }
+            } else if let Some(rx) = &job.rx {
+                match rx.try_recv() {
+                    Ok(r) => done = Some(r),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        done = Some(Err("Background worker stopped".to_string()));
+                    }
+                }
+            }
+        }
+
+        if let Some(result) = done {
+            let src = self.bg_job.as_ref().map(|j| j.src.clone());
+            self.bg_job = None;
+            match result {
+                Ok(dest) => {
+                    if let Some(src) = src {
+                        self.insert_derived(&src, dest);
+                    }
+                    self.bg_toast = Some(("Background removed ✓".to_string(), now + 3.0));
+                }
+                Err(e) => self.bg_toast = Some((format!("Background removal failed — {e}"), now + 6.0)),
+            }
+        }
+
+        if self.bg_job.is_some() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Insert a derived image (`dest`) just beneath its source in the browser and
+    /// select it; if it's already listed, just select it. Mirrors `crop_current`.
+    fn insert_derived(&mut self, src: &std::path::Path, dest: PathBuf) {
+        if let Some(i) = self.images.iter().position(|p| p == &dest) {
+            self.selected = Some(i);
+            self.update_filtered();
+            return;
+        }
+        let at = self
+            .images
+            .iter()
+            .position(|p| p == src)
+            .map(|i| i + 1)
+            .unwrap_or(self.images.len());
+        self.images.insert(at, dest);
+        self.selected = Some(at);
+        self.update_filtered();
+    }
+
+    /// Floating top-centre overlay showing background-removal progress / result.
+    fn paint_bg_status(&self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let (text, busy) = if let Some(job) = &self.bg_job {
+            (job.status.clone(), true)
+        } else if let Some((msg, until)) = &self.bg_toast {
+            if now < *until { (msg.clone(), false) } else { return }
+        } else {
+            return;
+        };
+        egui::Area::new(egui::Id::new("bg_status_overlay"))
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 64.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if busy {
+                            ui.add(egui::Spinner::new().size(16.0));
+                        }
+                        ui.label(text);
+                    });
+                });
+            });
     }
 
     fn step_selection(&mut self, delta: i32) {
@@ -554,6 +722,7 @@ impl ViewerApp {
                             }
                             zoom::ViewerAction::Crop(frac) => self.crop_current(&path, frac),
                             zoom::ViewerAction::CopyImage => self.copy_current(&path),
+                            zoom::ViewerAction::RemoveBackground => self.start_bgremove(&path, ui.ctx()),
                             zoom::ViewerAction::None => {}
                         }
                     }
@@ -608,6 +777,9 @@ impl ViewerApp {
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_dropped_files(ui.ctx());
+        // Advance any in-flight background-removal job (download → inference → result).
+        self.drive_bg_job(ui.ctx());
+        self.paint_bg_status(ui.ctx());
         // Only sample CPU/RAM when the top-bar graphs are actually shown.
         if self.settings.show_stats {
             self.stats.update();
