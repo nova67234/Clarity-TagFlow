@@ -315,20 +315,24 @@ impl ZoomState {
         let mut want_copy = false;
         let mut want_spatial = false;
         resp.context_menu(|ui| {
-            let fav_label = if is_favorite { "Remove favorite" } else { "Favorite" };
-            if ui.button(fav_label).clicked() {
+            let (fav_icon, fav_label) = if is_favorite {
+                (egui::include_image!("../icons/heart_minus.svg"), "Remove favorite")
+            } else {
+                (egui::include_image!("../icons/heart_plus.svg"), "Favorite")
+            };
+            if menu_item(ui, fav_icon, fav_label) {
                 want_favorite = true;
                 ui.close();
             }
-            if ui.button("Copy image").clicked() {
+            if menu_item(ui, egui::include_image!("../icons/copy.svg"), "Copy image") {
                 want_copy = true;
                 ui.close();
             }
-            if ui.button("Crop image…").clicked() {
+            if menu_item(ui, egui::include_image!("../icons/crop.svg"), "Crop image…") {
                 want_crop = true;
                 ui.close();
             }
-            if ui.button("Spatial Scene").clicked() {
+            if menu_item(ui, egui::include_image!("../icons/spatial_scene.svg"), "Spatial Scene") {
                 want_spatial = true;
                 ui.close();
             }
@@ -593,16 +597,20 @@ impl ZoomState {
         let mut want_favorite = false;
         let mut want_copy = false;
         resp.context_menu(|ui| {
-            if ui.button("Exit Spatial Scene").clicked() {
+            if menu_item(ui, egui::include_image!("../icons/spatial_scene.svg"), "Exit Spatial Scene") {
                 want_exit = true;
                 ui.close();
             }
-            let fav_label = if is_favorite { "Remove favorite" } else { "Favorite" };
-            if ui.button(fav_label).clicked() {
+            let (fav_icon, fav_label) = if is_favorite {
+                (egui::include_image!("../icons/heart_minus.svg"), "Remove favorite")
+            } else {
+                (egui::include_image!("../icons/heart_plus.svg"), "Favorite")
+            };
+            if menu_item(ui, fav_icon, fav_label) {
                 want_favorite = true;
                 ui.close();
             }
-            if ui.button("Copy image").clicked() {
+            if menu_item(ui, egui::include_image!("../icons/copy.svg"), "Copy image") {
                 want_copy = true;
                 ui.close();
             }
@@ -916,4 +924,14 @@ impl ZoomState {
         painter.rect_filled(bg, CornerRadius::same(8), Color32::from_black_alpha(190));
         painter.galley(bg.min + pad, galley, Color32::from_gray(235));
     }
+}
+
+/// A right-click context-menu entry with a leading SVG icon (tinted to the menu's
+/// text colour so it stays visible in light and dark themes). Returns true when
+/// clicked.
+fn menu_item(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, label: &str) -> bool {
+    let image = egui::Image::new(icon)
+        .fit_to_exact_size(egui::vec2(16.0, 16.0))
+        .tint(ui.visuals().text_color());
+    ui.add(egui::Button::image_and_text(image, label)).clicked()
 }
