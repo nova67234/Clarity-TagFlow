@@ -183,11 +183,26 @@ pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&
     // removal), so no Hugging Face login is needed — the field only exists in case
     // someone wants to use their own gated model. ---
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
         ui.label(RichText::new("HF token (optional)").color(MUTED()).size(11.0));
+        // Info icon: hover for an explanation + a clickable link.
+        ui.add(
+            egui::Image::new(egui::include_image!("../icons/info.svg"))
+                .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                .tint(crate::theme::icon_tint(MUTED())),
+        )
+        .on_hover_ui(|ui| {
+            ui.set_max_width(260.0);
+            ui.label(
+                "No Hugging Face login is needed — \"Setup Requirements\" downloads \
+                 every model from public sources. Only add a token if you want to use \
+                 your own gated model.",
+            );
+            ui.hyperlink_to("Manage Hugging Face tokens →", "https://huggingface.co/settings/tokens");
+        });
         let resp = ui.add(
             egui::TextEdit::singleline(&mut state.hf_token)
                 .password(true)
-                .hint_text("optional — Setup downloads everything; no login needed")
                 .desired_width(f32::INFINITY),
         );
         // Persist (encrypted) once the user finishes editing, so it survives
