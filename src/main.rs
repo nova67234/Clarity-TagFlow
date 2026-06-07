@@ -638,7 +638,10 @@ impl eframe::App for ViewerApp {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
         }
 
-        // Arrow keys cycle through the opened images.
+        // Arrow keys cycle through the opened images — but NOT while a text field
+        // (tags box, search, blacklist, …) has keyboard focus, where the arrows
+        // must move the text cursor instead.
+        let typing = ui.ctx().egui_wants_keyboard_input();
         let delta = ui.input(|i| {
             if i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::ArrowDown) {
                 1
@@ -648,7 +651,7 @@ impl eframe::App for ViewerApp {
                 0
             }
         });
-        if delta != 0 {
+        if delta != 0 && !typing {
             self.step_selection(delta);
         }
 
