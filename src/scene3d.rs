@@ -6,12 +6,15 @@
 //! scroll to zoom. Built on `three-d` 0.19 (which pins the same glow 0.17 /
 //! egui_glow 0.34 that eframe 0.34 uses, so the GL context type unifies).
 //!
-//! Loading is one-shot per file: the GLB bytes are read on the UI thread when the
-//! path changes, then parsed + uploaded to the GPU inside the callback (the only
-//! place a `three_d::Context` is available). The model is static after that, so
-//! we only repaint while the user is interacting.
+//! Loading is one-shot per file. The expensive part — reading the GLB and
+//! decoding its textures/geometry into a CPU model — runs on a background thread
+//! so the UI never freezes (a 40–80 MB GLB with 4K PBR textures can take many
+//! seconds, especially in debug builds). The cheap-ish GPU upload then happens in
+//! the paint callback (the only place a `three_d::Context` is available). The
+//! model is static after that, so we only repaint while interacting or loading.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -22,23 +25,27 @@ use crate::theme::MUTED;
 /// UI-facing handle. Owns the shared render state and tracks which file is loaded.
 pub struct Scene3D {
     inner: Arc<Mutex<Inner>>,
-    /// Path currently loaded (or attempted), so we only read+upload on change.
+    /// Path currently loaded (or attempted), so we only reload on change.
     loaded_path: Option<PathBuf>,
-    /// Set if reading the GLB file failed (shown instead of the viewport).
+    /// Set if reading/parsing the GLB failed (shown instead of the viewport).
     load_err: Option<String>,
+    /// Receives the parsed CPU model from the background loader thread.
+    loader: Option<Receiver<Result<CpuModel, String>>>,
 }
 
-/// Shared, callback-accessible state. Must be `Send + Sync + 'static` because the
-/// `egui_glow::CallbackFn` requires it.
+/// Shared, callback-accessible state. Must be `Send + 'static` (it lives behind a
+/// `Mutex` in the `egui_glow::CallbackFn`, which requires `Send + Sync`).
 struct Inner {
     // Orbit camera, driven by the UI.
     yaw: f32,
     pitch: f32,
     distance: f32,
     target: Vec3,
-    /// GLB bytes waiting to be parsed + uploaded (consumed in the callback).
-    pending: Option<Vec<u8>>,
-    /// Once a model is uploaded, frame the camera to its bounds (one-shot).
+    /// A parsed CPU model waiting for GPU upload (consumed in the callback).
+    pending_cpu: Option<CpuModel>,
+    /// True once a model has been uploaded and is renderable.
+    has_model: bool,
+    /// After an upload, frame the camera to the model's bounds (one-shot).
     needs_framing: bool,
     /// GPU-side resources, built lazily once the GL context is available.
     gpu: Option<Gpu>,
@@ -70,32 +77,51 @@ impl Scene3D {
                 pitch: 0.4,
                 distance: 3.0,
                 target: vec3(0.0, 0.0, 0.0),
-                pending: None,
+                pending_cpu: None,
+                has_model: false,
                 needs_framing: false,
                 gpu: None,
                 bg: [0.0; 4],
             })),
             loaded_path: None,
             load_err: None,
+            loader: None,
         }
     }
 
     /// Render the viewer for `glb_path` (the most recently generated model, if
     /// any). Call every frame while the Pixal3D view is active.
     pub fn show(&mut self, ui: &mut egui::Ui, glb_path: Option<&Path>) {
-        // Load (read bytes) when the target file changes. Done on the UI thread;
-        // parsing + GPU upload happen later in the callback.
+        // When the target file changes, kick off a background load. Reading +
+        // decoding the GLB (4K PBR textures, ~1M triangles) is heavy, so it runs
+        // off the UI thread; the UI shows a spinner and stays responsive.
         if glb_path.map(Path::to_path_buf) != self.loaded_path {
             self.loaded_path = glb_path.map(Path::to_path_buf);
             self.load_err = None;
+            self.loader = None;
             if let Some(p) = glb_path {
-                match std::fs::read(p) {
-                    Ok(bytes) => {
-                        let mut inner = self.inner.lock().unwrap();
-                        inner.pending = Some(bytes);
-                        inner.needs_framing = true;
-                    }
-                    Err(e) => self.load_err = Some(format!("Couldn't read model: {e}")),
+                self.loader = Some(spawn_loader(p.to_path_buf(), ui.ctx().clone()));
+            }
+        }
+
+        // Collect the parsed model from the loader thread when it's ready.
+        if let Some(rx) = &self.loader {
+            match rx.try_recv() {
+                Ok(Ok(cpu)) => {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.pending_cpu = Some(cpu);
+                    inner.needs_framing = true;
+                    drop(inner);
+                    self.loader = None;
+                }
+                Ok(Err(e)) => {
+                    self.load_err = Some(e);
+                    self.loader = None;
+                }
+                Err(TryRecvError::Empty) => {} // still loading
+                Err(TryRecvError::Disconnected) => {
+                    self.load_err = Some("Model loader stopped unexpectedly".into());
+                    self.loader = None;
                 }
             }
         }
@@ -106,6 +132,18 @@ impl Scene3D {
         }
         if let Some(err) = &self.load_err {
             placeholder(ui, err);
+            return;
+        }
+
+        // Nothing renderable yet (first load in progress): spinner, and keep the
+        // frame loop alive so we poll the loader and animate the spinner.
+        let (has_model, has_pending) = {
+            let inner = self.inner.lock().unwrap();
+            (inner.has_model, inner.pending_cpu.is_some())
+        };
+        if !has_model && !has_pending {
+            spinner(ui, "Loading 3D model…");
+            ui.ctx().request_repaint();
             return;
         }
 
@@ -130,8 +168,8 @@ impl Scene3D {
                     interacting = true;
                 }
             }
-            // First frame after a load: run the callback to build + frame the model.
-            if inner.pending.is_some() || inner.needs_framing {
+            // A freshly parsed model still needs one callback to upload + frame.
+            if inner.pending_cpu.is_some() || inner.needs_framing {
                 interacting = true;
             }
         }
@@ -151,6 +189,22 @@ impl Scene3D {
             ui.ctx().request_repaint();
         }
     }
+}
+
+/// Read + parse a GLB on a background thread, returning a channel that yields the
+/// CPU model (or an error). Wakes the UI via `request_repaint` when done.
+fn spawn_loader(path: PathBuf, ctx: egui::Context) -> Receiver<Result<CpuModel, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = std::fs::read(&path)
+            .map_err(|e| format!("Couldn't read model: {e}"))
+            .and_then(|bytes| {
+                three_d_asset::io::deserialize::<CpuModel>("model.glb", bytes).map_err(|e| e.to_string())
+            });
+        let _ = tx.send(result);
+        ctx.request_repaint();
+    });
+    rx
 }
 
 impl Inner {
@@ -173,12 +227,11 @@ impl Inner {
         }
         let gpu = self.gpu.as_mut().unwrap();
 
-        // Parse + upload any pending GLB (PBR materials are applied automatically).
-        if let Some(bytes) = self.pending.take() {
-            match three_d_asset::io::deserialize::<CpuModel>("model.glb", bytes)
-                .map_err(|e| e.to_string())
-                .and_then(|cpu| Model::<PhysicalMaterial>::new(&gpu.ctx, &cpu).map_err(|e| e.to_string()))
-            {
+        // Upload any parsed CPU model to the GPU (PBR materials applied
+        // automatically). Parsing already happened off-thread; this is the only
+        // step that must run on the GL thread.
+        if let Some(cpu) = self.pending_cpu.take() {
+            match Model::<PhysicalMaterial>::new(&gpu.ctx, &cpu).map_err(|e| e.to_string()) {
                 Ok(mut model) => {
                     // Force every part into the OPAQUE rendering pass. Pixal3D
                     // models are solid, but their PNG albedo often carries a stray
@@ -197,10 +250,12 @@ impl Inner {
                         part.material.render_states.depth_test = DepthTest::Less;
                     }
                     gpu.model = Some(model);
+                    self.has_model = true;
                 }
                 Err(e) => {
-                    eprintln!("[scene3d] GLB parse/upload failed: {e}");
+                    eprintln!("[scene3d] GLB GPU upload failed: {e}");
                     gpu.model = None;
+                    self.has_model = false;
                 }
             }
         }
@@ -288,6 +343,17 @@ impl Inner {
 fn placeholder(ui: &mut egui::Ui, msg: &str) {
     ui.centered_and_justified(|ui| {
         ui.label(egui::RichText::new(msg).size(15.0).color(MUTED()));
+    });
+}
+
+/// Centred spinner + label, shown while a model loads on the background thread.
+fn spinner(ui: &mut egui::Ui, msg: &str) {
+    ui.centered_and_justified(|ui| {
+        ui.vertical_centered(|ui| {
+            ui.add(egui::Spinner::new().size(40.0).color(MUTED()));
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new(msg).size(14.0).color(MUTED()));
+        });
     });
 }
 
