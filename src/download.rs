@@ -778,6 +778,9 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
     // Session cache of tag name -> Gelbooru type, so common tags are only looked
     // up once across the whole run (most tags repeat across posts).
     let mut tag_types: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    // Shared artist/character map (md5 -> roles), loaded once and accumulated into
+    // as images download, then saved back to one tag_roles.json in the config dir.
+    let mut roles_map = load_tag_roles_map();
 
     // Enforce the daily cap: today's remaining allowance bounds this run.
     let mut used_today = quota_used_today();
@@ -872,9 +875,9 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
                 log(format!("Warning: could not write tags for {}: {e}", post.md5));
             }
 
-            // Sidecar `{md5}.json` with the artist (username) + character tags, so
-            // the viewer can colour them. Resolve each tag's type via the tag API,
-            // caching results across the run to minimise extra requests.
+            // Record the artist (username) + character tags into the shared
+            // tag_roles.json so the viewer can colour them. Resolve each tag's type
+            // via the tag API, caching results across the run to minimise requests.
             let names: Vec<&str> = post.raw_tags.split_whitespace().collect();
             let unknown: Vec<String> = names
                 .iter()
@@ -897,11 +900,8 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
             let character: Vec<String> =
                 names.iter().filter(|n| tag_types.get(**n) == Some(&4)).map(|n| n.to_string()).collect();
             if !artist.is_empty() || !character.is_empty() {
-                let roles = TagRoles { artist, character };
-                let json_path = cfg.output_dir.join(format!("{}.json", post.md5));
-                if let Ok(s) = serde_json::to_string_pretty(&roles) {
-                    let _ = std::fs::write(&json_path, s);
-                }
+                roles_map.insert(post.md5.clone(), TagRoles { artist, character });
+                save_tag_roles_map(&roles_map);
             }
 
             append_download_log(&post.md5, &mut downloaded_log);
@@ -1120,12 +1120,37 @@ fn is_allowed_by_selection(ext: &str, img: bool, gif: bool, vid: bool) -> bool {
     false
 }
 
-/// Artist (username) + character tags for one image, written as `{md5}.json`
-/// beside the file so the viewer can colour them.
-#[derive(serde::Serialize)]
+/// Artist (username) + character tags for one image. Stored in a single shared
+/// `tag_roles.json` (in the app's config dir), keyed by md5, that accumulates as
+/// more images are downloaded — so the viewer can colour those tags.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
 struct TagRoles {
+    #[serde(default)]
     artist: Vec<String>,
+    #[serde(default)]
     character: Vec<String>,
+}
+
+/// Path of the shared tag-roles map (md5 -> {artist, character}) in the config dir.
+pub(crate) fn tag_roles_path() -> PathBuf {
+    config_dir().join("tag_roles.json")
+}
+
+/// Load the shared tag-roles map, or an empty map if none/invalid.
+fn load_tag_roles_map() -> std::collections::HashMap<String, TagRoles> {
+    std::fs::read_to_string(tag_roles_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the shared tag-roles map.
+fn save_tag_roles_map(map: &std::collections::HashMap<String, TagRoles>) {
+    let dir = config_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(s) = serde_json::to_string_pretty(map) {
+        let _ = std::fs::write(tag_roles_path(), s);
+    }
 }
 
 /// Look up each tag's Gelbooru `type` via the tag endpoint, returning name->type
