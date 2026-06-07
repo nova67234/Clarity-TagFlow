@@ -321,7 +321,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&
     let log_bg = if crate::theme::is_light() { FIELD() } else { Color32::from_rgb(15, 15, 17) };
     egui::Frame::new()
         .fill(log_bg)
-        .corner_radius(CornerRadius::same(12))
+        .corner_radius(CornerRadius::same(22))
         .inner_margin(Margin::same(10))
         .stroke(egui::Stroke::new(1.0, EDGE()))
         .show(ui, |ui| {
