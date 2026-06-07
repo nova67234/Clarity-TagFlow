@@ -263,7 +263,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
             };
             egui::Frame::new()
                 .fill(log_bg)
-                .corner_radius(egui::CornerRadius::same(12))
+                .corner_radius(egui::CornerRadius::same(22))
                 .inner_margin(egui::Margin::same(10))
                 .stroke(egui::Stroke::new(1.0, EDGE()))
                 .show(ui, |ui| {
