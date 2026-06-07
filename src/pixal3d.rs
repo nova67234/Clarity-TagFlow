@@ -7,10 +7,14 @@
 //! resolution, sparse-structure / shape / texture guidance + steps), a
 //! Generate 3D button, and GLB extraction settings. Styled after the Tag Manager.
 //!
-//! Backend status: the actual Pixal3D runtime (Python venv + CUDA wheels + model
-//! weights) isn't wired yet — "Setup Requirements" scaffolds the environment
-//! folder and Generate logs the request. Running real inference + viewing the GLB
-//! is future work.
+//! Backend status: fully wired. "Setup Requirements" provisions a self-contained
+//! runtime (standalone Python + cu128 PyTorch + prebuilt CUDA-kernel wheels +
+//! nvdiffrast + the vendored o_voxel GLB exporter) and downloads all model weights
+//! from public sources — no Hugging Face login needed (DINOv3 comes from the open
+//! camenduru mirror; the gated RMBG-2.0 is swapped for ZhengPeng7/BiRefNet).
+//! Generate runs real inference and writes a PNG-textured GLB, shown in the centre
+//! viewer (src/scene3d.rs). Requires an NVIDIA GPU + CUDA Toolkit + MSVC (the
+//! latter two only for nvdiffrast's first-use compile, as with NATTEN).
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
@@ -174,13 +178,16 @@ pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&
 
     ui.add_space(6.0);
 
-    // --- HF token (for the gated background-removal model RMBG-2.0). ---
+    // --- HF token (optional). Setup Requirements pulls every model from public
+    // sources (DINOv3 via the open camenduru mirror, BiRefNet for background
+    // removal), so no Hugging Face login is needed — the field only exists in case
+    // someone wants to use their own gated model. ---
     ui.horizontal(|ui| {
-        ui.label(RichText::new("HF token").color(MUTED()).size(11.0));
+        ui.label(RichText::new("HF token (optional)").color(MUTED()).size(11.0));
         let resp = ui.add(
             egui::TextEdit::singleline(&mut state.hf_token)
                 .password(true)
-                .hint_text("for gated models (DINOv3)")
+                .hint_text("optional — Setup downloads everything; no login needed")
                 .desired_width(f32::INFINITY),
         );
         // Persist (encrypted) once the user finishes editing, so it survives
