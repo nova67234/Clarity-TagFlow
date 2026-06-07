@@ -105,17 +105,36 @@ jobs:
           }
           Compress-Archive -Path ClarityTagFlow-windows/* -DestinationPath ClarityTagFlow-windows.zip -Force
 
-      - name: Upload .zip artifact
+      # Build a per-user installer (Inno Setup ships on the GitHub Windows image)
+      # so users download one Setup.exe; it tucks the exe + DLLs into a private
+      # install folder and creates shortcuts — they never see a loose .dll.
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $ver = ($env:GITHUB_REF_NAME -replace '^v','')
+          if (-not $ver) { $ver = '0.0.0' }
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "Inno Setup (ISCC.exe) not found at $iscc" }
+          & $iscc "/DAppVer=$ver" "/DRepo=$($PWD.Path)" packaging\windows-installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          Get-ChildItem ClarityTagFlow-Setup.exe | Format-List Name, Length
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ClarityTagFlow-windows-zip
-          path: ClarityTagFlow-windows.zip
+          name: ClarityTagFlow-windows
+          path: |
+            ClarityTagFlow-Setup.exe
+            ClarityTagFlow-windows.zip
 
-      # When triggered by a v* tag, also attach the .zip to the GitHub Release.
+      # When triggered by a v* tag, attach the installer (and the portable zip as a
+      # fallback) to the GitHub Release.
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ClarityTagFlow-windows.zip
+          files: |
+            ClarityTagFlow-Setup.exe
+            ClarityTagFlow-windows.zip
           # Mark hyphenated tags (e.g. v0.5.0-rc.1) as pre-releases.
           prerelease: ${{ contains(github.ref_name, '-') }}
