@@ -1050,6 +1050,9 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context) 
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let dest = outdir.join(format!("gen_{stamp}.png"));
+    // Stamp A1111-style generation metadata (incl. the Clarity TagFlow version) so
+    // sites like Civitai surface the prompt/settings and attribute the tool.
+    let bytes = add_png_text(&bytes, "parameters", &build_params(&job));
     if let Err(e) = std::fs::write(&dest, &bytes) {
         send(format!("ERROR: could not save image: {e}"));
         return false;
@@ -1058,6 +1061,63 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context) 
     let _ = tx.send(RunnerMsg::Output(dest));
     status("Done");
     true
+}
+
+/// Build an A1111-style `parameters` string for the PNG metadata. The trailing
+/// `Version:` field is how generators attribute themselves (Civitai shows it).
+fn build_params(job: &GenJob) -> String {
+    let model = match job.model {
+        GenModel::SchnellQ4 | GenModel::SchnellQ8 => "FLUX.1-schnell",
+        GenModel::DevQ4 | GenModel::DevQ8 => "FLUX.1-dev",
+        GenModel::ZImageFast | GenModel::ZImageQuality => "Z-Image Turbo",
+    };
+    let mut prompt = job.prompt.clone();
+    // Surface selected LoRAs as A1111 tags so they show up too.
+    for (file, strength) in &job.loras {
+        let name = file.trim_end_matches(".safetensors");
+        prompt.push_str(&format!(" <lora:{name}:{strength}>"));
+    }
+    format!(
+        "{prompt}\nNegative prompt: \nSteps: {}, Sampler: Euler, CFG scale: {}, Seed: {}, Size: {}x{}, Model: {}, Version: Clarity TagFlow v{}",
+        job.steps,
+        job.guidance,
+        job.seed,
+        job.width,
+        job.height,
+        model,
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// Insert a PNG `tEXt` chunk (keyword + text) right after IHDR, preserving every
+/// existing chunk (e.g. ComfyUI's own `prompt`/`workflow` metadata).
+fn add_png_text(png: &[u8], keyword: &str, text: &str) -> Vec<u8> {
+    // Bail unless this is a real PNG (8-byte signature + at least the IHDR chunk).
+    if png.len() < 33 || &png[..8] != b"\x89PNG\r\n\x1a\n" {
+        return png.to_vec();
+    }
+    let mut data = Vec::with_capacity(keyword.len() + 1 + text.len());
+    data.extend_from_slice(keyword.as_bytes());
+    data.push(0);
+    data.extend_from_slice(text.as_bytes());
+
+    let mut crc = flate2::Crc::new();
+    crc.update(b"tEXt");
+    crc.update(&data);
+
+    let mut chunk = Vec::with_capacity(12 + data.len());
+    chunk.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    chunk.extend_from_slice(b"tEXt");
+    chunk.extend_from_slice(&data);
+    chunk.extend_from_slice(&crc.sum().to_be_bytes());
+
+    // After the signature (8) + IHDR chunk (4 len + 4 type + 13 data + 4 crc = 25).
+    let at = 33;
+    let mut out = Vec::with_capacity(png.len() + chunk.len());
+    out.extend_from_slice(&png[..at]);
+    out.extend_from_slice(&chunk);
+    out.extend_from_slice(&png[at..]);
+    out
 }
 
 /// Build the ComfyUI API workflow for the job's model family.
