@@ -76,9 +76,10 @@ impl Default for ImageMeta {
     }
 }
 
-/// Artist (username) + character tag names for the current image, loaded from the
-/// downloader's `{md5}.json` sidecar. Used to colour those tags in the tag box.
-#[derive(Default)]
+/// Artist (username) + character tag names for the current image, looked up from
+/// the downloader's shared `tag_roles.json` (keyed by md5). Used to colour those
+/// tags in the tag box.
+#[derive(Default, Clone)]
 struct TagRoles {
     artist: std::collections::HashSet<String>,
     character: std::collections::HashSet<String>,
@@ -88,9 +89,12 @@ struct TagRoles {
 /// and whether the user is currently in edit mode.
 pub struct RightPanelState {
     pub current_tags: String,
-    /// Artist/character tags for the current image (from its `{md5}.json`), so the
-    /// tag box can colour the artist orange and the character green.
+    /// Artist/character tags for the current image (looked up by md5 from the
+    /// shared tag_roles.json), so the tag box can colour artist orange / char green.
     tag_roles: TagRoles,
+    /// Cached parse of the shared tag_roles.json (its mtime + md5->roles map),
+    /// reloaded only when the file changes — so selection changes don't re-parse it.
+    roles_cache: Option<(Option<SystemTime>, std::collections::HashMap<String, TagRoles>)>,
     /// Embedded Stable-Diffusion generation metadata for the selected image,
     /// or `None` when the image carries none. Read by `crate::sd_metadata`.
     pub sd_metadata: Option<String>,
@@ -138,6 +142,7 @@ impl Default for RightPanelState {
         Self {
             current_tags: String::new(),
             tag_roles: TagRoles::default(),
+            roles_cache: None,
             sd_metadata: None,
             showing_meta: false,
             downloader: crate::download::DownloaderState::default(),
@@ -199,9 +204,9 @@ pub fn show(
         if let Some(path) = current_image {
             let txt_path = sidecar_txt(path);
             state.current_tags = std::fs::read_to_string(&txt_path).unwrap_or_default();
-            // Load the downloader's `{md5}.json` (artist/character roles), if any,
-            // so the tag box can colour those tags.
-            state.tag_roles = load_tag_roles(path);
+            // Look up this image's artist/character roles (by md5) from the shared
+            // tag_roles.json, so the tag box can colour those tags.
+            state.tag_roles = lookup_tag_roles(&mut state.roles_cache, path);
             // Read embedded SD generation metadata (PNG text chunks / EXIF
             // UserComment). Cheap relative to the full-res decode below.
             state.sd_metadata = crate::sd_metadata::read(path);
@@ -1196,22 +1201,46 @@ pub(crate) fn sidecar_txt(img_path: &Path) -> PathBuf {
 const ARTIST_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 150, 50);
 const CHARACTER_COLOR: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
 
-/// Load the downloader's `{md5}.json` sidecar (artist + character tag names) for
-/// an image, if present. Returns empty roles when there's no sidecar.
-fn load_tag_roles(img_path: &Path) -> TagRoles {
-    let Ok(body) = std::fs::read_to_string(img_path.with_extension("json")) else {
-        return TagRoles::default();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
-        return TagRoles::default();
-    };
-    let set = |key: &str| -> std::collections::HashSet<String> {
-        v.get(key)
-            .and_then(|x| x.as_array())
-            .map(|arr| arr.iter().filter_map(|e| e.as_str().map(str::to_string)).collect())
-            .unwrap_or_default()
-    };
-    TagRoles { artist: set("artist"), character: set("character") }
+/// Look up an image's artist/character roles by its md5 (the downloaded file's
+/// stem) from the shared `tag_roles.json`. The parsed map is cached and only
+/// re-read when the file's mtime changes, so rapid selection changes don't
+/// re-parse it. Returns empty roles for images not in the map.
+fn lookup_tag_roles(
+    cache: &mut Option<(Option<SystemTime>, std::collections::HashMap<String, TagRoles>)>,
+    img_path: &Path,
+) -> TagRoles {
+    let path = crate::download::tag_roles_path();
+    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    // (Re)load the map when the cache is empty or the file changed on disk.
+    let stale = cache.as_ref().map(|(m, _)| *m != mtime).unwrap_or(true);
+    if stale {
+        let map = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.as_object().cloned())
+            .map(|obj| {
+                let set = |entry: &serde_json::Value, key: &str| -> std::collections::HashSet<String> {
+                    entry
+                        .get(key)
+                        .and_then(|x| x.as_array())
+                        .map(|arr| arr.iter().filter_map(|e| e.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default()
+                };
+                obj.into_iter()
+                    .map(|(md5, entry)| {
+                        (md5, TagRoles { artist: set(&entry, "artist"), character: set(&entry, "character") })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        *cache = Some((mtime, map));
+    }
+    let key = img_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    cache
+        .as_ref()
+        .and_then(|(_, map)| map.get(key))
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Build a colour-highlighted layout for the (comma-separated) tag text: artist
