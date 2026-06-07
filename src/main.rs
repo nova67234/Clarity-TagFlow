@@ -59,6 +59,8 @@ mod emoji;
 mod favorites;
 mod image_cache;
 mod download;
+mod gallery;
+mod gallery_detail;
 mod gif_info;
 mod left_browser;
 mod left_panel_settings;
@@ -236,6 +238,8 @@ struct ViewerApp {
     settings: settings::Settings,
     /// Deep Scan ("Find Issues") window state.
     scan: scan::ScanState,
+    /// Gallery-view image detail popup.
+    detail_popup: gallery_detail::DetailPopup,
     /// The "Create Backup" dialog (top bar).
     backup: backup::BackupState,
     /// Tag Manager view state, shown in the right panel when selected from its
@@ -290,6 +294,7 @@ impl Default for ViewerApp {
             right_state: right_details::RightPanelState::default(),
             settings: settings::Settings::default(),
             scan: scan::ScanState::default(),
+            detail_popup: gallery_detail::DetailPopup::default(),
             backup: backup::BackupState::default(),
             tag_manager: tag_manager::TagManagerState::default(),
             // Separate large-decode gates: the viewer gets a dedicated permit so
@@ -593,6 +598,32 @@ impl ViewerApp {
     }
 
     /// Delete the selected image and its `.txt` sidecar, then fix up the list.
+    /// Move the selected image (and its `.txt` sidecar) to a folder the user picks,
+    /// then drop it from the list. Shared by the right panel and the gallery popup.
+    fn move_selected(&mut self) {
+        let Some(idx) = self.selected else { return };
+        let Some(target_dir) = rfd::FileDialog::new().pick_folder() else { return };
+        let img_path = self.images[idx].clone();
+        let txt_path = right_details::sidecar_txt(&img_path);
+
+        if let Some(file_name) = img_path.file_name() {
+            let _ = std::fs::rename(&img_path, target_dir.join(file_name));
+        }
+        if txt_path.exists() {
+            if let Some(txt_name) = txt_path.file_name() {
+                let _ = std::fs::rename(&txt_path, target_dir.join(txt_name));
+            }
+        }
+
+        self.images.remove(idx);
+        self.update_filtered();
+        self.selected = if self.images.is_empty() {
+            None
+        } else {
+            Some(idx.min(self.images.len().saturating_sub(1)))
+        };
+    }
+
     fn delete_selected(&mut self) {
         let Some(idx) = self.selected else { return };
         let img_path = self.images[idx].clone();
@@ -850,6 +881,22 @@ impl eframe::App for ViewerApp {
             top_bar::TopBarAction::None => {}
         }
 
+        // When the Gallery layout is active, replace the three panels with a
+        // full-window masonry grid of the open folder's images.
+        if self.settings.layout == settings::Layout::Gallery {
+            if let Some(i) = gallery::show(
+                ui,
+                &self.images,
+                &self.filtered,
+                self.selected,
+                &mut self.thumbs,
+                &mut self.video_thumbs,
+                &mut self.favorites,
+                self.settings.thumbnail_size,
+            ) {
+                self.detail_popup.open_for(i, &self.images[i]);
+            }
+        } else {
         // 1. Left Panel
         // Only skip the poster capture for the file that's actually playing, so
         // its frame isn't decoded twice at once; every other video still loads
@@ -903,40 +950,13 @@ impl eframe::App for ViewerApp {
             // The right panel handles its own confirmation (gated by the setting),
             // so by the time we get a DeleteCurrent the delete is already confirmed.
             right_details::RightPanelAction::DeleteCurrent => self.delete_selected(),
-            right_details::RightPanelAction::MoveCurrent => {
-                if let Some(idx) = self.selected {
-                    if let Some(target_dir) = rfd::FileDialog::new().pick_folder() {
-                        let img_path = self.images[idx].clone();
-                        let txt_path = right_details::sidecar_txt(&img_path);
-
-                        if let Some(file_name) = img_path.file_name() {
-                            let _ = std::fs::rename(&img_path, target_dir.join(file_name));
-                        }
-
-                        if txt_path.exists() {
-                            if let Some(txt_name) = txt_path.file_name() {
-                                let _ = std::fs::rename(&txt_path, target_dir.join(txt_name));
-                            }
-                        }
-
-                        self.images.remove(idx);
-
-                        // RECOMPUTE filter so indices match correctly after shifting
-                        self.update_filtered();
-
-                        self.selected = if self.images.is_empty() {
-                            None
-                        } else {
-                            Some(idx.min(self.images.len().saturating_sub(1)))
-                        };
-                    }
-                }
-            }
+            right_details::RightPanelAction::MoveCurrent => self.move_selected(),
             right_details::RightPanelAction::None => {}
         }
 
         // 3. Central Panel (Fills remaining space)
         self.center(ui);
+        } // end of the classic Panels layout
 
         // 4. Settings window (floats on top when opened from the gear).
         // Keep the global extended-formats flag in sync with the setting so the
@@ -964,6 +984,35 @@ impl eframe::App for ViewerApp {
         }
 
         settings::show(ui.ctx(), &mut self.settings);
+
+        // Gallery detail popup (opened by clicking a gallery tile).
+        match gallery_detail::show(
+            ui.ctx(),
+            &mut self.detail_popup,
+            &mut self.viewer,
+            &mut self.right_state.civitai,
+            &mut self.favorites,
+        ) {
+            gallery_detail::DetailAction::Move(i) => {
+                self.selected = Some(i);
+                self.move_selected();
+            }
+            gallery_detail::DetailAction::Delete(i) => {
+                self.selected = Some(i);
+                self.delete_selected();
+            }
+            // Viewer right-click actions, handled exactly like the centre viewer.
+            gallery_detail::DetailAction::Viewer(va, path) => match va {
+                zoom::ViewerAction::ToggleFavorite => {
+                    self.favorites.toggle(&path);
+                }
+                zoom::ViewerAction::Crop(frac) => self.crop_current(&path, frac),
+                zoom::ViewerAction::CopyImage => self.copy_current(&path),
+                zoom::ViewerAction::RemoveBackground => self.start_bgremove(&path, ui.ctx()),
+                zoom::ViewerAction::None => {}
+            },
+            gallery_detail::DetailAction::None => {}
+        }
 
         // Deep Scan window. When a scan finishes it may have moved files out of
         // the current folder, so refresh the browser list once.

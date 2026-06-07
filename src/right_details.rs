@@ -80,9 +80,9 @@ impl Default for ImageMeta {
 /// the downloader's shared `tag_roles.json` (keyed by md5). Used to colour those
 /// tags in the tag box.
 #[derive(Default, Clone)]
-struct TagRoles {
-    artist: std::collections::HashSet<String>,
-    character: std::collections::HashSet<String>,
+pub(crate) struct TagRoles {
+    pub(crate) artist: std::collections::HashSet<String>,
+    pub(crate) character: std::collections::HashSet<String>,
 }
 
 /// Maintains the UI state for the right panel, such as the loaded text buffer
@@ -766,7 +766,7 @@ pub fn show(
 const DETAIL_LABEL_W: f32 = 110.0;
 const DETAIL_ROW_VPAD: f32 = 3.0;
 
-fn image_details_section(ui: &mut egui::Ui, meta: &ImageMeta) {
+pub(crate) fn image_details_section(ui: &mut egui::Ui, meta: &ImageMeta) {
     // Swap the heading + icon to match the selection: "Video Info" (video icon)
     // for videos, "GIF Info" (gif icon) for animated GIFs, else "Image Info".
     ui.horizontal(|ui| {
@@ -890,7 +890,7 @@ fn detail_color_row(ui: &mut egui::Ui, label: &str, colors: &[egui::Color32]) {
 }
 
 /// Read the metadata shown in the details card, including extracting dominant colors.
-fn load_meta(path: &Path) -> ImageMeta {
+pub(crate) fn load_meta(path: &Path) -> ImageMeta {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -1205,7 +1205,7 @@ const CHARACTER_COLOR: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
 /// stem) from the shared `tag_roles.json`. The parsed map is cached and only
 /// re-read when the file's mtime changes, so rapid selection changes don't
 /// re-parse it. Returns empty roles for images not in the map.
-fn lookup_tag_roles(
+pub(crate) fn lookup_tag_roles(
     cache: &mut Option<(Option<SystemTime>, std::collections::HashMap<String, TagRoles>)>,
     img_path: &Path,
 ) -> TagRoles {
@@ -1245,7 +1245,7 @@ fn lookup_tag_roles(
 
 /// Build a colour-highlighted layout for the (comma-separated) tag text: artist
 /// tags orange, character tags green, everything else `default_color`.
-fn highlight_tags(
+pub(crate) fn highlight_tags(
     ui: &egui::Ui,
     text: &str,
     artist: &std::collections::HashSet<String>,

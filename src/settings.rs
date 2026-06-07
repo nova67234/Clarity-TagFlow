@@ -19,6 +19,16 @@ pub enum SettingsTab {
     Appearance,
 }
 
+/// The overall UI layout: the classic three panels, or a full-window gallery.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layout {
+    /// Browser (left) · viewer (centre) · details (right).
+    #[default]
+    Panels,
+    /// A full-window masonry grid of the open folder's images.
+    Gallery,
+}
+
 /// User preferences. Lives on `ViewerApp` and is persisted across runs via
 /// eframe's storage (see `main.rs`). `#[serde(default)]` lets older saved files
 /// gain new fields gracefully.
@@ -55,6 +65,8 @@ pub struct Settings {
     /// The active app colour theme (Dark / Light). Applied on launch and live
     /// whenever changed from the Appearance tab.
     pub theme: Theme,
+    /// The overall UI layout (classic panels, or full-window gallery).
+    pub layout: Layout,
     /// Background colour (sRGB) for the Glass theme — painted behind its
     /// translucent panels. Independent of the panel colours, so changing it
     /// recolours the background without restyling the glass.
@@ -87,6 +99,7 @@ impl Default for Settings {
             enable_extended_formats: false,
             last_ai_model: "Select AI...".to_string(),
             theme: Theme::default(),
+            layout: Layout::default(),
             // A deep navy reads well behind the glass panels by default.
             glass_bg: [20, 22, 34],
             glass_backdrop: Backdrop::default(),
@@ -283,6 +296,26 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
 /// The Appearance tab: pick the app colour theme. Changing it updates
 /// `settings.theme`; `main.rs` applies the new palette live next frame.
 fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
+    section(ui, "Layout", |ui| {
+        ui.radio_value(
+            &mut settings.layout,
+            Layout::Panels,
+            egui::RichText::new("Panels").color(TEXT()),
+        );
+        ui.add_space(2.0);
+        ui.radio_value(
+            &mut settings.layout,
+            Layout::Gallery,
+            egui::RichText::new("Gallery").color(TEXT()),
+        );
+        hint(
+            ui,
+            "Panels is the classic browser · viewer · details layout. Gallery hides \
+             the panels and shows every image in the open folder as a grid — click \
+             one to open it back in Panels view.",
+        );
+    });
+
     section(ui, "Theme", |ui| {
         ui.label(egui::RichText::new("Colour theme").color(TEXT()));
         ui.add_space(6.0);
