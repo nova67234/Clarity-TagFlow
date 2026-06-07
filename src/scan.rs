@@ -24,6 +24,9 @@ use crate::theme::{ACCENT1, EDGE, FIELD, MUTED, PANEL, TEXT};
 const CORRUPTED_FOLDER: &str = "corrupted_files";
 const DUPLICATES_FOLDER: &str = "duplicates";
 
+/// Shared height for the two console column headers so their boxes line up.
+const HEADER_H: f32 = 22.0;
+
 /// Image extensions the corruption scan will try to decode.
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp", "ico", "hdr"];
 /// Extended formats only decodable when built with `--features avif`.
@@ -177,10 +180,10 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
     let x = (anchor.x - win_w).min(screen.right() - win_w - 10.0).max(screen.left() + 10.0);
     let y = anchor.y.min(screen.bottom() - win_h - 10.0).max(screen.top() + 10.0);
 
-    let mut open = state.open;
     let mut want_minimize = false;
-    egui::Window::new("Deep Scan")
-        .open(&mut open)
+    egui::Window::new("Find Issues")
+        .id(egui::Id::new("deep_scan_window"))
+        .title_bar(false) // custom header inside (matches the Civitai / Backup popups)
         .collapsible(false)
         .resizable(false)
         .fixed_size([win_w, win_h])
@@ -197,9 +200,30 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
                 v.widgets.noninteractive.corner_radius = radius;
             }
 
-            ui.add_space(2.0);
+            // Title row: frame-inspect icon + "Find Issues" + close (which just
+            // hides the window — a running scan keeps going in the background).
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add(
+                    egui::Image::new(egui::include_image!("../icons/frame_inspect.svg"))
+                        .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                        .tint(TEXT()),
+                );
+                ui.heading(egui::RichText::new("Find Issues").color(TEXT()).strong().size(17.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("✕").size(14.0)).frame(false))
+                        .on_hover_text("Close (a running scan keeps going)")
+                        .clicked()
+                    {
+                        want_minimize = true;
+                    }
+                });
+            });
+            ui.add_space(10.0);
+
             ui.label(
-                egui::RichText::new("Find corrupt images and exact duplicates, then quarantine them.")
+                egui::RichText::new("Find corrupt images and exact duplicates.")
                     .color(MUTED())
                     .size(12.0),
             );
@@ -298,51 +322,35 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
 
             ui.add_space(8.0);
 
-            // Start / Cancel (one toggling button) + Minimize.
-            ui.horizontal(|ui| {
-                let gap = 10.0;
-                ui.spacing_mut().item_spacing.x = gap;
-                let btn_w = (ui.available_width() - gap) / 2.0;
-                let size = egui::vec2(btn_w, 36.0);
-
+            // Right-aligned footer buttons (matches the Create Backup popup):
+            // primary Start Scan / Cancel rightmost, Minimize to its left.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
                 if state.running {
-                    let cancel = egui::Button::new(
-                        egui::RichText::new("Cancel").color(egui::Color32::WHITE).strong(),
-                    )
-                    .fill(egui::Color32::from_rgb(180, 40, 40));
-                    if ui.add_sized(size, cancel).clicked() {
+                    if footer_button(ui, "Cancel", Some(egui::Color32::from_rgb(180, 40, 40))).clicked() {
                         state.cancel.store(true, Ordering::SeqCst);
                         state.status = "Cancelling…".to_string();
                     }
-                } else {
-                    let start = egui::Button::new(
-                        egui::RichText::new("Start Scan").color(egui::Color32::WHITE).strong(),
-                    )
-                    .fill(ACCENT1());
-                    if ui.add_sized(size, start).clicked() {
-                        start_scan(state, ctx);
-                    }
+                } else if footer_button(ui, "Start Scan", Some(ACCENT1())).clicked() {
+                    start_scan(state, ctx);
                 }
-
                 // Minimize: hide the window but keep any running scan going in the
                 // background (messages are still drained at the top of `show`).
-                let minimize = egui::Button::new(
-                    egui::RichText::new("Minimize").color(TEXT()).strong(),
-                )
-                .fill(FIELD());
-                if ui.add_sized(size, minimize).clicked() {
+                if footer_button(ui, "Minimize", None).clicked() {
                     want_minimize = true;
                 }
             });
         });
-    // The window's X and the Minimize button both just hide it (scan keeps running).
-    state.open = open && !want_minimize;
+    // The ✕ and the Minimize button both just hide it (scan keeps running).
+    state.open = !want_minimize;
 }
 
 /// A titled, scrollable, dark console well.
 fn console_box(ui: &mut egui::Ui, title: &str, lines: &[String], height: f32, salt: &str) {
-    // Title row with a Copy button, so users can grab the log on an error.
+    // Title row with a Copy button, so users can grab the log on an error. Fixed
+    // height (HEADER_H) so it lines up with the sibling column's header.
     ui.horizontal(|ui| {
+        ui.set_min_height(HEADER_H);
         ui.label(egui::RichText::new(title).color(MUTED()).strong().size(11.0));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let copy = egui::Button::new(egui::RichText::new("Copy").size(10.0))
@@ -390,12 +398,16 @@ fn corrupt_review(
     to_open: &mut Option<PathBuf>,
     to_delete: &mut Option<usize>,
 ) {
-    ui.label(
-        egui::RichText::new(format!("Corrupt images ({})", items.len()))
-            .color(MUTED())
-            .strong()
-            .size(11.0),
-    );
+    // Fixed-height header so it lines up with the Console column's header.
+    ui.horizontal(|ui| {
+        ui.set_min_height(HEADER_H);
+        ui.label(
+            egui::RichText::new(format!("Corrupt images ({})", items.len()))
+                .color(MUTED())
+                .strong()
+                .size(11.0),
+        );
+    });
     ui.add_space(2.0);
     let bg = if crate::theme::is_light() { FIELD() } else { egui::Color32::from_rgb(15, 15, 17) };
     egui::Frame::new()
@@ -480,6 +492,18 @@ fn open_in_default(path: &Path) {
     }
 }
 
+/// A right-aligned footer button matching the Create Backup popup (corner-10,
+/// fixed size). `fill` Some → filled with white text; None → subtle TEXT label.
+fn footer_button(ui: &mut egui::Ui, label: &str, fill: Option<egui::Color32>) -> egui::Response {
+    let text = if fill.is_some() { egui::Color32::WHITE } else { TEXT() };
+    let mut btn = egui::Button::new(egui::RichText::new(label).color(text).strong().size(14.0))
+        .corner_radius(egui::CornerRadius::same(10));
+    if let Some(c) = fill {
+        btn = btn.fill(c);
+    }
+    ui.add_sized(egui::vec2(96.0, 32.0), btn)
+}
+
 fn window_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(PANEL())
@@ -487,10 +511,10 @@ fn window_frame() -> egui::Frame {
         .inner_margin(egui::Margin::same(14))
         .stroke(egui::Stroke::new(1.0, EDGE()))
         .shadow(egui::epaint::Shadow {
-            offset: [0, 4],
-            blur: 16,
+            offset: [0, 6],
+            blur: 20,
             spread: 0,
-            color: egui::Color32::from_black_alpha(140),
+            color: egui::Color32::from_black_alpha(150),
         })
 }
 

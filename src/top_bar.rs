@@ -122,11 +122,22 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool) -> TopBarA
                             }
 
                             ui.add_space(6.0);
-                            if bar_button(ui, "Create Backup", 150.0).clicked() {
+                            let backup = bar_button_icon(
+                                ui,
+                                egui::include_image!("../icons/backup.svg"),
+                                "Create Backup",
+                                150.0,
+                            );
+                            if backup.clicked() {
                                 action = TopBarAction::CreateBackup;
                             }
                             ui.add_space(6.0);
-                            let fi = bar_button(ui, "Find Issues", 130.0);
+                            let fi = bar_button_icon(
+                                ui,
+                                egui::include_image!("../icons/frame_inspect.svg"),
+                                "Find Issues",
+                                130.0,
+                            );
                             if fi.clicked() {
                                 action = TopBarAction::FindIssues(fi.rect.right_bottom());
                             }
@@ -184,10 +195,14 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool) -> TopBarA
 /// A fixed-width top-bar button styled exactly like the right-details panel
 /// buttons: theme fill and hover (no accent, no drop shadow) and the theme text
 /// color — just rendered at a fixed width.
-fn bar_button(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
+/// A top-bar action button with a leading SVG icon (tinted to the button's label
+/// colour so it matches in every theme).
+fn bar_button_icon(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, label: &str, width: f32) -> egui::Response {
+    let tint = ui.visuals().widgets.inactive.fg_stroke.color;
+    let img = egui::Image::new(icon).fit_to_exact_size(egui::vec2(16.0, 16.0)).tint(tint);
     ui.add_sized(
         egui::vec2(width, 34.0),
-        egui::Button::new(egui::RichText::new(label).size(15.0))
+        egui::Button::image_and_text(img, egui::RichText::new(label).size(15.0))
             .corner_radius(CornerRadius::same(12)),
     )
 }
