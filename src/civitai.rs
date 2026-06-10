@@ -619,12 +619,13 @@ fn card_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Respon
 /// The Civitai settings popup: API key (stored encrypted via src/secret.rs) and a
 /// download folder for models. A modern, sectioned card.
 fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
+    use crate::PopupPlacement;
     egui::Window::new("")
         .id(egui::Id::new("civitai_settings"))
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .placed_centered(ctx)
         .frame(
             egui::Frame::new()
                 .fill(PANEL())
@@ -659,7 +660,11 @@ fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
                 ui.heading(egui::RichText::new("Civitai Settings").color(TEXT()).strong().size(17.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add(egui::Button::new(egui::RichText::new("✕").size(14.0)).frame(false))
+                        .add(egui::Button::image(
+                            egui::Image::new(egui::include_image!("../icons/close.svg"))
+                                .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                                .tint(TEXT()),
+                        ).frame(false))
                         .on_hover_text("Close")
                         .clicked()
                     {
@@ -715,22 +720,24 @@ fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
 
             ui.add_space(18.0);
 
-            // Actions.
+            // Actions (right-aligned: Save, then Clear key).
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let save = egui::Button::new(
-                    egui::RichText::new("Save").color(egui::Color32::WHITE).strong(),
-                )
-                .fill(crate::theme::ACCENT1());
-                if ui.add_sized(egui::vec2(90.0, 32.0), save).clicked() {
-                    save_civitai_key(&state.api_key);
-                    save_download_dir(&state.download_dir);
-                    state.show_settings = false;
-                }
-                if ui.add_sized(egui::vec2(80.0, 32.0), egui::Button::new("Clear key")).clicked() {
-                    state.api_key.clear();
-                    save_civitai_key("");
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if ui.add_sized(egui::vec2(80.0, 32.0), egui::Button::new("Clear key")).clicked() {
+                        state.api_key.clear();
+                        save_civitai_key("");
+                    }
+                    let save = egui::Button::new(
+                        egui::RichText::new("Save").color(egui::Color32::WHITE).strong(),
+                    )
+                    .fill(crate::theme::ACCENT1());
+                    if ui.add_sized(egui::vec2(90.0, 32.0), save).clicked() {
+                        save_civitai_key(&state.api_key);
+                        save_download_dir(&state.download_dir);
+                        state.show_settings = false;
+                    }
+                });
             });
         });
 }
@@ -1754,7 +1761,10 @@ fn parse_a1111(metadata: &str) -> Vec<Task> {
                 }
             } else if let Some(name) = k.strip_prefix("embed:") {
                 let name = name.trim().to_string();
-                if claimed_hashes.insert(hash.clone()) {
+                // Civitai's by-hash endpoint matches AutoV2 (the first 10 hex of the
+                // SHA-256); a longer prefix is rejected, so clip to it.
+                let hash = autov2(&hash);
+                if !name.is_empty() && claimed_hashes.insert(hash.clone()) {
                     tasks.push(Task::embed(hash, name.clone()));
                     claimed_names.insert(name.to_lowercase());
                 }
@@ -1767,15 +1777,22 @@ fn parse_a1111(metadata: &str) -> Vec<Task> {
         for part in block.split(',') {
             if let Some((name, tail)) = part.split_once(':') {
                 let name = name.trim();
-                let hash: String = tail
+                // Skip names already captured from the "Hashes: {…}" block (this
+                // block repeats them, often with a longer non-resolving hash).
+                if name.is_empty() || claimed_names.contains(&name.to_lowercase()) {
+                    continue;
+                }
+                let hex: String = tail
                     .trim()
                     .chars()
                     .take_while(|c| c.is_ascii_hexdigit())
                     .collect();
-                let hash = hash.to_lowercase();
-                if name.is_empty() || !(8..=12).contains(&hash.len()) {
+                if hex.len() < 8 {
                     continue;
                 }
+                // Normalise to AutoV2 (≤10 hex) so a 12-char A1111 prefix still
+                // resolves on Civitai's by-hash endpoint.
+                let hash = autov2(&hex);
                 if claimed_hashes.insert(hash.clone()) {
                     tasks.push(Task::embed(hash, name.to_string()));
                     claimed_names.insert(name.to_lowercase());
@@ -1824,6 +1841,19 @@ fn label_value_block(metadata: &str, label: &str) -> Option<String> {
     } else {
         let end = rest.find('\n').unwrap_or(rest.len());
         Some(rest[..end].to_string())
+    }
+}
+
+/// Normalise a hex hash to its AutoV2 form: the first 10 hex chars of the SHA-256,
+/// lowercased. Civitai's `by-hash` endpoint matches AutoV2 exactly and rejects a
+/// longer prefix (e.g. the 12-char hashes A1111 writes into `TI hashes:`); an
+/// 8-char AutoV1 hash is left as-is.
+fn autov2(hash: &str) -> String {
+    let h = hash.trim().to_lowercase();
+    if h.len() > 10 {
+        h[..10].to_string()
+    } else {
+        h
     }
 }
 
@@ -1889,5 +1919,46 @@ mod sized_url_tests {
             sized_image_url("https://image.civitai.com/abc/uuid/x.jpeg", 200),
             "https://image.civitai.com/abc/uuid/width=200/x.jpeg"
         );
+    }
+}
+
+#[cfg(test)]
+mod embed_parse_tests {
+    use super::{parse_a1111, ItemType};
+
+    // Mirrors the real failing image: embeddings appear only in the `Hashes: {…}`
+    // and `TI hashes:` blocks (never as parseable prompt tags). The 10-char values
+    // are AutoV2 and resolve on Civitai; the 12-char `TI hashes` form does not.
+    const RAW: &str = "1girl, lazypos, <lora:USNR_STYLE_ILL:0.5>\n\
+        Negative prompt: lazyneg, lazyhand\n\
+        Steps: 30, Model hash: 5d255f746e, \
+        Hashes: {\"model\": \"5d255f746e\", \"lora:USNR_STYLE_ILL\": \"44586d0587\", \
+        \"embed:lazypos\": \"3086669265\", \"embed:lazyneg\": \"ba21023c70\"}, \
+        TI hashes: \"lazypos: 30866692653c, lazyneg: ba21023c7054, lazyreal: c23024a1f6a1\"";
+
+    #[test]
+    fn extracts_embeddings_as_autov2_without_duplicates() {
+        let tasks = parse_a1111(RAW);
+        let mut embeds: Vec<(String, String)> = tasks
+            .iter()
+            .filter(|t| t.kind == ItemType::Embedding)
+            .map(|t| (t.name.clone().unwrap_or_default(), t.hash.clone().unwrap_or_default()))
+            .collect();
+        embeds.sort();
+
+        // lazypos/lazyneg come from the Hashes block (10-char AutoV2); lazyreal is
+        // only in TI hashes (12-char) and is clipped to AutoV2 so it still resolves.
+        assert_eq!(
+            embeds,
+            vec![
+                ("lazyneg".into(), "ba21023c70".into()),
+                ("lazypos".into(), "3086669265".into()),
+                ("lazyreal".into(), "c23024a1f6".into()),
+            ],
+            "got {embeds:?}"
+        );
+
+        // The LoRA from the prompt tag is still captured by name.
+        assert!(tasks.iter().any(|t| t.kind == ItemType::Lora));
     }
 }

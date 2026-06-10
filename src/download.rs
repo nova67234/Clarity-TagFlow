@@ -365,7 +365,21 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                         field_label(ui, "API key");
                         field_edit(ui, enabled, egui::TextEdit::singleline(&mut state.api_key)
                             .password(true)
-                            .hint_text("Required · stored encrypted"));
+                            .hint_text("Paste your Gelbooru API key"));
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Stored encrypted on this device.")
+                                    .color(MUTED())
+                                    .size(10.5),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.hyperlink_to(
+                                    egui::RichText::new("Get credentials →").size(10.5),
+                                    "https://gelbooru.com/index.php?page=account&s=options",
+                                );
+                            });
+                        });
                     });
 
                     section(ui, "Search", |ui| {
@@ -511,25 +525,24 @@ fn section_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
         });
 }
 
-/// Draw the coloured "API: …" status pill.
+/// Draw the API status as a coloured dot + label (matches the Civitai panel's
+/// "● Online" style).
 fn api_pill(ui: &mut egui::Ui, api: u8) {
-    let (text, bg) = match api {
-        API_ONLINE => ("Online", egui::Color32::from_rgb(35, 137, 58)),
-        API_OFFLINE => ("Offline", egui::Color32::from_rgb(160, 60, 60)),
-        _ => ("Checking…", egui::Color32::from_rgb(120, 120, 120)),
+    let (text, dot) = match api {
+        API_ONLINE => ("Online", egui::Color32::from_rgb(46, 160, 67)),
+        API_OFFLINE => ("Offline", egui::Color32::from_rgb(210, 70, 70)),
+        _ => ("Checking…", egui::Color32::from_rgb(150, 150, 150)),
     };
-    egui::Frame::new()
-        .fill(bg)
-        .corner_radius(egui::CornerRadius::same(8))
-        .inner_margin(egui::Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(format!("API: {text}"))
-                    .color(egui::Color32::WHITE)
-                    .size(11.0)
-                    .strong(),
-            );
-        });
+    // The section title row is a right-to-left layout and `ui.horizontal` inherits
+    // it, so add the label FIRST (it lands rightmost) and the dot SECOND (to its
+    // left) to read "● Online".
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        ui.label(egui::RichText::new(text).color(MUTED()).size(11.0).strong());
+        // A small status dot painted to a fixed box so it stays crisp and centred.
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 4.0, dot);
+    });
 }
 
 /// Spawn a daemon-style thread that probes gelbooru.com every 5s and stores the

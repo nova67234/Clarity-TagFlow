@@ -268,7 +268,11 @@ impl BackupState {
                 if running.is_none() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add(egui::Button::new(RichText::new("✕").size(14.0)).frame(false))
+                            .add(egui::Button::image(
+                                egui::Image::new(egui::include_image!("../icons/close.svg"))
+                                    .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                                    .tint(TEXT()),
+                            ).frame(false))
                             .on_hover_text("Close")
                             .clicked()
                         {

@@ -104,6 +104,10 @@ pub struct RightPanelState {
     /// Embedded Stable-Diffusion generation metadata for the selected image,
     /// or `None` when the image carries none. Read by `crate::sd_metadata`.
     pub sd_metadata: Option<String>,
+    /// The *raw* (unformatted) embedded metadata for the selected image — handed to
+    /// the Civitai panel so its `Hashes:` / `TI hashes:` blocks survive intact
+    /// (formatting them away hid embeddings). `None` when the image carries none.
+    pub sd_metadata_raw: Option<String>,
     /// When true, the tag box shows the (read-only) SD metadata instead of tags.
     pub showing_meta: bool,
     /// State for the Gelbooru downloader view.
@@ -156,6 +160,7 @@ impl Default for RightPanelState {
             tag_roles: TagRoles::default(),
             roles_cache: None,
             sd_metadata: None,
+            sd_metadata_raw: None,
             showing_meta: false,
             downloader: crate::download::DownloaderState::default(),
             civitai: crate::civitai::CivitaiState::default(),
@@ -224,8 +229,11 @@ pub fn show(
             // tag_roles.json, so the tag box can colour those tags.
             state.tag_roles = lookup_tag_roles(&mut state.roles_cache, path);
             // Read embedded SD generation metadata (PNG text chunks / EXIF
-            // UserComment). Cheap relative to the full-res decode below.
-            state.sd_metadata = crate::sd_metadata::read(path);
+            // UserComment) once — both the formatted display text and the raw
+            // string the Civitai panel parses. Cheap relative to the decode below.
+            let (disp, raw) = crate::sd_metadata::read_both(path);
+            state.sd_metadata = disp;
+            state.sd_metadata_raw = raw;
             // Default to the .txt tags, but when the image has no tags yet *and*
             // carries embedded generation metadata, open straight to the metadata
             // view so it isn't hidden behind a manual switch. With both present,
@@ -268,6 +276,7 @@ pub fn show(
             state.current_tags.clear();
             state.tag_roles = TagRoles::default();
             state.sd_metadata = None;
+            state.sd_metadata_raw = None;
             state.showing_meta = false;
             state.meta = ImageMeta::default();
         }
@@ -414,7 +423,7 @@ pub fn show(
                     } else if state.view == RightView::Downloader {
                         crate::download::show(ui, &mut state.downloader);
                     } else if state.view == RightView::Civitai {
-                        crate::civitai::show(ui, &mut state.civitai, current_image, state.sd_metadata.as_deref());
+                        crate::civitai::show(ui, &mut state.civitai, current_image, state.sd_metadata_raw.as_deref());
                     } else if let Some(img_path) = current_image {
                         // --- FOOTER SECTION (Strictly Bottom Anchored) ---
                         egui::Panel::bottom("right_footer")
@@ -1011,7 +1020,7 @@ pub(crate) fn load_meta(path: &Path) -> ImageMeta {
         } else {
             #[cfg(feature = "avif")]
             {
-                if matches!(ext.as_str(), "avif" | "heic" | "heif" | "dng" | "arw" | "cr2" | "nef") {
+                if crate::is_extended_extension(&ext) {
                     crate::avif::decode_avif(path).map(image::DynamicImage::ImageRgba8)
                 } else {
                     None

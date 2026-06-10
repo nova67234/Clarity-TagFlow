@@ -16,8 +16,9 @@
 //!   EXIF `UserComment`, usually UTF-16 — the scan finds it without a full EXIF
 //!   parser, exactly like the Java `UniversalMetadataScanner`.
 //!
-//! [`read`] returns the cleaned, display-ready text (or `None` when the image has
-//! no SD metadata).
+//! [`read_both`] returns both the cleaned, display-ready text and the raw original
+//! metadata string (the latter for the Civitai panel) — or `None` when the image
+//! has no SD metadata.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -28,9 +29,25 @@ use std::path::Path;
 /// memory and decoded as UTF-8/UTF-16, which froze (and could OOM-crash) the app.
 const MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 
-/// Read and format the embedded SD generation metadata for `path`.
-/// Returns `None` when the file has no recognisable metadata.
-pub fn read(path: &Path) -> Option<String> {
+/// Read the embedded metadata **once** and return both the formatted **display**
+/// string (what [`read`] yields) and the **raw** original metadata string.
+///
+/// The Civitai panel needs the raw string: formatting splits the parameter line on
+/// `", "`, which shreds blocks like `Hashes: {…}`, `Lora hashes:` and `TI hashes:`.
+/// Embeddings (textual inversions) are recorded *only* in those blocks, so handing
+/// the panel the formatted text left it unable to list them.
+pub fn read_both(path: &Path) -> (Option<String>, Option<String>) {
+    match metadata_map(path) {
+        Some(map) => (format_from_map(&map), raw_from_map(&map)),
+        None => (None, None),
+    }
+}
+
+/// Read `path` and collect its embedded metadata into a keyword → text map (PNG
+/// text chunks, or a raw byte-scan of the EXIF `UserComment` for JPEG/WebP/AVIF).
+/// `None` only when the file can't be read; a readable file with no metadata
+/// yields an empty (or prompt-less) map.
+fn metadata_map(path: &Path) -> Option<BTreeMap<String, String>> {
     // Never touch videos — they carry no SD generation metadata, and reading a
     // multi-MB/GB file in full (then scanning it as UTF-8/UTF-16) freezes and can
     // crash the app. Bail before any read.
@@ -64,6 +81,11 @@ pub fn read(path: &Path) -> Option<String> {
         }
     }
 
+    Some(text)
+}
+
+/// Pick the best metadata field from the map and format it for display.
+fn format_from_map(text: &BTreeMap<String, String>) -> Option<String> {
     // Prefer the A1111 `parameters` block whenever it's a real param block (has
     // the `Steps:` anchor). Civitai/A1111 embed this clean, human-readable summary
     // — and many ComfyUI-saved images carry BOTH it AND the raw `prompt`/`workflow`
@@ -90,13 +112,30 @@ pub fn read(path: &Path) -> Option<String> {
     }
 
     // A1111 / generic: format the first parameter-ish field we found.
-    let raw = first_non_blank(&text, &["parameters", "prompt", "workflow", "Comment", "Description"])?;
+    let raw = first_non_blank(text, &["parameters", "prompt", "workflow", "Comment", "Description"])?;
     let formatted = format_a1111(raw);
     if formatted.trim().is_empty() {
         None
     } else {
         Some(formatted)
     }
+}
+
+/// The **raw** original metadata string (no formatting), as the Civitai parser
+/// expects it — preserving the `Hashes:` / `… hashes:` / `<lora:…>` blocks intact.
+/// Mirrors [`format_from_map`]'s source-selection order so it returns the same
+/// underlying field, just unformatted.
+fn raw_from_map(text: &BTreeMap<String, String>) -> Option<String> {
+    if let Some(p) = text.get("parameters") {
+        if has_steps_anchor(p) {
+            return Some(p.clone());
+        }
+    }
+    if text.contains_key("prompt") && text.contains_key("workflow") {
+        return text.get("prompt").cloned().filter(|s| !s.trim().is_empty());
+    }
+    first_non_blank(text, &["parameters", "prompt", "workflow", "Comment", "Description"])
+        .map(|s| s.to_string())
 }
 
 /// Returns the first of `keys` whose value in `map` is non-blank.

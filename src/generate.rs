@@ -197,6 +197,9 @@ pub struct GenerateState {
     loras: Vec<LoraEntry>,
     show_lora_popup: bool,
     show_log: bool,
+    /// Brief tint flash on the Copy-log button: (when, was_ok). Green on success,
+    /// red on failure; fades out after a short window.
+    copy_flash: Option<(std::time::Instant, bool)>,
 }
 
 impl Default for GenerateState {
@@ -231,6 +234,7 @@ impl GenerateState {
             loras: Vec::new(),
             show_lora_popup: false,
             show_log: false,
+            copy_flash: None,
         }
     }
 
@@ -291,12 +295,13 @@ fn refresh_loras(state: &mut GenerateState) {
 
 /// The LoRA multi-select popup: a checkbox + weight slider per installed LoRA.
 fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
+    use crate::PopupPlacement;
     egui::Window::new("")
         .id(egui::Id::new("zimage_lora_popup"))
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .placed_centered(ctx)
         .frame(window_frame())
         .show(ctx, |ui| {
             ui.set_width(380.0);
@@ -320,7 +325,11 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
                 ui.heading(RichText::new("LoRAs").color(TEXT()).strong().size(17.0));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
-                        .add(egui::Button::new(RichText::new("✕").size(14.0)).frame(false))
+                        .add(egui::Button::image(
+                            egui::Image::new(egui::include_image!("../icons/close.svg"))
+                                .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                                .tint(TEXT()),
+                        ).frame(false))
                         .on_hover_text("Close")
                         .clicked()
                     {
@@ -543,23 +552,41 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState) {
     // Generate button off the panel). ---
     ui.label(RichText::new("Prompt").color(MUTED()).size(12.0));
     ui.add_space(2.0);
-    let bg = if crate::theme::is_light() { FIELD() } else { Color32::from_rgb(15, 15, 17) };
-    egui::Frame::new()
-        .fill(bg)
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::same(2))
-        .stroke(egui::Stroke::new(1.0, EDGE()))
+    // Z-Image dresses the prompt box in the "Details & Actions" panel styling
+    // (PANEL fill, rounded-22 corners, faint edge). No drop shadow: the panel's
+    // shadow paints below the box and isn't clickable, which made the textbox
+    // feel like you had to "click higher" to focus it. Flux keeps the plain dark field.
+    let prompt_frame = if state.family == GenFamily::ZImage {
+        egui::Frame::new()
+            .fill(PANEL())
+            .corner_radius(CornerRadius::same(22))
+            .inner_margin(Margin::same(12))
+            .stroke(egui::Stroke::new(1.0, EDGE()))
+    } else {
+        let bg = if crate::theme::is_light() { FIELD() } else { Color32::from_rgb(15, 15, 17) };
+        egui::Frame::new()
+            .fill(bg)
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::same(2))
+            .stroke(egui::Stroke::new(1.0, EDGE()))
+    };
+    let (prompt_max_h, prompt_rows) = if state.family == GenFamily::ZImage {
+        (300.0, 13)
+    } else {
+        (108.0, 4)
+    };
+    prompt_frame
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::ScrollArea::vertical()
                 .id_salt("flux_prompt")
-                .max_height(108.0)
+                .max_height(prompt_max_h)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::multiline(&mut state.prompt)
                             .desired_width(f32::INFINITY)
-                            .desired_rows(4)
+                            .desired_rows(prompt_rows)
                             .frame(egui::Frame::NONE)
                             .hint_text("a cinematic photo of…"),
                     );
@@ -578,7 +605,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState) {
         int_slider(ui, "Height", &mut state.height, 512..=1536);
     });
     ui.horizontal(|ui| {
-        ui.checkbox(&mut state.randomize_seed, "");
+        // A radio-style filled dot instead of a checkmark for the toggle.
+        // Only the inner dot is enlarged; the outer circle keeps its default size.
+        ui.spacing_mut().icon_width_inner = 11.0;
+        if ui.radio(state.randomize_seed, "").clicked() {
+            state.randomize_seed = !state.randomize_seed;
+        }
         ui.label(RichText::new("Randomize seed").color(TEXT()).size(12.0));
     });
     if !state.randomize_seed {
@@ -617,14 +649,73 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState) {
 
     // --- Log (collapsible). ---
     ui.horizontal(|ui| {
-        let arrow = if state.show_log { "▾" } else { "▸" };
-        if ui.button(RichText::new(format!("{arrow} Log")).size(12.0)).clicked() {
+        // SVG disclosure arrow: drop-down when open, right when collapsed.
+        // `image_and_text` vertically centres the icon against the label.
+        let arrow_src = if state.show_log {
+            egui::include_image!("../icons/arrow_drop_down.svg")
+        } else {
+            egui::include_image!("../icons/arrow_right.svg")
+        };
+        // Fixed-size pill drawn by hand: the icon + label are painted centered
+        // *inside* it, so the pill never moves or resizes with the content (egui's
+        // Button auto-sizes to its content, which made it track the text).
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(46.0, 18.0), egui::Sense::click());
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if ui.is_rect_visible(rect) {
+            let visuals = *ui.style().interact(&resp);
+            let txt = visuals.text_color();
+            ui.painter().rect(
+                rect,
+                egui::CornerRadius::same(10), // pill (radius = half the 20px height)
+                visuals.weak_bg_fill,
+                visuals.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+
+            // Lay out the "Log" label, then centre [icon | gap | text] as a group.
+            let icon = 14.0_f32;
+            let gap = 3.0_f32;
+            let galley = ui.painter().layout_no_wrap("Log".to_owned(), egui::FontId::proportional(11.0), txt);
+            let content_w = icon + gap + galley.size().x;
+            let x0 = rect.center().x - content_w / 1.7;
+            let cy = rect.center().y;
+
+            let icon_rect = egui::Rect::from_min_size(egui::pos2(x0, cy - icon / 2.0), egui::vec2(icon, icon));
+            egui::Image::new(arrow_src)
+                .tint(crate::theme::icon_tint(txt))
+                .paint_at(ui, icon_rect);
+            ui.painter()
+                .galley(egui::pos2(x0 + icon + gap, cy - galley.size().y / 2.0), galley, txt);
+        }
+        if resp.clicked() {
             state.show_log = !state.show_log;
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let copy = egui::Button::new(RichText::new("Copy").size(11.0)).corner_radius(CornerRadius::same(8));
-            if ui.add_enabled(!state.log.is_empty(), copy).on_hover_text("Copy the log").clicked() {
-                ui.ctx().copy_text(state.log.join("\n"));
+            // Flash the icon green (copied) or red (failed) for ~0.9s after a click.
+            const COPY_FLASH_SECS: f32 = 0.9;
+            let flash_tint = match state.copy_flash {
+                Some((when, ok)) if when.elapsed().as_secs_f32() < COPY_FLASH_SECS => {
+                    ui.ctx().request_repaint(); // fade out smoothly / clear when done
+                    Some(if ok { GREEN } else { RED })
+                }
+                _ => None,
+            };
+            let tint = flash_tint.unwrap_or_else(|| crate::theme::icon_tint(MUTED()));
+            let copy_icon = egui::Image::new(egui::include_image!("../icons/copy.svg"))
+                .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                .tint(tint);
+            let copy = egui::Button::image(copy_icon).frame(false);
+            let tip = match state.copy_flash {
+                Some((_, true)) if flash_tint.is_some() => "Copied!",
+                Some((_, false)) if flash_tint.is_some() => "Copy failed",
+                _ => "Copy the log",
+            };
+            if ui.add_enabled(!state.log.is_empty(), copy).on_hover_text(tip).clicked() {
+                // Use arboard directly so we get a success/failure result to flash on.
+                let ok = arboard::Clipboard::new()
+                    .and_then(|mut c| c.set_text(state.log.join("\n")))
+                    .is_ok();
+                state.copy_flash = Some((std::time::Instant::now(), ok));
             }
         });
     });
@@ -632,7 +723,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState) {
         let bg = if crate::theme::is_light() { FIELD() } else { Color32::from_rgb(15, 15, 17) };
         egui::Frame::new()
             .fill(bg)
-            .corner_radius(CornerRadius::same(12))
+            .corner_radius(CornerRadius::same(22))
             .inner_margin(Margin::same(10))
             .stroke(egui::Stroke::new(1.0, EDGE()))
             .show(ui, |ui| {

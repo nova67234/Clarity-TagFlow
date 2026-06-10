@@ -254,7 +254,7 @@ pub(crate) fn load_rgb_on_white(path: &Path) -> Result<RgbImage, String> {
 fn is_extended_format(ext: &str) -> bool {
     #[cfg(feature = "avif")]
     {
-        matches!(ext, "avif" | "heic" | "heif" | "dng" | "arw" | "cr2" | "nef")
+        crate::is_extended_extension(ext)
     }
     #[cfg(not(feature = "avif"))]
     {

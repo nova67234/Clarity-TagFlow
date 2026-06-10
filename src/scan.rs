@@ -181,13 +181,14 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
     let y = anchor.y.min(screen.bottom() - win_h - 10.0).max(screen.top() + 10.0);
 
     let mut want_minimize = false;
+    use crate::PopupPlacement;
     egui::Window::new("Find Issues")
         .id(egui::Id::new("deep_scan_window"))
         .title_bar(false) // custom header inside (matches the Civitai / Backup popups)
         .collapsible(false)
         .resizable(false)
         .fixed_size([win_w, win_h])
-        .fixed_pos([x, y])
+        .placed_at([x, y])
         .frame(window_frame())
         .show(ctx, |ui| {
             ui.set_width(content_w);
@@ -212,7 +213,11 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
                 ui.heading(egui::RichText::new("Find Issues").color(TEXT()).strong().size(17.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add(egui::Button::new(egui::RichText::new("✕").size(14.0)).frame(false))
+                        .add(egui::Button::image(
+                            egui::Image::new(egui::include_image!("../icons/close.svg"))
+                                .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                                .tint(TEXT()),
+                        ).frame(false))
                         .on_hover_text("Close (a running scan keeps going)")
                         .clicked()
                     {
