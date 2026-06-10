@@ -1006,7 +1006,7 @@ impl eframe::App for ViewerApp {
                 &mut self.favorites,
                 self.settings.thumbnail_size,
             ) {
-                self.detail_popup.open_for(i, &self.images[i]);
+                self.detail_popup.open_for(i, &self.images[i], ui.ctx());
             }
         } else {
         // 1. Left Panel
@@ -1096,6 +1096,7 @@ impl eframe::App for ViewerApp {
             &mut self.viewer,
             &mut self.right_state.civitai,
             &mut self.favorites,
+            &mut self.settings.confirm_before_delete,
         ) {
             gallery_detail::DetailAction::Move(i) => {
                 self.selected = Some(i);
@@ -1172,6 +1173,27 @@ pub(crate) trait PopupPlacement<'a> {
     /// Place the popup's top-left at `top_left` (e.g. dropped from a button).
     /// Draggable from there + remembered when on; pinned there when off.
     fn placed_at(self, top_left: impl Into<egui::Pos2>) -> Self;
+}
+
+/// Constrain a movable popup so it can only be dragged by its top strip.
+///
+/// egui's window move-sense covers the WHOLE window, and a drag that starts on
+/// a click-only widget (e.g. a frameless ✕ / ☰ icon button) falls through to
+/// it — so a click that slipped by a pixel dragged the popup around. Call this
+/// FIRST inside the window's content closure: it registers an invisible
+/// drag-consuming shield over everything below `strip_h` (measured from the
+/// content top), leaving only the header strip draggable. Widgets added after
+/// this still win their own interactions (buttons, scroll areas, sliders, text
+/// selection) because later widgets sit on top of the shield.
+pub(crate) fn popup_drag_strip(ui: &mut egui::Ui, strip_h: f32) {
+    if !movable_popups() {
+        return; // pinned popups can't be dragged anyway
+    }
+    // Cover the window generously (the frame margins too); the interact rect is
+    // clipped to the window's clip rect, so the overshoot is harmless.
+    let mut rect = ui.max_rect().expand(64.0);
+    rect.min.y = ui.max_rect().min.y + strip_h;
+    ui.interact(rect, ui.id().with("popup_drag_shield"), egui::Sense::drag());
 }
 
 impl<'a> PopupPlacement<'a> for egui::Window<'a> {
@@ -1411,6 +1433,34 @@ pub(crate) fn svg_button(ui: &mut egui::Ui, source: egui::ImageSource<'_>, toolt
             .min_size(egui::vec2(icon_size + 12.0, icon_size + 12.0))
     );
     resp.on_hover_text(tooltip)
+}
+
+/// A hyperlink that ends in a right-pointing arrow drawn with the
+/// `arrow_right_alt.svg` icon (tinted to the link colour) instead of a "→" text
+/// glyph. The arrow is clickable and opens the same `url`. `size` sets the link
+/// text size (and the icon scales to match); `None` uses the default body size.
+pub(crate) fn arrow_link(ui: &mut egui::Ui, label: &str, url: &str, size: Option<f32>) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        let color = ui.visuals().hyperlink_color;
+        let mut text = egui::RichText::new(label).color(color);
+        if let Some(s) = size {
+            text = text.size(s);
+        }
+        ui.hyperlink_to(text, url);
+
+        let icon = size.unwrap_or_else(|| ui.text_style_height(&egui::TextStyle::Body));
+        let img = egui::Image::new(egui::include_image!("../icons/arrow_right_alt.svg"))
+            .fit_to_exact_size(egui::vec2(icon, icon))
+            .tint(color);
+        if ui
+            .add(egui::Button::image(img).frame(false))
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

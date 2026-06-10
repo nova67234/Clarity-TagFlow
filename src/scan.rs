@@ -191,6 +191,8 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
         .placed_at([x, y])
         .frame(window_frame())
         .show(ctx, |ui| {
+            // Only the top strip drags the popup — not stray drags on the body.
+            crate::popup_drag_strip(ui, 30.0);
             ui.set_width(content_w);
             let radius = egui::CornerRadius::same(10);
             {
@@ -212,12 +214,14 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
                 );
                 ui.heading(egui::RichText::new("Find Issues").color(TEXT()).strong().size(17.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // click_and_drag so a click that slips a pixel is swallowed
+                    // by the button instead of dragging the popup.
                     if ui
                         .add(egui::Button::image(
                             egui::Image::new(egui::include_image!("../icons/close.svg"))
                                 .fit_to_exact_size(egui::vec2(24.0, 24.0))
                                 .tint(TEXT()),
-                        ).frame(false))
+                        ).frame(false).sense(egui::Sense::click_and_drag()))
                         .on_hover_text("Close (a running scan keeps going)")
                         .clicked()
                     {

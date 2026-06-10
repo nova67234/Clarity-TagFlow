@@ -4,6 +4,9 @@
 //! Text · Move · Delete) and the Image Info card — just without the tab switcher.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::{Instant, SystemTime};
 
 use eframe::egui;
 
@@ -34,7 +37,31 @@ pub struct DetailPopup {
     metadata_raw: Option<String>,
     showing_meta: bool,
     editing: bool,
+    /// Copy-button result flash: (start, success) — green on copy, amber when
+    /// there was nothing to copy. Same feedback as the right panel.
+    copy_flash: Option<(Instant, bool)>,
+    /// Edit/Save-button result flash: green = saved, red = write failed.
+    save_flash: Option<(Instant, bool)>,
+    /// When edit mode was entered — pulses the tag box toward the accent.
+    edit_flash_start: Option<Instant>,
+    /// Delete-confirmation dialog state (mirrors the right panel's).
+    show_delete_confirm: bool,
+    skip_delete_confirm: bool,
     meta: ImageMeta,
+    /// Receiver for the background metadata load (full decode + colour palette
+    /// run off the UI thread, like the right panel — opening the popup must
+    /// never block on a multi-megapixel decode).
+    meta_rx: Option<mpsc::Receiver<ImageMeta>>,
+    /// Bumped per load so a stale background decode can bail early when the
+    /// popup is quickly reopened on another image.
+    meta_gen: Arc<AtomicU64>,
+    /// Cached parse of the shared tag_roles.json (mtime + md5->roles map),
+    /// reloaded only when the file changes — so reopening the popup doesn't
+    /// re-parse it every time.
+    roles_cache: Option<(
+        Option<SystemTime>,
+        std::collections::HashMap<String, right_details::TagRoles>,
+    )>,
     /// Artist / character tag names (for orange/green colouring), looked up the
     /// same way the right panel does.
     artist: std::collections::HashSet<String>,
@@ -56,7 +83,15 @@ impl Default for DetailPopup {
             metadata_raw: None,
             showing_meta: false,
             editing: false,
+            copy_flash: None,
+            save_flash: None,
+            edit_flash_start: None,
+            show_delete_confirm: false,
+            skip_delete_confirm: false,
             meta: ImageMeta::default(),
+            meta_rx: None,
+            meta_gen: Arc::new(AtomicU64::new(0)),
+            roles_cache: None,
             artist: std::collections::HashSet::new(),
             character: std::collections::HashSet::new(),
             zoom: crate::zoom::ZoomState::default(),
@@ -66,10 +101,14 @@ impl Default for DetailPopup {
 
 impl DetailPopup {
     /// Open the popup for `path` (the image at `index` in the folder list),
-    /// loading its tags, metadata and details once.
-    pub fn open_for(&mut self, index: usize, path: &Path) {
+    /// loading its tags, metadata and details once. The details-card metadata
+    /// (full decode + colour palette) loads on a background thread; everything
+    /// read here synchronously is cheap (sidecar txt, embedded text chunks,
+    /// the mtime-cached roles map).
+    pub fn open_for(&mut self, index: usize, path: &Path, ctx: &egui::Context) {
         self.open = true;
-        self.view = PopupView::Details;
+        // `self.view` is intentionally left alone: the popup reopens on whichever
+        // view (Details / Civitai) was selected last.
         self.index = Some(index);
         self.path = Some(path.to_path_buf());
         let txt = right_details::sidecar_txt(path);
@@ -80,9 +119,34 @@ impl DetailPopup {
         // Show metadata first only when there are no tags but there is metadata.
         self.showing_meta = self.tags.trim().is_empty() && self.metadata.is_some();
         self.editing = false;
-        self.meta = right_details::load_meta(path);
-        let mut cache = None;
-        let roles = right_details::lookup_tag_roles(&mut cache, path);
+        self.copy_flash = None;
+        self.save_flash = None;
+        self.edit_flash_start = None;
+        self.show_delete_confirm = false;
+
+        // Kick the heavy metadata read (decode + dominant colours) to a
+        // background thread — same pattern as the right panel. The card shows
+        // "Loading..." until it lands.
+        self.meta = ImageMeta::loading();
+        let (tx, rx) = mpsc::channel();
+        self.meta_rx = Some(rx);
+        let generation = self.meta_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let meta_gen = Arc::clone(&self.meta_gen);
+        let path_clone = path.to_path_buf();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            // Skip the heavy decode entirely if the popup already moved on.
+            if meta_gen.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let meta = right_details::load_meta(&path_clone);
+            // Deliver + repaint only if this is still the current image.
+            if meta_gen.load(Ordering::SeqCst) == generation && tx.send(meta).is_ok() {
+                ctx.request_repaint();
+            }
+        });
+
+        let roles = right_details::lookup_tag_roles(&mut self.roles_cache, path);
         self.artist = roles.artist;
         self.character = roles.character;
     }
@@ -107,9 +171,17 @@ pub fn show(
     viewer: &mut ImageCache,
     civitai: &mut crate::civitai::CivitaiState,
     favorites: &mut crate::favorites::Favorites,
+    confirm_before_delete: &mut bool,
 ) -> DetailAction {
     if !popup.open {
         return DetailAction::None;
+    }
+    // Non-blocking check for the background metadata load finishing.
+    if let Some(rx) = &popup.meta_rx {
+        if let Ok(meta) = rx.try_recv() {
+            popup.meta = meta;
+            popup.meta_rx = None; // Finished!
+        }
     }
     let Some(path) = popup.path.clone() else {
         popup.open = false;
@@ -134,6 +206,8 @@ pub fn show(
         .fixed_size([win_w, win_h])
         .frame(window_frame())
         .show(ctx, |ui| {
+            // Only the top strip drags the popup — not stray drags on the body.
+            crate::popup_drag_strip(ui, 30.0);
             // Rounder widgets + dark input wells, matching the right panel feel.
             let radius = egui::CornerRadius::same(12);
             {
@@ -174,11 +248,43 @@ pub fn show(
                     |ui| {
                         ui.set_min_height(col_h);
                         ui.set_width(det_w);
-                        right_column(ui, popup, civitai, &path, index, &mut action, &mut want_close);
+                        right_column(
+                            ui,
+                            popup,
+                            civitai,
+                            &path,
+                            index,
+                            *confirm_before_delete,
+                            &mut action,
+                            &mut want_close,
+                        );
                     },
                 );
             });
         });
+
+    // Delete confirmation — the same centered modal as the right panel's.
+    if popup.show_delete_confirm {
+        match right_details::delete_confirm_dialog(
+            ctx,
+            "gallery_detail_confirm_delete",
+            &mut popup.skip_delete_confirm,
+        ) {
+            Some(true) => {
+                popup.show_delete_confirm = false;
+                // "Don't ask again" disables (and persists, via Settings) future prompts.
+                if popup.skip_delete_confirm {
+                    *confirm_before_delete = false;
+                }
+                if let Some(i) = index {
+                    action = DetailAction::Delete(i);
+                    want_close = true;
+                }
+            }
+            Some(false) => popup.show_delete_confirm = false,
+            None => {}
+        }
+    }
 
     if want_close {
         popup.open = false;
@@ -193,6 +299,7 @@ fn right_column(
     civitai: &mut crate::civitai::CivitaiState,
     path: &Path,
     index: Option<usize>,
+    confirm_before_delete: bool,
     action: &mut DetailAction,
     want_close: &mut bool,
 ) {
@@ -200,12 +307,14 @@ fn right_column(
     // header) plus the menu (☰, like the right panel) and a close (✕).
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // click_and_drag so a click that slips a pixel is swallowed by the
+            // button instead of falling through and dragging the popup.
             if ui
                 .add(egui::Button::image(
                     egui::Image::new(egui::include_image!("../icons/close.svg"))
                         .fit_to_exact_size(egui::vec2(24.0, 24.0))
                         .tint(MUTED()),
-                ).frame(false))
+                ).frame(false).sense(egui::Sense::click_and_drag()))
                 .on_hover_text("Close")
                 .clicked()
             {
@@ -215,7 +324,7 @@ fn right_column(
                 .fit_to_exact_size(egui::vec2(20.0, 20.0))
                 .tint(MUTED());
             let menu_resp = ui
-                .add(egui::Button::image(menu_icon).frame(false))
+                .add(egui::Button::image(menu_icon).frame(false).sense(egui::Sense::click_and_drag()))
                 .on_hover_text("Switch view");
             egui::Popup::menu(&menu_resp)
                 .align(egui::RectAlign::BOTTOM_END)
@@ -247,7 +356,9 @@ fn right_column(
     ui.add_space(8.0);
 
     match popup.view {
-        PopupView::Details => details_content(ui, popup, path, index, action, want_close),
+        PopupView::Details => {
+            details_content(ui, popup, path, index, confirm_before_delete, action, want_close)
+        }
         PopupView::Civitai => {
             let meta = popup.metadata_raw.clone();
             crate::civitai::show(ui, civitai, Some(path), meta.as_deref());
@@ -262,6 +373,7 @@ fn details_content(
     popup: &mut DetailPopup,
     path: &Path,
     index: Option<usize>,
+    confirm_before_delete: bool,
     action: &mut DetailAction,
     want_close: &mut bool,
 ) {
@@ -271,7 +383,7 @@ fn details_content(
         .frame(egui::Frame::NONE.inner_margin(egui::Margin::ZERO))
         .show_inside(ui, |ui| {
             ui.add_space(6.0);
-            actions_row(ui, popup, path, index, action, want_close);
+            actions_row(ui, popup, path, index, confirm_before_delete, action, want_close);
             ui.add_space(10.0);
             right_details::image_details_section(ui, &popup.meta);
         });
@@ -293,11 +405,25 @@ fn details_content(
                 let has_meta = popup.metadata.is_some();
                 if has_tags && has_meta {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Button shows the view you'd switch *to*.
-                        let label = if popup.showing_meta { "Tags" } else { "Metadata" };
-                        if ui.button(egui::RichText::new(label).size(12.0)).clicked() {
+                        // Button shows the view you'd switch *to* — icon + label,
+                        // same as the right panel's switch.
+                        let to = if popup.showing_meta { "Tags" } else { "Metadata" };
+                        let switch_icon = egui::include_image!("../icons/window_switch.svg");
+                        let btn = egui::Button::image_and_text(
+                            egui::Image::new(switch_icon)
+                                .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                                .tint(TEXT()),
+                            egui::RichText::new(to).size(13.0),
+                        );
+                        if ui
+                            .add(btn)
+                            .on_hover_text(
+                                "Switch between .txt tags and embedded generation metadata",
+                            )
+                            .clicked()
+                        {
                             popup.showing_meta = !popup.showing_meta;
-                            popup.editing = false;
+                            popup.editing = false; // leave edit mode on switch
                         }
                     });
                 }
@@ -313,6 +439,7 @@ fn actions_row(
     popup: &mut DetailPopup,
     path: &Path,
     index: Option<usize>,
+    confirm_before_delete: bool,
     action: &mut DetailAction,
     want_close: &mut bool,
 ) {
@@ -323,26 +450,69 @@ fn actions_row(
         let size = egui::vec2(bw, 35.0);
         let label = |t: &str| egui::RichText::new(t).size(15.0);
 
-        if ui.add_sized(size, egui::Button::new(label("Copy"))).clicked() {
+        // Copy flashes green when it copies, amber when there's nothing to copy.
+        let mut copy_btn = egui::Button::new(label("Copy"));
+        if let Some(fill) = right_details::flash_fill(
+            ui,
+            popup.copy_flash,
+            right_details::FLASH_GREEN,
+            right_details::FLASH_AMBER,
+        ) {
+            copy_btn = copy_btn.fill(fill);
+        }
+        if ui
+            .add_sized(size, copy_btn)
+            .on_hover_text("Copy tags to clipboard")
+            .clicked()
+        {
             let text = if popup.showing_meta {
                 popup.metadata.clone().unwrap_or_default()
             } else {
                 popup.tags.clone()
             };
-            if !text.trim().is_empty() {
+            let ok = !text.trim().is_empty();
+            if ok {
                 ui.ctx().copy_text(text);
             }
+            popup.copy_flash = Some((Instant::now(), ok));
         }
 
-        let edit_label = if popup.editing { "Save" } else { "Edit Text" };
-        if ui.add_sized(size, egui::Button::new(label(edit_label))).clicked() {
-            if popup.editing {
+        // Edit/Save: flashes green when a save succeeds, red when the write
+        // fails (stays in edit mode to retry) — same as the right panel.
+        let mut edit_btn =
+            egui::Button::new(label(if popup.editing { "Save" } else { "Edit Text" }));
+        if let Some(fill) = right_details::flash_fill(
+            ui,
+            popup.save_flash,
+            right_details::FLASH_GREEN,
+            right_details::FLASH_RED,
+        ) {
+            edit_btn = edit_btn.fill(fill);
+        }
+        if ui.add_sized(size, edit_btn).clicked() {
+            if popup.showing_meta {
+                // The metadata view is read-only. Clicking Edit Text here drops
+                // to the .txt tags view, creating the sidecar file if it doesn't
+                // exist yet, and enters edit mode.
                 let txt = right_details::sidecar_txt(path);
-                let _ = std::fs::write(&txt, &popup.tags);
-                popup.editing = false;
-            } else {
-                popup.showing_meta = false; // edit the tags, not the read-only metadata
+                if !txt.exists() {
+                    let _ = std::fs::write(&txt, &popup.tags);
+                }
+                popup.showing_meta = false;
                 popup.editing = true;
+                popup.edit_flash_start = Some(Instant::now());
+                popup.save_flash = None;
+            } else if popup.editing {
+                let txt = right_details::sidecar_txt(path);
+                let ok = std::fs::write(&txt, &popup.tags).is_ok();
+                if ok {
+                    popup.editing = false; // saved — back to view mode
+                }
+                popup.save_flash = Some((Instant::now(), ok));
+            } else {
+                popup.editing = true;
+                popup.edit_flash_start = Some(Instant::now());
+                popup.save_flash = None; // clear any stale save flash
             }
         }
 
@@ -357,8 +527,14 @@ fn actions_row(
             .fill(egui::Color32::from_rgb(180, 40, 40));
         if ui.add_sized(size, del).clicked() {
             if let Some(i) = index {
-                *action = DetailAction::Delete(i);
-                *want_close = true;
+                // Confirm first, unless confirmations are disabled.
+                if confirm_before_delete {
+                    popup.show_delete_confirm = true;
+                    popup.skip_delete_confirm = false; // fresh checkbox
+                } else {
+                    *action = DetailAction::Delete(i);
+                    *want_close = true;
+                }
             }
         }
     });
@@ -385,8 +561,12 @@ fn tags_box_fill(ui: &mut egui::Ui, popup: &mut DetailPopup) {
     let box_outer_h = ui.available_height();
     let inner_h = (box_outer_h - 24.0).max(0.0); // minus the 12px margins
 
+    // Box background, with the "ready to edit" flash pulsing it toward the
+    // accent just after entering edit mode — same as the right panel.
+    let box_fill = right_details::edit_flash_fill(ui, popup.edit_flash_start);
+
     egui::Frame::new()
-        .fill(FIELD())
+        .fill(box_fill)
         .corner_radius(egui::CornerRadius::same(22))
         .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {

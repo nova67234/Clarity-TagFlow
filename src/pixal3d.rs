@@ -201,7 +201,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&
                  every model from public sources. Only add a token if you want to use \
                  your own gated model.",
             );
-            ui.hyperlink_to("Manage Hugging Face tokens →", "https://huggingface.co/settings/tokens");
+            crate::arrow_link(ui, "Manage Hugging Face tokens", "https://huggingface.co/settings/tokens", None);
         });
     });
     ui.add_space(2.0);

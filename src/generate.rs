@@ -304,6 +304,8 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
         .placed_centered(ctx)
         .frame(window_frame())
         .show(ctx, |ui| {
+            // Only the top strip drags the popup — not stray drags on the body.
+            crate::popup_drag_strip(ui, 30.0);
             ui.set_width(380.0);
             let radius = CornerRadius::same(10);
             {
@@ -324,19 +326,25 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
                 );
                 ui.heading(RichText::new("LoRAs").color(TEXT()).strong().size(17.0));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // click_and_drag so a click that slips a pixel is swallowed
+                    // by the button instead of dragging the popup.
                     if ui
                         .add(egui::Button::image(
                             egui::Image::new(egui::include_image!("../icons/close.svg"))
                                 .fit_to_exact_size(egui::vec2(24.0, 24.0))
                                 .tint(TEXT()),
-                        ).frame(false))
+                        ).frame(false).sense(egui::Sense::click_and_drag()))
                         .on_hover_text("Close")
                         .clicked()
                     {
                         state.show_lora_popup = false;
                     }
                     ui.add_space(2.0);
-                    if ui.button(RichText::new("Refresh").size(11.0)).clicked() {
+                    if ui
+                        .add(egui::Button::new(RichText::new("Refresh").size(11.0))
+                            .sense(egui::Sense::click_and_drag()))
+                        .clicked()
+                    {
                         refresh_loras(state);
                     }
                 });
@@ -530,7 +538,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState) {
             .on_hover_ui(|ui| {
                 ui.set_max_width(260.0);
                 ui.label("Flux dev is a gated model: accept its license on Hugging Face and paste a token.");
-                ui.hyperlink_to("Manage tokens →", "https://huggingface.co/settings/tokens");
+                crate::arrow_link(ui, "Manage tokens", "https://huggingface.co/settings/tokens", None);
             });
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut state.hf_token).password(true).desired_width(f32::INFINITY),
@@ -552,29 +560,16 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState) {
     // Generate button off the panel). ---
     ui.label(RichText::new("Prompt").color(MUTED()).size(12.0));
     ui.add_space(2.0);
-    // Z-Image dresses the prompt box in the "Details & Actions" panel styling
-    // (PANEL fill, rounded-22 corners, faint edge). No drop shadow: the panel's
-    // shadow paints below the box and isn't clickable, which made the textbox
-    // feel like you had to "click higher" to focus it. Flux keeps the plain dark field.
-    let prompt_frame = if state.family == GenFamily::ZImage {
-        egui::Frame::new()
-            .fill(PANEL())
-            .corner_radius(CornerRadius::same(22))
-            .inner_margin(Margin::same(12))
-            .stroke(egui::Stroke::new(1.0, EDGE()))
-    } else {
-        let bg = if crate::theme::is_light() { FIELD() } else { Color32::from_rgb(15, 15, 17) };
-        egui::Frame::new()
-            .fill(bg)
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::same(2))
-            .stroke(egui::Stroke::new(1.0, EDGE()))
-    };
-    let (prompt_max_h, prompt_rows) = if state.family == GenFamily::ZImage {
-        (300.0, 13)
-    } else {
-        (108.0, 4)
-    };
+    // Both Flux and Z-Image dress the prompt box in the "Details & Actions" panel
+    // styling (PANEL fill, rounded-22 corners, faint edge). No drop shadow: the
+    // panel's shadow paints below the box and isn't clickable, which made the
+    // textbox feel like you had to "click higher" to focus it.
+    let prompt_frame = egui::Frame::new()
+        .fill(PANEL())
+        .corner_radius(CornerRadius::same(22))
+        .inner_margin(Margin::same(12))
+        .stroke(egui::Stroke::new(1.0, EDGE()));
+    let (prompt_max_h, prompt_rows) = (300.0, 13);
     prompt_frame
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
