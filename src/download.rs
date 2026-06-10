@@ -374,9 +374,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                                     .size(10.5),
                             );
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.hyperlink_to(
-                                    egui::RichText::new("Get credentials →").size(10.5),
+                                crate::arrow_link(
+                                    ui,
+                                    "Get credentials",
                                     "https://gelbooru.com/index.php?page=account&s=options",
+                                    Some(10.5),
                                 );
                             });
                         });

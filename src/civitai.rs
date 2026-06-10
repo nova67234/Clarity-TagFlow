@@ -43,6 +43,11 @@ enum ItemType {
     Lora,
     Vae,
     Embedding,
+    /// Referenced by version id but with no recognisable type in the metadata
+    /// (newer `Civitai metadata` resources may omit it, and Civitai has types we
+    /// don't section — upscalers, motion modules, …). Classified after lookup
+    /// by the API-reported type.
+    Other,
 }
 
 #[derive(Clone, Copy)]
@@ -640,6 +645,8 @@ fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
                 }),
         )
         .show(ctx, |ui| {
+            // Only the top strip drags the popup — not stray drags on the body.
+            crate::popup_drag_strip(ui, 30.0);
             ui.set_width(380.0);
             let radius = egui::CornerRadius::same(10);
             {
@@ -659,12 +666,14 @@ fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
                 );
                 ui.heading(egui::RichText::new("Civitai Settings").color(TEXT()).strong().size(17.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // click_and_drag so a click that slips a pixel is swallowed
+                    // by the button instead of dragging the popup.
                     if ui
                         .add(egui::Button::image(
                             egui::Image::new(egui::include_image!("../icons/close.svg"))
                                 .fit_to_exact_size(egui::vec2(24.0, 24.0))
                                 .tint(TEXT()),
-                        ).frame(false))
+                        ).frame(false).sense(egui::Sense::click_and_drag()))
                         .on_hover_text("Close")
                         .clicked()
                     {
@@ -690,10 +699,7 @@ fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
                     egui::RichText::new("Stored encrypted on this device.").color(MUTED()).size(10.5),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.hyperlink_to(
-                        egui::RichText::new("Get a key →").size(10.5),
-                        "https://civitai.com/user/account",
-                    );
+                    crate::arrow_link(ui, "Get a key", "https://civitai.com/user/account", Some(10.5));
                 });
             });
 
@@ -1125,6 +1131,7 @@ fn run_fetch(
     let mut loras: Vec<Fetched> = Vec::new();
     let mut lycoris: Vec<Fetched> = Vec::new();
     let mut embeddings: Vec<Fetched> = Vec::new();
+    let mut others: Vec<Fetched> = Vec::new();
     let mut processed: HashSet<String> = HashSet::new();
 
     for task in &tasks {
@@ -1158,7 +1165,17 @@ fn run_fetch(
             continue;
         }
 
-        match task.kind {
+        // Bucket by the API-reported type when it's one we recognise — it's
+        // authoritative, and `Other` tasks (no type in the metadata) only learn
+        // their type here. Fall back to whatever the metadata claimed.
+        let kind = match info.resource_type.to_lowercase().as_str() {
+            "checkpoint" => ItemType::Model,
+            "vae" => ItemType::Vae,
+            "lora" | "locon" | "lycoris" | "dora" => ItemType::Lora,
+            "textualinversion" => ItemType::Embedding,
+            _ => task.kind,
+        };
+        match kind {
             ItemType::Model => {
                 if model.is_none() {
                     model = Some(info);
@@ -1178,6 +1195,9 @@ fn run_fetch(
                 }
             }
             ItemType::Embedding => embeddings.push(info),
+            // Still unrecognised after the lookup (upscaler, motion module, …) —
+            // show it rather than drop it.
+            ItemType::Other => others.push(info),
         }
     }
 
@@ -1196,6 +1216,9 @@ fn run_fetch(
     }
     if !embeddings.is_empty() {
         sections.push(FetchedSection { title: "Embeddings".into(), items: embeddings });
+    }
+    if !others.is_empty() {
+        sections.push(FetchedSection { title: "Other Resources".into(), items: others });
     }
 
     let _ = tx.send(CivMsg::Done(Box::new(CivResult { source_url, sections })));
@@ -1278,6 +1301,7 @@ fn fetch_resource_info(
                 ItemType::Lora => "&types=LORA&types=LoCon&types=Lycoris&types=DoRA",
                 ItemType::Vae => "&types=VAE",
                 ItemType::Embedding => "&types=TextualInversion",
+                ItemType::Other => "", // unknown — search across all types
             };
             let url = format!(
                 "https://civitai.com/api/v1/models?query={}&limit=1{}",
@@ -1573,65 +1597,131 @@ fn parse_metadata_for_tasks(metadata: &str) -> Vec<Task> {
 
 fn parse_civitai_generator(metadata: &str) -> Vec<Task> {
     let mut tasks = Vec::new();
-    let Some(idx) = metadata.find("Civitai resources:") else {
-        return tasks;
-    };
-    let start = idx + "Civitai resources:".len();
-    let rest = &metadata[start..];
-    let mut block = match rest.find("Civitai metadata:") {
-        Some(m) => rest[..m].trim().to_string(),
-        None => rest.trim().to_string(),
-    };
-    if block.ends_with(',') {
-        block.pop();
-        block = block.trim().to_string();
-    }
-    let block: String = block.chars().filter(|&c| c != '\n' && c != '\r').collect();
-    // The metadata may have trailing junk after the `]` (e.g. EXIF/scan tail), so
-    // clip to the outermost `[ … ]` before parsing.
-    let block = match (block.find('['), block.rfind(']')) {
-        (Some(a), Some(b)) if b >= a => block[a..=b].to_string(),
-        _ => block,
-    };
+    let mut claimed_versions: HashSet<String> = HashSet::new();
 
-    if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&block) {
-        if let Some(items) = arr.as_array() {
-            for node in items {
-                // The resource type and model-version id come from either the old
-                // `type` + `modelVersionId` fields, or the newer Civitai AIR id
-                // (`"air":"urn:air:<eco>:<type>:<source>:<modelId>@<versionId>"`).
-                let mut type_str =
-                    node.get("type").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                let mut ver = node.get("modelVersionId").and_then(as_text_opt).unwrap_or_default();
+    // 1) The legacy `Civitai resources: [ … ]` array.
+    if let Some(idx) = metadata.find("Civitai resources:") {
+        let start = idx + "Civitai resources:".len();
+        let rest = &metadata[start..];
+        let mut block = match rest.find("Civitai metadata:") {
+            Some(m) => rest[..m].trim().to_string(),
+            None => rest.trim().to_string(),
+        };
+        if block.ends_with(',') {
+            block.pop();
+            block = block.trim().to_string();
+        }
+        let block: String = block.chars().filter(|&c| c != '\n' && c != '\r').collect();
+        // The metadata may have trailing junk after the `]` (e.g. EXIF/scan tail), so
+        // clip to the outermost `[ … ]` before parsing.
+        let block = match (block.find('['), block.rfind(']')) {
+            (Some(a), Some(b)) if b >= a => block[a..=b].to_string(),
+            _ => block,
+        };
 
-                if ver.is_empty() {
-                    if let Some(air) = node.get("air").and_then(|v| v.as_str()) {
-                        if let Some((air_type, version_id)) = parse_air(air) {
-                            if type_str.is_empty() {
-                                type_str = air_type;
-                            }
-                            ver = version_id;
-                        }
-                    }
-                }
-
-                if ver.is_empty() || ver == "0" {
-                    continue;
-                }
-                let kind = match type_str.as_str() {
-                    "checkpoint" => Some(ItemType::Model),
-                    "lora" | "locon" | "lycoris" | "dora" => Some(ItemType::Lora),
-                    "textualinversion" | "embedding" => Some(ItemType::Embedding),
-                    "vae" => Some(ItemType::Vae),
-                    _ => None,
-                };
-                if let Some(kind) = kind {
-                    tasks.push(Task::version(kind, ver));
+        if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&block) {
+            if let Some(items) = arr.as_array() {
+                for node in items {
+                    push_resource_node(node, &mut tasks, &mut claimed_versions);
                 }
             }
         }
     }
+
+    // 2) The newer `Civitai metadata: { … "resources": [ … ] }` JSON blob. On-site
+    //    generator exports (e.g. the Seedream ecosystem) leave `Civitai resources`
+    //    EMPTY and reference their checkpoint only here, so without this block such
+    //    images showed "No Civitai resources found".
+    if let Some(idx) = metadata.find("Civitai metadata:") {
+        let rest = &metadata[idx + "Civitai metadata:".len()..];
+        if let Some(json) = balanced_json_object(rest) {
+            if let Ok(root) = serde_json::from_str::<serde_json::Value>(json) {
+                for key in ["resources", "additionalResources"] {
+                    if let Some(items) = root.get(key).and_then(|v| v.as_array()) {
+                        for node in items {
+                            push_resource_node(node, &mut tasks, &mut claimed_versions);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     tasks
+}
+
+/// Turn one resource node from either Civitai-generator block into a lookup
+/// task, skipping versions another node already claimed. The resource type and
+/// model-version id come from either the old `type` + `modelVersionId` fields,
+/// or the newer Civitai AIR id
+/// (`"air":"urn:air:<eco>:<type>:<source>:<modelId>@<versionId>"`). A node with
+/// a version id but no recognisable type is still looked up (as `Other`) — the
+/// API response then says what it really is.
+fn push_resource_node(
+    node: &serde_json::Value,
+    tasks: &mut Vec<Task>,
+    claimed_versions: &mut HashSet<String>,
+) {
+    let mut type_str = node.get("type").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+    let mut ver = node.get("modelVersionId").and_then(as_text_opt).unwrap_or_default();
+
+    if ver.is_empty() {
+        if let Some(air) = node.get("air").and_then(|v| v.as_str()) {
+            if let Some((air_type, version_id)) = parse_air(air) {
+                if type_str.is_empty() {
+                    type_str = air_type;
+                }
+                ver = version_id;
+            }
+        }
+    }
+
+    if ver.is_empty() || ver == "0" || !claimed_versions.insert(ver.clone()) {
+        return;
+    }
+    let kind = match type_str.as_str() {
+        "checkpoint" => ItemType::Model,
+        "lora" | "locon" | "lycoris" | "dora" => ItemType::Lora,
+        "textualinversion" | "embedding" => ItemType::Embedding,
+        "vae" => ItemType::Vae,
+        _ => ItemType::Other,
+    };
+    tasks.push(Task::version(kind, ver));
+}
+
+/// Extract the balanced `{ … }` JSON object starting at the first `{` in `s`,
+/// string-aware so braces inside quoted values (e.g. the prompt) don't end it
+/// early. A naive find('}') would clip the `Civitai metadata` blob at its first
+/// nested object (`aspectRatio`) and fail to parse.
+fn balanced_json_object(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escape = false;
+    for (i, &b) in s.as_bytes().iter().enumerate().skip(start) {
+        if in_str {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Parse a Civitai AIR identifier
@@ -1919,6 +2009,71 @@ mod sized_url_tests {
             sized_image_url("https://image.civitai.com/abc/uuid/x.jpeg", 200),
             "https://image.civitai.com/abc/uuid/width=200/x.jpeg"
         );
+    }
+}
+
+#[cfg(test)]
+mod civitai_generator_tests {
+    use super::{parse_civitai_generator, ItemType};
+
+    // Mirrors tests/bug/generator_import_*.jpg — Civitai on-site generator
+    // (Seedream ecosystem) exports: `Civitai resources` is EMPTY and the
+    // checkpoint is referenced only inside the `Civitai metadata` JSON blob,
+    // whose nested objects/strings must survive extraction.
+    const SEEDREAM: &str = "Highly detailed, photorealistic, a robot with glowing glyphs.\n\
+        Steps: 0, Sampler: Seedream-V45, CFG scale: 0, Seed: -1, Size: 2304x4096, \
+        Created Date: 2026-06-04T04:15:21.1001919Z, Civitai resources: [], \
+        Civitai metadata: {\"workflow\":\"txt2img\",\"priority\":\"low\",\
+        \"outputFormat\":\"jpeg\",\"ecosystem\":\"Seedream\",\"resolution\":\"4K\",\
+        \"aspectRatio\":{\"value\":\"9:16\",\"width\":2304,\"height\":4096},\
+        \"cfgScale\":5,\"seed\":1774949004,\
+        \"prompt\":\"a robot {with} \\\"glyphs\\\", bokeh\",\"quantity\":1,\
+        \"resources\":[{\"modelVersionId\":2470991,\"strength\":1,\"type\":\"Checkpoint\"}]}";
+
+    #[test]
+    fn finds_resources_in_civitai_metadata_blob() {
+        let tasks = parse_civitai_generator(SEEDREAM);
+        assert_eq!(tasks.len(), 1, "expected exactly one task");
+        assert!(tasks[0].kind == ItemType::Model);
+        assert_eq!(tasks[0].version_id.as_deref(), Some("2470991"));
+    }
+
+    // End-to-end against the real Civitai-generator JPEGs (UTF-16 EXIF
+    // UserComment → sd_metadata raw scan → parser). Ignored by default: the
+    // images live in the untracked tests/bug folder. Run with
+    // `cargo test seedream_jpegs -- --ignored`.
+    #[test]
+    #[ignore]
+    fn seedream_jpegs_end_to_end() {
+        for name in [
+            "tests/bug/generator_import_1780547142123_0.jpg",
+            "tests/bug/generator_import_1780631568326_0.jpg",
+        ] {
+            let (_disp, raw) = crate::sd_metadata::read_both(std::path::Path::new(name));
+            let raw = raw.expect("raw metadata should be found");
+            assert!(raw.contains("Civitai metadata:"), "{name}: blob missing");
+            let tasks = parse_civitai_generator(&raw);
+            assert_eq!(tasks.len(), 1, "{name}: expected one task");
+            assert!(tasks[0].kind == ItemType::Model);
+            assert_eq!(tasks[0].version_id.as_deref(), Some("2470991"));
+        }
+    }
+
+    #[test]
+    fn dedupes_versions_listed_in_both_blocks() {
+        // The same version in `Civitai resources` and `Civitai metadata` must
+        // only be looked up once; the typeless extra resource still surfaces
+        // (as Other) so the API lookup can classify it.
+        let meta = "prompt\nSteps: 20, \
+            Civitai resources: [{\"type\":\"checkpoint\",\"modelVersionId\":2470991}], \
+            Civitai metadata: {\"resources\":[{\"modelVersionId\":2470991,\"strength\":1},\
+            {\"modelVersionId\":12345,\"strength\":0.8}]}";
+        let tasks = parse_civitai_generator(meta);
+        assert_eq!(tasks.len(), 2, "got {} tasks", tasks.len());
+        assert!(tasks[0].kind == ItemType::Model);
+        assert_eq!(tasks[0].version_id.as_deref(), Some("2470991"));
+        assert!(tasks[1].kind == ItemType::Other);
+        assert_eq!(tasks[1].version_id.as_deref(), Some("12345"));
     }
 }
 

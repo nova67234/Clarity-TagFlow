@@ -82,6 +82,22 @@ impl Default for ImageMeta {
     }
 }
 
+impl ImageMeta {
+    /// The placeholder shown in the details card while a background `load_meta`
+    /// (full decode + colour extraction) is still running.
+    pub(crate) fn loading() -> Self {
+        Self {
+            name: "Loading...".into(),
+            file_type: "...".into(),
+            dimensions: "...".into(),
+            size: "...".into(),
+            date: "...".into(),
+            colors: vec![],
+            ..Self::default()
+        }
+    }
+}
+
 /// Artist (username) + character tag names for the current image, looked up from
 /// the downloader's shared `tag_roles.json` (keyed by md5). Used to colour those
 /// tags in the tag box.
@@ -241,12 +257,7 @@ pub fn show(
             state.showing_meta = state.current_tags.trim().is_empty() && state.sd_metadata.is_some();
 
             // Set temporary loading state for the card
-            state.meta = ImageMeta {
-                name: "Loading...".into(), file_type: "...".into(),
-                dimensions: "...".into(), size: "...".into(),
-                date: "...".into(), colors: vec![],
-                ..ImageMeta::default()
-            };
+            state.meta = ImageMeta::loading();
 
             // Spawn a background thread to calculate metadata and heavy colors
             let (tx, rx) = mpsc::channel();
@@ -453,15 +464,8 @@ pub fn show(
                                     // Copy flashes green when it copies tags, or amber
                                     // ("warning") when there's nothing to copy — then fades back.
                                     let mut copy_btn = egui::Button::new(label("Copy"));
-                                    if let Some((start, ok)) = state.copy_flash {
-                                        let elapsed = start.elapsed().as_secs_f32();
-                                        if elapsed < FLASH_SECS {
-                                            let intensity = 1.0 - elapsed / FLASH_SECS;
-                                            let target = if ok { FLASH_GREEN } else { FLASH_AMBER };
-                                            let base = ui.visuals().widgets.inactive.weak_bg_fill;
-                                            copy_btn = copy_btn.fill(lerp_color(base, target, intensity));
-                                            ui.ctx().request_repaint(); // animate the fade
-                                        }
+                                    if let Some(fill) = flash_fill(ui, state.copy_flash, FLASH_GREEN, FLASH_AMBER) {
+                                        copy_btn = copy_btn.fill(fill);
                                     }
 
                                     if ui
@@ -487,15 +491,8 @@ pub fn show(
                                     // red when the write fails (stays in edit mode to retry).
                                     let mut edit_btn =
                                         egui::Button::new(label(if state.is_editing { "Save" } else { "Edit Text" }));
-                                    if let Some((start, ok)) = state.save_flash {
-                                        let elapsed = start.elapsed().as_secs_f32();
-                                        if elapsed < FLASH_SECS {
-                                            let intensity = 1.0 - elapsed / FLASH_SECS;
-                                            let target = if ok { FLASH_GREEN } else { FLASH_RED };
-                                            let base = ui.visuals().widgets.inactive.weak_bg_fill;
-                                            edit_btn = edit_btn.fill(lerp_color(base, target, intensity));
-                                            ui.ctx().request_repaint();
-                                        }
+                                    if let Some(fill) = flash_fill(ui, state.save_flash, FLASH_GREEN, FLASH_RED) {
+                                        edit_btn = edit_btn.fill(fill);
                                     }
 
                                     if ui.add_sized(size, edit_btn).clicked() {
@@ -649,18 +646,7 @@ pub fn show(
 
                                 // Box background, with the "ready to edit" flash pulsing
                                 // it toward the accent just after entering edit mode.
-                                let mut box_fill = FIELD();
-                                if let Some(start) = state.edit_flash_start {
-                                    let elapsed = start.elapsed().as_secs_f32();
-                                    if elapsed < EDIT_FLASH_SECS {
-                                        let t = elapsed / EDIT_FLASH_SECS;          // 0..1
-                                        let envelope = 1.0 - t;                     // overall fade-out
-                                        let osc = (t * std::f32::consts::PI * 2.0).sin().abs(); // two pulses
-                                        let intensity = (envelope * osc).clamp(0.0, 1.0);
-                                        box_fill = lerp_color(FIELD(), ACCENT1(), intensity * 0.55);
-                                        ui.ctx().request_repaint(); // keep the animation smooth
-                                    }
-                                }
+                                let box_fill = edit_flash_fill(ui, state.edit_flash_start);
 
                                 // Lock the box height to the remaining space *before*
                                 // building the frame, so its size is independent of the
@@ -724,92 +710,17 @@ pub fn show(
 
     // --- 3. Delete Confirmation UI (Smaller, Centered Modal) ---
     if state.show_delete_confirm {
-        let mut close_dialog = false;
-        let mut confirm_delete = false;
-
-        egui::Window::new("Confirm Delete")
-            .title_bar(false) // No title bar to keep the UI small and clean
-            .resizable(false)
-            .collapsible(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO) // Anchor directly in the middle of the screen
-            .frame(card_frame(22)) // match the rest of the UI (PANEL() fill, radius 22, shadow)
-            .show(ui.ctx(), |ui| {
-                ui.set_max_width(260.0); // Stop it from stretching too wide
-
-                // Wrap inner elements in vertical_centered so text and buttons line up perfectly
-                ui.vertical_centered(|ui| {
-                    let warn = egui::include_image!("../icons/warning.svg");
-                    ui.add(
-                        egui::Image::new(warn)
-                            .fit_to_exact_size(egui::vec2(32.0, 32.0))
-                            .tint(egui::Color32::from_rgb(220, 160, 50)),
-                    );
-                    ui.add_space(8.0);
-
-                    ui.label(
-                        egui::RichText::new("Are you sure you want to delete this file?")
-                            .size(15.0)
-                            .strong()
-                            .color(TEXT())
-                    );
-
-                    ui.add_space(16.0);
-
-                    // Scope for checkbox to ensure it acts as a true square
-                    // with slightly rounded 4px edges (instead of inheriting 12px pill curves)
-                    ui.scope(|ui| {
-                        let r = egui::CornerRadius::same(4);
-                        ui.visuals_mut().widgets.inactive.corner_radius = r;
-                        ui.visuals_mut().widgets.hovered.corner_radius = r;
-                        ui.visuals_mut().widgets.active.corner_radius = r;
-                        ui.visuals_mut().widgets.noninteractive.corner_radius = r;
-
-                        ui.checkbox(&mut state.skip_delete_confirm, "Don't ask again");
-                    });
-
-                    ui.add_space(20.0);
-
-                    ui.horizontal(|ui| {
-                        let btn_w = 80.0;
-                        let gap = 12.0;
-                        let total_w = btn_w * 2.0 + gap;
-
-                        // Push the buttons perfectly to the middle of the layout
-                        ui.add_space((ui.available_width() - total_w) / 2.0);
-                        ui.spacing_mut().item_spacing.x = gap;
-
-                        // Add matching soft-corners to the inner action buttons
-                        let r = egui::CornerRadius::same(8);
-                        ui.visuals_mut().widgets.inactive.corner_radius = r;
-                        ui.visuals_mut().widgets.hovered.corner_radius = r;
-                        ui.visuals_mut().widgets.active.corner_radius = r;
-
-                        if ui.add_sized(egui::vec2(btn_w, 30.0), egui::Button::new("Cancel")).clicked() {
-                            close_dialog = true;
-                        }
-
-                        let danger_bg = egui::Color32::from_rgb(180, 40, 40);
-                        let del_btn = egui::Button::new(
-                            egui::RichText::new("Delete").color(egui::Color32::WHITE)
-                        ).fill(danger_bg);
-
-                        if ui.add_sized(egui::vec2(btn_w, 30.0), del_btn).clicked() {
-                            confirm_delete = true;
-                        }
-                    });
-                });
-            });
-
-        // Resolve actions after the UI block concludes
-        if confirm_delete {
-            action = RightPanelAction::DeleteCurrent;
-            state.show_delete_confirm = false;
-            // "Don't ask again" disables (and persists, via Settings) future prompts.
-            if state.skip_delete_confirm {
-                *confirm_before_delete = false;
+        match delete_confirm_dialog(ui.ctx(), "right_panel_confirm_delete", &mut state.skip_delete_confirm) {
+            Some(true) => {
+                action = RightPanelAction::DeleteCurrent;
+                state.show_delete_confirm = false;
+                // "Don't ask again" disables (and persists, via Settings) future prompts.
+                if state.skip_delete_confirm {
+                    *confirm_before_delete = false;
+                }
             }
-        } else if close_dialog {
-            state.show_delete_confirm = false;
+            Some(false) => state.show_delete_confirm = false,
+            None => {}
         }
     }
 
@@ -1343,9 +1254,138 @@ const EDIT_FLASH_SECS: f32 = 0.8;
 /// Duration (seconds) of the button result-flashes (Copy / Save).
 const FLASH_SECS: f32 = 1.0;
 /// Button flash colors: green = success, amber = nothing to do, red = failure.
-const FLASH_GREEN: egui::Color32 = egui::Color32::from_rgb(46, 160, 67);
-const FLASH_AMBER: egui::Color32 = egui::Color32::from_rgb(200, 145, 40);
-const FLASH_RED: egui::Color32 = egui::Color32::from_rgb(200, 55, 55);
+pub(crate) const FLASH_GREEN: egui::Color32 = egui::Color32::from_rgb(46, 160, 67);
+pub(crate) const FLASH_AMBER: egui::Color32 = egui::Color32::from_rgb(200, 145, 40);
+pub(crate) const FLASH_RED: egui::Color32 = egui::Color32::from_rgb(200, 55, 55);
+
+/// Fill for a button result-flash, fading from `ok`/`fail` back to the normal
+/// button colour over `FLASH_SECS`. `None` once the flash has expired (or there
+/// is no flash) — leave the button's default fill alone then. Shared by the
+/// right panel and the gallery detail popup.
+pub(crate) fn flash_fill(
+    ui: &egui::Ui,
+    flash: Option<(Instant, bool)>,
+    ok: egui::Color32,
+    fail: egui::Color32,
+) -> Option<egui::Color32> {
+    let (start, was_ok) = flash?;
+    let elapsed = start.elapsed().as_secs_f32();
+    if elapsed >= FLASH_SECS {
+        return None;
+    }
+    let intensity = 1.0 - elapsed / FLASH_SECS;
+    let target = if was_ok { ok } else { fail };
+    let base = ui.visuals().widgets.inactive.weak_bg_fill;
+    ui.ctx().request_repaint(); // animate the fade
+    Some(lerp_color(base, target, intensity))
+}
+
+/// The tag box's fill, with the "ready to edit" flash pulsing it toward the
+/// accent just after entering edit mode. Shared by the right panel and the
+/// gallery detail popup.
+pub(crate) fn edit_flash_fill(ui: &egui::Ui, start: Option<Instant>) -> egui::Color32 {
+    let mut fill = FIELD();
+    if let Some(start) = start {
+        let elapsed = start.elapsed().as_secs_f32();
+        if elapsed < EDIT_FLASH_SECS {
+            let t = elapsed / EDIT_FLASH_SECS;          // 0..1
+            let envelope = 1.0 - t;                     // overall fade-out
+            let osc = (t * std::f32::consts::PI * 2.0).sin().abs(); // two pulses
+            let intensity = (envelope * osc).clamp(0.0, 1.0);
+            fill = lerp_color(FIELD(), ACCENT1(), intensity * 0.55);
+            ui.ctx().request_repaint(); // keep the animation smooth
+        }
+    }
+    fill
+}
+
+/// The delete-confirmation modal (warning icon, "Don't ask again" checkbox,
+/// Cancel / Delete) — shared by the right panel and the gallery detail popup.
+/// Returns `Some(true)` when Delete is clicked, `Some(false)` on Cancel, and
+/// `None` while the dialog stays open.
+pub(crate) fn delete_confirm_dialog(
+    ctx: &egui::Context,
+    id: &str,
+    skip_confirm: &mut bool,
+) -> Option<bool> {
+    let mut result = None;
+
+    egui::Window::new("Confirm Delete")
+        .id(egui::Id::new(id))
+        .title_bar(false) // No title bar to keep the UI small and clean
+        .resizable(false)
+        .collapsible(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO) // Anchor directly in the middle of the screen
+        .frame(card_frame(22)) // match the rest of the UI (PANEL() fill, radius 22, shadow)
+        .show(ctx, |ui| {
+            ui.set_max_width(260.0); // Stop it from stretching too wide
+
+            // Wrap inner elements in vertical_centered so text and buttons line up perfectly
+            ui.vertical_centered(|ui| {
+                let warn = egui::include_image!("../icons/warning.svg");
+                ui.add(
+                    egui::Image::new(warn)
+                        .fit_to_exact_size(egui::vec2(32.0, 32.0))
+                        .tint(egui::Color32::from_rgb(220, 160, 50)),
+                );
+                ui.add_space(8.0);
+
+                ui.label(
+                    egui::RichText::new("Are you sure you want to delete this file?")
+                        .size(15.0)
+                        .strong()
+                        .color(TEXT())
+                );
+
+                ui.add_space(16.0);
+
+                // Scope for checkbox to ensure it acts as a true square
+                // with slightly rounded 4px edges (instead of inheriting 12px pill curves)
+                ui.scope(|ui| {
+                    let r = egui::CornerRadius::same(4);
+                    ui.visuals_mut().widgets.inactive.corner_radius = r;
+                    ui.visuals_mut().widgets.hovered.corner_radius = r;
+                    ui.visuals_mut().widgets.active.corner_radius = r;
+                    ui.visuals_mut().widgets.noninteractive.corner_radius = r;
+
+                    ui.checkbox(skip_confirm, "Don't ask again");
+                });
+
+                ui.add_space(20.0);
+
+                ui.horizontal(|ui| {
+                    let btn_w = 80.0;
+                    let gap = 12.0;
+                    let total_w = btn_w * 2.0 + gap;
+
+                    // Push the buttons perfectly to the middle of the layout
+                    ui.add_space((ui.available_width() - total_w) / 2.0);
+                    ui.spacing_mut().item_spacing.x = gap;
+
+                    // Add matching soft-corners to the inner action buttons
+                    let r = egui::CornerRadius::same(8);
+                    ui.visuals_mut().widgets.inactive.corner_radius = r;
+                    ui.visuals_mut().widgets.hovered.corner_radius = r;
+                    ui.visuals_mut().widgets.active.corner_radius = r;
+
+                    if ui.add_sized(egui::vec2(btn_w, 30.0), egui::Button::new("Cancel")).clicked() {
+                        result = Some(false);
+                    }
+
+                    let danger_bg = egui::Color32::from_rgb(180, 40, 40);
+                    let del_btn = egui::Button::new(
+                        egui::RichText::new("Delete").color(egui::Color32::WHITE)
+                    ).fill(danger_bg);
+
+                    if ui.add_sized(egui::vec2(btn_w, 30.0), del_btn).clicked() {
+                        result = Some(true);
+                    }
+                });
+            });
+        });
+
+    result
+}
 
 /// Linearly interpolate between two colors in sRGB component space.
 fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
