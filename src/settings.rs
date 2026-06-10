@@ -79,6 +79,11 @@ pub struct Settings {
     /// Show the live CPU / RAM graphs in the top bar. Off gives a cleaner bar (and
     /// skips the periodic system sampling).
     pub show_stats: bool,
+    /// Let floating popups (Civitai settings, LoRA picker, image detail view, Find
+    /// Issues) be dragged around and remember where they were left between runs.
+    /// Off pins them to their original spot. Modal dialogs (Settings / Backup /
+    /// delete confirm) are always fixed regardless.
+    pub movable_popups: bool,
     /// Which media type the browser is narrowed to (Filter tab). Not persisted —
     /// resets to `All` each launch, matching the Java filter dialog, so a stored
     /// "Favorites" can't make the browser look empty after a restart.
@@ -105,6 +110,7 @@ impl Default for Settings {
             glass_backdrop: Backdrop::default(),
             loop_video: false,
             show_stats: true,
+            movable_popups: true,
             media_filter: MediaFilter::default(),
         }
     }
@@ -150,7 +156,11 @@ pub fn show(ctx: &egui::Context, settings: &mut Settings) {
                 ui.heading(egui::RichText::new("Settings").color(TEXT()).strong().size(17.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add(egui::Button::new(egui::RichText::new("✕").size(14.0)).frame(false))
+                        .add(egui::Button::image(
+                            egui::Image::new(egui::include_image!("../icons/close.svg"))
+                                .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                                .tint(TEXT()),
+                        ).frame(false))
                         .on_hover_text("Close")
                         .clicked()
                     {
@@ -196,6 +206,18 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             ui,
             "The live CPU and memory graphs in the top bar. Turn off for a cleaner \
              bar (and to skip the periodic system sampling).",
+        );
+
+        ui.add_space(6.0);
+        ui.checkbox(
+            &mut settings.movable_popups,
+            egui::RichText::new("Movable popups").color(TEXT()),
+        );
+        hint(
+            ui,
+            "Let popups (Civitai settings, the LoRA picker, the image detail view, and \
+             Find Issues) be dragged around — and remember where you leave them next \
+             time. Turn off to keep them centred and fixed.",
         );
     });
 

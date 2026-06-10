@@ -56,9 +56,10 @@ pub struct Pixal3DState {
     hf_token: String,
     /// Low-VRAM mode (loads models on-demand; ~fits 16 GB vs ~18 GB standard).
     low_vram: bool,
-    // --- Section toggles ---
-    show_gen_settings: bool,
-    show_glb_settings: bool,
+    // --- Log (collapsible, Z-Image style) ---
+    show_log: bool,
+    /// Brief green/red flash on the copy-log button after a click.
+    copy_flash: Option<(std::time::Instant, bool)>,
     // --- Status / background runner ---
     status: String,
     status_err: bool,
@@ -88,8 +89,8 @@ impl Default for Pixal3DState {
             texture_size: 1024,
             hf_token: load_hf_token(),
             low_vram: true,
-            show_gen_settings: true,
-            show_glb_settings: false,
+            show_log: false,
+            copy_flash: None,
             status: "Ready".to_string(),
             status_err: false,
             log: Vec::new(),
@@ -165,7 +166,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&
 
     ui.add_space(8.0);
 
-    // --- Utility row: Setup Requirements. ---
+    // --- Setup row (Z-Image style: button + right-aligned status). ---
     ui.horizontal(|ui| {
         let setup = egui::Button::new(RichText::new("Setup Requirements").color(Color32::WHITE))
             .fill(Color32::from_rgb(96, 99, 105))
@@ -178,7 +179,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&
         });
     });
 
-    ui.add_space(6.0);
+    ui.add_space(8.0);
 
     // --- HF token (optional). Setup Requirements pulls every model from public
     // sources (DINOv3 via the open camenduru mirror, BiRefNet for background
@@ -202,17 +203,17 @@ pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&
             );
             ui.hyperlink_to("Manage Hugging Face tokens →", "https://huggingface.co/settings/tokens");
         });
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut state.hf_token)
-                .password(true)
-                .desired_width(f32::INFINITY),
-        );
-        // Persist (encrypted) once the user finishes editing, so it survives
-        // restarts and doesn't have to be pasted every session.
-        if resp.lost_focus() {
-            save_hf_token(&state.hf_token);
-        }
     });
+    ui.add_space(2.0);
+    let resp = ui.add(
+        egui::TextEdit::singleline(&mut state.hf_token)
+            .password(true)
+            .desired_width(f32::INFINITY),
+    );
+    // Persist (encrypted) once the user finishes editing, so it survives restarts.
+    if resp.lost_focus() {
+        save_hf_token(&state.hf_token);
+    }
 
     ui.add_space(8.0);
 
@@ -229,121 +230,182 @@ pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&
         }
     });
 
-    ui.add_space(6.0);
+    ui.add_space(8.0);
     ui.horizontal(|ui| {
-        ui.checkbox(&mut state.low_vram, "");
-        ui.label(RichText::new("Low VRAM mode").color(TEXT()).size(12.0));
-        ui.label(RichText::new("(recommended for ≤16 GB)").color(MUTED()).size(11.0));
+        ui.checkbox(&mut state.low_vram, RichText::new("Low VRAM mode").color(TEXT()).size(12.0));
+        ui.label(RichText::new("recommended for ≤16 GB").color(MUTED()).size(11.0));
     });
 
     ui.add_space(8.0);
 
-    // --- Generate button (primary). ---
+    // --- Generation settings (inline, Z-Image style). ---
+    labeled(ui, "Resolution", |ui| {
+        egui::ComboBox::from_id_salt("pixal3d_res")
+            .selected_text(state.resolution.to_string())
+            .show_ui(ui, |ui| {
+                for r in [512, 1024, 1536] {
+                    ui.selectable_value(&mut state.resolution, r, r.to_string());
+                }
+            });
+    });
+
+    ui.add_space(4.0);
+    ui.label(RichText::new("Sparse structure").color(MUTED()).size(11.0));
+    slider(ui, "Guidance", &mut state.ss_guidance, 0.0..=12.0);
+    int_slider(ui, "Steps", &mut state.ss_steps, 1..=50);
+    ui.add_space(2.0);
+    ui.label(RichText::new("Shape").color(MUTED()).size(11.0));
+    slider(ui, "Guidance", &mut state.shape_guidance, 0.0..=12.0);
+    int_slider(ui, "Steps", &mut state.shape_steps, 1..=50);
+    ui.add_space(2.0);
+    ui.label(RichText::new("Texture").color(MUTED()).size(11.0));
+    slider(ui, "Guidance", &mut state.tex_guidance, 0.0..=12.0);
+    int_slider(ui, "Steps", &mut state.tex_steps, 1..=50);
+
+    ui.add_space(6.0);
+    // Randomize seed — radio-style filled dot, matching Z-Image.
+    ui.horizontal(|ui| {
+        ui.spacing_mut().icon_width_inner = 11.0;
+        if ui.radio(state.randomize_seed, "").clicked() {
+            state.randomize_seed = !state.randomize_seed;
+        }
+        ui.label(RichText::new("Randomize seed").color(TEXT()).size(12.0));
+    });
+    if !state.randomize_seed {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Seed").color(MUTED()).size(12.0));
+            ui.add(egui::DragValue::new(&mut state.seed).range(0..=i64::MAX));
+        });
+    }
+
+    ui.add_space(8.0);
+    // --- GLB extraction (inline). ---
+    ui.label(RichText::new("GLB Extraction").color(MUTED()).size(11.0));
+    int_slider(ui, "Simplify (tris)", &mut state.decimation, 5_000..=200_000);
+    labeled(ui, "Texture size", |ui| {
+        egui::ComboBox::from_id_salt("pixal3d_texsize")
+            .selected_text(state.texture_size.to_string())
+            .show_ui(ui, |ui| {
+                for t in [512, 1024, 2048] {
+                    ui.selectable_value(&mut state.texture_size, t, t.to_string());
+                }
+            });
+    });
+    ui.add_space(4.0);
+    let extract = egui::Button::new(RichText::new("Extract GLB").color(TEXT()))
+        .corner_radius(CornerRadius::same(10));
+    if ui.add_enabled(!state.running, extract).clicked() {
+        state.status = "Pixal3D runtime not installed — Extract GLB unavailable".into();
+        state.status_err = true;
+    }
+
+    ui.add_space(10.0);
+
+    // --- Generate (primary), after the settings like Z-Image. ---
     let gen_btn = egui::Button::new(RichText::new("Generate 3D").color(Color32::WHITE).strong())
         .fill(ACCENT1())
         .corner_radius(CornerRadius::same(12));
     let enabled = !state.running && current_image.is_some();
-    if ui.add_enabled_ui(enabled, |ui| ui.add_sized(egui::vec2(ui.available_width(), 38.0), gen_btn)).inner.clicked() {
+    if ui.add_enabled_ui(enabled, |ui| ui.add_sized(egui::vec2(ui.available_width(), 34.0), gen_btn)).inner.clicked() {
         start_generate(state, ui.ctx(), current_image);
     }
 
     ui.add_space(8.0);
 
-    // --- Generation settings (collapsible). ---
-    egui::CollapsingHeader::new(RichText::new("Generation Settings").color(TEXT()))
-        .default_open(state.show_gen_settings)
-        .show(ui, |ui| {
-            labeled(ui, "Seed", |ui| {
-                ui.add_enabled(!state.randomize_seed, egui::DragValue::new(&mut state.seed).range(0..=i64::MAX));
-            });
-            labeled(ui, "Randomize seed", |ui| {
-                ui.checkbox(&mut state.randomize_seed, "");
-            });
-            labeled(ui, "Resolution", |ui| {
-                egui::ComboBox::from_id_salt("pixal3d_res")
-                    .selected_text(state.resolution.to_string())
-                    .show_ui(ui, |ui| {
-                        for r in [512, 1024, 1536] {
-                            ui.selectable_value(&mut state.resolution, r, r.to_string());
-                        }
-                    });
-            });
-            ui.add_space(4.0);
-            ui.label(RichText::new("Sparse structure").color(MUTED()).size(11.0));
-            slider(ui, "Guidance", &mut state.ss_guidance, 0.0..=12.0);
-            int_slider(ui, "Steps", &mut state.ss_steps, 1..=50);
-            ui.add_space(2.0);
-            ui.label(RichText::new("Shape").color(MUTED()).size(11.0));
-            slider(ui, "Guidance", &mut state.shape_guidance, 0.0..=12.0);
-            int_slider(ui, "Steps", &mut state.shape_steps, 1..=50);
-            ui.add_space(2.0);
-            ui.label(RichText::new("Texture").color(MUTED()).size(11.0));
-            slider(ui, "Guidance", &mut state.tex_guidance, 0.0..=12.0);
-            int_slider(ui, "Steps", &mut state.tex_steps, 1..=50);
-        });
-
-    // --- GLB extraction settings (collapsible). ---
-    egui::CollapsingHeader::new(RichText::new("GLB Extraction").color(TEXT()))
-        .default_open(state.show_glb_settings)
-        .show(ui, |ui| {
-            int_slider(ui, "Simplify (tris)", &mut state.decimation, 5_000..=200_000);
-            labeled(ui, "Texture size", |ui| {
-                egui::ComboBox::from_id_salt("pixal3d_texsize")
-                    .selected_text(state.texture_size.to_string())
-                    .show_ui(ui, |ui| {
-                        for t in [512, 1024, 2048] {
-                            ui.selectable_value(&mut state.texture_size, t, t.to_string());
-                        }
-                    });
-            });
-            let extract = egui::Button::new(RichText::new("Extract GLB").color(TEXT()))
-                .corner_radius(CornerRadius::same(10));
-            if ui.add_enabled(!state.running, extract).clicked() {
-                state.status = "Pixal3D runtime not installed — Extract GLB unavailable".into();
-                state.status_err = true;
-            }
-        });
-
     ui.add_space(8.0);
 
-    // --- Log header with a Copy button (the panel text isn't selectable). ---
+    // --- Log (collapsible, Z-Image style: disclosure pill + flashing copy). ---
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Log").color(MUTED()).size(11.0));
+        // SVG disclosure arrow: drop-down when open, right when collapsed.
+        let arrow_src = if state.show_log {
+            egui::include_image!("../icons/arrow_drop_down.svg")
+        } else {
+            egui::include_image!("../icons/arrow_right.svg")
+        };
+        // Fixed-size pill drawn by hand so it never resizes with the content.
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(46.0, 18.0), egui::Sense::click());
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if ui.is_rect_visible(rect) {
+            let visuals = *ui.style().interact(&resp);
+            let txt = visuals.text_color();
+            ui.painter().rect(
+                rect,
+                egui::CornerRadius::same(10),
+                visuals.weak_bg_fill,
+                visuals.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+            // Lay out the "Log" label, then centre [icon | gap | text] as a group.
+            let icon = 14.0_f32;
+            let gap = 3.0_f32;
+            let galley = ui.painter().layout_no_wrap("Log".to_owned(), egui::FontId::proportional(11.0), txt);
+            let content_w = icon + gap + galley.size().x;
+            let x0 = rect.center().x - content_w / 1.7;
+            let cy = rect.center().y;
+            let icon_rect = egui::Rect::from_min_size(egui::pos2(x0, cy - icon / 2.0), egui::vec2(icon, icon));
+            egui::Image::new(arrow_src)
+                .tint(crate::theme::icon_tint(txt))
+                .paint_at(ui, icon_rect);
+            ui.painter()
+                .galley(egui::pos2(x0 + icon + gap, cy - galley.size().y / 2.0), galley, txt);
+        }
+        if resp.clicked() {
+            state.show_log = !state.show_log;
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let copy = egui::Button::new(RichText::new("Copy").size(11.0))
-                .corner_radius(CornerRadius::same(8));
-            if ui.add_enabled(!state.log.is_empty(), copy).clicked() {
-                ui.ctx().copy_text(state.log.join("\n"));
+            // Flash the copy icon green (copied) or red (failed) for ~0.9s.
+            const COPY_FLASH_SECS: f32 = 0.9;
+            let flash_tint = match state.copy_flash {
+                Some((when, ok)) if when.elapsed().as_secs_f32() < COPY_FLASH_SECS => {
+                    ui.ctx().request_repaint();
+                    Some(if ok { GREEN } else { RED })
+                }
+                _ => None,
+            };
+            let tint = flash_tint.unwrap_or_else(|| crate::theme::icon_tint(MUTED()));
+            let copy_icon = egui::Image::new(egui::include_image!("../icons/copy.svg"))
+                .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                .tint(tint);
+            let copy = egui::Button::image(copy_icon).frame(false);
+            let tip = match state.copy_flash {
+                Some((_, true)) if flash_tint.is_some() => "Copied!",
+                Some((_, false)) if flash_tint.is_some() => "Copy failed",
+                _ => "Copy the log",
+            };
+            if ui.add_enabled(!state.log.is_empty(), copy).on_hover_text(tip).clicked() {
+                let ok = arboard::Clipboard::new()
+                    .and_then(|mut c| c.set_text(state.log.join("\n")))
+                    .is_ok();
+                state.copy_flash = Some((std::time::Instant::now(), ok));
             }
         });
     });
-    ui.add_space(2.0);
-
-    // --- Log (setup / generate output). ---
-    let log_bg = if crate::theme::is_light() { FIELD() } else { Color32::from_rgb(15, 15, 17) };
-    egui::Frame::new()
-        .fill(log_bg)
-        .corner_radius(CornerRadius::same(22))
-        .inner_margin(Margin::same(10))
-        .stroke(egui::Stroke::new(1.0, EDGE()))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            egui::ScrollArea::vertical()
-                .id_salt("pixal3d_log")
-                .max_height(140.0)
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    if state.log.is_empty() {
-                        ui.label(RichText::new("Output will appear here.").color(MUTED()).monospace().size(12.0));
-                    } else {
-                        for line in &state.log {
-                            ui.label(RichText::new(line).color(TEXT()).monospace().size(12.0));
+    if state.show_log {
+        let log_bg = if crate::theme::is_light() { FIELD() } else { Color32::from_rgb(15, 15, 17) };
+        egui::Frame::new()
+            .fill(log_bg)
+            .corner_radius(CornerRadius::same(22))
+            .inner_margin(Margin::same(10))
+            .stroke(egui::Stroke::new(1.0, EDGE()))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::ScrollArea::vertical()
+                    .id_salt("pixal3d_log")
+                    .max_height(180.0)
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        if state.log.is_empty() {
+                            ui.label(RichText::new("Output will appear here.").color(MUTED()).monospace().size(12.0));
+                        } else {
+                            for line in &state.log {
+                                ui.label(RichText::new(line).color(TEXT()).monospace().size(12.0));
+                            }
                         }
-                    }
-                });
-        });
+                    });
+            });
+    }
 }
 
 /// A titled card (PANEL fill, rounded) wrapping `contents`.
@@ -371,15 +433,19 @@ fn labeled(ui: &mut egui::Ui, label: &str, contents: impl FnOnce(&mut egui::Ui))
 
 fn slider(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(label).color(MUTED()).size(11.5));
-        ui.add(egui::Slider::new(value, range).fixed_decimals(1));
+        ui.label(RichText::new(label).color(MUTED()).size(12.0));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add(egui::Slider::new(value, range).fixed_decimals(1));
+        });
     });
 }
 
 fn int_slider(ui: &mut egui::Ui, label: &str, value: &mut i32, range: std::ops::RangeInclusive<i32>) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(label).color(MUTED()).size(11.5));
-        ui.add(egui::Slider::new(value, range));
+        ui.label(RichText::new(label).color(MUTED()).size(12.0));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add(egui::Slider::new(value, range));
+        });
     });
 }
 

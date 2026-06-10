@@ -23,6 +23,23 @@ const IMAGE_EXTENSIONS: &[&str] = &[
 #[cfg(feature = "avif")]
 const EXTENDED_IMAGE_EXTENSIONS: &[&str] = &["avif", "heic", "heif", "dng", "arw", "cr2", "nef"];
 
+/// True when `ext` (without the dot, any case) is one of the heavy "extended"
+/// image formats — AVIF / HEIC / HEIF and the TIFF-based camera raws — that need
+/// the pure-Rust decoders in `crate::avif` rather than `image::open`. Centralises
+/// the list that was otherwise repeated across every decode path. Always `false`
+/// in builds without the `avif` feature (those files aren't recognised anyway).
+pub(crate) fn is_extended_extension(ext: &str) -> bool {
+    #[cfg(feature = "avif")]
+    {
+        EXTENDED_IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+    }
+    #[cfg(not(feature = "avif"))]
+    {
+        let _ = ext;
+        false
+    }
+}
+
 /// Runtime flag mirroring `Settings::enable_extended_formats`, so the free
 /// `is_image()` helper (called all over) can gate the extended formats without
 /// threading `Settings` through every call site.
@@ -140,7 +157,7 @@ fn main() -> eframe::Result {
             }
             // Apply the saved colour theme before the first paint so a Light-mode
             // user doesn't see a dark flash on launch.
-            theme::set(app.settings.theme);
+            set(app.settings.theme);
             app.last_theme = app.settings.theme;
             apply_theme(&cc.egui_ctx);
             // Optional: open a folder passed on the command line (e.g. "Open with").
@@ -172,7 +189,7 @@ fn load_app_icon() -> egui::IconData {
 /// (text fields, scrollbars, etc.) match the custom-painted panels.
 fn apply_theme(ctx: &egui::Context) {
     // Delegates to the theme module, which picks the active Dark/Light palette.
-    theme::apply(ctx);
+    apply(ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +240,7 @@ struct ViewerApp {
     last_extended_formats: bool,
     /// Last-applied colour theme, so we re-push the egui visuals only when the
     /// user actually changes it in the Appearance tab.
-    last_theme: theme::Theme,
+    last_theme: Theme,
     /// Last-applied media-type filter (Filter tab), so we re-filter the browser
     /// only when the user actually changes it.
     last_media_filter: left_panel_settings::MediaFilter,
@@ -294,7 +311,7 @@ impl Default for ViewerApp {
             images: Vec::new(),
             current_folder: None,
             last_extended_formats: settings::Settings::default().enable_extended_formats,
-            last_theme: theme::Theme::default(),
+            last_theme: Theme::default(),
             last_media_filter: left_panel_settings::MediaFilter::default(),
             filtered: Vec::new(),
             selected: None,
@@ -672,6 +689,12 @@ impl ViewerApp {
             }
         }
 
+        self.remove_image_at(idx);
+    }
+
+    /// Remove image `idx`, re-filter the browser, and clamp the selection to a
+    /// still-valid index (or clear it when the list is now empty).
+    fn remove_image_at(&mut self, idx: usize) {
         self.images.remove(idx);
         self.update_filtered();
         self.selected = if self.images.is_empty() {
@@ -679,6 +702,34 @@ impl ViewerApp {
         } else {
             Some(idx.min(self.images.len().saturating_sub(1)))
         };
+    }
+
+    /// Apply a viewer right-click action (favorite / crop / copy / bg-remove) to
+    /// `path`. Shared by the centre viewer and the gallery-detail popup.
+    fn handle_viewer_action(&mut self, action: zoom::ViewerAction, path: &std::path::Path, ctx: &egui::Context) {
+        match action {
+            zoom::ViewerAction::ToggleFavorite => {
+                self.favorites.toggle(path);
+            }
+            zoom::ViewerAction::Crop(frac) => self.crop_current(path, frac),
+            zoom::ViewerAction::CopyImage => self.copy_current(path),
+            zoom::ViewerAction::RemoveBackground => self.start_bgremove(path, ctx),
+            zoom::ViewerAction::None => {}
+        }
+    }
+
+    /// Re-scan the current folder and try to keep the same image selected. Used
+    /// after the extended-format toggle changes and after a Deep Scan moves files.
+    fn rescan_current_folder(&mut self) {
+        if let Some(dir) = self.current_folder.clone() {
+            let keep = self.selected.and_then(|i| self.images.get(i).cloned());
+            self.images = images_in_dir(&dir);
+            // Try to keep the same image selected across the re-scan.
+            self.selected = keep
+                .and_then(|p| self.images.iter().position(|q| *q == p))
+                .or(if self.images.is_empty() { None } else { Some(0) });
+            self.update_filtered();
+        }
     }
 
     fn delete_selected(&mut self) {
@@ -695,13 +746,7 @@ impl ViewerApp {
             let _ = std::fs::remove_file(&txt_path);
         }
 
-        self.images.remove(idx);
-        self.update_filtered(); // indices shifted — re-filter
-        self.selected = if self.images.is_empty() {
-            None
-        } else {
-            Some(idx.min(self.images.len().saturating_sub(1)))
-        };
+        self.remove_image_at(idx);
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
@@ -792,7 +837,7 @@ impl ViewerApp {
                             // Hz) — a full-app relayout every refresh steals CPU from
                             // decoding. New frames still wake us instantly via the
                             // player's display callback (request_repaint).
-                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+                            ui.ctx().request_repaint_after(Duration::from_millis(16));
                             return;
                         }
                     } else {
@@ -816,15 +861,8 @@ impl ViewerApp {
                 match self.viewer.request(&path, now) {
                     image_cache::Cached::Ready(tex) => {
                         let is_fav = self.favorites.is_favorite(&path);
-                        match self.zoom.show(ui, &tex, &path, is_fav) {
-                            zoom::ViewerAction::ToggleFavorite => {
-                                self.favorites.toggle(&path);
-                            }
-                            zoom::ViewerAction::Crop(frac) => self.crop_current(&path, frac),
-                            zoom::ViewerAction::CopyImage => self.copy_current(&path),
-                            zoom::ViewerAction::RemoveBackground => self.start_bgremove(&path, ui.ctx()),
-                            zoom::ViewerAction::None => {}
-                        }
+                        let action = self.zoom.show(ui, &tex, &path, is_fav);
+                        self.handle_viewer_action(action, &path, ui.ctx());
                     }
                     image_cache::Cached::Animated(frame) => {
                         show_fitted(ui, &frame, false);
@@ -832,7 +870,7 @@ impl ViewerApp {
                         // repainting (and relaying out the whole app) as fast as
                         // the monitor allows — GIFs top out at 50 fps, so this is
                         // smooth while leaving CPU for decoding.
-                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+                        ui.ctx().request_repaint_after(Duration::from_millis(16));
                     }
                     image_cache::Cached::Failed => {
                         ui.centered_and_justified(|ui| {
@@ -885,6 +923,11 @@ impl eframe::App for ViewerApp {
             self.stats.update();
         }
 
+        // Mirror the movable-popups preference into the process-wide flag the popup
+        // builders read (via PopupPlacement), so it isn't threaded through every
+        // popup call site. Cheap; done each frame so the toggle applies live.
+        MOVABLE_POPUPS.store(self.settings.movable_popups, std::sync::atomic::Ordering::Relaxed);
+
         // Apply the HD-thumbnail setting (cheap; only clears the cache on change).
         self.thumbs.set_max_edge(if self.settings.hd_thumbnails {
             THUMB_MAX_EDGE_HD
@@ -897,12 +940,12 @@ impl eframe::App for ViewerApp {
 
         // Push the Glass theme's user-configurable background (colour + backdrop)
         // so the colour picker updates live; cheap, so done every frame.
-        theme::set_glass_config(self.settings.glass_bg, self.settings.glass_backdrop);
+        set_glass_config(self.settings.glass_bg, self.settings.glass_backdrop);
 
         // Paint the theme's full-window background (the Space theme's animated
         // starfield, the Glass theme's configured backdrop) on the bottom layer,
         // beneath every panel. No-op otherwise.
-        theme::paint_background(ui.ctx());
+        paint_background(ui.ctx());
 
         // --- Toggle fullscreen on F12 ---
         if ui.input(|i| i.key_pressed(egui::Key::F12)) {
@@ -1041,15 +1084,7 @@ impl eframe::App for ViewerApp {
         // appear (or disappear) right away instead of only after a reopen.
         if self.settings.enable_extended_formats != self.last_extended_formats {
             self.last_extended_formats = self.settings.enable_extended_formats;
-            if let Some(dir) = self.current_folder.clone() {
-                let keep = self.selected.and_then(|i| self.images.get(i).cloned());
-                self.images = images_in_dir(&dir);
-                // Try to keep the same image selected across the re-scan.
-                self.selected = keep
-                    .and_then(|p| self.images.iter().position(|q| *q == p))
-                    .or(if self.images.is_empty() { None } else { Some(0) });
-                self.update_filtered();
-            }
+            self.rescan_current_folder();
         }
 
         settings::show(ui.ctx(), &mut self.settings);
@@ -1071,15 +1106,9 @@ impl eframe::App for ViewerApp {
                 self.delete_selected();
             }
             // Viewer right-click actions, handled exactly like the centre viewer.
-            gallery_detail::DetailAction::Viewer(va, path) => match va {
-                zoom::ViewerAction::ToggleFavorite => {
-                    self.favorites.toggle(&path);
-                }
-                zoom::ViewerAction::Crop(frac) => self.crop_current(&path, frac),
-                zoom::ViewerAction::CopyImage => self.copy_current(&path),
-                zoom::ViewerAction::RemoveBackground => self.start_bgremove(&path, ui.ctx()),
-                zoom::ViewerAction::None => {}
-            },
+            gallery_detail::DetailAction::Viewer(va, path) => {
+                self.handle_viewer_action(va, &path, ui.ctx());
+            }
             gallery_detail::DetailAction::None => {}
         }
 
@@ -1088,22 +1117,15 @@ impl eframe::App for ViewerApp {
         scan::show(ui.ctx(), &mut self.scan);
         if self.scan.finished_tick {
             self.scan.finished_tick = false;
-            if let Some(dir) = self.current_folder.clone() {
-                let keep = self.selected.and_then(|i| self.images.get(i).cloned());
-                self.images = images_in_dir(&dir);
-                self.selected = keep
-                    .and_then(|p| self.images.iter().position(|q| *q == p))
-                    .or(if self.images.is_empty() { None } else { Some(0) });
-                self.update_filtered();
-            }
+            self.rescan_current_folder();
         }
 
         // Apply a theme change from the Appearance tab live (only when it
         // actually changed, so we don't re-push visuals every frame).
         if self.settings.theme != self.last_theme {
             self.last_theme = self.settings.theme;
-            theme::set(self.settings.theme);
-            theme::apply(ui.ctx());
+            set(self.settings.theme);
+            apply(ui.ctx());
             ui.ctx().request_repaint();
         }
 
@@ -1117,6 +1139,61 @@ impl eframe::App for ViewerApp {
     /// Persist settings to eframe's storage (called periodically and on exit).
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, settings::STORAGE_KEY, &self.settings);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Movable popups
+// ---------------------------------------------------------------------------
+
+/// Process-wide mirror of `Settings::movable_popups`, refreshed each frame in
+/// `ViewerApp::ui`. Popup builders in other modules read it through the
+/// [`PopupPlacement`] trait, so the preference doesn't have to be threaded through
+/// every call site.
+pub(crate) static MOVABLE_POPUPS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Whether popups should be draggable and remember where the user left them.
+pub(crate) fn movable_popups() -> bool {
+    MOVABLE_POPUPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Positioning for the app's floating popups (Civitai settings, LoRA picker,
+/// gallery detail, Find Issues). When movable popups are enabled the window is
+/// draggable and egui persists its position across runs (eframe's egui-memory
+/// storage); otherwise it's pinned to its original spot and can't be moved.
+///
+/// Modal-style dialogs (Settings, Backup, Confirm Delete) deliberately do NOT use
+/// this — they stay centred and fixed.
+pub(crate) trait PopupPlacement<'a> {
+    /// Centre the popup (its original placement). Draggable + remembered when
+    /// movable popups are on; pinned dead-centre when off.
+    fn placed_centered(self, ctx: &egui::Context) -> Self;
+    /// Place the popup's top-left at `top_left` (e.g. dropped from a button).
+    /// Draggable from there + remembered when on; pinned there when off.
+    fn placed_at(self, top_left: impl Into<egui::Pos2>) -> Self;
+}
+
+impl<'a> PopupPlacement<'a> for egui::Window<'a> {
+    fn placed_centered(self, ctx: &egui::Context) -> Self {
+        if movable_popups() {
+            // No anchor (anchoring forces immovability); centre via pivot so the
+            // first appearance matches the old CENTER_CENTER placement, then egui
+            // remembers any drag.
+            self.movable(true)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
+        } else {
+            self.movable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        }
+    }
+    fn placed_at(self, top_left: impl Into<egui::Pos2>) -> Self {
+        let pos = top_left.into();
+        if movable_popups() {
+            self.movable(true).default_pos(pos)
+        } else {
+            self.fixed_pos(pos)
+        }
     }
 }
 
@@ -1151,7 +1228,7 @@ fn video_notice(ui: &mut egui::Ui, path: &std::path::Path, support: video::Video
                 );
                 ui.add_space(10.0);
                 let install = egui::Button::new(
-                    egui::RichText::new("Install VLC").color(egui::Color32::WHITE).strong(),
+                    egui::RichText::new("Install VLC").color(Color32::WHITE).strong(),
                 )
                 .fill(ACCENT1());
                 if ui.add(install).clicked() {
@@ -1406,7 +1483,7 @@ fn decode_full_rgba(src: &std::path::Path) -> Option<image::RgbaImage> {
         let is_extended = src
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "avif" | "heic" | "heif" | "dng" | "arw" | "cr2" | "nef"))
+            .map(is_extended_extension)
             .unwrap_or(false);
         if is_extended {
             return avif::decode_avif(src);

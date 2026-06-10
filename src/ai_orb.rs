@@ -50,6 +50,7 @@ pub struct AiOrb {
 
     error: f32,      // 0..1, eased toward 1 in the Error state (redness + broken spring)
     impact: f32,     // 0..1, a quick flash/shock at the moment of failure; decays
+    twinkle: f32,    // 0..1, a celebratory sparkle fired when work finishes; decays
     think_time: f32, // seconds spent thinking, drives the long-wait morph
     morph: f32,      // shape-morph phase; integer part = shape index, frac = blend
 
@@ -88,6 +89,7 @@ impl AiOrb {
             burst: 0.0,
             error: 0.0,
             impact: 0.0,
+            twinkle: 0.0,
             think_time: 0.0,
             morph: 0.0,
             disp: vec![[0.0; 3]; n],
@@ -101,6 +103,13 @@ impl AiOrb {
     pub fn set_state(&mut self, s: OrbState) {
         if s == OrbState::Error && self.state != OrbState::Error {
             self.explode();
+        }
+        // Finished working — sparkle once when returning to Idle from an active
+        // (Thinking/Talking) state, i.e. it just completed something. Reset the
+        // long-wait morph so the orb snaps back into a ball for the twinkle.
+        if s == OrbState::Idle && matches!(self.state, OrbState::Thinking | OrbState::Talking) {
+            self.twinkle = 1.0;
+            self.think_time = 0.0;
         }
         self.state = s;
     }
@@ -158,6 +167,11 @@ impl AiOrb {
         let err_target = if self.state == OrbState::Error { 1.0 } else { 0.0 };
         self.error += (err_target - self.error) * (0.06 * f).min(1.0);
         self.impact = (self.impact - dt * 2.0).max(0.0);
+        // Hold the finish-sparkle at full until the orb has reformed into a ball
+        // (morph ~0), then let it fade — so it twinkles as a ball, not mid-morph.
+        if self.morph < 0.08 {
+            self.twinkle = (self.twinkle - dt * 1.5).max(0.0); // ~0.7s sparkle
+        }
 
         // Long-wait morph: accumulate thinking time, decay it otherwise.
         if self.state == OrbState::Thinking {
@@ -169,7 +183,10 @@ impl AiOrb {
         if morphing {
             self.morph += dt * 0.22; // ~one shape every 4.5s
         } else {
-            self.morph = (self.morph - dt * 1.5).max(0.0); // settle back to the sphere
+            // Snap back to the sphere quickly while finishing (so the twinkle lands
+            // on a clean ball), otherwise settle gently.
+            let reform = if self.twinkle > 0.0 { 6.0 } else { 1.5 };
+            self.morph = (self.morph - dt * reform).max(0.0);
         }
 
         // Per-particle physics: a spring back to the base position (strong when
@@ -246,18 +263,17 @@ impl AiOrb {
 
         let boost = self.burst;
         let flash = self.impact;
+        // Twinkle envelope: eased so the sparkle peaks early then fades.
+        let tw = self.twinkle * self.twinkle;
+        // Gate the sparkle to when the orb is (nearly) a ball, so it twinkles on
+        // the reformed sphere rather than mid-morph.
+        let ball_t = (1.0 - self.morph * 3.0).clamp(0.0, 1.0);
 
-        // Breathing sphere radius; swells on a burst or an impact.
+        // Breathing sphere radius; swells on a burst or an impact, with a gentle
+        // pop on the finish-twinkle.
         let breath_amp = 0.045 + self.energy * 0.11;
-        let ring_r = max_r * (0.60 + self.breath.sin() * breath_amp) * (1.0 + 0.45 * boost + 0.18 * flash);
-
-        // Soft halo behind everything (brighter, redder on impact).
-        let halo_r = ring_r * (1.0 + 0.25 * self.energy + 0.20 * boost + 0.45 * flash);
-        painter.circle_filled(
-            center,
-            halo_r,
-            mix(0.0, 14.0 + 26.0 * self.energy + 70.0 * boost + 95.0 * flash),
-        );
+        let ring_r =
+            max_r * (0.60 + self.breath.sin() * breath_amp) * (1.0 + 0.45 * boost + 0.18 * flash + 0.10 * tw);
 
         // 3D transform: rotate about Y by `phase`, tilt about X.
         let (sy, cy) = self.phase.sin_cos();
@@ -268,7 +284,7 @@ impl AiOrb {
         let dot_base = (max_r * (0.075 + self.energy * 0.03)).max(0.8) * (1.0 + 0.5 * boost);
         let n = self.particles.len() as f32;
 
-        let mut pts: Vec<(f32, Pos2, f32, f32)> = Vec::with_capacity(self.particles.len());
+        let mut pts: Vec<(f32, Pos2, f32, f32, f32)> = Vec::with_capacity(self.particles.len());
         for i in 0..self.particles.len() {
             let mb = self.morphed_base(i);
             let d = self.disp[i];
@@ -297,15 +313,24 @@ impl AiOrb {
             let depth = (z2 + 1.0) * 0.5;
             let shimmer = 0.55 + 0.45 * (a * 2.0 + self.breath).sin();
             let depth_fade = 0.35 + 0.65 * depth;
-            let alpha = (110.0 + 140.0 * self.energy + 120.0 * boost + 60.0 * flash) * shimmer * depth_fade;
-            pts.push((z2, pos, dot_base * persp, alpha));
+            // Per-particle sparkle: each pixel flashes white at a slightly
+            // different moment so the finish reads as a shimmering twinkle.
+            let spark = if tw > 0.0 {
+                let ph = (1.0 - self.twinkle) * std::f32::consts::TAU * 1.3 + i as f32 * 0.8;
+                ph.sin().max(0.0) * tw * ball_t
+            } else {
+                0.0
+            };
+            let alpha =
+                (110.0 + 140.0 * self.energy + 120.0 * boost + 60.0 * flash) * shimmer * depth_fade + spark * 165.0;
+            pts.push((z2, pos, dot_base * persp * (1.0 + 0.35 * spark), alpha, spark));
         }
 
         // Draw far particles first so nearer ones overdraw them.
         pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        for (z, pos, radius, alpha) in pts {
+        for (z, pos, radius, alpha, spark) in pts {
             let depth = (z + 1.0) * 0.5;
-            let white_t = (depth * 0.85 + boost * 0.6 + flash * 0.5).clamp(0.0, 1.0);
+            let white_t = (depth * 0.85 + boost * 0.6 + flash * 0.5 + spark * 0.9).clamp(0.0, 1.0);
             painter.circle_filled(pos, radius, mix(white_t, alpha));
         }
 

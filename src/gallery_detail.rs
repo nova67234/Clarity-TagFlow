@@ -27,8 +27,11 @@ pub struct DetailPopup {
     path: Option<PathBuf>,
     /// Sidecar `.txt` tags (editable).
     tags: String,
-    /// Embedded SD generation metadata, if any (read-only).
+    /// Embedded SD generation metadata, if any (read-only, formatted for display).
     metadata: Option<String>,
+    /// The raw (unformatted) metadata, handed to the Civitai panel so its
+    /// `Hashes:` / `TI hashes:` blocks survive (needed to list embeddings).
+    metadata_raw: Option<String>,
     showing_meta: bool,
     editing: bool,
     meta: ImageMeta,
@@ -50,6 +53,7 @@ impl Default for DetailPopup {
             path: None,
             tags: String::new(),
             metadata: None,
+            metadata_raw: None,
             showing_meta: false,
             editing: false,
             meta: ImageMeta::default(),
@@ -70,7 +74,9 @@ impl DetailPopup {
         self.path = Some(path.to_path_buf());
         let txt = right_details::sidecar_txt(path);
         self.tags = std::fs::read_to_string(&txt).unwrap_or_default();
-        self.metadata = crate::sd_metadata::read(path);
+        let (disp, raw) = crate::sd_metadata::read_both(path);
+        self.metadata = disp;
+        self.metadata_raw = raw;
         // Show metadata first only when there are no tags but there is metadata.
         self.showing_meta = self.tags.trim().is_empty() && self.metadata.is_some();
         self.editing = false;
@@ -118,12 +124,13 @@ pub fn show(
     let win_w = (screen.width() * 0.85).min(1150.0).max(480.0);
     let win_h = (screen.height() * 0.85).min(780.0).max(360.0);
 
+    use crate::PopupPlacement;
     egui::Window::new("gallery_detail")
         .id(egui::Id::new("gallery_detail_popup"))
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .placed_centered(ctx)
         .fixed_size([win_w, win_h])
         .frame(window_frame())
         .show(ctx, |ui| {
@@ -194,7 +201,11 @@ fn right_column(
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
-                .add(egui::Button::new(egui::RichText::new("✕").size(15.0)).frame(false))
+                .add(egui::Button::image(
+                    egui::Image::new(egui::include_image!("../icons/close.svg"))
+                        .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                        .tint(MUTED()),
+                ).frame(false))
                 .on_hover_text("Close")
                 .clicked()
             {
@@ -238,7 +249,7 @@ fn right_column(
     match popup.view {
         PopupView::Details => details_content(ui, popup, path, index, action, want_close),
         PopupView::Civitai => {
-            let meta = popup.metadata.clone();
+            let meta = popup.metadata_raw.clone();
             crate::civitai::show(ui, civitai, Some(path), meta.as_deref());
         }
     }
