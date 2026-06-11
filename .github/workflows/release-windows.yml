@@ -92,9 +92,18 @@ jobs:
           # Bundle the runtime DLLs that `cargo build` stages next to the exe —
           # the ONNX Runtime DirectML provider (DirectML.dll) and any
           # onnxruntime*.dll — or the app fails to launch with a missing-DLL error.
-          $staged = Get-ChildItem target/release -Filter *.dll -ErrorAction SilentlyContinue
+          # NEVER bundle VLC (libvlc*.dll / plugins): it is LGPL and we don't ship
+          # its license — the app uses the user's own VLC install at runtime and
+          # offers an install link when it's missing (build.rs also skips staging
+          # it when CI is set; this filter is defence in depth).
+          $staged = Get-ChildItem target/release -Filter *.dll -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notlike 'libvlc*' }
           if ($staged) { Copy-Item $staged.FullName ClarityTagFlow-windows/ -Force }
           Write-Host "Staged DLLs: $((Get-ChildItem ClarityTagFlow-windows -Filter *.dll).Name -join ', ')"
+          # Guard: fail the build outright if any VLC runtime file slipped in.
+          $vlcFiles = Get-ChildItem ClarityTagFlow-windows -Recurse |
+            Where-Object { $_.Name -like 'libvlc*' -or $_.Name -eq 'plugins' }
+          if ($vlcFiles) { throw "VLC runtime files must not be redistributed: $($vlcFiles.Name -join ', ')" }
           # Bundle the Visual C++ runtime DLLs alongside the exe (app-local
           # deployment) so users never need the Visual C++ Redistributable
           # installed. We can't statically link the CRT because the prebuilt
