@@ -20,6 +20,7 @@ dependencies = [
  "image",
  "jpeg-decoder",
  "libwebp-sys",
+ "memchr",
  "native-tls",
  "ort",
  "png 0.18.1",

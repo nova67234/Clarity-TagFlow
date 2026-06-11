@@ -56,9 +56,34 @@ pub fn show(
                 return;
             }
 
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
+            // Start at the very top whenever a different image list arrives (new
+            // folder, search/filter change). egui remembers the scroll offset per
+            // widget id — across folder changes and even app restarts — so without
+            // this the gallery opens wherever the previous list was left.
+            let sig = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                filtered.len().hash(&mut h);
+                if let Some(&f) = filtered.first() {
+                    images[f].hash(&mut h);
+                }
+                if let Some(&l) = filtered.last() {
+                    images[l].hash(&mut h);
+                }
+                h.finish()
+            };
+            let sig_id = egui::Id::new("gallery_list_sig");
+            let list_changed = ui.data_mut(|d| {
+                let prev = d.get_temp::<u64>(sig_id);
+                d.insert_temp(sig_id, sig);
+                prev != Some(sig)
+            });
+
+            let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+            if list_changed {
+                scroll = scroll.vertical_scroll_offset(0.0);
+            }
+            scroll.show(ui, |ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
                     let avail = ui.available_width();
                     let target = target_col_w.clamp(120.0, 400.0);

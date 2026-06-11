@@ -22,6 +22,15 @@ enum PopupView {
     Civitai,
 }
 
+/// What the popup's background loader streams back: the embedded SD metadata
+/// first (it only needs a file read), then the details-card info (a full
+/// decode + colour extraction).
+enum DetailMsg {
+    /// `(display, raw)` from `sd_metadata::read_both`.
+    Metadata(Option<String>, Option<String>),
+    Info(ImageMeta),
+}
+
 /// State for the gallery detail popup. Lives on `ViewerApp`.
 pub struct DetailPopup {
     pub open: bool,
@@ -35,6 +44,10 @@ pub struct DetailPopup {
     /// The raw (unformatted) metadata, handed to the Civitai panel so its
     /// `Hashes:` / `TI hashes:` blocks survive (needed to list embeddings).
     metadata_raw: Option<String>,
+    /// True once the background `read_both` has delivered (the Civitai view
+    /// waits for it — starting its lookup with `None` would cache "no
+    /// resources" for the image).
+    meta_loaded: bool,
     showing_meta: bool,
     editing: bool,
     /// Copy-button result flash: (start, success) — green on copy, amber when
@@ -48,10 +61,10 @@ pub struct DetailPopup {
     show_delete_confirm: bool,
     skip_delete_confirm: bool,
     meta: ImageMeta,
-    /// Receiver for the background metadata load (full decode + colour palette
-    /// run off the UI thread, like the right panel — opening the popup must
-    /// never block on a multi-megapixel decode).
-    meta_rx: Option<mpsc::Receiver<ImageMeta>>,
+    /// Receiver for the background loader (SD-metadata read, then the full
+    /// decode + colour palette — all off the UI thread, like the right panel:
+    /// opening the popup must never block on a multi-megapixel file).
+    meta_rx: Option<mpsc::Receiver<DetailMsg>>,
     /// Bumped per load so a stale background decode can bail early when the
     /// popup is quickly reopened on another image.
     meta_gen: Arc<AtomicU64>,
@@ -81,6 +94,7 @@ impl Default for DetailPopup {
             tags: String::new(),
             metadata: None,
             metadata_raw: None,
+            meta_loaded: false,
             showing_meta: false,
             editing: false,
             copy_flash: None,
@@ -113,20 +127,21 @@ impl DetailPopup {
         self.path = Some(path.to_path_buf());
         let txt = right_details::sidecar_txt(path);
         self.tags = std::fs::read_to_string(&txt).unwrap_or_default();
-        let (disp, raw) = crate::sd_metadata::read_both(path);
-        self.metadata = disp;
-        self.metadata_raw = raw;
-        // Show metadata first only when there are no tags but there is metadata.
-        self.showing_meta = self.tags.trim().is_empty() && self.metadata.is_some();
+        self.metadata = None;
+        self.metadata_raw = None;
+        self.meta_loaded = false;
+        self.showing_meta = false;
         self.editing = false;
         self.copy_flash = None;
         self.save_flash = None;
         self.edit_flash_start = None;
         self.show_delete_confirm = false;
 
-        // Kick the heavy metadata read (decode + dominant colours) to a
-        // background thread — same pattern as the right panel. The card shows
-        // "Loading..." until it lands.
+        // Everything that touches the image file goes to a background thread:
+        // the SD-metadata read first (a hi-res file is read in full and scanned,
+        // which froze the popup), then the details-card load (full decode +
+        // dominant colours) — same pattern as the right panel. The card shows
+        // "Loading..." until its part lands.
         self.meta = ImageMeta::loading();
         let (tx, rx) = mpsc::channel();
         self.meta_rx = Some(rx);
@@ -135,13 +150,23 @@ impl DetailPopup {
         let path_clone = path.to_path_buf();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            // Skip the heavy decode entirely if the popup already moved on.
+            // Skip everything if the popup already moved on.
             if meta_gen.load(Ordering::SeqCst) != generation {
                 return;
             }
+            let (disp, raw) = crate::sd_metadata::read_both(&path_clone);
+            if meta_gen.load(Ordering::SeqCst) != generation
+                || tx.send(DetailMsg::Metadata(disp, raw)).is_err()
+            {
+                return;
+            }
+            ctx.request_repaint();
+
             let meta = right_details::load_meta(&path_clone);
             // Deliver + repaint only if this is still the current image.
-            if meta_gen.load(Ordering::SeqCst) == generation && tx.send(meta).is_ok() {
+            if meta_gen.load(Ordering::SeqCst) == generation
+                && tx.send(DetailMsg::Info(meta)).is_ok()
+            {
                 ctx.request_repaint();
             }
         });
@@ -176,11 +201,32 @@ pub fn show(
     if !popup.open {
         return DetailAction::None;
     }
-    // Non-blocking check for the background metadata load finishing.
+    // Non-blocking drain of the background loader.
     if let Some(rx) = &popup.meta_rx {
-        if let Ok(meta) = rx.try_recv() {
-            popup.meta = meta;
-            popup.meta_rx = None; // Finished!
+        let mut finished = false;
+        loop {
+            match rx.try_recv() {
+                Ok(DetailMsg::Metadata(disp, raw)) => {
+                    popup.metadata = disp;
+                    popup.metadata_raw = raw;
+                    popup.meta_loaded = true;
+                    // Open straight to the metadata view when there are no tags
+                    // but there is metadata — deferred to its arrival (and
+                    // skipped if the user already started editing the tags).
+                    if !popup.editing && popup.metadata.is_some() && popup.tags.trim().is_empty() {
+                        popup.showing_meta = true;
+                    }
+                }
+                Ok(DetailMsg::Info(meta)) => popup.meta = meta,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        if finished {
+            popup.meta_rx = None;
         }
     }
     let Some(path) = popup.path.clone() else {
@@ -360,8 +406,20 @@ fn right_column(
             details_content(ui, popup, path, index, confirm_before_delete, action, want_close)
         }
         PopupView::Civitai => {
-            let meta = popup.metadata_raw.clone();
-            crate::civitai::show(ui, civitai, Some(path), meta.as_deref());
+            if popup.meta_loaded {
+                let meta = popup.metadata_raw.clone();
+                crate::civitai::show(ui, civitai, Some(path), meta.as_deref());
+            } else {
+                // The background metadata read hasn't landed yet; starting the
+                // Civitai lookup now (with no metadata) would cache an empty
+                // result for this image. It repaints in when the read finishes.
+                ui.add_space(24.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("Reading image metadata…").color(MUTED()).size(13.0),
+                    );
+                });
+            }
         }
     }
 }

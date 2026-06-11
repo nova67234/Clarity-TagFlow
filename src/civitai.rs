@@ -2049,6 +2049,10 @@ mod civitai_generator_tests {
             "tests/bug/generator_import_1780547142123_0.jpg",
             "tests/bug/generator_import_1780631568326_0.jpg",
         ] {
+            if !std::path::Path::new(name).exists() {
+                eprintln!("skipping {name} (not present locally)");
+                continue;
+            }
             let (_disp, raw) = crate::sd_metadata::read_both(std::path::Path::new(name));
             let raw = raw.expect("raw metadata should be found");
             assert!(raw.contains("Civitai metadata:"), "{name}: blob missing");
@@ -2056,6 +2060,37 @@ mod civitai_generator_tests {
             assert_eq!(tasks.len(), 1, "{name}: expected one task");
             assert!(tasks[0].kind == ItemType::Model);
             assert_eq!(tasks[0].version_id.as_deref(), Some("2470991"));
+        }
+    }
+
+    // Diagnostic over the local tests/bug folder: times the metadata read and
+    // the full decode for each image and reports whether it decodes at all.
+    // Run with `cargo test bug_folder_diag -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bug_folder_diag() {
+        let Ok(dir) = std::fs::read_dir("tests/bug") else { return };
+        for entry in dir.flatten() {
+            let p = entry.path();
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp") {
+                continue;
+            }
+            let t = std::time::Instant::now();
+            let (disp, raw) = crate::sd_metadata::read_both(&p);
+            let t_meta = t.elapsed();
+            let t = std::time::Instant::now();
+            let decoded = image::open(&p);
+            let t_decode = t.elapsed();
+            let dims = decoded.as_ref().map(|i| format!("{}x{}", i.width(), i.height()));
+            println!(
+                "{}: read_both {t_meta:?} (display={} raw={}), decode {t_decode:?} -> {:?}, civitai tasks: {}",
+                p.display(),
+                disp.is_some(),
+                raw.is_some(),
+                dims,
+                raw.as_deref().map(|r| parse_civitai_generator(r).len()).unwrap_or(0),
+            );
         }
     }
 
