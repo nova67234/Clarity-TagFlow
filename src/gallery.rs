@@ -137,31 +137,67 @@ pub fn show(
 /// The floating search/filter pill shown over the Gallery in the bottom-right
 /// corner: a frameless "Search tag…" field plus a settings gear that opens the
 /// gallery filters (media type + thumbnail size). Movable (drag the pill
-/// background) and position-remembering, like the other popups. Returns `true`
-/// when the search text or media filter changed so the app re-filters.
+/// background), but unlike the other popups its position is remembered as an
+/// OFFSET FROM THE BOTTOM-RIGHT CORNER, not an absolute point — so it always
+/// starts in the corner and stays put relative to it when the app window is
+/// resized. Returns `true` when the search text or media filter changed so the
+/// app re-filters.
 pub fn search_pill(
     ctx: &egui::Context,
     search: &mut String,
     settings: &mut crate::settings::Settings,
 ) -> bool {
     use crate::left_panel_settings::MediaFilter;
-    use crate::PopupPlacement;
 
     let mut changed = false;
     let pill_w = 320.0;
     let pill_h = 46.0;
     let screen = ctx.content_rect();
-    let default_pos = egui::pos2(
-        screen.right() - pill_w - 18.0,
-        screen.bottom() - pill_h - 18.0,
-    );
 
-    egui::Window::new("")
+    // Gap between the pill's bottom-right corner and the screen's. Persisted
+    // (egui memory) when the user drags the pill; clamped so a shrunken window
+    // can never strand it off-screen.
+    let off_id = egui::Id::new("gallery_search_pill_offset");
+    let default_off = egui::vec2(18.0, 18.0);
+    let off = if crate::movable_popups() {
+        ctx.data_mut(|d| *d.get_persisted_mut_or(off_id, default_off))
+    } else {
+        default_off
+    };
+    let max_off = (screen.size() - egui::vec2(pill_w, pill_h)).max(egui::Vec2::ZERO);
+    let off = off.clamp(egui::Vec2::ZERO, max_off);
+
+    // Last frame's measured pill size (egui auto-sizes the window); the
+    // constants are only the first-frame estimate.
+    let size_id = egui::Id::new("gallery_search_pill_size");
+    let size = ctx
+        .data(|d| d.get_temp::<egui::Vec2>(size_id))
+        .unwrap_or(egui::vec2(pill_w, pill_h));
+
+    // Only assert the position when the target really moved (first frame,
+    // app-window resize, drag, clamp), and with a 1px tolerance. Re-asserting
+    // every frame — or chasing sub-pixel rounding — makes egui treat the window
+    // as perpetually moving and repaint forever; under a gallery full of
+    // thumbnails/video tiles that runaway loop can exhaust the whole machine.
+    let desired = screen.max - size - off;
+    let anchor_id = egui::Id::new("gallery_search_pill_anchor");
+    let last = ctx.data(|d| d.get_temp::<egui::Pos2>(anchor_id));
+    let assert_pos =
+        last.is_none_or(|l| (l.x - desired.x).abs() > 1.0 || (l.y - desired.y).abs() > 1.0);
+    if assert_pos {
+        ctx.data_mut(|d| d.insert_temp(anchor_id, desired));
+    }
+
+    let mut win = egui::Window::new("")
         .id(egui::Id::new("gallery_search_pill"))
         .title_bar(false)
         .resizable(false)
         .collapsible(false)
-        .placed_at(default_pos)
+        .movable(crate::movable_popups());
+    if assert_pos {
+        win = win.current_pos(desired);
+    }
+    let resp = win
         .frame(
             egui::Frame::new()
                 .fill(PANEL())
@@ -248,6 +284,18 @@ pub fn search_pill(
                 });
             });
         });
+
+    if let Some(resp) = resp {
+        ctx.data_mut(|d| d.insert_temp(size_id, resp.response.rect.size()));
+        // While the pill is being dragged egui moves the window itself; record
+        // the landing spot as a new corner offset so the next frame's
+        // `current_pos` (and future resizes/restarts) keep it there relative to
+        // the corner.
+        if resp.response.dragged() {
+            let new_off = (screen.max - resp.response.rect.max).clamp(egui::Vec2::ZERO, max_off);
+            ctx.data_mut(|d| d.insert_persisted(off_id, new_off));
+        }
+    }
 
     changed
 }
