@@ -968,6 +968,14 @@ impl eframe::App for ViewerApp {
         });
         if delta != 0 && !typing {
             self.step_selection(delta);
+            // In the Gallery layout the arrow keys also page the open detail
+            // popup to the newly selected image (it loads its content once on
+            // open, so it must be re-pointed explicitly).
+            if self.settings.layout == settings::Layout::Gallery && self.detail_popup.open {
+                if let Some(i) = self.selected {
+                    self.detail_popup.open_for(i, &self.images[i], ui.ctx());
+                }
+            }
         }
 
         match top_bar::show(ui, &self.stats, self.settings.show_stats) {
@@ -1006,6 +1014,9 @@ impl eframe::App for ViewerApp {
                 &mut self.favorites,
                 self.settings.thumbnail_size,
             ) {
+                // Select the clicked tile (accent ring + arrow-key anchor) and
+                // open its detail popup.
+                self.selected = Some(i);
                 self.detail_popup.open_for(i, &self.images[i], ui.ctx());
             }
         } else {
