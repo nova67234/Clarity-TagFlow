@@ -134,6 +134,124 @@ pub fn show(
     clicked
 }
 
+/// The floating search/filter pill shown over the Gallery in the bottom-right
+/// corner: a frameless "Search tag…" field plus a settings gear that opens the
+/// gallery filters (media type + thumbnail size). Movable (drag the pill
+/// background) and position-remembering, like the other popups. Returns `true`
+/// when the search text or media filter changed so the app re-filters.
+pub fn search_pill(
+    ctx: &egui::Context,
+    search: &mut String,
+    settings: &mut crate::settings::Settings,
+) -> bool {
+    use crate::left_panel_settings::MediaFilter;
+    use crate::PopupPlacement;
+
+    let mut changed = false;
+    let pill_w = 320.0;
+    let pill_h = 46.0;
+    let screen = ctx.content_rect();
+    let default_pos = egui::pos2(
+        screen.right() - pill_w - 18.0,
+        screen.bottom() - pill_h - 18.0,
+    );
+
+    egui::Window::new("")
+        .id(egui::Id::new("gallery_search_pill"))
+        .title_bar(false)
+        .resizable(false)
+        .collapsible(false)
+        .placed_at(default_pos)
+        .frame(
+            egui::Frame::new()
+                .fill(PANEL())
+                // Half the pill height → fully rounded ends, like the mock.
+                .corner_radius(CornerRadius::same((pill_h / 2.0) as u8))
+                .inner_margin(Margin::symmetric(16, 8))
+                .stroke(Stroke::new(1.0, EDGE()))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 4],
+                    blur: 16,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(120),
+                }),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(pill_w - 32.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                // Gear first in a right-to-left layout so it pins to the right
+                // end; the search field then fills the rest.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let gear = egui::include_image!("../icons/settings.svg");
+                    let gear_resp = crate::svg_button(
+                        ui,
+                        gear,
+                        "Gallery filters",
+                        18.0,
+                        crate::theme::icon_tint(MUTED()),
+                    );
+                    // The filters popup opens UPWARD (the pill sits at the
+                    // bottom of the screen).
+                    egui::Popup::menu(&gear_resp)
+                        .align(egui::RectAlign::TOP_END)
+                        .show(|ui| {
+                            ui.set_min_width(210.0);
+                            let r = CornerRadius::same(8);
+                            ui.visuals_mut().widgets.inactive.corner_radius = r;
+                            ui.visuals_mut().widgets.hovered.corner_radius = r;
+                            ui.visuals_mut().widgets.active.corner_radius = r;
+
+                            ui.label(
+                                egui::RichText::new("SHOW").color(MUTED()).strong().size(10.5),
+                            );
+                            ui.add_space(2.0);
+                            for opt in MediaFilter::OPTIONS {
+                                if ui
+                                    .selectable_label(settings.media_filter == opt, opt.label())
+                                    .clicked()
+                                {
+                                    if settings.media_filter != opt {
+                                        settings.media_filter = opt;
+                                        changed = true;
+                                    }
+                                    ui.close();
+                                }
+                            }
+
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("THUMBNAIL SIZE")
+                                    .color(MUTED())
+                                    .strong()
+                                    .size(10.5),
+                            );
+                            ui.add_space(2.0);
+                            ui.spacing_mut().slider_width = ui.available_width() - 8.0;
+                            ui.add(
+                                egui::Slider::new(&mut settings.thumbnail_size, 120.0..=400.0)
+                                    .show_value(false),
+                            );
+                        });
+
+                    // Search field fills the remaining pill width.
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(search)
+                            .hint_text(egui::RichText::new("Search tag…").color(MUTED()))
+                            .frame(egui::Frame::NONE)
+                            .desired_width(ui.available_width())
+                            .margin(Margin::symmetric(4, 4)),
+                    );
+                    if resp.changed() {
+                        changed = true;
+                    }
+                });
+            });
+        });
+
+    changed
+}
+
 /// Aspect ratio (h/w) of an image's thumbnail, or a square default if unknown.
 fn aspect_of(thumbs: &ImageCache, video_thumbs: &crate::video::VideoThumbs, path: &Path) -> f32 {
     if crate::is_video(path) {

@@ -9,6 +9,7 @@ dependencies = [
  "arboard",
  "avif-parse",
  "chrono",
+ "clipboard-win",
  "dirs",
  "eframe",
  "egui_extras",

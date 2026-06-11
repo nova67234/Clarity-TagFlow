@@ -98,6 +98,7 @@ mod scan;
 mod sd_metadata;
 mod secret;
 mod settings;
+mod splash;
 mod tag_manager;
 mod tag_manager_settings;
 mod tagger;
@@ -248,6 +249,9 @@ struct ViewerApp {
     filtered: Vec<usize>,
     selected: Option<usize>,
     search: String,
+    /// Lowercased sidecar-tag text per image, validated by the sidecar's mtime,
+    /// so the search can match tags without re-reading every .txt per keystroke.
+    tag_search_cache: std::collections::HashMap<PathBuf, (Option<std::time::SystemTime>, String)>,
     /// Favorited ("hearted") files, tracked by content hash so they survive
     /// moves/renames. Shown as a heart badge on the browser thumbnails.
     favorites: favorites::Favorites,
@@ -260,6 +264,8 @@ struct ViewerApp {
     scan: scan::ScanState,
     /// Gallery-view image detail popup.
     detail_popup: gallery_detail::DetailPopup,
+    /// Startup splash (the cursive "Clarity TagFlow" write-on).
+    splash: splash::Splash,
     /// While the Generate (Flux) view is open, the browser/viewer show the session's
     /// generated images; these remember the real folder list to restore on exit.
     flux_active: bool,
@@ -316,12 +322,14 @@ impl Default for ViewerApp {
             filtered: Vec::new(),
             selected: None,
             search: String::new(),
+            tag_search_cache: std::collections::HashMap::new(),
             favorites: favorites::Favorites::load(),
             stats: top_bar::SystemStats::default(),
             right_state: right_details::RightPanelState::default(),
             settings: settings::Settings::default(),
             scan: scan::ScanState::default(),
             detail_popup: gallery_detail::DetailPopup::default(),
+            splash: splash::Splash::default(),
             flux_active: false,
             images_backup: None,
             flux_sig: (false, 0),
@@ -346,7 +354,8 @@ impl Default for ViewerApp {
 }
 
 impl ViewerApp {
-    /// Update the cached list of filtered indices based on the search string
+    /// Update the cached list of filtered indices based on the search string.
+    /// The query matches the file name OR the sidecar .txt tags (cached).
     fn update_filtered(&mut self) {
         use left_panel_settings::MediaFilter;
         let query = self.search.trim().to_lowercase();
@@ -356,7 +365,10 @@ impl ViewerApp {
             // Clone the path so the favorite look-up (which needs `&mut favorites`)
             // doesn't clash with borrowing `self.images`.
             let path = self.images[i].clone();
-            if !query.is_empty() && !file_name(&path).to_lowercase().contains(&query) {
+            if !query.is_empty()
+                && !file_name(&path).to_lowercase().contains(&query)
+                && !self.tags_match(&path, &query)
+            {
                 continue;
             }
             let keep = match filter {
@@ -375,6 +387,23 @@ impl ViewerApp {
         self.filtered = filtered;
     }
 
+    /// Whether `path`'s sidecar tags contain `query` (lowercase). The tag text
+    /// is cached and only re-read when the sidecar's mtime changes, so typing
+    /// in the search box costs one `stat` per image, not a file read.
+    fn tags_match(&mut self, path: &std::path::Path, query: &str) -> bool {
+        let txt = right_details::sidecar_txt(path);
+        let mtime = std::fs::metadata(&txt).and_then(|m| m.modified()).ok();
+        let entry = self
+            .tag_search_cache
+            .entry(path.to_path_buf())
+            .or_insert_with(|| (None, String::new()));
+        if entry.0 != mtime {
+            entry.0 = mtime;
+            entry.1 = std::fs::read_to_string(&txt).unwrap_or_default().to_lowercase();
+        }
+        entry.1.contains(query)
+    }
+
     /// Pick a folder and show every image in it (replacing the current list).
     fn open_dialog(&mut self) {
         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
@@ -387,6 +416,7 @@ impl ViewerApp {
         self.images = images_in_dir(dir);
         self.current_folder = Some(dir.to_path_buf());
         self.selected = if self.images.is_empty() { None } else { Some(0) };
+        self.tag_search_cache.clear(); // tags belong to the previous folder
         self.update_filtered();
     }
 
@@ -476,15 +506,56 @@ impl ViewerApp {
         std::thread::spawn(move || {
             let Some(rgba) = decode_full_rgba(&src) else { return };
             let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+            // Build the plain-DIB payload first; the RGBA buffer then moves
+            // into arboard.
+            #[cfg(target_os = "windows")]
+            let dib = Self::rgba_to_cf_dib(rgba.width(), rgba.height(), rgba.as_raw());
             let img = arboard::ImageData {
                 width: w,
                 height: h,
                 bytes: std::borrow::Cow::Owned(rgba.into_raw()),
             };
+            // arboard writes the "PNG" + CF_DIBV5 clipboard formats…
             if let Ok(mut clip) = arboard::Clipboard::new() {
                 let _ = clip.set_image(img);
             }
+            // …but Chromium-based browsers only ever request the legacy CF_DIB
+            // when pasting an image (they ignore DIBV5 and PNG — see
+            // PhotoDemon #343), so pasting into Chrome/Edge (e.g. a Gemini
+            // upload box) found nothing. Append a plain DIB to what arboard
+            // just set, without clearing it.
+            #[cfg(target_os = "windows")]
+            if let Ok(_clip) = clipboard_win::Clipboard::new_attempts(10) {
+                let _ = clipboard_win::raw::set_without_clear(clipboard_win::formats::CF_DIB, &dib);
+            }
         });
+    }
+
+    /// Encode RGBA pixels as a clipboard `CF_DIB` payload: a 40-byte
+    /// BITMAPINFOHEADER (BI_RGB, 32 bpp) followed by bottom-up BGRX rows.
+    /// Alpha is composited against white — plain-DIB consumers rarely honour
+    /// an alpha channel, and a white backdrop matches what image editors put
+    /// in the legacy format.
+    #[cfg(target_os = "windows")]
+    fn rgba_to_cf_dib(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+        let row = w as usize * 4;
+        let mut dib = Vec::with_capacity(40 + rgba.len());
+        dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        dib.extend_from_slice(&(w as i32).to_le_bytes()); // biWidth
+        dib.extend_from_slice(&(h as i32).to_le_bytes()); // biHeight > 0: bottom-up
+        dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        dib.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
+        dib.extend_from_slice(&(rgba.len() as u32).to_le_bytes()); // biSizeImage
+        dib.extend_from_slice(&[0u8; 16]); // ppm + palette fields, all zero
+        for y in (0..h as usize).rev() {
+            for px in rgba[y * row..(y + 1) * row].chunks_exact(4) {
+                let a = px[3] as u32;
+                let blend = |c: u8| ((c as u32 * a + 255 * (255 - a)) / 255) as u8;
+                dib.extend_from_slice(&[blend(px[2]), blend(px[1]), blend(px[0]), 0xFF]);
+            }
+        }
+        dib
     }
 
     /// Start removing the background of `src` (right-click action). Downloads the
@@ -914,6 +985,15 @@ impl ViewerApp {
 
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // While the splash is writing its wordmark, render ONLY the splash —
+        // the panels (and the folder/thumbnail work they kick off) build after
+        // it, so launch shows the text before the app UI exists. The fade-out
+        // phase falls through and plays over the real UI.
+        if self.splash.covers_ui(ui.ctx()) {
+            self.splash.show(ui.ctx());
+            return;
+        }
+
         self.handle_dropped_files(ui.ctx());
         // Advance any in-flight background-removal job (download → inference → result).
         self.drive_bg_job(ui.ctx());
@@ -1018,6 +1098,10 @@ impl eframe::App for ViewerApp {
                 // open its detail popup.
                 self.selected = Some(i);
                 self.detail_popup.open_for(i, &self.images[i], ui.ctx());
+            }
+            // Floating search/filter pill (bottom-right corner, movable).
+            if gallery::search_pill(ui.ctx(), &mut self.search, &mut self.settings) {
+                self.update_filtered();
             }
         } else {
         // 1. Left Panel
@@ -1143,6 +1227,10 @@ impl eframe::App for ViewerApp {
 
         // 5. Backup dialog (floats on top when opened from the top bar).
         self.backup.show(ui.ctx());
+
+        // Startup splash — drawn last so it covers the whole UI while the
+        // "Clarity TagFlow" wordmark writes itself on.
+        self.splash.show(ui.ctx());
 
         // Keep the live graphs animating without busy-looping.
         ui.ctx().request_repaint_after(Duration::from_millis(250));
@@ -1401,10 +1489,6 @@ fn install_fallback_fonts(ctx: &egui::Context) {
         }
     }
 
-    if added.is_empty() {
-        return; // no system CJK fonts found — leave egui's defaults untouched
-    }
-
     // Append the CJK fonts after the existing fonts in both families, so they act
     // purely as fallbacks for glyphs the default fonts can't render.
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
@@ -1413,6 +1497,42 @@ fn install_fallback_fonts(ctx: &egui::Context) {
             list.push(key.clone());
         }
     }
+
+    // Cursive script font for the startup splash ("Clarity TagFlow" write-on).
+    // The family is ALWAYS registered — laying out with an unknown family
+    // panics — and just maps to the proportional list when no script font is
+    // installed (the splash then writes in the regular face).
+    #[cfg(target_os = "windows")]
+    let cursive_candidates: &[&str] = &[
+        r"C:\Windows\Fonts\segoesc.ttf",  // Segoe Script
+        r"C:\Windows\Fonts\segoepr.ttf",  // Segoe Print
+        r"C:\Windows\Fonts\BRUSHSCI.TTF", // Brush Script MT
+        r"C:\Windows\Fonts\FREESCPT.TTF", // Freestyle Script
+    ];
+    #[cfg(target_os = "macos")]
+    let cursive_candidates: &[&str] = &[
+        "/System/Library/Fonts/Supplemental/SnellRoundhand.ttc",
+        "/System/Library/Fonts/Supplemental/Brush Script.ttf",
+    ];
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let cursive_candidates: &[&str] = &[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf",
+    ];
+    let mut cursive_list: Vec<String> = Vec::new();
+    for path in cursive_candidates {
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        fonts
+            .font_data
+            .insert("splash_cursive".into(), egui::FontData::from_owned(bytes).into());
+        cursive_list.push("splash_cursive".into());
+        break;
+    }
+    if let Some(prop) = fonts.families.get(&egui::FontFamily::Proportional) {
+        cursive_list.extend(prop.iter().cloned());
+    }
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("cursive".into()), cursive_list);
 
     ctx.set_fonts(fonts);
 }
@@ -1572,4 +1692,31 @@ pub(crate) fn file_name(p: &std::path::Path) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or("<unknown>")
         .to_owned()
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod cf_dib_tests {
+    // Layout check for the clipboard CF_DIB payload: 40-byte BITMAPINFOHEADER,
+    // bottom-up BGRX rows, alpha composited against white.
+    #[test]
+    fn dib_header_and_pixels() {
+        // 2x2 RGBA: red | half-green / blue | fully transparent.
+        let rgba = [
+            255u8, 0, 0, 255,   0, 255, 0, 128,
+            0, 0, 255, 255,     0, 0, 0, 0,
+        ];
+        let dib = super::ViewerApp::rgba_to_cf_dib(2, 2, &rgba);
+        assert_eq!(dib.len(), 40 + 16);
+        assert_eq!(&dib[0..4], &40u32.to_le_bytes()); // biSize
+        assert_eq!(&dib[4..8], &2i32.to_le_bytes()); // biWidth
+        assert_eq!(&dib[8..12], &2i32.to_le_bytes()); // biHeight (bottom-up)
+        assert_eq!(u16::from_le_bytes([dib[14], dib[15]]), 32); // biBitCount
+        assert_eq!(&dib[16..20], &0u32.to_le_bytes()); // BI_RGB
+        // Bottom row first: blue -> BGRX(255,0,0); transparent -> white.
+        assert_eq!(&dib[40..44], &[255, 0, 0, 255]);
+        assert_eq!(&dib[44..48], &[255, 255, 255, 255]);
+        // Top row: red -> BGRX(0,0,255); half-green on white -> (127,255,127).
+        assert_eq!(&dib[48..52], &[0, 0, 255, 255]);
+        assert_eq!(&dib[52..56], &[127, 255, 127, 255]);
+    }
 }
