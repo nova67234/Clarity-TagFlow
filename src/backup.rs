@@ -344,7 +344,7 @@ impl BackupState {
         let start_backup = self.create_flash.is_some_and(|t| t.elapsed() >= FLASH);
         let do_cancel = self.cancel_flash.is_some_and(|t| t.elapsed() >= FLASH);
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        footer_row(ui, |ui| {
             let create = footer_button(ui, "Create", create_flashing.then_some(FLASH_GREEN));
             if create.clicked() && self.create_flash.is_none() && !cancel_flashing {
                 self.create_flash = Some(Instant::now());
@@ -455,7 +455,7 @@ impl BackupState {
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(10.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        footer_row(ui, |ui| {
             let cancelling = prog.cancel.load(Relaxed);
             let btn_label = if cancelling { "Cancelling…" } else { "Cancel" };
             ui.add_enabled_ui(!cancelling, |ui| {
@@ -525,7 +525,7 @@ fn done_body(ui: &mut egui::Ui, outcome: &Outcome) -> bool {
     ui.separator();
     ui.add_space(10.0);
     let mut close = false;
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    footer_row(ui, |ui| {
         if accent_button(ui, "Close").clicked() {
             close = true;
         }
@@ -593,6 +593,19 @@ fn text_field(ui: &mut egui::Ui, value: &mut String, hint: &str, password: bool)
                 .hint_text(hint),
         );
     });
+}
+
+/// The right-aligned footer button row. Allocated at a FIXED 380×32 — a bare
+/// `with_layout(right_to_left)` here would claim all the height left in the
+/// window, so once the window had grown (e.g. the password fields were shown)
+/// the auto-sizer saw that leftover space as "content" and never shrank back,
+/// leaving a big dead gap above the buttons.
+fn footer_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(DIALOG_WIDTH, 32.0),
+        egui::Layout::right_to_left(egui::Align::Center),
+        add,
+    );
 }
 
 fn footer_button(ui: &mut egui::Ui, label: &str, flash: Option<Color32>) -> egui::Response {
