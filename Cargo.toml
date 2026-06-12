@@ -2,6 +2,7 @@
 name = "Clarity_TagFlow"
 version = "5.3.1-beta.2"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 # "persistence" enables eframe's storage (saves settings to the OS data dir).
