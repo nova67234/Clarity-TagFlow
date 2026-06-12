@@ -4,7 +4,7 @@
 
 Browse and tag thousands of images, auto-tag them with built-in AI models, read Stable Diffusion metadata, generate new images with Flux or Z-Image, turn photos into 3D models, and more — all in one app, no Python environment or command line required.
 
-[![Latest release](https://img.shields.io/github/v/release/nova67234/Clarity-TagFlow?include_prereleases&label=download)](https://github.com/nova67234/Clarity-TagFlow/releases/latest)
+[![Latest release](https://img.shields.io/github/v/release/nova67234/Clarity-TagFlow?include_prereleases&label=download)](https://github.com/nova67234/Clarity-TagFlow/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 
@@ -42,7 +42,7 @@ Browse and tag thousands of images, auto-tag them with built-in AI models, read 
 
 ## 📥 Download
 
-Grab the latest version from the **[Releases page](https://github.com/nova67234/Clarity-TagFlow/releases/latest)**:
+Grab the latest version from the **[Releases page](https://github.com/nova67234/Clarity-TagFlow/releases)**:
 
 | Platform | File | Notes |
 |---|---|---|
