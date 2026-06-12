@@ -1,0 +1,24 @@
+name: Feature request
+description: Suggest an idea or improvement for Clarity TagFlow
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like?
+      description: Describe the feature or improvement.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why is it useful?
+      description: What problem does it solve, or what workflow does it improve?
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      description: Other ways to achieve the same thing, or how you work around it today.
