@@ -1,0 +1,85 @@
+name: Bug report
+description: Something in Clarity TagFlow isn't working right
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! The more detail you give, the faster it gets fixed.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug. What did you expect to happen instead?
+      placeholder: "When I click X, the app does Y, but I expected Z."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: How can we make it happen? Step by step.
+      placeholder: |
+        1. Open a folder with images
+        2. Click on …
+        3. See the error
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      description: Shown in the window title / the release you downloaded.
+      placeholder: "v5.3.1-beta.2"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS (Apple Silicon)
+        - Linux
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where in the app?
+      options:
+        - Image viewer / browser
+        - Gallery layout
+        - Tagging / Tag Manager
+        - AI tagging
+        - Downloader
+        - Generate (Flux)
+        - Generate (Z-Image)
+        - Pixal3D (image to 3D)
+        - Civitai panel
+        - Video playback
+        - Settings / themes
+        - Backup
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: file-type
+    attributes:
+      label: File type involved (if any)
+      description: e.g. PNG, JPG, DNG, ARW, CR2, NEF, HDR, AVIF, MP4 — if the bug involves a specific image or video.
+      placeholder: "PNG"
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Screenshots or extra details
+      description: Drag & drop screenshots here. Anything else that might help (GPU model for AI/Generate bugs, whether VLC is installed for video bugs, etc.).
