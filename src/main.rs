@@ -98,6 +98,7 @@ mod scan;
 mod sd_metadata;
 mod secret;
 mod settings;
+mod spellcheck;
 mod splash;
 mod tag_manager;
 mod tag_manager_settings;
@@ -1084,6 +1085,13 @@ impl eframe::App for ViewerApp {
         // When the Gallery layout is active, replace the three panels with a
         // full-window masonry grid of the open folder's images.
         if self.settings.layout == settings::Layout::Gallery {
+            // Release the centre viewer's player — without this, a clip selected
+            // in the Panels layout keeps playing (audibly) behind the grid.
+            self.video_player = None;
+            self.last_video_path = None;
+            // Skip the poster capture for the clip playing in the detail popup,
+            // like the browser does for the centre player.
+            self.video_thumbs.set_busy(self.detail_popup.playing_video());
             if let Some(i) = gallery::show(
                 ui,
                 &self.images,
@@ -1184,7 +1192,10 @@ impl eframe::App for ViewerApp {
 
         settings::show(ui.ctx(), &mut self.settings);
 
-        // Gallery detail popup (opened by clicking a gallery tile).
+        // Gallery detail popup (opened by clicking a gallery tile). Push the loop
+        // preference first so a clip the popup starts picks it up (the centre
+        // viewer only pushes it when it is itself playing a video).
+        video::set_loop(self.settings.loop_video);
         match gallery_detail::show(
             ui.ctx(),
             &mut self.detail_popup,
@@ -1326,7 +1337,7 @@ impl<'a> PopupPlacement<'a> for egui::Window<'a> {
 /// Centred placeholder for a video that isn't playing: the video glyph, the file
 /// name, and a message that depends on why there's no player — playback failed,
 /// VLC needs installing (with a button), or this build has no video backend.
-fn video_notice(ui: &mut egui::Ui, path: &std::path::Path, support: video::VideoSupport) {
+pub(crate) fn video_notice(ui: &mut egui::Ui, path: &std::path::Path, support: video::VideoSupport) {
     ui.vertical_centered(|ui| {
         let avail_h = ui.available_height();
         ui.add_space((avail_h * 0.5 - 84.0).max(8.0));
@@ -1371,7 +1382,7 @@ fn video_notice(ui: &mut egui::Ui, path: &std::path::Path, support: video::Video
     });
 }
 
-fn show_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle, is_loading: bool) {
+pub(crate) fn show_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle, is_loading: bool) {
     let avail = ui.available_size();
     let tex_size = tex.size_vec2();
     let aspect = tex_size.y / tex_size.x.max(1.0);

@@ -8,7 +8,9 @@
 //! ComfyUI server launch + the generation workflow/API are wired next.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 
 use eframe::egui;
 use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText};
@@ -200,6 +202,15 @@ pub struct GenerateState {
     /// Brief tint flash on the Copy-log button: (when, was_ok). Green on success,
     /// red on failure; fades out after a short window.
     copy_flash: Option<(std::time::Instant, bool)>,
+    /// Spell-check state for the prompt box (right-click suggestion menu).
+    spell: crate::spellcheck::SpellcheckState,
+    /// Cooperative cancel flag for the in-flight generation (the in-prompt stop
+    /// button sets it; the runner thread polls it and interrupts ComfyUI).
+    cancel: Arc<AtomicBool>,
+    /// Z-Image: measured height (last frame) of everything between the prompt box
+    /// and the end of the Log row. The prompt stretches by this much short of the
+    /// panel bottom, so the Log row + copy icon sit exactly on the bottom edge.
+    below_h: f32,
 }
 
 impl Default for GenerateState {
@@ -235,6 +246,9 @@ impl GenerateState {
             show_lora_popup: false,
             show_log: false,
             copy_flash: None,
+            spell: crate::spellcheck::SpellcheckState::default(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            below_h: 210.0,
         }
     }
 
@@ -358,7 +372,7 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
                         .size(12.0),
                 );
             } else {
-                let bg = if crate::theme::is_light() { FIELD() } else { Color32::from_rgb(15, 15, 17) };
+                let bg = if is_light() { FIELD() } else { Color32::from_rgb(15, 15, 17) };
                 egui::Frame::new()
                     .fill(bg)
                     .corner_radius(CornerRadius::same(10))
@@ -418,6 +432,25 @@ fn is_installed() -> bool {
 
 /// Render the Generate view into the right panel.
 pub fn show(ui: &mut egui::Ui, state: &mut GenerateState) {
+    if state.family == GenFamily::ZImage {
+        // Z-Image: the whole view is one scrollable column. Normally everything
+        // fits exactly (the prompt box is stretched so the Log row bottoms out at
+        // the panel edge); expanding the log console overflows the panel and this
+        // scroll area lets you scroll down to read it.
+        let panel_h = ui.available_height();
+        egui::ScrollArea::vertical()
+            .id_salt("zimage_view")
+            .auto_shrink([false, false])
+            .show(ui, |ui| show_inner(ui, state, Some(panel_h)));
+    } else {
+        show_inner(ui, state, None);
+    }
+}
+
+/// The view body. `fill_h` (Z-Image only) is the panel height to fill: the
+/// prompt box stretches so the content below it ends exactly at that height.
+fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: Option<f32>) {
+    let top_y = ui.cursor().min.y;
     // Drain background-runner messages.
     if let Some(rx) = &state.rx {
         let mut finished = false;
@@ -493,38 +526,24 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState) {
 
     ui.add_space(8.0);
 
-    // --- Model picker (+ a LoRA button for Z-Image). ---
-    ui.horizontal(|ui| {
+    // --- Model picker. (Flux only — Z-Image's compact selector sits inside the
+    // prompt box footer, next to the send icon. Its LoRA picker is in the + menu.)
+    if state.family != GenFamily::ZImage {
         ui.label(RichText::new("Model").color(MUTED()).size(12.0));
-        if state.family == GenFamily::ZImage {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let n = state.loras.iter().filter(|l| l.selected).count();
-                let label = if n > 0 { format!("LoRA ({n})") } else { "LoRA".to_string() };
-                let icon = egui::Image::new(egui::include_image!("../icons/lora.svg"))
-                    .fit_to_exact_size(egui::vec2(14.0, 14.0))
-                    .tint(crate::theme::icon_tint(MUTED()));
-                let btn = egui::Button::image_and_text(icon, RichText::new(label).size(11.0))
-                    .corner_radius(CornerRadius::same(10));
-                if ui.add(btn).clicked() {
-                    refresh_loras(state);
-                    state.show_lora_popup = true;
+        ui.add_space(2.0);
+        egui::ComboBox::from_id_salt("gen_model")
+            .width(ui.available_width())
+            .selected_text(state.model.label())
+            .show_ui(ui, |ui| {
+                for &m in GenModel::all_for(state.family) {
+                    if ui.selectable_label(state.model == m, m.label()).clicked() {
+                        state.model = m;
+                        state.steps = m.default_steps();
+                        state.cfg = m.default_cfg();
+                    }
                 }
             });
-        }
-    });
-    ui.add_space(2.0);
-    egui::ComboBox::from_id_salt("gen_model")
-        .width(ui.available_width())
-        .selected_text(state.model.label())
-        .show_ui(ui, |ui| {
-            for &m in GenModel::all_for(state.family) {
-                if ui.selectable_label(state.model == m, m.label()).clicked() {
-                    state.model = m;
-                    state.steps = m.default_steps();
-                    state.cfg = m.default_cfg();
-                }
-            }
-        });
+    }
     if state.model.gated() {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -533,7 +552,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState) {
             ui.add(
                 egui::Image::new(egui::include_image!("../icons/info.svg"))
                     .fit_to_exact_size(egui::vec2(14.0, 14.0))
-                    .tint(crate::theme::icon_tint(MUTED())),
+                    .tint(icon_tint(MUTED())),
             )
             .on_hover_ui(|ui| {
                 ui.set_max_width(260.0);
@@ -569,35 +588,113 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState) {
         .corner_radius(CornerRadius::same(22))
         .inner_margin(Margin::same(12))
         .stroke(egui::Stroke::new(1.0, EDGE()));
-    let (prompt_max_h, prompt_rows) = (300.0, 13);
+    // Flux keeps the fixed 300px box. Z-Image stretches the box downward so the
+    // settings + Log row below it (height measured last frame → state.below_h)
+    // bottom out exactly at the panel's edge.
+    let prompt_max_h = match fill_h {
+        // 24 = the prompt frame's own top+bottom inner margins.
+        Some(panel_h) => (panel_h - (ui.cursor().min.y - top_y) - state.below_h - 24.0).max(140.0),
+        None => 300.0,
+    };
+    let zimage = state.family == GenFamily::ZImage;
+    // Z-Image reserves a strip at the bottom of the box for the send/stop button
+    // so prompt text never hides underneath it.
+    let btn_strip = if zimage { 34.0 } else { 0.0 };
+    // Enough rows to fill the box's visible height, so a click anywhere inside
+    // lands on the text. (egui 0.34 ignores TextEdit::min_size's height — the
+    // allocation comes from desired_rows — so the row count is the only lever.)
+    let row_h = ui.text_style_height(&egui::TextStyle::Body);
+    let prompt_rows = (((prompt_max_h - btn_strip - 4.0) / row_h).floor() as usize).max(4);
     prompt_frame
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::ScrollArea::vertical()
                 .id_salt("flux_prompt")
-                .max_height(prompt_max_h)
+                .max_height(prompt_max_h - btn_strip)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut state.prompt)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(prompt_rows)
-                            .frame(egui::Frame::NONE)
-                            .hint_text("a cinematic photo of…"),
-                    );
+                    let out = egui::TextEdit::multiline(&mut state.prompt)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(prompt_rows)
+                        .frame(egui::Frame::NONE)
+                        .hint_text("a cinematic photo of…")
+                        .show(ui);
+                    // Live spell-check: red squiggles + right-click suggestions.
+                    crate::spellcheck::attach(ui, &out, &mut state.prompt, &mut state.spell);
                 });
+            if zimage {
+                // Send / stop button pinned to the box's bottom-right corner.
+                // Allocate an exact-height strip: a bare `with_layout` here would
+                // claim all remaining height (unbounded inside the outer scroll
+                // area) and balloon the prompt box to thousands of pixels.
+                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 28.0), Layout::left_to_right(Align::Center), |ui| {
+                    // "+" menu in the bottom-LEFT corner (flips to an × while
+                    // open) — home of the LoRA picker and future tools.
+                    let menu_id = ui.id().with("zimage_add_menu");
+                    let open = egui::Popup::is_id_open(ui.ctx(), menu_id);
+                    let (icon, tip) = if open {
+                        (egui::include_image!("../icons/close.svg"), "Close")
+                    } else {
+                        (egui::include_image!("../icons/add.svg"), "Add")
+                    };
+                    let add_resp = round_icon_button(ui, icon, 18.0, tip, true);
+                    egui::Popup::menu(&add_resp)
+                        .id(menu_id)
+                        .align(egui::RectAlign::TOP_START)
+                        .frame(menu_frame())
+                        .show(|ui| {
+                            ui.set_min_width(150.0);
+                            round_menu_rows(ui);
+                            let n = state.loras.iter().filter(|l| l.selected).count();
+                            let label = if n > 0 { format!("LoRA ({n})") } else { "LoRA".to_string() };
+                            let licon = egui::Image::new(egui::include_image!("../icons/lora.svg"))
+                                .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                                .tint(icon_tint(TEXT()));
+                            if ui.add(egui::Button::image_and_text(licon, RichText::new(label).size(12.0)).frame(false)).clicked() {
+                                refresh_loras(state);
+                                state.show_lora_popup = true;
+                                ui.close();
+                            }
+                        });
+
+                    // Send / stop pinned to the bottom-RIGHT corner, with the
+                    // compact model selector to their left.
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if state.running {
+                            if round_icon_button(ui, egui::include_image!("../icons/stop.svg"), 18.0, "Stop generating", true).clicked() {
+                                state.cancel.store(true, Ordering::SeqCst);
+                                state.status = "Cancelling…".into();
+                            }
+                        } else if !state.prompt.trim().is_empty() {
+                            // The send button only appears once you start typing.
+                            let inst = is_installed();
+                            let tip = if inst { "Generate" } else { "Run Setup Requirements first" };
+                            if round_icon_button(ui, egui::include_image!("../icons/send.svg"), 18.0, tip, inst).clicked() && inst {
+                                start_generate(state, ui.ctx());
+                            }
+                        } else {
+                            // Invisible stand-in so the model selector doesn't
+                            // drift into the corner while the send icon is hidden.
+                            ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
+                        }
+                        ui.add_space(2.0);
+                        model_selector(ui, state);
+                    });
+                });
+            }
         });
+    let after_prompt_y = ui.cursor().min.y;
 
     ui.add_space(8.0);
 
     // --- Settings. ---
-    int_slider(ui, "Steps", &mut state.steps, 1..=50);
+    slider(ui, "Steps", &mut state.steps, 1..=50);
     slider(ui, "Guidance (CFG)", &mut state.cfg, 1.0..=8.0);
     ui.horizontal(|ui| {
-        int_slider(ui, "Width", &mut state.width, 512..=1536);
+        slider(ui, "Width", &mut state.width, 512..=1536);
     });
     ui.horizontal(|ui| {
-        int_slider(ui, "Height", &mut state.height, 512..=1536);
+        slider(ui, "Height", &mut state.height, 512..=1536);
     });
     ui.horizontal(|ui| {
         // A radio-style filled dot instead of a checkmark for the toggle.
@@ -617,16 +714,18 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState) {
 
     ui.add_space(10.0);
 
-    // --- Generate. ---
-    let gen_btn = egui::Button::new(RichText::new("Generate").color(Color32::WHITE).strong())
-        .fill(ACCENT1())
-        .corner_radius(CornerRadius::same(12));
-    let can_gen = !state.running && is_installed() && !state.prompt.trim().is_empty();
-    if ui.add_enabled_ui(can_gen, |ui| ui.add_sized(egui::vec2(ui.available_width(), 34.0), gen_btn)).inner.clicked() {
-        start_generate(state, ui.ctx());
-    }
+    // --- Generate. (Flux only — Z-Image uses the send icon inside the prompt box.) ---
+    if state.family != GenFamily::ZImage {
+        let gen_btn = egui::Button::new(RichText::new("Generate").color(Color32::WHITE).strong())
+            .fill(ACCENT1())
+            .corner_radius(CornerRadius::same(12));
+        let can_gen = !state.running && is_installed() && !state.prompt.trim().is_empty();
+        if ui.add_enabled_ui(can_gen, |ui| ui.add_sized(egui::vec2(ui.available_width(), 34.0), gen_btn)).inner.clicked() {
+            start_generate(state, ui.ctx());
+        }
 
-    ui.add_space(8.0);
+        ui.add_space(8.0);
+    }
 
     // Generated images appear in the left browser + centre viewer while this view
     // is open (see ViewerApp::sync_flux_browser).
@@ -661,7 +760,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState) {
             let txt = visuals.text_color();
             ui.painter().rect(
                 rect,
-                egui::CornerRadius::same(10), // pill (radius = half the 20px height)
+                CornerRadius::same(10), // pill (radius = half the 20px height)
                 visuals.weak_bg_fill,
                 visuals.bg_stroke,
                 egui::StrokeKind::Inside,
@@ -677,7 +776,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState) {
 
             let icon_rect = egui::Rect::from_min_size(egui::pos2(x0, cy - icon / 2.0), egui::vec2(icon, icon));
             egui::Image::new(arrow_src)
-                .tint(crate::theme::icon_tint(txt))
+                .tint(icon_tint(txt))
                 .paint_at(ui, icon_rect);
             ui.painter()
                 .galley(egui::pos2(x0 + icon + gap, cy - galley.size().y / 2.0), galley, txt);
@@ -695,7 +794,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState) {
                 }
                 _ => None,
             };
-            let tint = flash_tint.unwrap_or_else(|| crate::theme::icon_tint(MUTED()));
+            let tint = flash_tint.unwrap_or_else(|| icon_tint(MUTED()));
             let copy_icon = egui::Image::new(egui::include_image!("../icons/copy.svg"))
                 .fit_to_exact_size(egui::vec2(16.0, 16.0))
                 .tint(tint);
@@ -714,8 +813,19 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState) {
             }
         });
     });
+    // Remember how tall everything between the prompt box and the end of the Log
+    // row is — next frame the Z-Image prompt stretches to push this row to the
+    // panel's bottom edge (the open log console below is deliberately excluded:
+    // it overflows and is reached by scrolling). Both cursor reads sit one
+    // item-spacing past their widget, so the difference needs no correction.
+    let below_h = ui.cursor().min.y - after_prompt_y;
+    if (below_h - state.below_h).abs() > 0.5 {
+        // Sizing settles one frame after a layout change — repaint to get there.
+        state.below_h = below_h;
+        ui.ctx().request_repaint();
+    }
     if state.show_log {
-        let bg = if crate::theme::is_light() { FIELD() } else { Color32::from_rgb(15, 15, 17) };
+        let bg = if is_light() { FIELD() } else { Color32::from_rgb(15, 15, 17) };
         egui::Frame::new()
             .fill(bg)
             .corner_radius(CornerRadius::same(22))
@@ -732,16 +842,96 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState) {
     }
 }
 
-fn slider(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).color(MUTED()).size(12.0));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.add(egui::Slider::new(value, range));
-        });
-    });
+/// Rounded-22 card frame for the prompt-box popup menus (+ menu, model list),
+/// matching the app's panel styling.
+fn menu_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(PANEL())
+        .corner_radius(CornerRadius::same(22))
+        .inner_margin(Margin::same(12))
+        .stroke(egui::Stroke::new(1.0, EDGE()))
 }
 
-fn int_slider(ui: &mut egui::Ui, label: &str, value: &mut i32, range: std::ops::RangeInclusive<i32>) {
+/// Round the hover highlight of menu rows (egui's default is square).
+fn round_menu_rows(ui: &mut egui::Ui) {
+    let radius = CornerRadius::same(6);
+    ui.visuals_mut().widgets.inactive.corner_radius = radius;
+    ui.visuals_mut().widgets.hovered.corner_radius = radius;
+}
+
+/// Compact model selector for the prompt-box footer: the model name (truncated
+/// with … past 150px — hover shows the full name) plus an up/down chevron.
+/// Clicking opens the model list in a rounded-22 popup above the footer.
+fn model_selector(ui: &mut egui::Ui, state: &mut GenerateState) {
+    let full = state.model.label();
+    let menu_id = ui.id().with("zimage_model_menu");
+    let open = egui::Popup::is_id_open(ui.ctx(), menu_id);
+
+    let mut job = egui::text::LayoutJob::simple_singleline(full.to_owned(), egui::FontId::proportional(12.0), TEXT());
+    job.wrap = egui::text::TextWrapping::truncate_at_width(150.0);
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let (arrow, gap) = (14.0, 2.0);
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(galley.size().x + gap + arrow, 28.0), egui::Sense::click());
+    let resp = resp.on_hover_text(full).on_hover_cursor(egui::CursorIcon::PointingHand);
+    if ui.is_rect_visible(rect) {
+        let text_pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
+        ui.painter().galley(text_pos, galley, TEXT());
+        let arrow_src = if open {
+            egui::include_image!("../icons/arrow_up.svg")
+        } else {
+            egui::include_image!("../icons/arrow_down.svg")
+        };
+        let arrow_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - arrow / 2.0, rect.center().y),
+            egui::vec2(arrow, arrow),
+        );
+        egui::Image::new(arrow_src).tint(icon_tint(MUTED())).paint_at(ui, arrow_rect);
+    }
+    egui::Popup::menu(&resp)
+        .id(menu_id)
+        .align(egui::RectAlign::TOP_END)
+        .frame(menu_frame())
+        .show(|ui| {
+            ui.set_min_width(240.0);
+            round_menu_rows(ui);
+            for &m in GenModel::all_for(state.family) {
+                if ui.selectable_label(state.model == m, m.label()).clicked() {
+                    state.model = m;
+                    state.steps = m.default_steps();
+                    state.cfg = m.default_cfg();
+                    ui.close();
+                }
+            }
+        });
+}
+
+/// A bare icon button on a 28px click target: the SVG is painted dead-centre,
+/// tinted to the theme's text colour (dark in light mode, white in dark mode,
+/// pink on Aurora — the white-authored SVGs take the tint 1:1). Dims when
+/// disabled.
+fn round_icon_button(
+    ui: &mut egui::Ui,
+    icon: egui::ImageSource<'_>,
+    icon_size: f32,
+    tip: &str,
+    enabled: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
+    let resp = resp.on_hover_text(tip);
+    let resp = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
+    if ui.is_rect_visible(rect) {
+        let tint = icon_tint(TEXT());
+        let tint = if enabled { tint } else { tint.gamma_multiply(0.45) };
+        egui::Image::new(icon)
+            .tint(tint)
+            .paint_at(ui, egui::Rect::from_center_size(rect.center(), egui::vec2(icon_size, icon_size)));
+    }
+    resp
+}
+
+/// Label + right-aligned slider row; works for both the f32 and i32 settings.
+fn slider<N: egui::emath::Numeric>(ui: &mut egui::Ui, label: &str, value: &mut N, range: std::ops::RangeInclusive<N>) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(label).color(MUTED()).size(12.0));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -968,6 +1158,8 @@ fn start_generate(state: &mut GenerateState, ctx: &egui::Context) {
     state.running = true;
     state.status = "Generating…".into();
     state.status_err = false;
+    state.cancel.store(false, Ordering::SeqCst);
+    let cancel = state.cancel.clone();
 
     let seed = if state.randomize_seed {
         (std::time::SystemTime::now()
@@ -995,7 +1187,7 @@ fn start_generate(state: &mut GenerateState, ctx: &egui::Context) {
     };
     let ctx = ctx.clone();
     std::thread::spawn(move || {
-        let ok = run_generate(job, &tx, &ctx);
+        let ok = run_generate(job, &tx, &ctx, &cancel);
         let _ = tx.send(RunnerMsg::Done(ok));
         ctx.request_repaint();
     });
@@ -1013,7 +1205,7 @@ struct GenJob {
     loras: Vec<(String, f32)>,
 }
 
-fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context) -> bool {
+fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, cancel: &AtomicBool) -> bool {
     let send = |s: String| {
         let _ = tx.send(RunnerMsg::Line(s));
         ctx.request_repaint();
@@ -1084,6 +1276,18 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context) 
     status("Generating…");
     let mut images: Option<serde_json::Value> = None;
     for _ in 0..600 {
+        if cancel.load(Ordering::SeqCst) {
+            // Abort the running job server-side (and drop it from the queue in
+            // case it hadn't started), then bail out without flagging an error.
+            let _ = agent.post(&format!("{SERVER_URL}/interrupt")).send_empty();
+            let _ = agent
+                .post(&format!("{SERVER_URL}/queue"))
+                .header("Content-Type", "application/json")
+                .send(serde_json::json!({ "delete": [prompt_id] }).to_string().as_str());
+            send("== Cancelled".into());
+            status("Cancelled");
+            return true;
+        }
         std::thread::sleep(std::time::Duration::from_millis(500));
         // Live step progress, parsed from the server's tqdm output → shown by the orb.
         if let Some(pct) = read_progress(&log_path, log_offset) {

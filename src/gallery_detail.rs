@@ -82,6 +82,10 @@ pub struct DetailPopup {
     /// The image viewer's own zoom/pan + right-click menu state (independent of
     /// the centre viewer's).
     zoom: crate::zoom::ZoomState,
+    /// In-popup video playback (its own player, independent of the centre
+    /// viewer's), plus the clip it was started for.
+    video_player: Option<crate::video::VideoPlayer>,
+    video_path: Option<PathBuf>,
 }
 
 impl Default for DetailPopup {
@@ -109,6 +113,8 @@ impl Default for DetailPopup {
             artist: std::collections::HashSet::new(),
             character: std::collections::HashSet::new(),
             zoom: crate::zoom::ZoomState::default(),
+            video_player: None,
+            video_path: None,
         }
     }
 }
@@ -136,6 +142,10 @@ impl DetailPopup {
         self.save_flash = None;
         self.edit_flash_start = None;
         self.show_delete_confirm = false;
+        // Stop any clip from the previous popup content; if `path` is a video it
+        // restarts fresh in `draw_video` (also re-points it on arrow-key paging).
+        self.video_player = None;
+        self.video_path = None;
 
         // Everything that touches the image file goes to a background thread:
         // the SD-metadata read first (a hi-res file is read in full and scanned,
@@ -175,6 +185,12 @@ impl DetailPopup {
         self.artist = roles.artist;
         self.character = roles.character;
     }
+
+    /// The clip currently playing in the popup, if any — the poster cache skips
+    /// it so the file isn't decoded twice at once (like the centre player).
+    pub fn playing_video(&self) -> Option<&Path> {
+        self.video_player.as_ref().and(self.video_path.as_deref())
+    }
 }
 
 /// What the popup asks the app to do after it closes.
@@ -199,6 +215,9 @@ pub fn show(
     confirm_before_delete: &mut bool,
 ) -> DetailAction {
     if !popup.open {
+        // Release a playing clip once the popup is gone (stops VLC, frees the file).
+        popup.video_player = None;
+        popup.video_path = None;
         return DetailAction::None;
     }
     // Non-blocking drain of the background loader.
@@ -277,10 +296,14 @@ pub fn show(
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         ui.set_min_size(egui::vec2(img_w, col_h));
-                        let is_fav = favorites.is_favorite(&path);
-                        let va = draw_image(ui, &mut popup.zoom, viewer, &path, is_fav);
-                        if !matches!(va, crate::zoom::ViewerAction::None) {
-                            action = DetailAction::Viewer(va, path.clone());
+                        if crate::is_video(&path) {
+                            draw_video(ui, popup, &path);
+                        } else {
+                            let is_fav = favorites.is_favorite(&path);
+                            let va = draw_image(ui, &mut popup.zoom, viewer, &path, is_fav);
+                            if !matches!(va, crate::zoom::ViewerAction::None) {
+                                action = DetailAction::Viewer(va, path.clone());
+                            }
                         }
                     },
                 );
@@ -334,6 +357,9 @@ pub fn show(
 
     if want_close {
         popup.open = false;
+        // Stop playback right away (don't wait a frame for the early return).
+        popup.video_player = None;
+        popup.video_path = None;
     }
     action
 }
@@ -658,9 +684,42 @@ fn tags_box_fill(ui: &mut egui::Ui, popup: &mut DetailPopup) {
     }
 }
 
+/// Play the video in the popup's left column via libVLC — the same lifecycle as
+/// the centre viewer: (re)start the player when the clip changes, then pull
+/// decoded frames; show the install/unsupported notice when no player can run.
+fn draw_video(ui: &mut egui::Ui, popup: &mut DetailPopup, path: &Path) {
+    let support = crate::video::support();
+    if matches!(support, crate::video::VideoSupport::Available) {
+        if popup.video_path.as_deref() != Some(path) {
+            popup.video_path = Some(path.to_path_buf());
+            popup.video_player = crate::video::VideoPlayer::start(path, ui.ctx());
+        }
+        if let Some(player) = &mut popup.video_player {
+            match player.frame(ui.ctx()) {
+                Some(tex) => crate::show_fitted(ui, &tex, false),
+                None => {
+                    ui.centered_and_justified(|ui| {
+                        ui.add(egui::Spinner::new().size(48.0).color(MUTED()));
+                    });
+                }
+            }
+            // Keep pulling frames, capped to ~60 Hz like the centre viewer (new
+            // frames also wake us instantly via the player's display callback).
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+            return;
+        }
+    } else {
+        // No runtime (or unsupported build): drop any stale player so that, once
+        // VLC is installed, reopening the clip restarts it.
+        popup.video_player = None;
+        popup.video_path = None;
+    }
+    crate::video_notice(ui, path, support);
+}
+
 /// Draw the image in the column. For a ready static image this delegates to the
-/// shared zoom viewer (zoom/pan + right-click menu) and returns its action; videos
-/// and not-yet-loaded images show a placeholder.
+/// shared zoom viewer (zoom/pan + right-click menu) and returns its action;
+/// not-yet-loaded images show a placeholder.
 fn draw_image(
     ui: &mut egui::Ui,
     zoom: &mut crate::zoom::ZoomState,
@@ -669,16 +728,6 @@ fn draw_image(
     is_fav: bool,
 ) -> crate::zoom::ViewerAction {
     let rect = ui.available_rect_before_wrap();
-
-    if crate::is_video(path) {
-        ui.painter().rect_filled(rect, egui::CornerRadius::same(22), FIELD());
-        let s = (rect.width().min(rect.height()) * 0.25).clamp(32.0, 96.0);
-        let icon = egui::Rect::from_center_size(rect.center(), egui::vec2(s, s));
-        egui::Image::new(egui::include_image!("../icons/video.svg"))
-            .tint(MUTED())
-            .paint_at(ui, icon);
-        return crate::zoom::ViewerAction::None;
-    }
 
     let now = ui.input(|i| i.time);
     match viewer.request(path, now) {
