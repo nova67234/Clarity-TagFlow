@@ -1091,7 +1091,7 @@ pub(crate) fn hide_window(cmd: &mut std::process::Command) {
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 }
 #[cfg(not(windows))]
-fn hide_window(_cmd: &mut std::process::Command) {}
+pub(crate) fn hide_window(_cmd: &mut std::process::Command) {}
 
 /// Tie every process this module spawns to the app's lifetime, so closing
 /// Clarity_TagFlow (or it crashing) can never leave an orphaned Python/CUDA job
