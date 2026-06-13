@@ -83,3 +83,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ClarityTagFlow-macOS.dmg
+          # Mark hyphenated tags (e.g. v0.5.0-rc.1) as pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}

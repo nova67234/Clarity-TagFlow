@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use crate::theme::{EDGE, FIELD, MUTED, TEXT};
+use crate::theme::{EDGE, FIELD, MUTED, PANEL, TEXT};
 
 const USER_AGENT: &str = "Clarity TagFlow (Civitai resource lookup)";
 const API_PING: &str = "https://civitai.com/api/v1/models?limit=1";
@@ -43,6 +43,11 @@ enum ItemType {
     Lora,
     Vae,
     Embedding,
+    /// Referenced by version id but with no recognisable type in the metadata
+    /// (newer `Civitai metadata` resources may omit it, and Civitai has types we
+    /// don't section — upscalers, motion modules, …). Classified after lookup
+    /// by the API-reported type.
+    Other,
 }
 
 #[derive(Clone, Copy)]
@@ -91,6 +96,10 @@ struct Fetched {
     /// The Civitai `type` ("LORA" / "LoCon" / "DoRA" / …), used to split LoRAs
     /// from LyCORIS-style models into separate sections.
     resource_type: String,
+    /// API download URL for the resolved version's primary file (for in-app
+    /// download), and the file's suggested name.
+    download_url: String,
+    download_filename: Option<String>,
 }
 
 struct FetchedSection {
@@ -108,6 +117,30 @@ enum CivMsg {
     Done(Box<CivResult>),
 }
 
+/// What the Download button asks for (collected during render, acted on after).
+struct DownloadRequest {
+    name: String,
+    download_url: String,
+    filename: Option<String>,
+}
+
+/// Progress from a model-download worker thread.
+enum DlMsg {
+    Progress(u64, u64), // received, total (total = 0 if unknown)
+    Done(std::path::PathBuf),
+    Error(String),
+}
+
+/// One in-flight / finished model download, shown as a progress row.
+struct Download {
+    name: String,
+    rx: Option<Receiver<DlMsg>>,
+    received: u64,
+    total: u64,
+    status: String,
+    ok: bool,
+}
+
 // ---------------------------------------------------------------------------
 // UI-side resolved state (textures live here)
 // ---------------------------------------------------------------------------
@@ -118,6 +151,8 @@ struct UiResource {
     triggers: Vec<String>,
     tex: Option<egui::TextureHandle>,
     has_video_only: bool,
+    download_url: String,
+    download_filename: Option<String>,
 }
 
 struct UiSection {
@@ -151,6 +186,17 @@ pub struct CivitaiState {
     /// Civitai reachability: 0 = checking, 1 = online, 2 = offline.
     api_status: Arc<AtomicU8>,
     monitor_started: bool,
+
+    /// Civitai API key (plaintext in memory; stored encrypted on disk). Used for
+    /// authenticated model downloads. Loaded once on first show.
+    api_key: String,
+    /// Folder downloaded models are saved into (like the Gelbooru downloader).
+    download_dir: String,
+    key_loaded: bool,
+    /// Whether the API-key / download settings popup is open.
+    show_settings: bool,
+    /// In-flight / finished model downloads (progress rows).
+    downloads: Vec<Download>,
 }
 
 impl Default for CivitaiState {
@@ -163,6 +209,11 @@ impl Default for CivitaiState {
             cancel: Arc::new(AtomicBool::new(false)),
             api_status: Arc::new(AtomicU8::new(API_CHECKING)),
             monitor_started: false,
+            api_key: String::new(),
+            download_dir: String::new(),
+            key_loaded: false,
+            show_settings: false,
+            downloads: Vec::new(),
         }
     }
 }
@@ -183,6 +234,50 @@ pub fn show(
     if !state.monitor_started {
         state.monitor_started = true;
         start_api_monitor(Arc::clone(&state.api_status), ui.ctx().clone());
+    }
+    // Load the saved (encrypted) API key + download folder once.
+    if !state.key_loaded {
+        state.key_loaded = true;
+        state.api_key = load_civitai_key();
+        state.download_dir = load_download_dir();
+    }
+
+    // Drain model-download progress.
+    let mut any_active = false;
+    for d in &mut state.downloads {
+        // Drain into a Vec first so the `&d.rx` borrow ends before we mutate `d`.
+        let msgs: Vec<DlMsg> = match &d.rx {
+            Some(rx) => std::iter::from_fn(|| rx.try_recv().ok()).collect(),
+            None => Vec::new(),
+        };
+        for msg in msgs {
+            match msg {
+                DlMsg::Progress(r, t) => {
+                    d.received = r;
+                    d.total = t;
+                    d.status = "Downloading…".into();
+                }
+                DlMsg::Done(path) => {
+                    d.rx = None;
+                    d.ok = true;
+                    d.status = format!(
+                        "Saved to {}",
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
+                    );
+                }
+                DlMsg::Error(e) => {
+                    d.rx = None;
+                    d.ok = false;
+                    d.status = format!("Failed: {e}");
+                }
+            }
+        }
+        if d.rx.is_some() {
+            any_active = true;
+        }
+    }
+    if any_active {
+        ui.ctx().request_repaint_after(Duration::from_millis(150));
     }
 
     // Drain worker messages.
@@ -242,17 +337,35 @@ pub fn show(
         ui.heading(egui::RichText::new("Civitai Resources").color(TEXT()).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             api_pill(ui, state.api_status.load(Ordering::Relaxed));
+            // Settings gear next to the status: opens the API-key popup. Nudged up
+            // ~3px (negative top margin) so it optically centres with the text/dot.
+            let gear = egui::include_image!("../icons/settings.svg");
+            let gear_clicked = egui::Frame::new()
+                .inner_margin(egui::Margin { left: 0, right: 0, top: -3, bottom: 0 })
+                .show(ui, |ui| {
+                    crate::svg_button(ui, gear, "Civitai API key", 18.0, crate::theme::icon_tint(MUTED())).clicked()
+                })
+                .inner;
+            if gear_clicked {
+                state.show_settings = !state.show_settings;
+            }
         });
     });
     ui.add_space(8.0);
 
-    // Body.
+    // API-key / download settings popup.
+    if state.show_settings {
+        api_key_popup(ui.ctx(), state);
+    }
+
+    // Body. The Download buttons set `download_req`, acted on after rendering.
+    let mut download_req: Option<DownloadRequest> = None;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             match &state.result {
-                Some(res) => render_result(ui, res),
+                Some(res) => render_result(ui, res, &state.downloads, &state.download_dir, &mut download_req),
                 None => {
                     ui.add_space(24.0);
                     ui.vertical_centered(|ui| {
@@ -265,9 +378,18 @@ pub fn show(
                 }
             }
         });
+    if let Some(req) = download_req {
+        start_download(state, req, ui.ctx());
+    }
 }
 
-fn render_result(ui: &mut egui::Ui, res: &UiResult) {
+fn render_result(
+    ui: &mut egui::Ui,
+    res: &UiResult,
+    downloads: &[Download],
+    download_dir: &str,
+    download_req: &mut Option<DownloadRequest>,
+) {
     if let Some(url) = &res.source_url {
         section_label(ui, "Original Upload");
         source_link_card(ui, url);
@@ -278,7 +400,7 @@ fn render_result(ui: &mut egui::Ui, res: &UiResult) {
         }
         section_label(ui, &section.title);
         for item in &section.items {
-            resource_card(ui, item);
+            resource_card(ui, item, downloads, download_dir, download_req);
         }
     }
 }
@@ -311,7 +433,25 @@ fn source_link_card(ui: &mut egui::Ui, url: &str) {
 
 /// A single resource card: preview thumbnail (or video placeholder) on the left,
 /// name + trigger words on the right. The whole card is clickable.
-fn resource_card(ui: &mut egui::Ui, data: &UiResource) {
+fn resource_card(
+    ui: &mut egui::Ui,
+    data: &UiResource,
+    downloads: &[Download],
+    download_dir: &str,
+    download_req: &mut Option<DownloadRequest>,
+) {
+    // Latest download for this resource (any state), driving the right-slot icon.
+    let dl = downloads.iter().rev().find(|d| d.name == data.name);
+    // Already installed? Check whether its file exists in the models folder.
+    let installed = !download_dir.is_empty()
+        && data
+            .download_filename
+            .as_deref()
+            .map(|f| Path::new(download_dir).join(sanitize_filename(f)).exists())
+            .unwrap_or(false);
+    // Rect of the Download button, so a click there starts a download instead of
+    // opening the page (the card-level interact below would otherwise win).
+    let mut dl_rect: Option<egui::Rect> = None;
     let inner = card_body(ui, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
@@ -329,18 +469,93 @@ fn resource_card(ui: &mut egui::Ui, data: &UiResource) {
                 video_placeholder(ui);
             }
 
-            ui.vertical(|ui| {
-                crate::emoji::label(ui, &data.name, TEXT(), 12.0, true);
-                if !data.triggers.is_empty() {
-                    ui.add_space(2.0);
-                    crate::emoji::label(
-                        ui,
-                        &format!("Triggers: {}", data.triggers.join(", ")),
-                        MUTED(),
-                        11.0,
-                        false,
-                    );
+            // The right slot is added FIRST (so it reserves its space); the
+            // name/triggers then fill and WRAP in the remaining width. Otherwise a
+            // long resource name lays out on one line and pushes the whole panel
+            // wider than the other right-panel views. The slot reflects the
+            // download state: downloading → % · done/installed → green check ·
+            // failed → orange warning (instant hover error) · idle → download arrow.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(2.0);
+                match dl {
+                    Some(d) if d.rx.is_some() => {
+                        let pct = if d.total > 0 {
+                            (d.received as f64 / d.total as f64 * 100.0).round() as u32
+                        } else {
+                            0
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("{pct}%"))
+                                .color(crate::theme::ACCENT1())
+                                .strong()
+                                .size(13.0),
+                        );
+                    }
+                    Some(d) if d.ok => {
+                        ui.add(
+                            egui::Image::new(egui::include_image!("../icons/checkmark.svg"))
+                                .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                                .tint(egui::Color32::from_rgb(46, 160, 67)),
+                        )
+                        .on_hover_text(&d.status);
+                    }
+                    Some(d) => {
+                        // Failed — orange warning with an immediately-shown tooltip.
+                        ui.scope(|ui| {
+                            ui.style_mut().interaction.tooltip_delay = 0.0;
+                            ui.add(
+                                egui::Image::new(egui::include_image!("../icons/warning.svg"))
+                                    .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                                    .sense(egui::Sense::hover())
+                                    .tint(egui::Color32::from_rgb(235, 150, 45)),
+                            )
+                            .on_hover_text(&d.status);
+                        });
+                    }
+                    None if installed => {
+                        // Already downloaded — green check.
+                        ui.add(
+                            egui::Image::new(egui::include_image!("../icons/checkmark.svg"))
+                                .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                                .tint(egui::Color32::from_rgb(46, 160, 67)),
+                        )
+                        .on_hover_text("Already in your models folder");
+                    }
+                    None => {
+                        // Blue download arrow — a 20px clickable Image (NOT a
+                        // button) so it occupies the exact same footprint as the
+                        // check/warning icons and the slot doesn't jump on state
+                        // change. The click is detected by position (below).
+                        let arrow = egui::include_image!("../icons/arrow_circle_down.svg");
+                        let r = ui
+                            .add(
+                                egui::Image::new(arrow)
+                                    .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                                    .tint(crate::theme::ACCENT1())
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("Download into your models folder");
+                        if r.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        dl_rect = Some(r.rect);
+                    }
                 }
+                // Remaining width → name + triggers, left-aligned and wrapped.
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(ui.available_width());
+                    crate::emoji::label(ui, &data.name, TEXT(), 12.0, true);
+                    if !data.triggers.is_empty() {
+                        ui.add_space(2.0);
+                        crate::emoji::label(
+                            ui,
+                            &format!("Triggers: {}", data.triggers.join(", ")),
+                            MUTED(),
+                            11.0,
+                            false,
+                        );
+                    }
+                });
             });
         });
     });
@@ -350,7 +565,22 @@ fn resource_card(ui: &mut egui::Ui, data: &UiResource) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     if resp.clicked() {
-        open_url(ui.ctx(), &data.url);
+        // A click on the Download button starts a download; anywhere else on the
+        // card opens the resource page. We test by click position because the
+        // card's interact can swallow the button's own click event.
+        let on_download = matches!(
+            (resp.interact_pointer_pos(), dl_rect),
+            (Some(p), Some(r)) if r.contains(p)
+        );
+        if on_download {
+            *download_req = Some(DownloadRequest {
+                name: data.name.clone(),
+                download_url: data.download_url.clone(),
+                filename: data.download_filename.clone(),
+            });
+        } else {
+            open_url(ui.ctx(), &data.url);
+        }
     }
 }
 
@@ -375,8 +605,9 @@ fn video_placeholder(ui: &mut egui::Ui) {
 }
 
 /// The shared rounded card frame; returns the frame's allocated response so the
-/// caller can make the whole card clickable.
-fn card_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+/// caller can make the whole card clickable. (Also used by the Generate panels'
+/// LoRA picker, so its cards match this panel's.)
+pub(crate) fn card_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
     let r = egui::Frame::new()
         .fill(FIELD())
         .corner_radius(egui::CornerRadius::same(12))
@@ -391,24 +622,408 @@ fn card_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Respon
 }
 
 /// Draw the coloured "API: …" status pill (same look as the downloader's).
-fn api_pill(ui: &mut egui::Ui, api: u8) {
-    let (text, bg) = match api {
-        API_ONLINE => ("Online", egui::Color32::from_rgb(35, 137, 58)),
-        API_OFFLINE => ("Offline", egui::Color32::from_rgb(160, 60, 60)),
-        _ => ("Checking…", egui::Color32::from_rgb(120, 120, 120)),
-    };
-    egui::Frame::new()
-        .fill(bg)
-        .corner_radius(egui::CornerRadius::same(8))
-        .inner_margin(egui::Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(format!("API: {text}"))
-                    .color(egui::Color32::WHITE)
-                    .size(11.0)
-                    .strong(),
+/// The Civitai settings popup: API key (stored encrypted via src/secret.rs) and a
+/// download folder for models. A modern, sectioned card.
+fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
+    use crate::PopupPlacement;
+    egui::Window::new("")
+        .id(egui::Id::new("civitai_settings"))
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .placed_centered(ctx)
+        .frame(
+            egui::Frame::new()
+                .fill(PANEL())
+                .corner_radius(egui::CornerRadius::same(16))
+                .inner_margin(egui::Margin::same(18))
+                .stroke(egui::Stroke::new(1.0, EDGE()))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 6],
+                    blur: 20,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(150),
+                }),
+        )
+        .show(ctx, |ui| {
+            // Only the top strip drags the popup — not stray drags on the body.
+            crate::popup_drag_strip(ui, 30.0);
+            ui.set_width(380.0);
+            let radius = egui::CornerRadius::same(10);
+            {
+                let v = ui.visuals_mut();
+                v.widgets.inactive.corner_radius = radius;
+                v.widgets.hovered.corner_radius = radius;
+                v.widgets.active.corner_radius = radius;
+                v.extreme_bg_color = FIELD();
+            }
+
+            // Title row.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add(
+                    egui::Image::new(egui::include_image!("../icons/civitai.svg"))
+                        .fit_to_exact_size(egui::vec2(20.0, 20.0)),
+                );
+                ui.heading(egui::RichText::new("Civitai Settings").color(TEXT()).strong().size(17.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // click_and_drag so a click that slips a pixel is swallowed
+                    // by the button instead of dragging the popup.
+                    if ui
+                        .add(egui::Button::image(
+                            egui::Image::new(egui::include_image!("../icons/close.svg"))
+                                .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                                .tint(TEXT()),
+                        ).frame(false).sense(egui::Sense::click_and_drag()))
+                        .on_hover_text("Close")
+                        .clicked()
+                    {
+                        state.show_settings = false;
+                    }
+                });
+            });
+            ui.add_space(14.0);
+
+            // API key section.
+            ui.label(egui::RichText::new("API KEY").color(MUTED()).strong().size(11.0));
+            ui.add_space(4.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut state.api_key)
+                    .password(true)
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::Margin::symmetric(10, 8))
+                    .hint_text("Paste your Civitai API key"),
             );
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Stored encrypted on this device.").color(MUTED()).size(10.5),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    crate::arrow_link(ui, "Get a key", "https://civitai.com/user/account", Some(10.5));
+                });
+            });
+
+            ui.add_space(14.0);
+
+            // Download folder section.
+            ui.label(egui::RichText::new("MODELS FOLDER").color(MUTED()).strong().size(11.0));
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let folder = egui::include_image!("../icons/folder.svg");
+                if crate::svg_button(ui, folder, "Choose folder", 30.0, crate::theme::icon_tint(MUTED())).clicked() {
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        state.download_dir = dir.display().to_string();
+                    }
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.download_dir)
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::Margin::symmetric(10, 8))
+                        .hint_text("Where downloaded models are saved"),
+                );
+            });
+
+            ui.add_space(18.0);
+
+            // Actions (right-aligned: Save, then Clear key).
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if ui.add_sized(egui::vec2(80.0, 32.0), egui::Button::new("Clear key")).clicked() {
+                        state.api_key.clear();
+                        save_civitai_key("");
+                    }
+                    let save = egui::Button::new(
+                        egui::RichText::new("Save").color(egui::Color32::WHITE).strong(),
+                    )
+                    .fill(crate::theme::ACCENT1());
+                    if ui.add_sized(egui::vec2(90.0, 32.0), save).clicked() {
+                        save_civitai_key(&state.api_key);
+                        save_download_dir(&state.download_dir);
+                        state.show_settings = false;
+                    }
+                });
+            });
         });
+}
+
+/// Validate + start a model download on a worker thread.
+fn start_download(state: &mut CivitaiState, req: DownloadRequest, ctx: &egui::Context) {
+    let dir = state.download_dir.trim().to_string();
+    if dir.is_empty() {
+        // No folder yet — open settings so the user can pick one.
+        state.show_settings = true;
+        state.downloads.push(Download {
+            name: req.name,
+            rx: None,
+            received: 0,
+            total: 0,
+            status: "Failed: set a models folder in settings".into(),
+            ok: false,
+        });
+        return;
+    }
+    let key = state.api_key.trim().to_string();
+    let (tx, rx) = mpsc::channel();
+    state.downloads.push(Download {
+        name: req.name.clone(),
+        rx: Some(rx),
+        received: 0,
+        total: 0,
+        status: "Starting…".into(),
+        ok: false,
+    });
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        run_download(req.download_url, req.filename, key, std::path::PathBuf::from(dir), tx, ctx);
+    });
+}
+
+/// Stream a Civitai model file to `dir`, reporting progress. The token goes in the
+/// query string (not a header), since Civitai 302-redirects to S3 and strips
+/// headers on the cross-domain hop.
+fn run_download(
+    mut url: String,
+    filename_hint: Option<String>,
+    key: String,
+    dir: std::path::PathBuf,
+    tx: Sender<DlMsg>,
+    ctx: egui::Context,
+) {
+    use std::io::{Read, Write};
+
+    if !key.is_empty() {
+        url.push(if url.contains('?') { '&' } else { '?' });
+        url.push_str("token=");
+        url.push_str(&key);
+    }
+
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .max_redirects(10)
+        .http_status_as_error(false)
+        // No global/body timeout — model files are large; only bound setup phases.
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_send_request(Some(Duration::from_secs(15)))
+        .timeout_recv_response(Some(Duration::from_secs(30)))
+        .build()
+        .into();
+
+    let send_err = |e: String| {
+        let _ = tx.send(DlMsg::Error(e));
+        ctx.request_repaint();
+    };
+
+    let resp = match agent.get(&url).header("User-Agent", USER_AGENT).call() {
+        Ok(r) => r,
+        Err(e) => return send_err(format!("request failed: {e}")),
+    };
+    let mut resp = resp;
+    let status = resp.status().as_u16();
+    if status != 200 {
+        return send_err(if status == 401 || status == 403 {
+            "unauthorized — check your API key".into()
+        } else {
+            format!("HTTP {status}")
+        });
+    }
+
+    // Prefer the server-suggested filename, then the API file name, then a default.
+    let cd = resp
+        .headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .and_then(filename_from_content_disposition);
+    let name = cd
+        .or(filename_hint)
+        .unwrap_or_else(|| "civitai-model.safetensors".to_string());
+    let total: u64 = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return send_err(format!("cannot create folder: {e}"));
+    }
+    let dest = unique_path(&dir, &sanitize_filename(&name));
+    let tmp = dest.with_extension("part");
+    let mut out = match std::fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(e) => return send_err(format!("cannot write file: {e}")),
+    };
+
+    let mut reader = resp.body_mut().as_reader();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut got: u64 = 0;
+    let mut last_sent = 0u64;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => return send_err(format!("download error: {e}")),
+        };
+        if out.write_all(&buf[..n]).is_err() {
+            return send_err("write error".into());
+        }
+        got += n as u64;
+        if got - last_sent >= 1 << 20 {
+            last_sent = got;
+            let _ = tx.send(DlMsg::Progress(got, total));
+            ctx.request_repaint();
+        }
+    }
+    out.flush().ok();
+    drop(out);
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        return send_err(format!("could not finalize: {e}"));
+    }
+    let _ = tx.send(DlMsg::Done(dest));
+    ctx.request_repaint();
+}
+
+/// Extract a filename from a `Content-Disposition` header value.
+fn filename_from_content_disposition(cd: &str) -> Option<String> {
+    // filename*=UTF-8''name takes priority over filename="name".
+    if let Some(i) = cd.to_ascii_lowercase().find("filename*=") {
+        let rest = &cd[i + "filename*=".len()..];
+        let val = rest.split(';').next().unwrap_or(rest).trim();
+        let val = val.rsplit("''").next().unwrap_or(val);
+        let decoded = percent_decode(val.trim_matches('"'));
+        if !decoded.is_empty() {
+            return Some(decoded);
+        }
+    }
+    if let Some(i) = cd.to_ascii_lowercase().find("filename=") {
+        let rest = &cd[i + "filename=".len()..];
+        let val = rest.split(';').next().unwrap_or(rest).trim().trim_matches('"');
+        if !val.is_empty() {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+/// Minimal percent-decoding for Content-Disposition filenames.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Strip path separators / illegal characters from a download filename.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() { "civitai-model.safetensors".to_string() } else { cleaned.to_string() }
+}
+
+/// A non-clashing path in `dir`, appending " (n)" before the extension if needed.
+fn unique_path(dir: &Path, name: &str) -> std::path::PathBuf {
+    let base = dir.join(name);
+    if !base.exists() {
+        return base;
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) => (&name[..i], &name[i..]),
+        None => (name, ""),
+    };
+    for i in 1..100_000 {
+        let cand = dir.join(format!("{stem} ({i}){ext}"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    base
+}
+
+/// Path of the saved download-folder setting (plaintext — not sensitive).
+fn download_dir_path() -> std::path::PathBuf {
+    dirs::config_dir()
+        .map(|p| p.join("Clarity TagFlow").join("civitai_download_dir.txt"))
+        .unwrap_or_else(|| std::path::PathBuf::from("civitai_download_dir.txt"))
+}
+
+fn load_download_dir() -> String {
+    std::fs::read_to_string(download_dir_path()).map(|s| s.trim().to_string()).unwrap_or_default()
+}
+
+fn save_download_dir(dir: &str) {
+    let path = download_dir_path();
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(&path, dir.trim());
+}
+
+/// Path of the encrypted Civitai API key file in the app config dir.
+fn civitai_key_path() -> std::path::PathBuf {
+    dirs::config_dir()
+        .map(|p| p.join("Clarity TagFlow").join("civitai_api_key.dat"))
+        .unwrap_or_else(|| std::path::PathBuf::from("civitai_api_key.dat"))
+}
+
+/// Load the saved Civitai API key (decrypted), or "" if none/unreadable.
+fn load_civitai_key() -> String {
+    std::fs::read_to_string(civitai_key_path())
+        .ok()
+        .map(|s| crate::secret::unprotect(s.trim()))
+        .unwrap_or_default()
+}
+
+/// Save the Civitai API key encrypted. An empty key removes the file.
+fn save_civitai_key(key: &str) {
+    let path = civitai_key_path();
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, crate::secret::protect(trimmed));
+}
+
+fn api_pill(ui: &mut egui::Ui, api: u8) {
+    let (text, dot) = match api {
+        API_ONLINE => ("Online", egui::Color32::from_rgb(46, 160, 67)),
+        API_OFFLINE => ("Offline", egui::Color32::from_rgb(210, 70, 70)),
+        _ => ("Checking…", egui::Color32::from_rgb(150, 150, 150)),
+    };
+    // The header is a right-to-left layout and `ui.horizontal` inherits it (this
+    // keeps the group sized-to-content and right-aligned). So add the label FIRST
+    // (it lands rightmost) and the dot SECOND (to its left) to read "● Online".
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        ui.label(egui::RichText::new(text).color(MUTED()).size(11.0).strong());
+        // A small status dot painted to a fixed box so it stays crisp and centred.
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 4.0, dot);
+    });
 }
 
 fn open_url(ctx: &egui::Context, url: &str) {
@@ -439,6 +1054,8 @@ fn resolve(ctx: &egui::Context, res: CivResult) -> UiResult {
                         triggers: f.triggers,
                         tex,
                         has_video_only: f.has_video_only,
+                        download_url: f.download_url,
+                        download_filename: f.download_filename,
                     }
                 })
                 .collect(),
@@ -515,6 +1132,7 @@ fn run_fetch(
     let mut loras: Vec<Fetched> = Vec::new();
     let mut lycoris: Vec<Fetched> = Vec::new();
     let mut embeddings: Vec<Fetched> = Vec::new();
+    let mut others: Vec<Fetched> = Vec::new();
     let mut processed: HashSet<String> = HashSet::new();
 
     for task in &tasks {
@@ -548,7 +1166,17 @@ fn run_fetch(
             continue;
         }
 
-        match task.kind {
+        // Bucket by the API-reported type when it's one we recognise — it's
+        // authoritative, and `Other` tasks (no type in the metadata) only learn
+        // their type here. Fall back to whatever the metadata claimed.
+        let kind = match info.resource_type.to_lowercase().as_str() {
+            "checkpoint" => ItemType::Model,
+            "vae" => ItemType::Vae,
+            "lora" | "locon" | "lycoris" | "dora" => ItemType::Lora,
+            "textualinversion" => ItemType::Embedding,
+            _ => task.kind,
+        };
+        match kind {
             ItemType::Model => {
                 if model.is_none() {
                     model = Some(info);
@@ -568,6 +1196,9 @@ fn run_fetch(
                 }
             }
             ItemType::Embedding => embeddings.push(info),
+            // Still unrecognised after the lookup (upscaler, motion module, …) —
+            // show it rather than drop it.
+            ItemType::Other => others.push(info),
         }
     }
 
@@ -586,6 +1217,9 @@ fn run_fetch(
     }
     if !embeddings.is_empty() {
         sections.push(FetchedSection { title: "Embeddings".into(), items: embeddings });
+    }
+    if !others.is_empty() {
+        sections.push(FetchedSection { title: "Other Resources".into(), items: others });
     }
 
     let _ = tx.send(CivMsg::Done(Box::new(CivResult { source_url, sections })));
@@ -668,6 +1302,7 @@ fn fetch_resource_info(
                 ItemType::Lora => "&types=LORA&types=LoCon&types=Lycoris&types=DoRA",
                 ItemType::Vae => "&types=VAE",
                 ItemType::Embedding => "&types=TextualInversion",
+                ItemType::Other => "", // unknown — search across all types
             };
             let url = format!(
                 "https://civitai.com/api/v1/models?query={}&limit=1{}",
@@ -738,6 +1373,24 @@ fn get_formatted_model_data(
     let vid = as_text(version.get("id").unwrap_or(&serde_json::Value::Null)).unwrap_or_default();
     let page_url = format!("https://civitai.com/models/{model_id}?modelVersionId={vid}");
 
+    // Pick the primary file for download (its own downloadUrl + name), falling
+    // back to the version-level download endpoint.
+    let primary_file = version
+        .get("files")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|f| f.get("primary").and_then(|v| v.as_bool()).unwrap_or(false))
+                .or_else(|| arr.first())
+        });
+    let download_url = primary_file
+        .and_then(|f| f.get("downloadUrl").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("https://civitai.com/api/download/models/{vid}"));
+    let download_filename = primary_file
+        .and_then(|f| f.get("name").and_then(|v| v.as_str()))
+        .map(|s| s.to_string());
+
     // Pick the first still-image preview; note if the version only has videos.
     let mut image_url: Option<String> = None;
     let mut has_video = false;
@@ -784,6 +1437,8 @@ fn get_formatted_model_data(
         image,
         has_video_only,
         resource_type,
+        download_url,
+        download_filename,
     })
 }
 
@@ -814,8 +1469,34 @@ fn sized_image_url(url: &str, width: u32) -> String {
     parts.join("/")
 }
 
+/// First preview image (~200px render) of the Civitai model version matching a
+/// file hash — used by the Generate panels for LoRA thumbnails. Returns the raw
+/// downloaded bytes (a small JPEG), or None when the hash isn't on Civitai.
+pub(crate) fn preview_image_by_hash(sha256: &str) -> Option<Vec<u8>> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        // Match the other agents: we build ureq with only the native-tls feature,
+        // so the provider MUST be set explicitly — its default (Rustls) isn't
+        // compiled in and panics at connect time on an https URL.
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .timeout_global(Some(std::time::Duration::from_secs(20)))
+        .build()
+        .into();
+    let url = format!("https://civitai.com/api/v1/model-versions/by-hash/{sha256}");
+    let data = get_json(&agent, &url)?;
+    let images = data.get("images")?.as_array()?;
+    // Skip video previews — we want a still image.
+    let img = images.iter().find(|i| i.get("type").and_then(|t| t.as_str()) != Some("video"))?;
+    let img_url = img.get("url")?.as_str()?;
+    get_bytes(&agent, &sized_image_url(img_url, 200))
+}
+
 /// Decode downloaded preview bytes into a small `ColorImage` (max ~200px).
-fn decode_thumb(bytes: &[u8]) -> Option<egui::ColorImage> {
+pub(crate) fn decode_thumb(bytes: &[u8]) -> Option<egui::ColorImage> {
     let img = image::load_from_memory(bytes).ok()?;
     let thumb = img.thumbnail(200, 200).to_rgba8();
     let size = [thumb.width() as usize, thumb.height() as usize];
@@ -943,65 +1624,131 @@ fn parse_metadata_for_tasks(metadata: &str) -> Vec<Task> {
 
 fn parse_civitai_generator(metadata: &str) -> Vec<Task> {
     let mut tasks = Vec::new();
-    let Some(idx) = metadata.find("Civitai resources:") else {
-        return tasks;
-    };
-    let start = idx + "Civitai resources:".len();
-    let rest = &metadata[start..];
-    let mut block = match rest.find("Civitai metadata:") {
-        Some(m) => rest[..m].trim().to_string(),
-        None => rest.trim().to_string(),
-    };
-    if block.ends_with(',') {
-        block.pop();
-        block = block.trim().to_string();
-    }
-    let block: String = block.chars().filter(|&c| c != '\n' && c != '\r').collect();
-    // The metadata may have trailing junk after the `]` (e.g. EXIF/scan tail), so
-    // clip to the outermost `[ … ]` before parsing.
-    let block = match (block.find('['), block.rfind(']')) {
-        (Some(a), Some(b)) if b >= a => block[a..=b].to_string(),
-        _ => block,
-    };
+    let mut claimed_versions: HashSet<String> = HashSet::new();
 
-    if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&block) {
-        if let Some(items) = arr.as_array() {
-            for node in items {
-                // The resource type and model-version id come from either the old
-                // `type` + `modelVersionId` fields, or the newer Civitai AIR id
-                // (`"air":"urn:air:<eco>:<type>:<source>:<modelId>@<versionId>"`).
-                let mut type_str =
-                    node.get("type").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                let mut ver = node.get("modelVersionId").and_then(as_text_opt).unwrap_or_default();
+    // 1) The legacy `Civitai resources: [ … ]` array.
+    if let Some(idx) = metadata.find("Civitai resources:") {
+        let start = idx + "Civitai resources:".len();
+        let rest = &metadata[start..];
+        let mut block = match rest.find("Civitai metadata:") {
+            Some(m) => rest[..m].trim().to_string(),
+            None => rest.trim().to_string(),
+        };
+        if block.ends_with(',') {
+            block.pop();
+            block = block.trim().to_string();
+        }
+        let block: String = block.chars().filter(|&c| c != '\n' && c != '\r').collect();
+        // The metadata may have trailing junk after the `]` (e.g. EXIF/scan tail), so
+        // clip to the outermost `[ … ]` before parsing.
+        let block = match (block.find('['), block.rfind(']')) {
+            (Some(a), Some(b)) if b >= a => block[a..=b].to_string(),
+            _ => block,
+        };
 
-                if ver.is_empty() {
-                    if let Some(air) = node.get("air").and_then(|v| v.as_str()) {
-                        if let Some((air_type, version_id)) = parse_air(air) {
-                            if type_str.is_empty() {
-                                type_str = air_type;
-                            }
-                            ver = version_id;
-                        }
-                    }
-                }
-
-                if ver.is_empty() || ver == "0" {
-                    continue;
-                }
-                let kind = match type_str.as_str() {
-                    "checkpoint" => Some(ItemType::Model),
-                    "lora" | "locon" | "lycoris" | "dora" => Some(ItemType::Lora),
-                    "textualinversion" | "embedding" => Some(ItemType::Embedding),
-                    "vae" => Some(ItemType::Vae),
-                    _ => None,
-                };
-                if let Some(kind) = kind {
-                    tasks.push(Task::version(kind, ver));
+        if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&block) {
+            if let Some(items) = arr.as_array() {
+                for node in items {
+                    push_resource_node(node, &mut tasks, &mut claimed_versions);
                 }
             }
         }
     }
+
+    // 2) The newer `Civitai metadata: { … "resources": [ … ] }` JSON blob. On-site
+    //    generator exports (e.g. the Seedream ecosystem) leave `Civitai resources`
+    //    EMPTY and reference their checkpoint only here, so without this block such
+    //    images showed "No Civitai resources found".
+    if let Some(idx) = metadata.find("Civitai metadata:") {
+        let rest = &metadata[idx + "Civitai metadata:".len()..];
+        if let Some(json) = balanced_json_object(rest) {
+            if let Ok(root) = serde_json::from_str::<serde_json::Value>(json) {
+                for key in ["resources", "additionalResources"] {
+                    if let Some(items) = root.get(key).and_then(|v| v.as_array()) {
+                        for node in items {
+                            push_resource_node(node, &mut tasks, &mut claimed_versions);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     tasks
+}
+
+/// Turn one resource node from either Civitai-generator block into a lookup
+/// task, skipping versions another node already claimed. The resource type and
+/// model-version id come from either the old `type` + `modelVersionId` fields,
+/// or the newer Civitai AIR id
+/// (`"air":"urn:air:<eco>:<type>:<source>:<modelId>@<versionId>"`). A node with
+/// a version id but no recognisable type is still looked up (as `Other`) — the
+/// API response then says what it really is.
+fn push_resource_node(
+    node: &serde_json::Value,
+    tasks: &mut Vec<Task>,
+    claimed_versions: &mut HashSet<String>,
+) {
+    let mut type_str = node.get("type").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+    let mut ver = node.get("modelVersionId").and_then(as_text_opt).unwrap_or_default();
+
+    if ver.is_empty() {
+        if let Some(air) = node.get("air").and_then(|v| v.as_str()) {
+            if let Some((air_type, version_id)) = parse_air(air) {
+                if type_str.is_empty() {
+                    type_str = air_type;
+                }
+                ver = version_id;
+            }
+        }
+    }
+
+    if ver.is_empty() || ver == "0" || !claimed_versions.insert(ver.clone()) {
+        return;
+    }
+    let kind = match type_str.as_str() {
+        "checkpoint" => ItemType::Model,
+        "lora" | "locon" | "lycoris" | "dora" => ItemType::Lora,
+        "textualinversion" | "embedding" => ItemType::Embedding,
+        "vae" => ItemType::Vae,
+        _ => ItemType::Other,
+    };
+    tasks.push(Task::version(kind, ver));
+}
+
+/// Extract the balanced `{ … }` JSON object starting at the first `{` in `s`,
+/// string-aware so braces inside quoted values (e.g. the prompt) don't end it
+/// early. A naive find('}') would clip the `Civitai metadata` blob at its first
+/// nested object (`aspectRatio`) and fail to parse.
+fn balanced_json_object(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escape = false;
+    for (i, &b) in s.as_bytes().iter().enumerate().skip(start) {
+        if in_str {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Parse a Civitai AIR identifier
@@ -1131,7 +1878,10 @@ fn parse_a1111(metadata: &str) -> Vec<Task> {
                 }
             } else if let Some(name) = k.strip_prefix("embed:") {
                 let name = name.trim().to_string();
-                if claimed_hashes.insert(hash.clone()) {
+                // Civitai's by-hash endpoint matches AutoV2 (the first 10 hex of the
+                // SHA-256); a longer prefix is rejected, so clip to it.
+                let hash = autov2(&hash);
+                if !name.is_empty() && claimed_hashes.insert(hash.clone()) {
                     tasks.push(Task::embed(hash, name.clone()));
                     claimed_names.insert(name.to_lowercase());
                 }
@@ -1144,15 +1894,22 @@ fn parse_a1111(metadata: &str) -> Vec<Task> {
         for part in block.split(',') {
             if let Some((name, tail)) = part.split_once(':') {
                 let name = name.trim();
-                let hash: String = tail
+                // Skip names already captured from the "Hashes: {…}" block (this
+                // block repeats them, often with a longer non-resolving hash).
+                if name.is_empty() || claimed_names.contains(&name.to_lowercase()) {
+                    continue;
+                }
+                let hex: String = tail
                     .trim()
                     .chars()
                     .take_while(|c| c.is_ascii_hexdigit())
                     .collect();
-                let hash = hash.to_lowercase();
-                if name.is_empty() || !(8..=12).contains(&hash.len()) {
+                if hex.len() < 8 {
                     continue;
                 }
+                // Normalise to AutoV2 (≤10 hex) so a 12-char A1111 prefix still
+                // resolves on Civitai's by-hash endpoint.
+                let hash = autov2(&hex);
                 if claimed_hashes.insert(hash.clone()) {
                     tasks.push(Task::embed(hash, name.to_string()));
                     claimed_names.insert(name.to_lowercase());
@@ -1201,6 +1958,19 @@ fn label_value_block(metadata: &str, label: &str) -> Option<String> {
     } else {
         let end = rest.find('\n').unwrap_or(rest.len());
         Some(rest[..end].to_string())
+    }
+}
+
+/// Normalise a hex hash to its AutoV2 form: the first 10 hex chars of the SHA-256,
+/// lowercased. Civitai's `by-hash` endpoint matches AutoV2 exactly and rejects a
+/// longer prefix (e.g. the 12-char hashes A1111 writes into `TI hashes:`); an
+/// 8-char AutoV1 hash is left as-is.
+fn autov2(hash: &str) -> String {
+    let h = hash.trim().to_lowercase();
+    if h.len() > 10 {
+        h[..10].to_string()
+    } else {
+        h
     }
 }
 
@@ -1266,5 +2036,146 @@ mod sized_url_tests {
             sized_image_url("https://image.civitai.com/abc/uuid/x.jpeg", 200),
             "https://image.civitai.com/abc/uuid/width=200/x.jpeg"
         );
+    }
+}
+
+#[cfg(test)]
+mod civitai_generator_tests {
+    use super::{parse_civitai_generator, ItemType};
+
+    // Mirrors tests/bug/generator_import_*.jpg — Civitai on-site generator
+    // (Seedream ecosystem) exports: `Civitai resources` is EMPTY and the
+    // checkpoint is referenced only inside the `Civitai metadata` JSON blob,
+    // whose nested objects/strings must survive extraction.
+    const SEEDREAM: &str = "Highly detailed, photorealistic, a robot with glowing glyphs.\n\
+        Steps: 0, Sampler: Seedream-V45, CFG scale: 0, Seed: -1, Size: 2304x4096, \
+        Created Date: 2026-06-04T04:15:21.1001919Z, Civitai resources: [], \
+        Civitai metadata: {\"workflow\":\"txt2img\",\"priority\":\"low\",\
+        \"outputFormat\":\"jpeg\",\"ecosystem\":\"Seedream\",\"resolution\":\"4K\",\
+        \"aspectRatio\":{\"value\":\"9:16\",\"width\":2304,\"height\":4096},\
+        \"cfgScale\":5,\"seed\":1774949004,\
+        \"prompt\":\"a robot {with} \\\"glyphs\\\", bokeh\",\"quantity\":1,\
+        \"resources\":[{\"modelVersionId\":2470991,\"strength\":1,\"type\":\"Checkpoint\"}]}";
+
+    #[test]
+    fn finds_resources_in_civitai_metadata_blob() {
+        let tasks = parse_civitai_generator(SEEDREAM);
+        assert_eq!(tasks.len(), 1, "expected exactly one task");
+        assert!(tasks[0].kind == ItemType::Model);
+        assert_eq!(tasks[0].version_id.as_deref(), Some("2470991"));
+    }
+
+    // End-to-end against the real Civitai-generator JPEGs (UTF-16 EXIF
+    // UserComment → sd_metadata raw scan → parser). Ignored by default: the
+    // images live in the untracked tests/bug folder. Run with
+    // `cargo test seedream_jpegs -- --ignored`.
+    #[test]
+    #[ignore]
+    fn seedream_jpegs_end_to_end() {
+        for name in [
+            "tests/bug/generator_import_1780547142123_0.jpg",
+            "tests/bug/generator_import_1780631568326_0.jpg",
+        ] {
+            if !std::path::Path::new(name).exists() {
+                eprintln!("skipping {name} (not present locally)");
+                continue;
+            }
+            let (_disp, raw) = crate::sd_metadata::read_both(std::path::Path::new(name));
+            let raw = raw.expect("raw metadata should be found");
+            assert!(raw.contains("Civitai metadata:"), "{name}: blob missing");
+            let tasks = parse_civitai_generator(&raw);
+            assert_eq!(tasks.len(), 1, "{name}: expected one task");
+            assert!(tasks[0].kind == ItemType::Model);
+            assert_eq!(tasks[0].version_id.as_deref(), Some("2470991"));
+        }
+    }
+
+    // Diagnostic over the local tests/bug folder: times the metadata read and
+    // the full decode for each image and reports whether it decodes at all.
+    // Run with `cargo test bug_folder_diag -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bug_folder_diag() {
+        let Ok(dir) = std::fs::read_dir("tests/bug") else { return };
+        for entry in dir.flatten() {
+            let p = entry.path();
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp") {
+                continue;
+            }
+            let t = std::time::Instant::now();
+            let (disp, raw) = crate::sd_metadata::read_both(&p);
+            let t_meta = t.elapsed();
+            let t = std::time::Instant::now();
+            let decoded = image::open(&p);
+            let t_decode = t.elapsed();
+            let dims = decoded.as_ref().map(|i| format!("{}x{}", i.width(), i.height()));
+            println!(
+                "{}: read_both {t_meta:?} (display={} raw={}), decode {t_decode:?} -> {:?}, civitai tasks: {}",
+                p.display(),
+                disp.is_some(),
+                raw.is_some(),
+                dims,
+                raw.as_deref().map(|r| parse_civitai_generator(r).len()).unwrap_or(0),
+            );
+        }
+    }
+
+    #[test]
+    fn dedupes_versions_listed_in_both_blocks() {
+        // The same version in `Civitai resources` and `Civitai metadata` must
+        // only be looked up once; the typeless extra resource still surfaces
+        // (as Other) so the API lookup can classify it.
+        let meta = "prompt\nSteps: 20, \
+            Civitai resources: [{\"type\":\"checkpoint\",\"modelVersionId\":2470991}], \
+            Civitai metadata: {\"resources\":[{\"modelVersionId\":2470991,\"strength\":1},\
+            {\"modelVersionId\":12345,\"strength\":0.8}]}";
+        let tasks = parse_civitai_generator(meta);
+        assert_eq!(tasks.len(), 2, "got {} tasks", tasks.len());
+        assert!(tasks[0].kind == ItemType::Model);
+        assert_eq!(tasks[0].version_id.as_deref(), Some("2470991"));
+        assert!(tasks[1].kind == ItemType::Other);
+        assert_eq!(tasks[1].version_id.as_deref(), Some("12345"));
+    }
+}
+
+#[cfg(test)]
+mod embed_parse_tests {
+    use super::{parse_a1111, ItemType};
+
+    // Mirrors the real failing image: embeddings appear only in the `Hashes: {…}`
+    // and `TI hashes:` blocks (never as parseable prompt tags). The 10-char values
+    // are AutoV2 and resolve on Civitai; the 12-char `TI hashes` form does not.
+    const RAW: &str = "1girl, lazypos, <lora:USNR_STYLE_ILL:0.5>\n\
+        Negative prompt: lazyneg, lazyhand\n\
+        Steps: 30, Model hash: 5d255f746e, \
+        Hashes: {\"model\": \"5d255f746e\", \"lora:USNR_STYLE_ILL\": \"44586d0587\", \
+        \"embed:lazypos\": \"3086669265\", \"embed:lazyneg\": \"ba21023c70\"}, \
+        TI hashes: \"lazypos: 30866692653c, lazyneg: ba21023c7054, lazyreal: c23024a1f6a1\"";
+
+    #[test]
+    fn extracts_embeddings_as_autov2_without_duplicates() {
+        let tasks = parse_a1111(RAW);
+        let mut embeds: Vec<(String, String)> = tasks
+            .iter()
+            .filter(|t| t.kind == ItemType::Embedding)
+            .map(|t| (t.name.clone().unwrap_or_default(), t.hash.clone().unwrap_or_default()))
+            .collect();
+        embeds.sort();
+
+        // lazypos/lazyneg come from the Hashes block (10-char AutoV2); lazyreal is
+        // only in TI hashes (12-char) and is clipped to AutoV2 so it still resolves.
+        assert_eq!(
+            embeds,
+            vec![
+                ("lazyneg".into(), "ba21023c70".into()),
+                ("lazypos".into(), "3086669265".into()),
+                ("lazyreal".into(), "c23024a1f6".into()),
+            ],
+            "got {embeds:?}"
+        );
+
+        // The LoRA from the prompt tag is still captured by name.
+        assert!(tasks.iter().any(|t| t.kind == ItemType::Lora));
     }
 }

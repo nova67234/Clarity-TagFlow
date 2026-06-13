@@ -31,11 +31,11 @@ jobs:
         shell: pwsh
         run: |
           $ver = "3.0.21"
-          $url = "https://get.videolan.org/vlc/$ver/win64/vlc-$ver-win64.7z"
-          # get.videolan.org load-balances across mirrors; some occasionally serve
-          # an HTML error page instead of the archive (7z then reports "Is not
-          # archive"). Retry and validate the 7z magic bytes so a flaky mirror
-          # response doesn't fail the release.
+          # Use the canonical origin (download.videolan.org), NOT get.videolan.org:
+          # the latter load-balances across mirrors and was redirecting CI to a
+          # mirror that served an HTML error page instead of the 7z. The retry +
+          # 7z-magic validation below stays as a guard against transient blips.
+          $url = "https://download.videolan.org/pub/videolan/vlc/$ver/win64/vlc-$ver-win64.7z"
           $ok = $false
           for ($i = 1; $i -le 6; $i++) {
             try {
@@ -72,13 +72,16 @@ jobs:
           Copy-Item (Join-Path $lib 'libvlc.lib') (Join-Path $lib 'vlc.lib') -Force
           "VLC_LIB=$lib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      # Build with the vlc feature. RUSTFLAGS overrides the machine-specific paths
-      # in .cargo/config.toml: point the linker at the import lib above and
-      # delay-load libvlc.dll so the exe still launches when VLC isn't installed.
+      # Build with the vlc feature. RUSTFLAGS overrides the machine-specific path
+      # in .cargo/config.toml, pointing the linker at the import lib fetched above.
+      # The /DELAYLOAD:libvlc.dll + delayimp.lib link args are emitted by build.rs
+      # (so the exe still launches when VLC isn't installed) and need not be repeated
+      # here — repeating them in RUSTFLAGS is what previously left libvlc as a
+      # load-time import in some builds.
       - name: Build
         shell: pwsh
         env:
-          RUSTFLAGS: -L native=${{ env.VLC_LIB }} -C link-arg=/DELAYLOAD:libvlc.dll -C link-arg=delayimp.lib
+          RUSTFLAGS: -L native=${{ env.VLC_LIB }}
         run: cargo build --release --no-default-features --features vlc
 
       - name: Package into a .zip
@@ -86,17 +89,61 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force ClarityTagFlow-windows | Out-Null
           Copy-Item target/release/Clarity_TagFlow.exe ClarityTagFlow-windows/
+          # Bundle the runtime DLLs that `cargo build` stages next to the exe —
+          # the ONNX Runtime DirectML provider (DirectML.dll) and any
+          # onnxruntime*.dll — or the app fails to launch with a missing-DLL error.
+          # NEVER bundle VLC (libvlc*.dll / plugins): it is LGPL and we don't ship
+          # its license — the app uses the user's own VLC install at runtime and
+          # offers an install link when it's missing (build.rs also skips staging
+          # it when CI is set; this filter is defence in depth).
+          $staged = Get-ChildItem target/release -Filter *.dll -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notlike 'libvlc*' }
+          if ($staged) { Copy-Item $staged.FullName ClarityTagFlow-windows/ -Force }
+          Write-Host "Staged DLLs: $((Get-ChildItem ClarityTagFlow-windows -Filter *.dll).Name -join ', ')"
+          # Guard: fail the build outright if any VLC runtime file slipped in.
+          $vlcFiles = Get-ChildItem ClarityTagFlow-windows -Recurse |
+            Where-Object { $_.Name -like 'libvlc*' -or $_.Name -eq 'plugins' }
+          if ($vlcFiles) { throw "VLC runtime files must not be redistributed: $($vlcFiles.Name -join ', ')" }
+          # Bundle the Visual C++ runtime DLLs alongside the exe (app-local
+          # deployment) so users never need the Visual C++ Redistributable
+          # installed. We can't statically link the CRT because the prebuilt
+          # ONNX Runtime is built against the dynamic CRT (/MD), which conflicts
+          # with +crt-static — shipping the DLLs is the equivalent guarantee.
+          foreach ($dll in 'vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll') {
+            Copy-Item "$env:SystemRoot\System32\$dll" ClarityTagFlow-windows/ -ErrorAction Stop
+          }
           Compress-Archive -Path ClarityTagFlow-windows/* -DestinationPath ClarityTagFlow-windows.zip -Force
 
-      - name: Upload .zip artifact
+      # Build a per-user installer (Inno Setup ships on the GitHub Windows image)
+      # so users download one Setup.exe; it tucks the exe + DLLs into a private
+      # install folder and creates shortcuts — they never see a loose .dll.
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $ver = ($env:GITHUB_REF_NAME -replace '^v','')
+          if (-not $ver) { $ver = '0.0.0' }
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "Inno Setup (ISCC.exe) not found at $iscc" }
+          & $iscc "/DAppVer=$ver" "/DRepo=$($PWD.Path)" packaging\windows-installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          Get-ChildItem ClarityTagFlow-Setup.exe | Format-List Name, Length
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ClarityTagFlow-windows-zip
-          path: ClarityTagFlow-windows.zip
+          name: ClarityTagFlow-windows
+          path: |
+            ClarityTagFlow-Setup.exe
+            ClarityTagFlow-windows.zip
 
-      # When triggered by a v* tag, also attach the .zip to the GitHub Release.
+      # When triggered by a v* tag, attach the installer (and the portable zip as a
+      # fallback) to the GitHub Release.
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ClarityTagFlow-windows.zip
+          files: |
+            ClarityTagFlow-Setup.exe
+            ClarityTagFlow-windows.zip
+          # Mark hyphenated tags (e.g. v0.5.0-rc.1) as pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}

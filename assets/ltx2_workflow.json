@@ -1,0 +1,418 @@
+{
+ "278": {
+  "class_type": "RandomNoise",
+  "inputs": {
+   "noise_seed": 42
+  }
+ },
+ "279": {
+  "class_type": "RandomNoise",
+  "inputs": {
+   "noise_seed": 343011291748534
+  }
+ },
+ "280": {
+  "class_type": "LTXVConcatAVLatent",
+  "inputs": {
+   "video_latent": [
+    "290",
+    0
+   ],
+   "audio_latent": [
+    "309",
+    1
+   ]
+  }
+ },
+ "281": {
+  "class_type": "LTXVAudioVAELoader",
+  "inputs": {
+   "ckpt_name": "ltx-2.3-22b-distilled-fp8.safetensors"
+  }
+ },
+ "282": {
+  "class_type": "KSamplerSelect",
+  "inputs": {
+   "sampler_name": "euler_cfg_pp"
+  }
+ },
+ "283": {
+  "class_type": "ManualSigmas",
+  "inputs": {
+   "sigmas": "0.85, 0.7250, 0.4219, 0.0"
+  }
+ },
+ "284": {
+  "class_type": "CFGGuider",
+  "inputs": {
+   "model": [
+    "318",
+    0
+   ],
+   "positive": [
+    "286",
+    0
+   ],
+   "negative": [
+    "286",
+    1
+   ],
+   "cfg": 1
+  }
+ },
+ "285": {
+  "class_type": "SamplerCustomAdvanced",
+  "inputs": {
+   "noise": [
+    "279",
+    0
+   ],
+   "guider": [
+    "316",
+    0
+   ],
+   "sampler": [
+    "293",
+    0
+   ],
+   "sigmas": [
+    "308",
+    0
+   ],
+   "latent_image": [
+    "321",
+    0
+   ]
+  }
+ },
+ "286": {
+  "class_type": "LTXVCropGuides",
+  "inputs": {
+   "positive": [
+    "306",
+    0
+   ],
+   "negative": [
+    "306",
+    1
+   ],
+   "latent": [
+    "309",
+    0
+   ]
+  }
+ },
+ "288": {
+  "class_type": "ResizeImagesByLongerEdge",
+  "inputs": {
+   "images": [
+    "292",
+    0
+   ],
+   "longer_edge": 1536
+  }
+ },
+ "289": {
+  "class_type": "LTXVLatentUpsampler",
+  "inputs": {
+   "samples": [
+    "309",
+    0
+   ],
+   "upscale_model": [
+    "313",
+    0
+   ],
+   "vae": [
+    "318",
+    2
+   ]
+  }
+ },
+ "290": {
+  "class_type": "LTXVImgToVideoInplace",
+  "inputs": {
+   "vae": [
+    "318",
+    2
+   ],
+   "image": [
+    "291",
+    0
+   ],
+   "latent": [
+    "289",
+    0
+   ],
+   "strength": 1,
+   "bypass": true
+  }
+ },
+ "291": {
+  "class_type": "LTXVPreprocess",
+  "inputs": {
+   "image": [
+    "288",
+    0
+   ],
+   "img_compression": 18
+  }
+ },
+ "292": {
+  "class_type": "ResizeImageMaskNode",
+  "inputs": {
+   "input": [
+    "322",
+    0
+   ],
+   "resize_type": "scale dimensions",
+   "resize_type.width": 1280,
+   "resize_type.height": 704,
+   "resize_type.crop": "center",
+   "scale_method": "lanczos"
+  }
+ },
+ "293": {
+  "class_type": "KSamplerSelect",
+  "inputs": {
+   "sampler_name": "euler_ancestral_cfg_pp"
+  }
+ },
+ "297": {
+  "class_type": "EmptyLTXVLatentVideo",
+  "inputs": {
+   "width": 640,
+   "height": 352,
+   "length": 97,
+   "batch_size": 1
+  }
+ },
+ "298": {
+  "class_type": "LTXVImgToVideoInplace",
+  "inputs": {
+   "vae": [
+    "318",
+    2
+   ],
+   "image": [
+    "291",
+    0
+   ],
+   "latent": [
+    "297",
+    0
+   ],
+   "strength": 0.7,
+   "bypass": true
+  }
+ },
+ "299": {
+  "class_type": "LTXVAudioVAEDecode",
+  "inputs": {
+   "samples": [
+    "311",
+    1
+   ],
+   "audio_vae": [
+    "281",
+    0
+   ]
+  }
+ },
+ "305": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "319",
+    0
+   ],
+   "text": "A young woman with long flowing auburn hair in an elegant white dress stands in a sunlit meadow at golden hour. The light fabric of her dress billows and ripples in the warm breeze and her hair sways gently. The camera slowly pushes in as she turns toward us and smiles. Cinematic, photorealistic, sharp focus, fine detail, soft volumetric sunlight, shallow depth of field, smooth natural motion."
+  }
+ },
+ "306": {
+  "class_type": "LTXVConditioning",
+  "inputs": {
+   "positive": [
+    "305",
+    0
+   ],
+   "negative": [
+    "315",
+    0
+   ],
+   "frame_rate": 24
+  }
+ },
+ "307": {
+  "class_type": "LTXVEmptyLatentAudio",
+  "inputs": {
+   "audio_vae": [
+    "281",
+    0
+   ],
+   "frames_number": 97,
+   "frame_rate": 24,
+   "batch_size": 1
+  }
+ },
+ "308": {
+  "class_type": "ManualSigmas",
+  "inputs": {
+   "sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+  }
+ },
+ "309": {
+  "class_type": "LTXVSeparateAVLatent",
+  "inputs": {
+   "av_latent": [
+    "285",
+    0
+   ]
+  }
+ },
+ "310": {
+  "class_type": "SamplerCustomAdvanced",
+  "inputs": {
+   "noise": [
+    "278",
+    0
+   ],
+   "guider": [
+    "284",
+    0
+   ],
+   "sampler": [
+    "282",
+    0
+   ],
+   "sigmas": [
+    "283",
+    0
+   ],
+   "latent_image": [
+    "280",
+    0
+   ]
+  }
+ },
+ "311": {
+  "class_type": "LTXVSeparateAVLatent",
+  "inputs": {
+   "av_latent": [
+    "310",
+    0
+   ]
+  }
+ },
+ "312": {
+  "class_type": "CreateVideo",
+  "inputs": {
+   "images": [
+    "317",
+    0
+   ],
+   "audio": [
+    "299",
+    0
+   ],
+   "fps": 24
+  }
+ },
+ "313": {
+  "class_type": "LatentUpscaleModelLoader",
+  "inputs": {
+   "model_name": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+  }
+ },
+ "315": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "319",
+    0
+   ],
+   "text": "pc game, console game, video game, cartoon, childish, ugly"
+  }
+ },
+ "316": {
+  "class_type": "CFGGuider",
+  "inputs": {
+   "model": [
+    "318",
+    0
+   ],
+   "positive": [
+    "306",
+    0
+   ],
+   "negative": [
+    "306",
+    1
+   ],
+   "cfg": 1
+  }
+ },
+ "317": {
+  "class_type": "VAEDecodeTiled",
+  "inputs": {
+   "samples": [
+    "311",
+    0
+   ],
+   "vae": [
+    "318",
+    2
+   ],
+   "tile_size": 768,
+   "overlap": 64,
+   "temporal_size": 4096,
+   "temporal_overlap": 4
+  }
+ },
+ "318": {
+  "class_type": "CheckpointLoaderSimple",
+  "inputs": {
+   "ckpt_name": "ltx-2.3-22b-distilled-fp8.safetensors"
+  }
+ },
+ "319": {
+  "class_type": "LTXAVTextEncoderLoader",
+  "inputs": {
+   "text_encoder": "gemma_3_12B_it_fp4_mixed.safetensors",
+   "ckpt_name": "ltx-2.3-22b-distilled-fp8.safetensors",
+   "device": "default"
+  }
+ },
+ "321": {
+  "class_type": "LTXVConcatAVLatent",
+  "inputs": {
+   "video_latent": [
+    "298",
+    0
+   ],
+   "audio_latent": [
+    "307",
+    0
+   ]
+  }
+ },
+ "322": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "example.png",
+   "upload": "image"
+  }
+ },
+ "9000": {
+  "class_type": "SaveVideo",
+  "inputs": {
+   "video": [
+    "312",
+    0
+   ],
+   "filename_prefix": "ClarityLTX2",
+   "format": "mp4",
+   "codec": "h264"
+  }
+ }
+}

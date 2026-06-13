@@ -178,6 +178,20 @@ const CATALOG: &[ModelInfo] = &[
             ("model.onnx_data", "https://huggingface.co/onnx-community/depth-anything-v2-base-ONNX/resolve/main/onnx/model.onnx_data"),
         ],
     },
+    ModelInfo {
+        name: "BiRefNet Lite (background removal)",
+        tab: "Background",
+        folder: "birefnet-lite-onnx",
+        desc: "State-of-the-art background removal. Right-click an image → Remove \
+               Background to save a transparent-PNG cutout of the subject. Not a tagger.",
+        note: "Downloads model.onnx (~224 MB).",
+        repo: "https://huggingface.co/onnx-community/BiRefNet_lite-ONNX",
+        kind: None,
+        // Self-contained export (no external weights sidecar).
+        files: &[
+            ("model.onnx", "https://huggingface.co/onnx-community/BiRefNet_lite-ONNX/resolve/main/onnx/model.onnx"),
+        ],
+    },
 ];
 
 /// True when every file for a model is present in any of the searched model

@@ -23,6 +23,23 @@ const IMAGE_EXTENSIONS: &[&str] = &[
 #[cfg(feature = "avif")]
 const EXTENDED_IMAGE_EXTENSIONS: &[&str] = &["avif", "heic", "heif", "dng", "arw", "cr2", "nef"];
 
+/// True when `ext` (without the dot, any case) is one of the heavy "extended"
+/// image formats — AVIF / HEIC / HEIF and the TIFF-based camera raws — that need
+/// the pure-Rust decoders in `crate::avif` rather than `image::open`. Centralises
+/// the list that was otherwise repeated across every decode path. Always `false`
+/// in builds without the `avif` feature (those files aren't recognised anyway).
+pub(crate) fn is_extended_extension(ext: &str) -> bool {
+    #[cfg(feature = "avif")]
+    {
+        EXTENDED_IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+    }
+    #[cfg(not(feature = "avif"))]
+    {
+        let _ = ext;
+        false
+    }
+}
+
 /// Runtime flag mirroring `Settings::enable_extended_formats`, so the free
 /// `is_image()` helper (called all over) can gate the extended formats without
 /// threading `Settings` through every call site.
@@ -52,26 +69,42 @@ mod ai_orb;
 #[cfg(feature = "avif")]
 mod avif;
 mod backup;
+mod bgremove;
 mod civitai;
 mod depth;
 mod emoji;
 mod favorites;
 mod image_cache;
 mod download;
+mod gallery;
+mod gallery_detail;
+// Flux text-to-image generation (ComfyUI backend) — NVIDIA-only, like Pixal3D.
+#[cfg(not(target_os = "macos"))]
+mod generate;
 mod gif_info;
 mod left_browser;
 mod left_panel_settings;
 mod mp4;
+// Pixal3D image->3D requirement setup — Linux/Windows only (compiled out on macOS).
+#[cfg(not(target_os = "macos"))]
+mod pixal3d;
+// Interactive 3D viewer for Pixal3D's GLB output (centre panel). Linux/Windows
+// only, like Pixal3D — pulls in three-d, which is a not-macOS dependency.
+#[cfg(not(target_os = "macos"))]
+mod scene3d;
 mod raw_preview;
 mod right_details;
 mod scan;
 mod sd_metadata;
 mod secret;
 mod settings;
+mod spellcheck;
+mod splash;
 mod tag_manager;
 mod tag_manager_settings;
 mod tagger;
 mod top_bar;
+mod update;
 mod video; // embedded VLC playback (real backend only under --features vlc)
 mod zoom; // zoom + pan for the centre image viewer
 
@@ -85,6 +118,14 @@ fn main() -> eframe::Result {
             .with_min_inner_size([920.0, 460.0])
             .with_icon(load_app_icon()) // taskbar / title-bar icon
             .with_drag_and_drop(true),
+        // Use the OpenGL backend: the Pixal3D 3D viewer (src/scene3d.rs) renders
+        // with three-d into eframe's GL context. eframe 0.34 defaults to wgpu,
+        // which would silently drop the glow paint callback.
+        renderer: eframe::Renderer::Glow,
+        // Request a depth buffer: egui itself doesn't need one, but the 3D viewer
+        // does — without it three-d can't depth-test, so the model renders
+        // see-through (back faces show through the front) while orbiting.
+        depth_buffer: 24,
         ..Default::default()
     };
 
@@ -119,7 +160,7 @@ fn main() -> eframe::Result {
             }
             // Apply the saved colour theme before the first paint so a Light-mode
             // user doesn't see a dark flash on launch.
-            theme::set(app.settings.theme);
+            set(app.settings.theme);
             app.last_theme = app.settings.theme;
             apply_theme(&cc.egui_ctx);
             // Optional: open a folder passed on the command line (e.g. "Open with").
@@ -151,7 +192,41 @@ fn load_app_icon() -> egui::IconData {
 /// (text fields, scrollbars, etc.) match the custom-painted panels.
 fn apply_theme(ctx: &egui::Context) {
     // Delegates to the theme module, which picks the active Dark/Light palette.
-    theme::apply(ctx);
+    apply(ctx);
+}
+
+// ---------------------------------------------------------------------------
+// Background removal (BiRefNet) — async right-click action
+// ---------------------------------------------------------------------------
+
+/// Catalog folder for the BiRefNet background-removal model (see ai_models.rs).
+const BG_FOLDER: &str = "birefnet-lite-onnx";
+
+/// In-flight background-removal job for one image. First downloads the model if
+/// missing (best-effort progress), then runs inference on a worker thread.
+struct BgRemoveJob {
+    src: PathBuf,
+    /// Set while the model is downloading on first use.
+    download: Option<ai_models::DownloadHandle>,
+    /// Set while inference runs; yields the written cutout path (or an error).
+    rx: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
+    /// Status line shown in the floating overlay.
+    status: String,
+}
+
+/// Spawn BiRefNet inference for `src` on a worker thread, returning the result
+/// channel. The model path is resolved on the worker (it may have just landed).
+fn spawn_bg_inference(src: PathBuf, ctx: egui::Context) -> std::sync::mpsc::Receiver<Result<PathBuf, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let res = match tagger::resolve(BG_FOLDER, "model.onnx") {
+            Some(model) => bgremove::run_bgremove_job(model, src),
+            None => Err("Background model file is missing".to_string()),
+        };
+        let _ = tx.send(res);
+        ctx.request_repaint();
+    });
+    rx
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +243,7 @@ struct ViewerApp {
     last_extended_formats: bool,
     /// Last-applied colour theme, so we re-push the egui visuals only when the
     /// user actually changes it in the Appearance tab.
-    last_theme: theme::Theme,
+    last_theme: Theme,
     /// Last-applied media-type filter (Filter tab), so we re-filter the browser
     /// only when the user actually changes it.
     last_media_filter: left_panel_settings::MediaFilter,
@@ -176,6 +251,9 @@ struct ViewerApp {
     filtered: Vec<usize>,
     selected: Option<usize>,
     search: String,
+    /// Lowercased sidecar-tag text per image, validated by the sidecar's mtime,
+    /// so the search can match tags without re-reading every .txt per keystroke.
+    tag_search_cache: std::collections::HashMap<PathBuf, (Option<std::time::SystemTime>, String)>,
     /// Favorited ("hearted") files, tracked by content hash so they survive
     /// moves/renames. Shown as a heart badge on the browser thumbnails.
     favorites: favorites::Favorites,
@@ -186,6 +264,17 @@ struct ViewerApp {
     settings: settings::Settings,
     /// Deep Scan ("Find Issues") window state.
     scan: scan::ScanState,
+    /// Gallery-view image detail popup.
+    detail_popup: gallery_detail::DetailPopup,
+    /// Startup splash (the cursive "Clarity TagFlow" write-on).
+    splash: splash::Splash,
+    /// While the Generate (Flux) view is open, the browser/viewer show the session's
+    /// generated images; these remember the real folder list to restore on exit.
+    flux_active: bool,
+    images_backup: Option<(Vec<PathBuf>, Option<usize>)>,
+    /// (is_zimage, count) of the gen list currently shown, so switching between the
+    /// Flux/Z-Image tabs or a new render refreshes the browser.
+    flux_sig: (u8, usize),
     /// The "Create Backup" dialog (top bar).
     backup: backup::BackupState,
     /// Tag Manager view state, shown in the right panel when selected from its
@@ -209,6 +298,21 @@ struct ViewerApp {
 
     /// Zoom + pan state for the centre image viewer (resets per selection).
     zoom: zoom::ZoomState,
+
+    /// Interactive 3D viewer shown in the centre when the Pixal3D view is active
+    /// (displays the generated GLB instead of the selected image).
+    #[cfg(not(target_os = "macos"))]
+    scene3d: scene3d::Scene3D,
+
+    /// In-flight background-removal job (right-click → Remove Background).
+    bg_job: Option<BgRemoveJob>,
+    /// Transient status/result message for background removal (text, hide-time).
+    bg_toast: Option<(String, f64)>,
+    /// Screen rect of the centre (image) panel, captured each frame so overlays
+    /// can be positioned over the image rather than the whole window.
+    last_center_rect: Option<egui::Rect>,
+    /// App + ComfyUI update checker (drives the Updates tab and the gear's red dot).
+    update: update::UpdateState,
 }
 
 impl Default for ViewerApp {
@@ -217,16 +321,22 @@ impl Default for ViewerApp {
             images: Vec::new(),
             current_folder: None,
             last_extended_formats: settings::Settings::default().enable_extended_formats,
-            last_theme: theme::Theme::default(),
+            last_theme: Theme::default(),
             last_media_filter: left_panel_settings::MediaFilter::default(),
             filtered: Vec::new(),
             selected: None,
             search: String::new(),
+            tag_search_cache: std::collections::HashMap::new(),
             favorites: favorites::Favorites::load(),
             stats: top_bar::SystemStats::default(),
             right_state: right_details::RightPanelState::default(),
             settings: settings::Settings::default(),
             scan: scan::ScanState::default(),
+            detail_popup: gallery_detail::DetailPopup::default(),
+            splash: splash::Splash::default(),
+            flux_active: false,
+            images_backup: None,
+            flux_sig: (0, 0),
             backup: backup::BackupState::default(),
             tag_manager: tag_manager::TagManagerState::default(),
             // Separate large-decode gates: the viewer gets a dedicated permit so
@@ -238,12 +348,19 @@ impl Default for ViewerApp {
             video_player: None,
             last_video_path: None,
             zoom: zoom::ZoomState::default(),
+            #[cfg(not(target_os = "macos"))]
+            scene3d: scene3d::Scene3D::new(),
+            bg_job: None,
+            bg_toast: None,
+            last_center_rect: None,
+            update: update::UpdateState::default(),
         }
     }
 }
 
 impl ViewerApp {
-    /// Update the cached list of filtered indices based on the search string
+    /// Update the cached list of filtered indices based on the search string.
+    /// The query matches the file name OR the sidecar .txt tags (cached).
     fn update_filtered(&mut self) {
         use left_panel_settings::MediaFilter;
         let query = self.search.trim().to_lowercase();
@@ -253,7 +370,10 @@ impl ViewerApp {
             // Clone the path so the favorite look-up (which needs `&mut favorites`)
             // doesn't clash with borrowing `self.images`.
             let path = self.images[i].clone();
-            if !query.is_empty() && !file_name(&path).to_lowercase().contains(&query) {
+            if !query.is_empty()
+                && !file_name(&path).to_lowercase().contains(&query)
+                && !self.tags_match(&path, &query)
+            {
                 continue;
             }
             let keep = match filter {
@@ -272,6 +392,23 @@ impl ViewerApp {
         self.filtered = filtered;
     }
 
+    /// Whether `path`'s sidecar tags contain `query` (lowercase). The tag text
+    /// is cached and only re-read when the sidecar's mtime changes, so typing
+    /// in the search box costs one `stat` per image, not a file read.
+    fn tags_match(&mut self, path: &std::path::Path, query: &str) -> bool {
+        let txt = right_details::sidecar_txt(path);
+        let mtime = std::fs::metadata(&txt).and_then(|m| m.modified()).ok();
+        let entry = self
+            .tag_search_cache
+            .entry(path.to_path_buf())
+            .or_insert_with(|| (None, String::new()));
+        if entry.0 != mtime {
+            entry.0 = mtime;
+            entry.1 = std::fs::read_to_string(&txt).unwrap_or_default().to_lowercase();
+        }
+        entry.1.contains(query)
+    }
+
     /// Pick a folder and show every image in it (replacing the current list).
     fn open_dialog(&mut self) {
         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
@@ -284,6 +421,7 @@ impl ViewerApp {
         self.images = images_in_dir(dir);
         self.current_folder = Some(dir.to_path_buf());
         self.selected = if self.images.is_empty() { None } else { Some(0) };
+        self.tag_search_cache.clear(); // tags belong to the previous folder
         self.update_filtered();
     }
 
@@ -364,16 +502,196 @@ impl ViewerApp {
     /// in image_cache — since `image::open` can't handle them (and would mis-read
     /// TIFF-based raws like DNG).
     fn copy_current(&mut self, src: &std::path::Path) {
-        let Some(rgba) = decode_full_rgba(src) else { return };
-        let (w, h) = (rgba.width() as usize, rgba.height() as usize);
-        let img = arboard::ImageData {
-            width: w,
-            height: h,
-            bytes: std::borrow::Cow::Owned(rgba.into_raw()),
-        };
-        if let Ok(mut clip) = arboard::Clipboard::new() {
-            let _ = clip.set_image(img);
+        // Decoding the full-resolution original and having arboard convert it to
+        // the clipboard's DIB/PNG formats is heavy — on a large image it takes
+        // seconds. Do it on a background thread so the UI never freezes; the
+        // clipboard is populated a moment later. (arboard sets image data
+        // immediately, so a short-lived thread is fine.)
+        let src = src.to_path_buf();
+        std::thread::spawn(move || {
+            let Some(rgba) = decode_full_rgba(&src) else { return };
+            let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+            // Build the plain-DIB payload first; the RGBA buffer then moves
+            // into arboard.
+            #[cfg(target_os = "windows")]
+            let dib = Self::rgba_to_cf_dib(rgba.width(), rgba.height(), rgba.as_raw());
+            let img = arboard::ImageData {
+                width: w,
+                height: h,
+                bytes: std::borrow::Cow::Owned(rgba.into_raw()),
+            };
+            // arboard writes the "PNG" + CF_DIBV5 clipboard formats…
+            if let Ok(mut clip) = arboard::Clipboard::new() {
+                let _ = clip.set_image(img);
+            }
+            // …but Chromium-based browsers only ever request the legacy CF_DIB
+            // when pasting an image (they ignore DIBV5 and PNG — see
+            // PhotoDemon #343), so pasting into Chrome/Edge (e.g. a Gemini
+            // upload box) found nothing. Append a plain DIB to what arboard
+            // just set, without clearing it.
+            #[cfg(target_os = "windows")]
+            if let Ok(_clip) = clipboard_win::Clipboard::new_attempts(10) {
+                let _ = clipboard_win::raw::set_without_clear(clipboard_win::formats::CF_DIB, &dib);
+            }
+        });
+    }
+
+    /// Encode RGBA pixels as a clipboard `CF_DIB` payload: a 40-byte
+    /// BITMAPINFOHEADER (BI_RGB, 32 bpp) followed by bottom-up BGRX rows.
+    /// Alpha is composited against white — plain-DIB consumers rarely honour
+    /// an alpha channel, and a white backdrop matches what image editors put
+    /// in the legacy format.
+    #[cfg(target_os = "windows")]
+    fn rgba_to_cf_dib(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+        let row = w as usize * 4;
+        let mut dib = Vec::with_capacity(40 + rgba.len());
+        dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        dib.extend_from_slice(&(w as i32).to_le_bytes()); // biWidth
+        dib.extend_from_slice(&(h as i32).to_le_bytes()); // biHeight > 0: bottom-up
+        dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        dib.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
+        dib.extend_from_slice(&(rgba.len() as u32).to_le_bytes()); // biSizeImage
+        dib.extend_from_slice(&[0u8; 16]); // ppm + palette fields, all zero
+        for y in (0..h as usize).rev() {
+            for px in rgba[y * row..(y + 1) * row].chunks_exact(4) {
+                let a = px[3] as u32;
+                let blend = |c: u8| ((c as u32 * a + 255 * (255 - a)) / 255) as u8;
+                dib.extend_from_slice(&[blend(px[2]), blend(px[1]), blend(px[0]), 0xFF]);
+            }
         }
+        dib
+    }
+
+    /// Start removing the background of `src` (right-click action). Downloads the
+    /// BiRefNet model first if it isn't installed. One job at a time.
+    fn start_bgremove(&mut self, src: &std::path::Path, ctx: &egui::Context) {
+        if self.bg_job.is_some() {
+            return;
+        }
+        let src = src.to_path_buf();
+        let mut job = BgRemoveJob { src: src.clone(), download: None, rx: None, status: String::new() };
+        if tagger::resolve(BG_FOLDER, "model.onnx").is_none() {
+            job.download = ai_models::start_model_download(BG_FOLDER);
+            if job.download.is_some() {
+                job.status = "Downloading background model…".to_string();
+            } else {
+                self.bg_toast = Some(("Background model unavailable".to_string(), ctx.input(|i| i.time) + 5.0));
+                return;
+            }
+        } else {
+            job.status = "Removing background…".to_string();
+            job.rx = Some(spawn_bg_inference(src, ctx.clone()));
+        }
+        self.bg_job = Some(job);
+    }
+
+    /// Advance the background-removal job each frame: poll the model download,
+    /// kick inference once it's ready, and handle the result. Also expires the
+    /// transient toast.
+    fn drive_bg_job(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        if let Some((_, until)) = &self.bg_toast {
+            if now >= *until {
+                self.bg_toast = None;
+            }
+        }
+
+        // Result of this frame's polling, applied after the &mut borrow ends.
+        let mut done: Option<Result<PathBuf, String>> = None;
+        if let Some(job) = &mut self.bg_job {
+            if let Some(dl) = &job.download {
+                if dl.done() {
+                    if dl.ok() {
+                        job.download = None;
+                        job.status = "Removing background…".to_string();
+                        job.rx = Some(spawn_bg_inference(job.src.clone(), ctx.clone()));
+                    } else {
+                        done = Some(Err(format!(
+                            "Model download failed: {}",
+                            dl.error().unwrap_or_else(|| "unknown error".into())
+                        )));
+                    }
+                } else {
+                    job.status = format!("Downloading background model… {}%", dl.pct());
+                }
+            } else if let Some(rx) = &job.rx {
+                match rx.try_recv() {
+                    Ok(r) => done = Some(r),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        done = Some(Err("Background worker stopped".to_string()));
+                    }
+                }
+            }
+        }
+
+        if let Some(result) = done {
+            let src = self.bg_job.as_ref().map(|j| j.src.clone());
+            self.bg_job = None;
+            match result {
+                Ok(dest) => {
+                    if let Some(src) = src {
+                        self.insert_derived(&src, dest);
+                    }
+                    self.bg_toast = Some(("Background removed ✓".to_string(), now + 3.0));
+                }
+                Err(e) => self.bg_toast = Some((format!("Background removal failed — {e}"), now + 6.0)),
+            }
+        }
+
+        if self.bg_job.is_some() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Insert a derived image (`dest`) just beneath its source in the browser and
+    /// select it; if it's already listed, just select it. Mirrors `crop_current`.
+    fn insert_derived(&mut self, src: &std::path::Path, dest: PathBuf) {
+        if let Some(i) = self.images.iter().position(|p| p == &dest) {
+            self.selected = Some(i);
+            self.update_filtered();
+            return;
+        }
+        let at = self
+            .images
+            .iter()
+            .position(|p| p == src)
+            .map(|i| i + 1)
+            .unwrap_or(self.images.len());
+        self.images.insert(at, dest);
+        self.selected = Some(at);
+        self.update_filtered();
+    }
+
+    /// Floating top-centre overlay showing background-removal progress / result.
+    fn paint_bg_status(&self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let (text, busy) = if let Some(job) = &self.bg_job {
+            (job.status.clone(), true)
+        } else if let Some((msg, until)) = &self.bg_toast {
+            if now < *until { (msg.clone(), false) } else { return }
+        } else {
+            return;
+        };
+        let mut area = egui::Area::new(egui::Id::new("bg_status_overlay")).interactable(false);
+        // Centre over the image panel if we know its rect; else fall back to the
+        // window centre.
+        area = match self.last_center_rect {
+            Some(rect) => area.pivot(egui::Align2::CENTER_CENTER).fixed_pos(rect.center()),
+            None => area.anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)),
+        };
+        area
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if busy {
+                            ui.add(egui::Spinner::new().size(16.0));
+                        }
+                        ui.label(text);
+                    });
+                });
+            });
     }
 
     fn step_selection(&mut self, delta: i32) {
@@ -386,6 +704,113 @@ impl ViewerApp {
     }
 
     /// Delete the selected image and its `.txt` sidecar, then fix up the list.
+    /// While the Generate (Flux) view is open, show the session's generated images
+    /// in the browser + viewer; restore the real folder list when it closes.
+    fn sync_flux_browser(&mut self, in_flux: bool) {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = in_flux;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if in_flux {
+                // Which generation tab is active picks the source list (0 = Flux,
+                // 1 = Z-Image, 2 = LTX, 3 = Wan); the index is folded into `sig` so
+                // a tab switch refreshes the browser.
+                let (tab, gen_list) = match self.right_state.view {
+                    right_details::RightView::ZImage => (1u8, self.right_state.zimage.gen_images().to_vec()),
+                    right_details::RightView::Ltx => (2u8, self.right_state.ltx.gen_images().to_vec()),
+                    right_details::RightView::Wan => (3u8, self.right_state.wan.gen_images().to_vec()),
+                    _ => (0u8, self.right_state.generate.gen_images().to_vec()),
+                };
+                let sig = (tab, gen_list.len());
+                if !self.flux_active {
+                    // Entering: stash the folder list, show the generated images.
+                    self.images_backup = Some((std::mem::take(&mut self.images), self.selected.take()));
+                    self.images = gen_list;
+                    self.selected = if self.images.is_empty() { None } else { Some(self.images.len() - 1) };
+                    self.update_filtered();
+                    self.flux_active = true;
+                    self.flux_sig = sig;
+                } else if self.flux_sig != sig {
+                    // Switched gen tab or a new image arrived — refresh + select newest.
+                    self.images = gen_list;
+                    self.selected = if self.images.is_empty() { None } else { Some(self.images.len() - 1) };
+                    self.update_filtered();
+                    self.flux_sig = sig;
+                }
+            } else if self.flux_active {
+                // Leaving: restore the real folder list.
+                if let Some((imgs, sel)) = self.images_backup.take() {
+                    self.images = imgs;
+                    self.selected = sel;
+                    self.update_filtered();
+                }
+                self.flux_active = false;
+            }
+        }
+    }
+
+    /// Move the selected image (and its `.txt` sidecar) to a folder the user picks,
+    /// then drop it from the list. Shared by the right panel and the gallery popup.
+    fn move_selected(&mut self) {
+        let Some(idx) = self.selected else { return };
+        let Some(target_dir) = rfd::FileDialog::new().pick_folder() else { return };
+        let img_path = self.images[idx].clone();
+        let txt_path = right_details::sidecar_txt(&img_path);
+
+        if let Some(file_name) = img_path.file_name() {
+            let _ = std::fs::rename(&img_path, target_dir.join(file_name));
+        }
+        if txt_path.exists() {
+            if let Some(txt_name) = txt_path.file_name() {
+                let _ = std::fs::rename(&txt_path, target_dir.join(txt_name));
+            }
+        }
+
+        self.remove_image_at(idx);
+    }
+
+    /// Remove image `idx`, re-filter the browser, and clamp the selection to a
+    /// still-valid index (or clear it when the list is now empty).
+    fn remove_image_at(&mut self, idx: usize) {
+        self.images.remove(idx);
+        self.update_filtered();
+        self.selected = if self.images.is_empty() {
+            None
+        } else {
+            Some(idx.min(self.images.len().saturating_sub(1)))
+        };
+    }
+
+    /// Apply a viewer right-click action (favorite / crop / copy / bg-remove) to
+    /// `path`. Shared by the centre viewer and the gallery-detail popup.
+    fn handle_viewer_action(&mut self, action: zoom::ViewerAction, path: &std::path::Path, ctx: &egui::Context) {
+        match action {
+            zoom::ViewerAction::ToggleFavorite => {
+                self.favorites.toggle(path);
+            }
+            zoom::ViewerAction::Crop(frac) => self.crop_current(path, frac),
+            zoom::ViewerAction::CopyImage => self.copy_current(path),
+            zoom::ViewerAction::RemoveBackground => self.start_bgremove(path, ctx),
+            zoom::ViewerAction::None => {}
+        }
+    }
+
+    /// Re-scan the current folder and try to keep the same image selected. Used
+    /// after the extended-format toggle changes and after a Deep Scan moves files.
+    fn rescan_current_folder(&mut self) {
+        if let Some(dir) = self.current_folder.clone() {
+            let keep = self.selected.and_then(|i| self.images.get(i).cloned());
+            self.images = images_in_dir(&dir);
+            // Try to keep the same image selected across the re-scan.
+            self.selected = keep
+                .and_then(|p| self.images.iter().position(|q| *q == p))
+                .or(if self.images.is_empty() { None } else { Some(0) });
+            self.update_filtered();
+        }
+    }
+
     fn delete_selected(&mut self) {
         let Some(idx) = self.selected else { return };
         let img_path = self.images[idx].clone();
@@ -400,13 +825,7 @@ impl ViewerApp {
             let _ = std::fs::remove_file(&txt_path);
         }
 
-        self.images.remove(idx);
-        self.update_filtered(); // indices shifted — re-filter
-        self.selected = if self.images.is_empty() {
-            None
-        } else {
-            Some(idx.min(self.images.len().saturating_sub(1)))
-        };
+        self.remove_image_at(idx);
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
@@ -436,11 +855,23 @@ impl ViewerApp {
 
     // ---- Center: the image display ------------------------------------
     fn center(&mut self, ui: &mut egui::Ui) {
+        // Remember the centre-panel rect so overlays (e.g. the background-removal
+        // loader) can be centred over the image rather than the whole window.
+        self.last_center_rect = Some(ui.available_rect_before_wrap());
         egui::CentralPanel::default()
             // Match the side panels' margins (top: 0) so the viewer rises to the
             // top bar and is the same height as the left/right panels.
             .frame(egui::Frame::new().fill(BG()).inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 10 }))
             .show_inside(ui, |ui| {
+                // When the Pixal3D view is active, the centre shows the generated
+                // 3D model (orbit viewer) instead of the selected image/video.
+                #[cfg(not(target_os = "macos"))]
+                if self.right_state.view == right_details::RightView::Pixal3D {
+                    let glb = self.right_state.pixal3d.last_glb.clone();
+                    self.scene3d.show(ui, glb.as_deref());
+                    return;
+                }
+
                 let Some(idx) = self.selected else {
                     ui.centered_and_justified(|ui| {
                         ui.label(
@@ -485,7 +916,7 @@ impl ViewerApp {
                             // Hz) — a full-app relayout every refresh steals CPU from
                             // decoding. New frames still wake us instantly via the
                             // player's display callback (request_repaint).
-                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+                            ui.ctx().request_repaint_after(Duration::from_millis(16));
                             return;
                         }
                     } else {
@@ -509,14 +940,8 @@ impl ViewerApp {
                 match self.viewer.request(&path, now) {
                     image_cache::Cached::Ready(tex) => {
                         let is_fav = self.favorites.is_favorite(&path);
-                        match self.zoom.show(ui, &tex, &path, is_fav) {
-                            zoom::ViewerAction::ToggleFavorite => {
-                                self.favorites.toggle(&path);
-                            }
-                            zoom::ViewerAction::Crop(frac) => self.crop_current(&path, frac),
-                            zoom::ViewerAction::CopyImage => self.copy_current(&path),
-                            zoom::ViewerAction::None => {}
-                        }
+                        let action = self.zoom.show(ui, &tex, &path, is_fav);
+                        self.handle_viewer_action(action, &path, ui.ctx());
                     }
                     image_cache::Cached::Animated(frame) => {
                         show_fitted(ui, &frame, false);
@@ -524,7 +949,7 @@ impl ViewerApp {
                         // repainting (and relaying out the whole app) as fast as
                         // the monitor allows — GIFs top out at 50 fps, so this is
                         // smooth while leaving CPU for decoding.
-                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+                        ui.ctx().request_repaint_after(Duration::from_millis(16));
                     }
                     image_cache::Cached::Failed => {
                         ui.centered_and_justified(|ui| {
@@ -568,11 +993,30 @@ impl ViewerApp {
 
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // While the splash is writing its wordmark, render ONLY the splash —
+        // the panels (and the folder/thumbnail work they kick off) build after
+        // it, so launch shows the text before the app UI exists. The fade-out
+        // phase falls through and plays over the real UI.
+        if self.splash.covers_ui(ui.ctx()) {
+            self.splash.show(ui.ctx());
+            return;
+        }
+
         self.handle_dropped_files(ui.ctx());
+        // Kick off the launch update-check and drain its workers (badge + Updates tab).
+        self.update.tick(ui.ctx());
+        // Advance any in-flight background-removal job (download → inference → result).
+        self.drive_bg_job(ui.ctx());
+        self.paint_bg_status(ui.ctx());
         // Only sample CPU/RAM when the top-bar graphs are actually shown.
         if self.settings.show_stats {
             self.stats.update();
         }
+
+        // Mirror the movable-popups preference into the process-wide flag the popup
+        // builders read (via PopupPlacement), so it isn't threaded through every
+        // popup call site. Cheap; done each frame so the toggle applies live.
+        MOVABLE_POPUPS.store(self.settings.movable_popups, std::sync::atomic::Ordering::Relaxed);
 
         // Apply the HD-thumbnail setting (cheap; only clears the cache on change).
         self.thumbs.set_max_edge(if self.settings.hd_thumbnails {
@@ -586,12 +1030,12 @@ impl eframe::App for ViewerApp {
 
         // Push the Glass theme's user-configurable background (colour + backdrop)
         // so the colour picker updates live; cheap, so done every frame.
-        theme::set_glass_config(self.settings.glass_bg, self.settings.glass_backdrop);
+        set_glass_config(self.settings.glass_bg, self.settings.glass_backdrop);
 
         // Paint the theme's full-window background (the Space theme's animated
         // starfield, the Glass theme's configured backdrop) on the bottom layer,
         // beneath every panel. No-op otherwise.
-        theme::paint_background(ui.ctx());
+        paint_background(ui.ctx());
 
         // --- Toggle fullscreen on F12 ---
         if ui.input(|i| i.key_pressed(egui::Key::F12)) {
@@ -599,7 +1043,10 @@ impl eframe::App for ViewerApp {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
         }
 
-        // Arrow keys cycle through the opened images.
+        // Arrow keys cycle through the opened images — but NOT while a text field
+        // (tags box, search, blacklist, …) has keyboard focus, where the arrows
+        // must move the text cursor instead.
+        let typing = ui.ctx().egui_wants_keyboard_input();
         let delta = ui.input(|i| {
             if i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::ArrowDown) {
                 1
@@ -609,11 +1056,20 @@ impl eframe::App for ViewerApp {
                 0
             }
         });
-        if delta != 0 {
+        if delta != 0 && !typing {
             self.step_selection(delta);
+            // In the Gallery layout the arrow keys also page the open detail
+            // popup to the newly selected image (it loads its content once on
+            // open, so it must be re-pointed explicitly).
+            if self.settings.layout == settings::Layout::Gallery && self.detail_popup.open {
+                if let Some(i) = self.selected {
+                    self.detail_popup.open_for(i, &self.images[i], ui.ctx());
+                }
+            }
         }
 
-        match top_bar::show(ui, &self.stats, self.settings.show_stats) {
+        let update_badge = self.update.badge(&self.settings);
+        match top_bar::show(ui, &self.stats, self.settings.show_stats, update_badge) {
             top_bar::TopBarAction::OpenFolder => self.open_dialog(),
             top_bar::TopBarAction::OpenSettings => self.settings.open = !self.settings.open,
             top_bar::TopBarAction::CreateBackup => self.start_backup(),
@@ -624,6 +1080,51 @@ impl eframe::App for ViewerApp {
             top_bar::TopBarAction::None => {}
         }
 
+        // While the Generate (Flux) view is open, swap the browser/viewer over to
+        // the session's generated images (restored on exit).
+        #[cfg(not(target_os = "macos"))]
+        let in_flux = self.settings.layout == settings::Layout::Panels
+            && matches!(
+                self.right_state.view,
+                right_details::RightView::Generate
+                    | right_details::RightView::ZImage
+                    | right_details::RightView::Ltx
+                    | right_details::RightView::Wan
+            );
+        #[cfg(target_os = "macos")]
+        let in_flux = false;
+        self.sync_flux_browser(in_flux);
+
+        // When the Gallery layout is active, replace the three panels with a
+        // full-window masonry grid of the open folder's images.
+        if self.settings.layout == settings::Layout::Gallery {
+            // Release the centre viewer's player — without this, a clip selected
+            // in the Panels layout keeps playing (audibly) behind the grid.
+            self.video_player = None;
+            self.last_video_path = None;
+            // Skip the poster capture for the clip playing in the detail popup,
+            // like the browser does for the centre player.
+            self.video_thumbs.set_busy(self.detail_popup.playing_video());
+            if let Some(i) = gallery::show(
+                ui,
+                &self.images,
+                &self.filtered,
+                self.selected,
+                &mut self.thumbs,
+                &mut self.video_thumbs,
+                &mut self.favorites,
+                self.settings.thumbnail_size,
+            ) {
+                // Select the clicked tile (accent ring + arrow-key anchor) and
+                // open its detail popup.
+                self.selected = Some(i);
+                self.detail_popup.open_for(i, &self.images[i], ui.ctx());
+            }
+            // Floating search/filter pill (bottom-right corner, movable).
+            if gallery::search_pill(ui.ctx(), &mut self.search, &mut self.settings) {
+                self.update_filtered();
+            }
+        } else {
         // 1. Left Panel
         // Only skip the poster capture for the file that's actually playing, so
         // its frame isn't decoded twice at once; every other video still loads
@@ -677,40 +1178,13 @@ impl eframe::App for ViewerApp {
             // The right panel handles its own confirmation (gated by the setting),
             // so by the time we get a DeleteCurrent the delete is already confirmed.
             right_details::RightPanelAction::DeleteCurrent => self.delete_selected(),
-            right_details::RightPanelAction::MoveCurrent => {
-                if let Some(idx) = self.selected {
-                    if let Some(target_dir) = rfd::FileDialog::new().pick_folder() {
-                        let img_path = self.images[idx].clone();
-                        let txt_path = right_details::sidecar_txt(&img_path);
-
-                        if let Some(file_name) = img_path.file_name() {
-                            let _ = std::fs::rename(&img_path, target_dir.join(file_name));
-                        }
-
-                        if txt_path.exists() {
-                            if let Some(txt_name) = txt_path.file_name() {
-                                let _ = std::fs::rename(&txt_path, target_dir.join(txt_name));
-                            }
-                        }
-
-                        self.images.remove(idx);
-
-                        // RECOMPUTE filter so indices match correctly after shifting
-                        self.update_filtered();
-
-                        self.selected = if self.images.is_empty() {
-                            None
-                        } else {
-                            Some(idx.min(self.images.len().saturating_sub(1)))
-                        };
-                    }
-                }
-            }
+            right_details::RightPanelAction::MoveCurrent => self.move_selected(),
             right_details::RightPanelAction::None => {}
         }
 
         // 3. Central Panel (Fills remaining space)
         self.center(ui);
+        } // end of the classic Panels layout
 
         // 4. Settings window (floats on top when opened from the gear).
         // Keep the global extended-formats flag in sync with the setting so the
@@ -726,45 +1200,61 @@ impl eframe::App for ViewerApp {
         // appear (or disappear) right away instead of only after a reopen.
         if self.settings.enable_extended_formats != self.last_extended_formats {
             self.last_extended_formats = self.settings.enable_extended_formats;
-            if let Some(dir) = self.current_folder.clone() {
-                let keep = self.selected.and_then(|i| self.images.get(i).cloned());
-                self.images = images_in_dir(&dir);
-                // Try to keep the same image selected across the re-scan.
-                self.selected = keep
-                    .and_then(|p| self.images.iter().position(|q| *q == p))
-                    .or(if self.images.is_empty() { None } else { Some(0) });
-                self.update_filtered();
-            }
+            self.rescan_current_folder();
         }
 
-        settings::show(ui.ctx(), &mut self.settings);
+        settings::show(ui.ctx(), &mut self.settings, &mut self.update);
+
+        // Gallery detail popup (opened by clicking a gallery tile). Push the loop
+        // preference first so a clip the popup starts picks it up (the centre
+        // viewer only pushes it when it is itself playing a video).
+        video::set_loop(self.settings.loop_video);
+        match gallery_detail::show(
+            ui.ctx(),
+            &mut self.detail_popup,
+            &mut self.viewer,
+            &mut self.right_state.civitai,
+            &mut self.favorites,
+            &mut self.settings.confirm_before_delete,
+        ) {
+            gallery_detail::DetailAction::Move(i) => {
+                self.selected = Some(i);
+                self.move_selected();
+            }
+            gallery_detail::DetailAction::Delete(i) => {
+                self.selected = Some(i);
+                self.delete_selected();
+            }
+            // Viewer right-click actions, handled exactly like the centre viewer.
+            gallery_detail::DetailAction::Viewer(va, path) => {
+                self.handle_viewer_action(va, &path, ui.ctx());
+            }
+            gallery_detail::DetailAction::None => {}
+        }
 
         // Deep Scan window. When a scan finishes it may have moved files out of
         // the current folder, so refresh the browser list once.
         scan::show(ui.ctx(), &mut self.scan);
         if self.scan.finished_tick {
             self.scan.finished_tick = false;
-            if let Some(dir) = self.current_folder.clone() {
-                let keep = self.selected.and_then(|i| self.images.get(i).cloned());
-                self.images = images_in_dir(&dir);
-                self.selected = keep
-                    .and_then(|p| self.images.iter().position(|q| *q == p))
-                    .or(if self.images.is_empty() { None } else { Some(0) });
-                self.update_filtered();
-            }
+            self.rescan_current_folder();
         }
 
         // Apply a theme change from the Appearance tab live (only when it
         // actually changed, so we don't re-push visuals every frame).
         if self.settings.theme != self.last_theme {
             self.last_theme = self.settings.theme;
-            theme::set(self.settings.theme);
-            theme::apply(ui.ctx());
+            set(self.settings.theme);
+            apply(ui.ctx());
             ui.ctx().request_repaint();
         }
 
         // 5. Backup dialog (floats on top when opened from the top bar).
         self.backup.show(ui.ctx());
+
+        // Startup splash — drawn last so it covers the whole UI while the
+        // "Clarity TagFlow" wordmark writes itself on.
+        self.splash.show(ui.ctx());
 
         // Keep the live graphs animating without busy-looping.
         ui.ctx().request_repaint_after(Duration::from_millis(250));
@@ -777,6 +1267,82 @@ impl eframe::App for ViewerApp {
 }
 
 // ---------------------------------------------------------------------------
+// Movable popups
+// ---------------------------------------------------------------------------
+
+/// Process-wide mirror of `Settings::movable_popups`, refreshed each frame in
+/// `ViewerApp::ui`. Popup builders in other modules read it through the
+/// [`PopupPlacement`] trait, so the preference doesn't have to be threaded through
+/// every call site.
+pub(crate) static MOVABLE_POPUPS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Whether popups should be draggable and remember where the user left them.
+pub(crate) fn movable_popups() -> bool {
+    MOVABLE_POPUPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Positioning for the app's floating popups (Civitai settings, LoRA picker,
+/// gallery detail, Find Issues). When movable popups are enabled the window is
+/// draggable and egui persists its position across runs (eframe's egui-memory
+/// storage); otherwise it's pinned to its original spot and can't be moved.
+///
+/// Modal-style dialogs (Settings, Backup, Confirm Delete) deliberately do NOT use
+/// this — they stay centred and fixed.
+pub(crate) trait PopupPlacement<'a> {
+    /// Centre the popup (its original placement). Draggable + remembered when
+    /// movable popups are on; pinned dead-centre when off.
+    fn placed_centered(self, ctx: &egui::Context) -> Self;
+    /// Place the popup's top-left at `top_left` (e.g. dropped from a button).
+    /// Draggable from there + remembered when on; pinned there when off.
+    fn placed_at(self, top_left: impl Into<egui::Pos2>) -> Self;
+}
+
+/// Constrain a movable popup so it can only be dragged by its top strip.
+///
+/// egui's window move-sense covers the WHOLE window, and a drag that starts on
+/// a click-only widget (e.g. a frameless ✕ / ☰ icon button) falls through to
+/// it — so a click that slipped by a pixel dragged the popup around. Call this
+/// FIRST inside the window's content closure: it registers an invisible
+/// drag-consuming shield over everything below `strip_h` (measured from the
+/// content top), leaving only the header strip draggable. Widgets added after
+/// this still win their own interactions (buttons, scroll areas, sliders, text
+/// selection) because later widgets sit on top of the shield.
+pub(crate) fn popup_drag_strip(ui: &mut egui::Ui, strip_h: f32) {
+    if !movable_popups() {
+        return; // pinned popups can't be dragged anyway
+    }
+    // Cover the window generously (the frame margins too); the interact rect is
+    // clipped to the window's clip rect, so the overshoot is harmless.
+    let mut rect = ui.max_rect().expand(64.0);
+    rect.min.y = ui.max_rect().min.y + strip_h;
+    ui.interact(rect, ui.id().with("popup_drag_shield"), egui::Sense::drag());
+}
+
+impl<'a> PopupPlacement<'a> for egui::Window<'a> {
+    fn placed_centered(self, ctx: &egui::Context) -> Self {
+        if movable_popups() {
+            // No anchor (anchoring forces immovability); centre via pivot so the
+            // first appearance matches the old CENTER_CENTER placement, then egui
+            // remembers any drag.
+            self.movable(true)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
+        } else {
+            self.movable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        }
+    }
+    fn placed_at(self, top_left: impl Into<egui::Pos2>) -> Self {
+        let pos = top_left.into();
+        if movable_popups() {
+            self.movable(true).default_pos(pos)
+        } else {
+            self.fixed_pos(pos)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Reusable painting helpers
 // ---------------------------------------------------------------------------
 
@@ -784,7 +1350,7 @@ impl eframe::App for ViewerApp {
 /// Centred placeholder for a video that isn't playing: the video glyph, the file
 /// name, and a message that depends on why there's no player — playback failed,
 /// VLC needs installing (with a button), or this build has no video backend.
-fn video_notice(ui: &mut egui::Ui, path: &std::path::Path, support: video::VideoSupport) {
+pub(crate) fn video_notice(ui: &mut egui::Ui, path: &std::path::Path, support: video::VideoSupport) {
     ui.vertical_centered(|ui| {
         let avail_h = ui.available_height();
         ui.add_space((avail_h * 0.5 - 84.0).max(8.0));
@@ -807,7 +1373,7 @@ fn video_notice(ui: &mut egui::Ui, path: &std::path::Path, support: video::Video
                 );
                 ui.add_space(10.0);
                 let install = egui::Button::new(
-                    egui::RichText::new("Install VLC").color(egui::Color32::WHITE).strong(),
+                    egui::RichText::new("Install VLC").color(Color32::WHITE).strong(),
                 )
                 .fill(ACCENT1());
                 if ui.add(install).clicked() {
@@ -829,7 +1395,7 @@ fn video_notice(ui: &mut egui::Ui, path: &std::path::Path, support: video::Video
     });
 }
 
-fn show_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle, is_loading: bool) {
+pub(crate) fn show_fitted(ui: &mut egui::Ui, tex: &egui::TextureHandle, is_loading: bool) {
     let avail = ui.available_size();
     let tex_size = tex.size_vec2();
     let aspect = tex_size.y / tex_size.x.max(1.0);
@@ -947,10 +1513,6 @@ fn install_fallback_fonts(ctx: &egui::Context) {
         }
     }
 
-    if added.is_empty() {
-        return; // no system CJK fonts found — leave egui's defaults untouched
-    }
-
     // Append the CJK fonts after the existing fonts in both families, so they act
     // purely as fallbacks for glyphs the default fonts can't render.
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
@@ -959,6 +1521,42 @@ fn install_fallback_fonts(ctx: &egui::Context) {
             list.push(key.clone());
         }
     }
+
+    // Cursive script font for the startup splash ("Clarity TagFlow" write-on).
+    // The family is ALWAYS registered — laying out with an unknown family
+    // panics — and just maps to the proportional list when no script font is
+    // installed (the splash then writes in the regular face).
+    #[cfg(target_os = "windows")]
+    let cursive_candidates: &[&str] = &[
+        r"C:\Windows\Fonts\segoesc.ttf",  // Segoe Script
+        r"C:\Windows\Fonts\segoepr.ttf",  // Segoe Print
+        r"C:\Windows\Fonts\BRUSHSCI.TTF", // Brush Script MT
+        r"C:\Windows\Fonts\FREESCPT.TTF", // Freestyle Script
+    ];
+    #[cfg(target_os = "macos")]
+    let cursive_candidates: &[&str] = &[
+        "/System/Library/Fonts/Supplemental/SnellRoundhand.ttc",
+        "/System/Library/Fonts/Supplemental/Brush Script.ttf",
+    ];
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let cursive_candidates: &[&str] = &[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf",
+    ];
+    let mut cursive_list: Vec<String> = Vec::new();
+    for path in cursive_candidates {
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        fonts
+            .font_data
+            .insert("splash_cursive".into(), egui::FontData::from_owned(bytes).into());
+        cursive_list.push("splash_cursive".into());
+        break;
+    }
+    if let Some(prop) = fonts.families.get(&egui::FontFamily::Proportional) {
+        cursive_list.extend(prop.iter().cloned());
+    }
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("cursive".into()), cursive_list);
 
     ctx.set_fonts(fonts);
 }
@@ -990,6 +1588,34 @@ pub(crate) fn svg_button(ui: &mut egui::Ui, source: egui::ImageSource<'_>, toolt
             .min_size(egui::vec2(icon_size + 12.0, icon_size + 12.0))
     );
     resp.on_hover_text(tooltip)
+}
+
+/// A hyperlink that ends in a right-pointing arrow drawn with the
+/// `arrow_right_alt.svg` icon (tinted to the link colour) instead of a "→" text
+/// glyph. The arrow is clickable and opens the same `url`. `size` sets the link
+/// text size (and the icon scales to match); `None` uses the default body size.
+pub(crate) fn arrow_link(ui: &mut egui::Ui, label: &str, url: &str, size: Option<f32>) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        let color = ui.visuals().hyperlink_color;
+        let mut text = egui::RichText::new(label).color(color);
+        if let Some(s) = size {
+            text = text.size(s);
+        }
+        ui.hyperlink_to(text, url);
+
+        let icon = size.unwrap_or_else(|| ui.text_style_height(&egui::TextStyle::Body));
+        let img = egui::Image::new(egui::include_image!("../icons/arrow_right_alt.svg"))
+            .fit_to_exact_size(egui::vec2(icon, icon))
+            .tint(color);
+        if ui
+            .add(egui::Button::image(img).frame(false))
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,7 +1688,7 @@ fn decode_full_rgba(src: &std::path::Path) -> Option<image::RgbaImage> {
         let is_extended = src
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "avif" | "heic" | "heif" | "dng" | "arw" | "cr2" | "nef"))
+            .map(is_extended_extension)
             .unwrap_or(false);
         if is_extended {
             return avif::decode_avif(src);
@@ -1090,4 +1716,31 @@ pub(crate) fn file_name(p: &std::path::Path) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or("<unknown>")
         .to_owned()
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod cf_dib_tests {
+    // Layout check for the clipboard CF_DIB payload: 40-byte BITMAPINFOHEADER,
+    // bottom-up BGRX rows, alpha composited against white.
+    #[test]
+    fn dib_header_and_pixels() {
+        // 2x2 RGBA: red | half-green / blue | fully transparent.
+        let rgba = [
+            255u8, 0, 0, 255,   0, 255, 0, 128,
+            0, 0, 255, 255,     0, 0, 0, 0,
+        ];
+        let dib = super::ViewerApp::rgba_to_cf_dib(2, 2, &rgba);
+        assert_eq!(dib.len(), 40 + 16);
+        assert_eq!(&dib[0..4], &40u32.to_le_bytes()); // biSize
+        assert_eq!(&dib[4..8], &2i32.to_le_bytes()); // biWidth
+        assert_eq!(&dib[8..12], &2i32.to_le_bytes()); // biHeight (bottom-up)
+        assert_eq!(u16::from_le_bytes([dib[14], dib[15]]), 32); // biBitCount
+        assert_eq!(&dib[16..20], &0u32.to_le_bytes()); // BI_RGB
+        // Bottom row first: blue -> BGRX(255,0,0); transparent -> white.
+        assert_eq!(&dib[40..44], &[255, 0, 0, 255]);
+        assert_eq!(&dib[44..48], &[255, 255, 255, 255]);
+        // Top row: red -> BGRX(0,0,255); half-green on white -> (127,255,127).
+        assert_eq!(&dib[48..52], &[0, 0, 255, 255]);
+        assert_eq!(&dib[52..56], &[127, 255, 127, 255]);
+    }
 }
