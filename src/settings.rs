@@ -17,6 +17,7 @@ pub enum SettingsTab {
     #[default]
     General,
     Appearance,
+    Updates,
 }
 
 /// The overall UI layout: the classic three panels, or a full-window gallery.
@@ -89,6 +90,11 @@ pub struct Settings {
     /// "Favorites" can't make the browser look empty after a restart.
     #[serde(skip)]
     pub media_filter: MediaFilter,
+    /// The app release tag the user dismissed the update badge for, so the red dot
+    /// stays hidden until a newer release appears. Empty = nothing dismissed.
+    pub dismissed_app_version: String,
+    /// Same, for the dismissed ComfyUI release tag.
+    pub dismissed_comfy_version: String,
 }
 
 impl Default for Settings {
@@ -112,13 +118,15 @@ impl Default for Settings {
             show_stats: true,
             movable_popups: true,
             media_filter: MediaFilter::default(),
+            dismissed_app_version: String::new(),
+            dismissed_comfy_version: String::new(),
         }
     }
 }
 
 /// Render the settings window when it's open. Mutates `settings` in place; the
 /// title-bar close button dismisses it (so does clicking the gear again).
-pub fn show(ctx: &egui::Context, settings: &mut Settings) {
+pub fn show(ctx: &egui::Context, settings: &mut Settings, update: &mut crate::update::UpdateState) {
     if !settings.open {
         return;
     }
@@ -174,6 +182,9 @@ pub fn show(ctx: &egui::Context, settings: &mut Settings) {
             ui.horizontal(|ui| {
                 tab_button(ui, settings, SettingsTab::General, "General");
                 tab_button(ui, settings, SettingsTab::Appearance, "Appearance");
+                // The Updates tab title carries a small dot when an update is waiting.
+                let updates_label = if update.badge(settings) { "Updates ●" } else { "Updates" };
+                tab_button(ui, settings, SettingsTab::Updates, updates_label);
             });
             ui.add_space(8.0);
 
@@ -188,6 +199,7 @@ pub fn show(ctx: &egui::Context, settings: &mut Settings) {
                     match settings.tab {
                         SettingsTab::General => general_tab(ui, settings),
                         SettingsTab::Appearance => appearance_tab(ui, settings),
+                        SettingsTab::Updates => crate::update::updates_tab(ui, update, settings),
                     }
                 });
         });
@@ -461,7 +473,7 @@ fn tab_button(ui: &mut egui::Ui, settings: &mut Settings, tab: SettingsTab, labe
 
 /// A flat section: an uppercase muted label with its controls directly below,
 /// left-aligned (matches the Civitai / Backup popups — no bordered card).
-fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+pub(crate) fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(4.0);
     ui.label(egui::RichText::new(title.to_uppercase()).color(MUTED()).strong().size(11.0));
     ui.add_space(6.0);

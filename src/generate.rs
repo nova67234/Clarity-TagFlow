@@ -1165,6 +1165,136 @@ fn is_installed() -> bool {
     comfy_base().join("ComfyUI").join("main.py").exists()
 }
 
+/// The installed ComfyUI version, read from its `comfyui_version.py`
+/// (`__version__ = "x.y.z"`). `None` if not installed or unparsable.
+pub fn comfyui_installed_version() -> Option<String> {
+    let text = std::fs::read_to_string(comfy_base().join("ComfyUI").join("comfyui_version.py")).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("__version__") {
+            // grab the contents of the first quoted string on the line
+            let bytes = line.as_bytes();
+            if let Some(q1) = line.find(['"', '\'']) {
+                let quote = bytes[q1];
+                if let Some(rel) = line[q1 + 1..].bytes().position(|b| b == quote) {
+                    return Some(line[q1 + 1..q1 + 1 + rel].to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Re-download ComfyUI (master) and refresh the code in place, preserving the
+/// user's `models/`, `custom_nodes/`, `user/`, `input/`, and `output/` dirs, then
+/// re-install requirements. Returns true on success. Runs on a worker thread; all
+/// progress goes through `send`. The running server (if any) is stopped first so
+/// its files aren't locked on Windows.
+pub fn update_comfyui(send: &dyn Fn(String)) -> bool {
+    let base = comfy_base();
+    let comfy = base.join("ComfyUI");
+    if !comfy.join("main.py").exists() {
+        send("ERROR: ComfyUI isn't installed yet — run Setup Requirements first.".into());
+        return false;
+    }
+
+    // Stop the bundled server so its source files aren't held open while we copy.
+    if let Ok(mut guard) = SERVER.lock() {
+        if let Some(mut child) = guard.take() {
+            send("== Stopping ComfyUI server…".into());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    send("== Downloading latest ComfyUI…".into());
+    let zip = base.join("comfyui_update.zip");
+    if let Err(e) = download(COMFYUI_ZIP, &zip, send) {
+        send(format!("ERROR: download failed: {e}"));
+        return false;
+    }
+    // Extract to a temp dir so we can copy the code over selectively.
+    let tmp = base.join("comfyui_update_tmp");
+    let _ = std::fs::remove_dir_all(&tmp);
+    if let Err(e) = unzip(&zip, &tmp) {
+        send(format!("ERROR: extract failed: {e}"));
+        let _ = std::fs::remove_file(&zip);
+        return false;
+    }
+    let _ = std::fs::remove_file(&zip);
+    let src = tmp.join("ComfyUI-master");
+    if !src.join("main.py").exists() {
+        send("ERROR: unexpected archive layout — aborting.".into());
+        let _ = std::fs::remove_dir_all(&tmp);
+        return false;
+    }
+
+    // Copy the fresh code over the install, but never touch the user's data dirs
+    // (downloaded models, installed nodes, generated outputs).
+    const KEEP: &[&str] = &["models", "custom_nodes", "user", "input", "output"];
+    send("== Updating ComfyUI files…".into());
+    if let Err(e) = copy_tree_skip(&src, &comfy, KEEP) {
+        send(format!("ERROR: copy failed: {e}"));
+        let _ = std::fs::remove_dir_all(&tmp);
+        return false;
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // Requirements may have changed between versions; refresh them.
+    let py = if cfg!(windows) {
+        base.join("python").join("python.exe")
+    } else {
+        base.join("python").join("bin").join("python3")
+    };
+    let py = py.to_string_lossy().to_string();
+    let req = comfy.join("requirements.txt");
+    if req.exists() {
+        send("== Updating ComfyUI requirements…".into());
+        let _ = run_streamed(&base, &py, &["-m", "pip", "install", "-r", &req.to_string_lossy()], send);
+    }
+    match comfyui_installed_version() {
+        Some(v) => send(format!("== ComfyUI updated to {v}. It will relaunch on the next generation.")),
+        None => send("== ComfyUI updated. It will relaunch on the next generation.".into()),
+    }
+    true
+}
+
+/// Recursively copy `src` into `dst`, overwriting, but skip any top-level entry
+/// whose name is in `skip_top` (case-insensitive). Used to refresh ComfyUI's code
+/// without clobbering the user's data dirs.
+fn copy_tree_skip(src: &Path, dst: &Path, skip_top: &[&str]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if skip_top.iter().any(|s| s.eq_ignore_ascii_case(&name.to_string_lossy())) {
+            continue;
+        }
+        let (from, to) = (entry.path(), dst.join(&name));
+        if from.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recursively copy `src` into `dst`, overwriting existing files.
+fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let (from, to) = (entry.path(), dst.join(entry.file_name()));
+        if from.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
 /// Render the Generate view into the right panel. `current_image` is the
 /// browser's selected file, used as the source for LTX image-to-video (None for
 /// the image families).
