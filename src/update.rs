@@ -180,11 +180,11 @@ impl UpdateState {
     }
 }
 
-/// Run both version checks (blocking; called on a worker thread).
-fn run_check() -> CheckResult {
-    // Must select NativeTls explicitly: the crate is built without the rustls
-    // feature, so the default provider would panic on an https connection.
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+/// An HTTPS agent configured the way the rest of the app does. Must select
+/// NativeTls explicitly: the crate is built without the rustls feature, so the
+/// default provider would panic on an https connection.
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
         .tls_config(
             ureq::tls::TlsConfig::builder()
@@ -193,8 +193,12 @@ fn run_check() -> CheckResult {
                 .build(),
         )
         .build()
-        .into();
+        .into()
+}
 
+/// Run both version checks (blocking; called on a worker thread).
+fn run_check() -> CheckResult {
+    let agent = http_agent();
     let mut out = CheckResult::default();
     let mut errs: Vec<String> = Vec::new();
 
@@ -464,4 +468,46 @@ fn notes_box(ui: &mut egui::Ui, id: &str, text: &str) {
 fn hint(ui: &mut egui::Ui, text: &str) {
     ui.add_space(4.0);
     ui.label(RichText::new(text).color(MUTED()).size(11.0));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_compare() {
+        // Newer core wins.
+        assert!(is_newer("v5.4.0", "5.3.1-beta.2"));
+        assert!(is_newer("0.24.0", "0.20.5"));
+        // A final release outranks its own pre-release.
+        assert!(is_newer("5.3.1", "5.3.1-beta.2"));
+        // Later beta outranks earlier beta of the same core.
+        assert!(is_newer("5.3.1-beta.3", "5.3.1-beta.2"));
+        // Identical (incl. the 'v' prefix and matching beta) is NOT newer — this
+        // is the real-world case for this build vs its own latest release.
+        assert!(!is_newer("v5.3.1-beta.2", "5.3.1-beta.2"));
+        assert!(!is_newer("v0.24.0", "0.24.0"));
+        // Older never counts (e.g. the app's stale v0.3.0 release vs this build).
+        assert!(!is_newer("v0.3.0", "5.3.1-beta.2"));
+        // Component-wise, not lexical: 0.24 > 0.3.
+        assert!(is_newer("0.24.0", "0.3.40"));
+    }
+
+    /// Hits GitHub through the app's exact ureq/native-tls agent — proves the
+    /// HTTPS path works (no TLS-provider panic) and the release JSON parses,
+    /// including the prerelease fallback for the app repo. Network test, so it's
+    /// ignored by default: run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_github() {
+        let agent = http_agent();
+        let comfy = fetch_release(&agent, COMFY_REPO).expect("comfyui release");
+        assert!(!comfy.tag.is_empty());
+        println!("comfyui latest = {} ({})", comfy.tag, comfy.url);
+
+        // The app repo has only pre-releases, so this exercises the fallback.
+        let app = fetch_release(&agent, APP_REPO).expect("app release (via fallback)");
+        assert!(!app.tag.is_empty());
+        println!("app latest = {} ({})", app.tag, app.url);
+    }
 }
