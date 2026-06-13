@@ -3,7 +3,7 @@
 
 # Packaged build artifacts (regenerated locally / by CI — don't commit)
 /dist
-/installer/Output
+/installer
 /Clarity_TagFlow.zip
 *.dmg
 
@@ -16,20 +16,9 @@
 # Debug screenshots
 /images/*.png
 
-# Local extended-format test sample sets + decoder smoke-test output (not committed)
+# Local test sample sets / media fixtures (not committed — kept on disk only)
 /avif
-/tests/avif
-/tests/HEIC
-/tests/DNG
-/tests/ARW
-/tests/CR2
-/tests/NEF
-/tests/TIFF
-/tests/HDR
-/tests/bug
-/tests/civitai
-/tests/example
-/tests/vedo
+/tests
 
 # Original Python/Java sources kept locally as a porting reference (already ported)
 /covert to rust
