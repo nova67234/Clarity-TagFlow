@@ -3,7 +3,11 @@
 
 # Packaged build artifacts (regenerated locally / by CI — don't commit)
 /dist
-/installer
+# Ignore the installer dir EXCEPT Info.plist, which the macOS release CI copies
+# into the app bundle. (The old installer/ClarityTagFlow.iss is unused — the
+# Windows installer is built from packaging/windows-installer.iss.)
+/installer/*
+!/installer/Info.plist
 /Clarity_TagFlow.zip
 *.dmg
 
