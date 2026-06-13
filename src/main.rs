@@ -273,7 +273,7 @@ struct ViewerApp {
     images_backup: Option<(Vec<PathBuf>, Option<usize>)>,
     /// (is_zimage, count) of the gen list currently shown, so switching between the
     /// Flux/Z-Image tabs or a new render refreshes the browser.
-    flux_sig: (bool, usize),
+    flux_sig: (u8, usize),
     /// The "Create Backup" dialog (top bar).
     backup: backup::BackupState,
     /// Tag Manager view state, shown in the right panel when selected from its
@@ -333,7 +333,7 @@ impl Default for ViewerApp {
             splash: splash::Splash::default(),
             flux_active: false,
             images_backup: None,
-            flux_sig: (false, 0),
+            flux_sig: (0, 0),
             backup: backup::BackupState::default(),
             tag_manager: tag_manager::TagManagerState::default(),
             // Separate large-decode gates: the viewer gets a dedicated permit so
@@ -710,13 +710,16 @@ impl ViewerApp {
         #[cfg(not(target_os = "macos"))]
         {
             if in_flux {
-                let is_zimage = self.right_state.view == right_details::RightView::ZImage;
-                let gen_list = if is_zimage {
-                    self.right_state.zimage.gen_images().to_vec()
-                } else {
-                    self.right_state.generate.gen_images().to_vec()
+                // Which generation tab is active picks the source list (0 = Flux,
+                // 1 = Z-Image, 2 = LTX, 3 = Wan); the index is folded into `sig` so
+                // a tab switch refreshes the browser.
+                let (tab, gen_list) = match self.right_state.view {
+                    right_details::RightView::ZImage => (1u8, self.right_state.zimage.gen_images().to_vec()),
+                    right_details::RightView::Ltx => (2u8, self.right_state.ltx.gen_images().to_vec()),
+                    right_details::RightView::Wan => (3u8, self.right_state.wan.gen_images().to_vec()),
+                    _ => (0u8, self.right_state.generate.gen_images().to_vec()),
                 };
-                let sig = (is_zimage, gen_list.len());
+                let sig = (tab, gen_list.len());
                 if !self.flux_active {
                     // Entering: stash the folder list, show the generated images.
                     self.images_backup = Some((std::mem::take(&mut self.images), self.selected.take()));
@@ -1076,7 +1079,10 @@ impl eframe::App for ViewerApp {
         let in_flux = self.settings.layout == settings::Layout::Panels
             && matches!(
                 self.right_state.view,
-                right_details::RightView::Generate | right_details::RightView::ZImage
+                right_details::RightView::Generate
+                    | right_details::RightView::ZImage
+                    | right_details::RightView::Ltx
+                    | right_details::RightView::Wan
             );
         #[cfg(target_os = "macos")]
         let in_flux = false;

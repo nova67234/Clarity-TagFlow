@@ -38,6 +38,12 @@ pub enum RightView {
     /// The Z-Image Turbo generation view (same ComfyUI backend).
     #[cfg(not(target_os = "macos"))]
     ZImage,
+    /// The LTX-Video text/image-to-video generation view (same ComfyUI backend).
+    #[cfg(not(target_os = "macos"))]
+    Ltx,
+    /// The Wan 2.2 text/image-to-video generation view (same ComfyUI backend).
+    #[cfg(not(target_os = "macos"))]
+    Wan,
 }
 
 /// Read-only file metadata shown in the bottom "Image Details" card. A Rust
@@ -139,6 +145,12 @@ pub struct RightPanelState {
     /// State for the Z-Image generation view (same backend, different model).
     #[cfg(not(target_os = "macos"))]
     pub zimage: crate::generate::GenerateState,
+    /// State for the LTX-Video generation view (same backend, video output).
+    #[cfg(not(target_os = "macos"))]
+    pub ltx: crate::generate::GenerateState,
+    /// State for the Wan 2.2 generation view (same backend, video output).
+    #[cfg(not(target_os = "macos"))]
+    pub wan: crate::generate::GenerateState,
     pub is_editing: bool,
 
     /// Which view the panel currently shows (Details vs Tag Manager).
@@ -186,6 +198,10 @@ impl Default for RightPanelState {
             generate: crate::generate::GenerateState::default(),
             #[cfg(not(target_os = "macos"))]
             zimage: crate::generate::GenerateState::new(crate::generate::GenFamily::ZImage),
+            #[cfg(not(target_os = "macos"))]
+            ltx: crate::generate::GenerateState::new(crate::generate::GenFamily::Ltx),
+            #[cfg(not(target_os = "macos"))]
+            wan: crate::generate::GenerateState::new(crate::generate::GenFamily::Wan),
             is_editing: false,
             view: RightView::default(),
             show_delete_confirm: false,
@@ -398,6 +414,22 @@ pub fn show(
                                 state.view = RightView::ZImage;
                                 ui.close();
                             }
+                            #[cfg(not(target_os = "macos"))]
+                            if ui
+                                .selectable_label(state.view == RightView::Ltx, "LTX Director")
+                                .clicked()
+                            {
+                                state.view = RightView::Ltx;
+                                ui.close();
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            if ui
+                                .selectable_label(state.view == RightView::Wan, "Wan Director")
+                                .clicked()
+                            {
+                                state.view = RightView::Wan;
+                                ui.close();
+                            }
                         });
 
                     // --- Swap Views ---
@@ -420,15 +452,31 @@ pub fn show(
                     #[cfg(target_os = "macos")]
                     let show_zimage = false;
 
+                    #[cfg(not(target_os = "macos"))]
+                    let show_ltx = state.view == RightView::Ltx;
+                    #[cfg(target_os = "macos")]
+                    let show_ltx = false;
+
+                    #[cfg(not(target_os = "macos"))]
+                    let show_wan = state.view == RightView::Wan;
+                    #[cfg(target_os = "macos")]
+                    let show_wan = false;
+
                     if show_pixal3d {
                         #[cfg(not(target_os = "macos"))]
                         crate::pixal3d::show(ui, &mut state.pixal3d, current_image);
                     } else if show_generate {
                         #[cfg(not(target_os = "macos"))]
-                        crate::generate::show(ui, &mut state.generate);
+                        crate::generate::show(ui, &mut state.generate, None);
                     } else if show_zimage {
                         #[cfg(not(target_os = "macos"))]
-                        crate::generate::show(ui, &mut state.zimage);
+                        crate::generate::show(ui, &mut state.zimage, None);
+                    } else if show_ltx {
+                        #[cfg(not(target_os = "macos"))]
+                        crate::generate::show(ui, &mut state.ltx, current_image);
+                    } else if show_wan {
+                        #[cfg(not(target_os = "macos"))]
+                        crate::generate::show(ui, &mut state.wan, current_image);
                     } else if state.view == RightView::TagManager {
                         crate::tag_manager::show(ui, tag_manager, current_image, &mut state.current_tags, all_images);
                     } else if state.view == RightView::Downloader {

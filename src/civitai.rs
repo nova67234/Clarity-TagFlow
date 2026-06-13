@@ -605,8 +605,9 @@ fn video_placeholder(ui: &mut egui::Ui) {
 }
 
 /// The shared rounded card frame; returns the frame's allocated response so the
-/// caller can make the whole card clickable.
-fn card_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+/// caller can make the whole card clickable. (Also used by the Generate panels'
+/// LoRA picker, so its cards match this panel's.)
+pub(crate) fn card_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
     let r = egui::Frame::new()
         .fill(FIELD())
         .corner_radius(egui::CornerRadius::same(12))
@@ -1468,8 +1469,34 @@ fn sized_image_url(url: &str, width: u32) -> String {
     parts.join("/")
 }
 
+/// First preview image (~200px render) of the Civitai model version matching a
+/// file hash — used by the Generate panels for LoRA thumbnails. Returns the raw
+/// downloaded bytes (a small JPEG), or None when the hash isn't on Civitai.
+pub(crate) fn preview_image_by_hash(sha256: &str) -> Option<Vec<u8>> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        // Match the other agents: we build ureq with only the native-tls feature,
+        // so the provider MUST be set explicitly — its default (Rustls) isn't
+        // compiled in and panics at connect time on an https URL.
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .timeout_global(Some(std::time::Duration::from_secs(20)))
+        .build()
+        .into();
+    let url = format!("https://civitai.com/api/v1/model-versions/by-hash/{sha256}");
+    let data = get_json(&agent, &url)?;
+    let images = data.get("images")?.as_array()?;
+    // Skip video previews — we want a still image.
+    let img = images.iter().find(|i| i.get("type").and_then(|t| t.as_str()) != Some("video"))?;
+    let img_url = img.get("url")?.as_str()?;
+    get_bytes(&agent, &sized_image_url(img_url, 200))
+}
+
 /// Decode downloaded preview bytes into a small `ColorImage` (max ~200px).
-fn decode_thumb(bytes: &[u8]) -> Option<egui::ColorImage> {
+pub(crate) fn decode_thumb(bytes: &[u8]) -> Option<egui::ColorImage> {
     let img = image::load_from_memory(bytes).ok()?;
     let thumb = img.thumbnail(200, 200).to_rgba8();
     let size = [thumb.width() as usize, thumb.height() as usize];

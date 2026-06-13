@@ -811,8 +811,8 @@ fn unique_target(dest: &Path, name: &str) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// SHA-256 of a file as lowercase hex, streamed in 64 KiB chunks. `None` on I/O
-/// error.
-fn sha256_file(path: &Path) -> Option<String> {
+/// error. (Also used by the Generate panels to look LoRAs up on Civitai.)
+pub(crate) fn sha256_file(path: &Path) -> Option<String> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
     let mut h = Sha256::new();
