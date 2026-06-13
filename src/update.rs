@@ -173,7 +173,7 @@ impl UpdateState {
                 let _ = tx.send(ComfyMsg::Line(s));
                 ctx.request_repaint();
             };
-            let ok = crate::generate::update_comfyui(&send);
+            let ok = run_comfy_update(&send);
             let _ = tx.send(ComfyMsg::Done(ok));
             ctx.request_repaint();
         });
@@ -196,6 +196,28 @@ fn http_agent() -> ureq::Agent {
         .into()
 }
 
+// ComfyUI generation (the `generate` module) is Windows/Linux-only — it's
+// `#[cfg(not(target_os = "macos"))]` in main.rs. These shims let the rest of the
+// update checker stay platform-independent: on macOS the ComfyUI side is simply
+// absent (no installed version, the update is a no-op).
+#[cfg(not(target_os = "macos"))]
+fn comfy_installed_version() -> Option<String> {
+    crate::generate::comfyui_installed_version()
+}
+#[cfg(target_os = "macos")]
+fn comfy_installed_version() -> Option<String> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_comfy_update(send: &dyn Fn(String)) -> bool {
+    crate::generate::update_comfyui(send)
+}
+#[cfg(target_os = "macos")]
+fn run_comfy_update(_send: &dyn Fn(String)) -> bool {
+    false
+}
+
 /// Run both version checks (blocking; called on a worker thread).
 fn run_check() -> CheckResult {
     let agent = http_agent();
@@ -207,7 +229,7 @@ fn run_check() -> CheckResult {
         Err(e) => errs.push(format!("app: {e}")),
     }
 
-    out.comfy_installed = crate::generate::comfyui_installed_version();
+    out.comfy_installed = comfy_installed_version();
     // Only bother fetching ComfyUI's latest if it's actually installed.
     if out.comfy_installed.is_some() {
         match fetch_release(&agent, COMFY_REPO) {
@@ -359,7 +381,7 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
         let installed = state.result.as_ref().and_then(|r| r.comfy_installed.clone());
         match &installed {
             Some(v) => ui.label(RichText::new(format!("Installed: {v}")).color(MUTED()).size(12.0)),
-            None => ui.label(RichText::new("Not installed (set it up from a Generate tab).").color(MUTED()).size(12.0)),
+            None => ui.label(RichText::new("Not installed.").color(MUTED()).size(12.0)),
         };
         if let Some(r) = &state.result {
             if let (Some(inst), Some(latest)) = (&r.comfy_installed, &r.comfy_latest) {
