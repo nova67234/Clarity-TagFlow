@@ -91,8 +91,9 @@ pub enum TopBarAction {
 }
 
 /// Render the top bar. Returns any action the app should perform. `show_stats`
-/// toggles the centre CPU/RAM graphs.
-pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool) -> TopBarAction {
+/// toggles the centre CPU/RAM graphs; `update_badge` paints a red dot on the
+/// settings gear when an app/ComfyUI update is available.
+pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool, update_badge: bool) -> TopBarAction {
     let mut action = TopBarAction::None;
 
     egui::Panel::top("topbar")
@@ -117,8 +118,17 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool) -> TopBarA
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             let settings_svg = egui::include_image!("../icons/top_settings.svg");
-                            if svg_button(ui, settings_svg, "Settings", 37.0, MUTED()).clicked() {
+                            let gear = svg_button(ui, settings_svg, "Settings", 37.0, MUTED());
+                            if gear.clicked() {
                                 action = TopBarAction::OpenSettings;
+                            }
+                            // Red "update available" dot on the gear's top-right corner.
+                            if update_badge {
+                                let center = gear.rect.center();
+                                let dot = egui::pos2(center.x + 14.0, center.y - 14.0);
+                                let p = ui.painter();
+                                p.circle_filled(dot, 5.5, BG());
+                                p.circle_filled(dot, 4.0, Color32::from_rgb(230, 70, 70));
                             }
 
                             ui.add_space(6.0);

@@ -104,6 +104,7 @@ mod tag_manager;
 mod tag_manager_settings;
 mod tagger;
 mod top_bar;
+mod update;
 mod video; // embedded VLC playback (real backend only under --features vlc)
 mod zoom; // zoom + pan for the centre image viewer
 
@@ -310,6 +311,8 @@ struct ViewerApp {
     /// Screen rect of the centre (image) panel, captured each frame so overlays
     /// can be positioned over the image rather than the whole window.
     last_center_rect: Option<egui::Rect>,
+    /// App + ComfyUI update checker (drives the Updates tab and the gear's red dot).
+    update: update::UpdateState,
 }
 
 impl Default for ViewerApp {
@@ -350,6 +353,7 @@ impl Default for ViewerApp {
             bg_job: None,
             bg_toast: None,
             last_center_rect: None,
+            update: update::UpdateState::default(),
         }
     }
 }
@@ -999,6 +1003,8 @@ impl eframe::App for ViewerApp {
         }
 
         self.handle_dropped_files(ui.ctx());
+        // Kick off the launch update-check and drain its workers (badge + Updates tab).
+        self.update.tick(ui.ctx());
         // Advance any in-flight background-removal job (download → inference → result).
         self.drive_bg_job(ui.ctx());
         self.paint_bg_status(ui.ctx());
@@ -1062,7 +1068,8 @@ impl eframe::App for ViewerApp {
             }
         }
 
-        match top_bar::show(ui, &self.stats, self.settings.show_stats) {
+        let update_badge = self.update.badge(&self.settings);
+        match top_bar::show(ui, &self.stats, self.settings.show_stats, update_badge) {
             top_bar::TopBarAction::OpenFolder => self.open_dialog(),
             top_bar::TopBarAction::OpenSettings => self.settings.open = !self.settings.open,
             top_bar::TopBarAction::CreateBackup => self.start_backup(),
@@ -1196,7 +1203,7 @@ impl eframe::App for ViewerApp {
             self.rescan_current_folder();
         }
 
-        settings::show(ui.ctx(), &mut self.settings);
+        settings::show(ui.ctx(), &mut self.settings, &mut self.update);
 
         // Gallery detail popup (opened by clicking a gallery tile). Push the loop
         // preference first so a clip the popup starts picks it up (the centre
