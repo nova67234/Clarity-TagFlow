@@ -1,0 +1,392 @@
+//! Interactive 3D GLB viewer for the centre panel (Pixal3D output), Linux/Windows
+//! only (compiled out on macOS alongside Pixal3D itself).
+//!
+//! Renders a loaded `.glb` model with PBR materials + lighting into eframe's
+//! existing glow (OpenGL) context, inside an egui paint callback. Drag to orbit,
+//! scroll to zoom. Built on `three-d` 0.19 (which pins the same glow 0.17 /
+//! egui_glow 0.34 that eframe 0.34 uses, so the GL context type unifies).
+//!
+//! Loading is one-shot per file. The expensive part — reading the GLB and
+//! decoding its textures/geometry into a CPU model — runs on a background thread
+//! so the UI never freezes (a 40–80 MB GLB with 4K PBR textures can take many
+//! seconds, especially in debug builds). The cheap-ish GPU upload then happens in
+//! the paint callback (the only place a `three_d::Context` is available). The
+//! model is static after that, so we only repaint while interacting or loading.
+
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
+
+use eframe::egui;
+use three_d::*;
+
+use crate::theme::MUTED;
+
+/// UI-facing handle. Owns the shared render state and tracks which file is loaded.
+pub struct Scene3D {
+    inner: Arc<Mutex<Inner>>,
+    /// Path currently loaded (or attempted), so we only reload on change.
+    loaded_path: Option<PathBuf>,
+    /// Set if reading/parsing the GLB failed (shown instead of the viewport).
+    load_err: Option<String>,
+    /// Receives the parsed CPU model from the background loader thread.
+    loader: Option<Receiver<Result<CpuModel, String>>>,
+}
+
+/// Shared, callback-accessible state. Must be `Send + 'static` (it lives behind a
+/// `Mutex` in the `egui_glow::CallbackFn`, which requires `Send + Sync`).
+struct Inner {
+    // Orbit camera, driven by the UI.
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+    target: Vec3,
+    /// A parsed CPU model waiting for GPU upload (consumed in the callback).
+    pending_cpu: Option<CpuModel>,
+    /// True once a model has been uploaded and is renderable.
+    has_model: bool,
+    /// After an upload, frame the camera to the model's bounds (one-shot).
+    needs_framing: bool,
+    /// GPU-side resources, built lazily once the GL context is available.
+    gpu: Option<Gpu>,
+    /// Background clear colour for the viewport (RGBA, linear-ish).
+    bg: [f32; 4],
+}
+
+struct Gpu {
+    ctx: Context,
+    /// Raw glow context, kept so we can reset GL state after rendering.
+    gl: Arc<glow::Context>,
+    model: Option<Model<PhysicalMaterial>>,
+    ambient: AmbientLight,
+    key: DirectionalLight,
+    fill: DirectionalLight,
+}
+
+impl Default for Scene3D {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Scene3D {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner {
+                yaw: 0.7,
+                pitch: 0.4,
+                distance: 3.0,
+                target: vec3(0.0, 0.0, 0.0),
+                pending_cpu: None,
+                has_model: false,
+                needs_framing: false,
+                gpu: None,
+                bg: [0.0; 4],
+            })),
+            loaded_path: None,
+            load_err: None,
+            loader: None,
+        }
+    }
+
+    /// Render the viewer for `glb_path` (the most recently generated model, if
+    /// any). Call every frame while the Pixal3D view is active.
+    pub fn show(&mut self, ui: &mut egui::Ui, glb_path: Option<&Path>) {
+        // When the target file changes, kick off a background load. Reading +
+        // decoding the GLB (4K PBR textures, ~1M triangles) is heavy, so it runs
+        // off the UI thread; the UI shows a spinner and stays responsive.
+        if glb_path.map(Path::to_path_buf) != self.loaded_path {
+            self.loaded_path = glb_path.map(Path::to_path_buf);
+            self.load_err = None;
+            self.loader = None;
+            if let Some(p) = glb_path {
+                self.loader = Some(spawn_loader(p.to_path_buf(), ui.ctx().clone()));
+            }
+        }
+
+        // Collect the parsed model from the loader thread when it's ready.
+        if let Some(rx) = &self.loader {
+            match rx.try_recv() {
+                Ok(Ok(cpu)) => {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.pending_cpu = Some(cpu);
+                    inner.needs_framing = true;
+                    drop(inner);
+                    self.loader = None;
+                }
+                Ok(Err(e)) => {
+                    self.load_err = Some(e);
+                    self.loader = None;
+                }
+                Err(TryRecvError::Empty) => {} // still loading
+                Err(TryRecvError::Disconnected) => {
+                    self.load_err = Some("Model loader stopped unexpectedly".into());
+                    self.loader = None;
+                }
+            }
+        }
+
+        if glb_path.is_none() {
+            placeholder(ui, "Generate a 3D model to view it here.");
+            return;
+        }
+        if let Some(err) = &self.load_err {
+            placeholder(ui, err);
+            return;
+        }
+
+        // Nothing renderable yet (first load in progress): spinner, and keep the
+        // frame loop alive so we poll the loader and animate the spinner.
+        let (has_model, has_pending) = {
+            let inner = self.inner.lock().unwrap();
+            (inner.has_model, inner.pending_cpu.is_some())
+        };
+        if !has_model && !has_pending {
+            spinner(ui, "Loading 3D model…");
+            ui.ctx().request_repaint();
+            return;
+        }
+
+        // Claim the whole panel and let it orbit / zoom.
+        let (rect, response) =
+            ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+
+        let mut interacting = false;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.bg = clear_color();
+            if response.dragged() {
+                let d = response.drag_delta();
+                inner.yaw -= d.x * 0.01;
+                inner.pitch = (inner.pitch + d.y * 0.01).clamp(-1.54, 1.54);
+                interacting = true;
+            }
+            if response.hovered() {
+                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll != 0.0 {
+                    inner.distance = (inner.distance * (1.0 - scroll * 0.0015)).clamp(0.05, 1.0e5);
+                    interacting = true;
+                }
+            }
+            // A freshly parsed model still needs one callback to upload + frame.
+            if inner.pending_cpu.is_some() || inner.needs_framing {
+                interacting = true;
+            }
+        }
+
+        let inner = Arc::clone(&self.inner);
+        let callback = egui::PaintCallback {
+            rect,
+            callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
+                inner.lock().unwrap().render(painter.gl().clone(), &info);
+            })),
+        };
+        ui.painter().add(callback);
+
+        // The model is static, so only keep repainting while interacting (or
+        // settling a freshly loaded model).
+        if interacting {
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+/// Read + parse a GLB on a background thread, returning a channel that yields the
+/// CPU model (or an error). Wakes the UI via `request_repaint` when done.
+fn spawn_loader(path: PathBuf, ctx: egui::Context) -> Receiver<Result<CpuModel, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = std::fs::read(&path)
+            .map_err(|e| format!("Couldn't read model: {e}"))
+            .and_then(|bytes| {
+                three_d_asset::io::deserialize::<CpuModel>("model.glb", bytes).map_err(|e| e.to_string())
+            });
+        let _ = tx.send(result);
+        ctx.request_repaint();
+    });
+    rx
+}
+
+impl Inner {
+    fn render(&mut self, gl: Arc<glow::Context>, info: &egui::PaintCallbackInfo) {
+        // Lazily build the three-d context + lights from the live glow context.
+        if self.gpu.is_none() {
+            let ctx = match Context::from_gl_context(gl.clone()) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            // Image-based lighting: Pixal3D models are fully metallic, so their
+            // colour comes from environment reflections — with no environment they
+            // render near-black. A simple studio cubemap (bright top, mid sides,
+            // dark floor) gives believable metal without bundling an HDR.
+            let env = studio_cubemap(&ctx);
+            let ambient = AmbientLight::new_with_environment(&ctx, 1.0, Srgba::WHITE, &env);
+            let key = DirectionalLight::new(&ctx, 1.4, Srgba::WHITE, vec3(-0.5, -1.0, -0.7));
+            let fill = DirectionalLight::new(&ctx, 0.6, Srgba::WHITE, vec3(0.6, -0.3, 0.5));
+            self.gpu = Some(Gpu { ctx, gl, model: None, ambient, key, fill });
+        }
+        let gpu = self.gpu.as_mut().unwrap();
+
+        // Upload any parsed CPU model to the GPU (PBR materials applied
+        // automatically). Parsing already happened off-thread; this is the only
+        // step that must run on the GL thread.
+        if let Some(cpu) = self.pending_cpu.take() {
+            match Model::<PhysicalMaterial>::new(&gpu.ctx, &cpu).map_err(|e| e.to_string()) {
+                Ok(mut model) => {
+                    // Force every part into the OPAQUE rendering pass. Pixal3D
+                    // models are solid, but their PNG albedo often carries a stray
+                    // alpha channel (a feathering byproduct of background removal),
+                    // which makes three-d classify the material as transparent.
+                    // Transparent materials disable depth writing and fall back to
+                    // CPU back-to-front triangle sorting — so on this dense,
+                    // self-intersecting AI geometry the back faces draw over the
+                    // front while orbiting, making the model look see-through.
+                    // Disabling blend + enabling depth write/test fixes that (the
+                    // GL context also needs a depth buffer; see NativeOptions).
+                    for part in model.iter_mut() {
+                        part.material.is_transparent = false;
+                        part.material.render_states.blend = Blend::Disabled;
+                        part.material.render_states.write_mask = WriteMask::COLOR_AND_DEPTH;
+                        part.material.render_states.depth_test = DepthTest::Less;
+                    }
+                    gpu.model = Some(model);
+                    self.has_model = true;
+                }
+                Err(e) => {
+                    eprintln!("[scene3d] GLB GPU upload failed: {e}");
+                    gpu.model = None;
+                    self.has_model = false;
+                }
+            }
+        }
+
+        // egui gives a top-left rect; glow/three-d want bottom-left origin, which
+        // `from_bottom_px` already provides.
+        let vp = info.viewport_in_pixels();
+        let viewport = Viewport {
+            x: vp.left_px,
+            y: vp.from_bottom_px,
+            width: vp.width_px.max(0) as u32,
+            height: vp.height_px.max(0) as u32,
+        };
+        if viewport.width == 0 || viewport.height == 0 {
+            return;
+        }
+
+        const FOV_Y: f32 = std::f32::consts::FRAC_PI_4; // 45° vertical field of view
+
+        // Frame the camera to the model bounds, once. Fit the bounding sphere into
+        // whichever axis is tighter (a tall, narrow panel is limited horizontally),
+        // with margin, so the model never clips the panel edges.
+        if self.needs_framing {
+            if let Some(model) = &gpu.model {
+                let mut aabb = AxisAlignedBoundingBox::EMPTY;
+                for part in model {
+                    aabb.expand_with_aabb(part.aabb());
+                }
+                if !aabb.is_empty() {
+                    self.target = aabb.center();
+                    let radius = (aabb.size().magnitude() * 0.5).max(1.0e-3);
+                    let aspect = viewport.width as f32 / viewport.height as f32;
+                    let half_y = FOV_Y * 0.5;
+                    let half_x = (half_y.tan() * aspect).atan();
+                    let half = half_x.min(half_y); // tighter axis governs the fit
+                    self.distance = radius / half.sin() * 1.2; // 20% breathing room
+                }
+                self.needs_framing = false;
+            }
+        }
+
+        // Orbit camera from spherical coords (three-d's Camera has no setters, so
+        // it's rebuilt each frame — also needed because the viewport changes).
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        let eye = vec3(
+            self.target.x + self.distance * cp * sy,
+            self.target.y + self.distance * sp,
+            self.target.z + self.distance * cp * cy,
+        );
+        let z_near = (self.distance * 0.01).max(1.0e-3);
+        let z_far = self.distance * 10.0 + 100.0;
+        let camera = Camera::new_perspective(
+            viewport,
+            eye,
+            self.target,
+            vec3(0.0, 1.0, 0.0),
+            radians(FOV_Y),
+            z_near,
+            z_far,
+        );
+
+        // Render only our panel region — never wipe the rest of egui's framebuffer.
+        let [sw, sh] = info.screen_size_px;
+        let sb = ScissorBox { x: viewport.x, y: viewport.y, width: viewport.width, height: viewport.height };
+        let [r, g, b, a] = self.bg;
+        let screen = RenderTarget::screen(&gpu.ctx, sw, sh);
+        screen.clear_partially(sb, ClearState::color_and_depth(r, g, b, a, 1.0));
+        if let Some(model) = &gpu.model {
+            screen.render_partially(sb, &camera, model, &[&gpu.ambient, &gpu.key, &gpu.fill]);
+        }
+
+        // Defensive: clear state three-d may leave set (scissor/program/VAO) so it
+        // can't disturb egui's subsequent draws.
+        use glow::HasContext as _;
+        unsafe {
+            gpu.gl.disable(glow::SCISSOR_TEST);
+            gpu.gl.bind_vertex_array(None);
+            gpu.gl.use_program(None);
+        }
+    }
+}
+
+/// Centred muted message shown when there's no model (or a load error).
+fn placeholder(ui: &mut egui::Ui, msg: &str) {
+    ui.centered_and_justified(|ui| {
+        ui.label(egui::RichText::new(msg).size(15.0).color(MUTED()));
+    });
+}
+
+/// Centred spinner + label, shown while a model loads on the background thread.
+fn spinner(ui: &mut egui::Ui, msg: &str) {
+    ui.centered_and_justified(|ui| {
+        ui.vertical_centered(|ui| {
+            ui.add(egui::Spinner::new().size(40.0).color(MUTED()));
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new(msg).size(14.0).color(MUTED()));
+        });
+    });
+}
+
+/// A minimal "studio" environment cubemap for image-based lighting: bright top
+/// (key light from above), neutral mid-grey sides, dark floor. Uniform per face,
+/// so it's orientation-independent and gives metallic surfaces a natural top-lit
+/// reflection without bundling an HDR file.
+fn studio_cubemap(ctx: &Context) -> TextureCubeMap {
+    const N: usize = 16;
+    let face = |c: [u8; 3]| three_d_asset::Texture2D {
+        data: three_d_asset::TextureData::RgbaU8(vec![[c[0], c[1], c[2], 255]; N * N]),
+        width: N as u32,
+        height: N as u32,
+        mipmap: None,
+        ..Default::default()
+    };
+    let side = face([165, 170, 180]);
+    TextureCubeMap::new(
+        ctx,
+        &side,             // right
+        &side,             // left
+        &face([250, 250, 255]), // top (key)
+        &face([45, 46, 52]),    // bottom (floor)
+        &side,             // front
+        &side,             // back
+    )
+}
+
+/// Viewport clear colour, matched loosely to the active theme.
+fn clear_color() -> [f32; 4] {
+    if crate::theme::is_light() {
+        [0.93, 0.93, 0.95, 1.0]
+    } else {
+        [0.07, 0.07, 0.09, 1.0]
+    }
+}

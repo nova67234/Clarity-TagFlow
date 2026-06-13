@@ -20,6 +20,10 @@ use eframe::egui;
 use crate::theme::{ACCENT1, EDGE, FIELD, MUTED, PANEL, TEXT};
 
 const API_URL: &str = "https://gelbooru.com/index.php?page=dapi&s=post&q=index&json=1";
+/// Tag-info endpoint: returns each tag's `type` (0 general, 1 artist, 3 copyright,
+/// 4 character, 5 metadata). Used to split a post's flat tag list into artist /
+/// character roles for the `{md5}.json` sidecar.
+const TAG_API_URL: &str = "https://gelbooru.com/index.php?page=dapi&s=tag&q=index&json=1";
 const SITE_HOME: &str = "https://gelbooru.com/";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -263,7 +267,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
             };
             egui::Frame::new()
                 .fill(log_bg)
-                .corner_radius(egui::CornerRadius::same(12))
+                .corner_radius(egui::CornerRadius::same(22))
                 .inner_margin(egui::Margin::same(10))
                 .stroke(egui::Stroke::new(1.0, EDGE()))
                 .show(ui, |ui| {
@@ -361,7 +365,23 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                         field_label(ui, "API key");
                         field_edit(ui, enabled, egui::TextEdit::singleline(&mut state.api_key)
                             .password(true)
-                            .hint_text("Required · stored encrypted"));
+                            .hint_text("Paste your Gelbooru API key"));
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Stored encrypted on this device.")
+                                    .color(MUTED())
+                                    .size(10.5),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                crate::arrow_link(
+                                    ui,
+                                    "Get credentials",
+                                    "https://gelbooru.com/index.php?page=account&s=options",
+                                    Some(10.5),
+                                );
+                            });
+                        });
                     });
 
                     section(ui, "Search", |ui| {
@@ -507,25 +527,24 @@ fn section_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
         });
 }
 
-/// Draw the coloured "API: …" status pill.
+/// Draw the API status as a coloured dot + label (matches the Civitai panel's
+/// "● Online" style).
 fn api_pill(ui: &mut egui::Ui, api: u8) {
-    let (text, bg) = match api {
-        API_ONLINE => ("Online", egui::Color32::from_rgb(35, 137, 58)),
-        API_OFFLINE => ("Offline", egui::Color32::from_rgb(160, 60, 60)),
-        _ => ("Checking…", egui::Color32::from_rgb(120, 120, 120)),
+    let (text, dot) = match api {
+        API_ONLINE => ("Online", egui::Color32::from_rgb(46, 160, 67)),
+        API_OFFLINE => ("Offline", egui::Color32::from_rgb(210, 70, 70)),
+        _ => ("Checking…", egui::Color32::from_rgb(150, 150, 150)),
     };
-    egui::Frame::new()
-        .fill(bg)
-        .corner_radius(egui::CornerRadius::same(8))
-        .inner_margin(egui::Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(format!("API: {text}"))
-                    .color(egui::Color32::WHITE)
-                    .size(11.0)
-                    .strong(),
-            );
-        });
+    // The section title row is a right-to-left layout and `ui.horizontal` inherits
+    // it, so add the label FIRST (it lands rightmost) and the dot SECOND (to its
+    // left) to read "● Online".
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        ui.label(egui::RichText::new(text).color(MUTED()).size(11.0).strong());
+        // A small status dot painted to a fixed box so it stays crisp and centred.
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 4.0, dot);
+    });
 }
 
 /// Spawn a daemon-style thread that probes gelbooru.com every 5s and stores the
@@ -771,6 +790,13 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
         .build()
         .into();
 
+    // Session cache of tag name -> Gelbooru type, so common tags are only looked
+    // up once across the whole run (most tags repeat across posts).
+    let mut tag_types: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    // Shared artist/character map (md5 -> roles), loaded once and accumulated into
+    // as images download, then saved back to one tag_roles.json in the config dir.
+    let mut roles_map = load_tag_roles_map();
+
     // Enforce the daily cap: today's remaining allowance bounds this run.
     let mut used_today = quota_used_today();
     let remaining_today = DAILY_CAP.saturating_sub(used_today);
@@ -862,6 +888,35 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
             let formatted = format_gelbooru_tags(&post.raw_tags);
             if let Err(e) = std::fs::write(&txt_path, formatted) {
                 log(format!("Warning: could not write tags for {}: {e}", post.md5));
+            }
+
+            // Record the artist (username) + character tags into the shared
+            // tag_roles.json so the viewer can colour them. Resolve each tag's type
+            // via the tag API, caching results across the run to minimise requests.
+            let names: Vec<&str> = post.raw_tags.split_whitespace().collect();
+            let unknown: Vec<String> = names
+                .iter()
+                .filter(|n| !tag_types.contains_key(**n))
+                .map(|n| n.to_string())
+                .collect();
+            if !unknown.is_empty() {
+                let fetched = fetch_tag_types(&agent, &unknown, &cfg.user_id, &cfg.api_key);
+                for (k, v) in fetched {
+                    tag_types.insert(k, v);
+                }
+                // Mark any tag the API didn't return as general (0), so we don't
+                // re-query it for every subsequent post.
+                for n in &unknown {
+                    tag_types.entry(n.clone()).or_insert(0);
+                }
+            }
+            let artist: Vec<String> =
+                names.iter().filter(|n| tag_types.get(**n) == Some(&1)).map(|n| n.to_string()).collect();
+            let character: Vec<String> =
+                names.iter().filter(|n| tag_types.get(**n) == Some(&4)).map(|n| n.to_string()).collect();
+            if !artist.is_empty() || !character.is_empty() {
+                roles_map.insert(post.md5.clone(), TagRoles { artist, character });
+                save_tag_roles_map(&roles_map);
             }
 
             append_download_log(&post.md5, &mut downloaded_log);
@@ -1078,6 +1133,96 @@ fn is_allowed_by_selection(ext: &str, img: bool, gif: bool, vid: bool) -> bool {
         return vid;
     }
     false
+}
+
+/// Artist (username) + character tags for one image. Stored in a single shared
+/// `tag_roles.json` (in the app's config dir), keyed by md5, that accumulates as
+/// more images are downloaded — so the viewer can colour those tags.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct TagRoles {
+    #[serde(default)]
+    artist: Vec<String>,
+    #[serde(default)]
+    character: Vec<String>,
+}
+
+/// Path of the shared tag-roles map (md5 -> {artist, character}) in the config dir.
+pub(crate) fn tag_roles_path() -> PathBuf {
+    config_dir().join("tag_roles.json")
+}
+
+/// Load the shared tag-roles map, or an empty map if none/invalid.
+fn load_tag_roles_map() -> std::collections::HashMap<String, TagRoles> {
+    std::fs::read_to_string(tag_roles_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the shared tag-roles map.
+fn save_tag_roles_map(map: &std::collections::HashMap<String, TagRoles>) {
+    let dir = config_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(s) = serde_json::to_string_pretty(map) {
+        let _ = std::fs::write(tag_roles_path(), s);
+    }
+}
+
+/// Look up each tag's Gelbooru `type` via the tag endpoint, returning name->type
+/// (0 general · 1 artist · 3 copyright · 4 character · 5 metadata). Chunked, since
+/// the endpoint takes space-separated `names`. Best-effort: any network/parse
+/// failure just yields fewer entries (those tags fall back to "general").
+fn fetch_tag_types(
+    agent: &ureq::Agent,
+    names: &[String],
+    user_id: &str,
+    api_key: &str,
+) -> std::collections::HashMap<String, i64> {
+    let mut out = std::collections::HashMap::new();
+    let add = |t: &serde_json::Value, out: &mut std::collections::HashMap<String, i64>| {
+        let name = t.get("name").and_then(|v| v.as_str());
+        // `type` is an integer with json=1, but tolerate a stringified form too.
+        let ty = t
+            .get("type")
+            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+        if let (Some(name), Some(ty)) = (name, ty) {
+            out.insert(name.to_string(), ty);
+        }
+    };
+    for chunk in names.chunks(100) {
+        let mut url = format!("{TAG_API_URL}&names={}", percent_encode(&chunk.join(" ")));
+        if !user_id.trim().is_empty() {
+            url.push_str("&user_id=");
+            url.push_str(&percent_encode(user_id.trim()));
+        }
+        if !api_key.trim().is_empty() {
+            url.push_str("&api_key=");
+            url.push_str(&percent_encode(api_key.trim()));
+        }
+        let resp = agent
+            .get(&url)
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "application/json,text/plain,*/*")
+            .call();
+        let Ok(mut resp) = resp else { continue };
+        if resp.status().as_u16() != 200 {
+            continue;
+        }
+        let Ok(body) = resp.body_mut().read_to_string() else { continue };
+        let Ok(root) = serde_json::from_str::<serde_json::Value>(&body) else { continue };
+        // { "@attributes": {...}, "tag": [ {name,type,...}, ... ] } — "tag" can be a
+        // single object instead of an array when there's one result.
+        match root.get("tag") {
+            Some(serde_json::Value::Array(arr)) => {
+                for t in arr {
+                    add(t, &mut out);
+                }
+            }
+            Some(obj @ serde_json::Value::Object(_)) => add(obj, &mut out),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn build_api_url(final_tags: &str, per_page: u32, pid: u32, user_id: &str, api_key: &str) -> String {

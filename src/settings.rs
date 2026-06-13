@@ -5,7 +5,7 @@
 use eframe::egui;
 
 use crate::left_panel_settings::MediaFilter;
-use crate::theme::{Backdrop, Theme, EDGE, FIELD, MUTED, PANEL, TEXT};
+use crate::theme::{Backdrop, Theme, EDGE, MUTED, PANEL, TEXT};
 
 /// Key under which the settings are saved in eframe's persistent storage.
 pub const STORAGE_KEY: &str = "clarity_tagflow_settings";
@@ -17,6 +17,17 @@ pub enum SettingsTab {
     #[default]
     General,
     Appearance,
+    Updates,
+}
+
+/// The overall UI layout: the classic three panels, or a full-window gallery.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layout {
+    /// Browser (left) · viewer (centre) · details (right).
+    #[default]
+    Panels,
+    /// A full-window masonry grid of the open folder's images.
+    Gallery,
 }
 
 /// User preferences. Lives on `ViewerApp` and is persisted across runs via
@@ -55,6 +66,8 @@ pub struct Settings {
     /// The active app colour theme (Dark / Light). Applied on launch and live
     /// whenever changed from the Appearance tab.
     pub theme: Theme,
+    /// The overall UI layout (classic panels, or full-window gallery).
+    pub layout: Layout,
     /// Background colour (sRGB) for the Glass theme — painted behind its
     /// translucent panels. Independent of the panel colours, so changing it
     /// recolours the background without restyling the glass.
@@ -67,11 +80,21 @@ pub struct Settings {
     /// Show the live CPU / RAM graphs in the top bar. Off gives a cleaner bar (and
     /// skips the periodic system sampling).
     pub show_stats: bool,
+    /// Let floating popups (Civitai settings, LoRA picker, image detail view, Find
+    /// Issues) be dragged around and remember where they were left between runs.
+    /// Off pins them to their original spot. Modal dialogs (Settings / Backup /
+    /// delete confirm) are always fixed regardless.
+    pub movable_popups: bool,
     /// Which media type the browser is narrowed to (Filter tab). Not persisted —
     /// resets to `All` each launch, matching the Java filter dialog, so a stored
     /// "Favorites" can't make the browser look empty after a restart.
     #[serde(skip)]
     pub media_filter: MediaFilter,
+    /// The app release tag the user dismissed the update badge for, so the red dot
+    /// stays hidden until a newer release appears. Empty = nothing dismissed.
+    pub dismissed_app_version: String,
+    /// Same, for the dismissed ComfyUI release tag.
+    pub dismissed_comfy_version: String,
 }
 
 impl Default for Settings {
@@ -87,36 +110,41 @@ impl Default for Settings {
             enable_extended_formats: false,
             last_ai_model: "Select AI...".to_string(),
             theme: Theme::default(),
+            layout: Layout::default(),
             // A deep navy reads well behind the glass panels by default.
             glass_bg: [20, 22, 34],
             glass_backdrop: Backdrop::default(),
             loop_video: false,
             show_stats: true,
+            movable_popups: true,
             media_filter: MediaFilter::default(),
+            dismissed_app_version: String::new(),
+            dismissed_comfy_version: String::new(),
         }
     }
 }
 
 /// Render the settings window when it's open. Mutates `settings` in place; the
 /// title-bar close button dismisses it (so does clicking the gear again).
-pub fn show(ctx: &egui::Context, settings: &mut Settings) {
+pub fn show(ctx: &egui::Context, settings: &mut Settings, update: &mut crate::update::UpdateState) {
     if !settings.open {
         return;
     }
 
-    let mut open = true;
+    let mut want_close = false;
     egui::Window::new("Settings")
-        .open(&mut open)
+        .id(egui::Id::new("settings_window"))
+        .title_bar(false) // custom header inside (matches the other popups)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .frame(window_frame())
         .show(ctx, |ui| {
-            // Shrink the UI smaller horizontally
-            ui.set_width(260.0);
+            ui.set_width(360.0);
+            ui.set_max_width(360.0);
 
-            // Force check boxes to be square with round edges.
-            // This overrides heavy corner radiuses from the global theme that cause circular checkboxes.
+            // Square-but-rounded checkboxes (the global theme rounds them into
+            // pills otherwise).
             let square_radius = egui::CornerRadius::same(4);
             let visuals = ui.visuals_mut();
             visuals.widgets.noninteractive.corner_radius = square_radius;
@@ -125,17 +153,44 @@ pub fn show(ctx: &egui::Context, settings: &mut Settings) {
             visuals.widgets.active.corner_radius = square_radius;
             visuals.widgets.open.corner_radius = square_radius;
 
-            // Tabs across the top of the window.
+            // Title row: settings icon + "Settings" + close.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add(
+                    egui::Image::new(egui::include_image!("../icons/settings.svg"))
+                        .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                        .tint(TEXT()),
+                );
+                ui.heading(egui::RichText::new("Settings").color(TEXT()).strong().size(17.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::image(
+                            egui::Image::new(egui::include_image!("../icons/close.svg"))
+                                .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                                .tint(TEXT()),
+                        ).frame(false))
+                        .on_hover_text("Close")
+                        .clicked()
+                    {
+                        want_close = true;
+                    }
+                });
+            });
+            ui.add_space(12.0);
+
+            // Tabs.
             ui.horizontal(|ui| {
                 tab_button(ui, settings, SettingsTab::General, "General");
                 tab_button(ui, settings, SettingsTab::Appearance, "Appearance");
+                // The Updates tab title carries a small dot when an update is waiting.
+                let updates_label = if update.badge(settings) { "Updates ●" } else { "Updates" };
+                tab_button(ui, settings, SettingsTab::Updates, updates_label);
             });
             ui.add_space(8.0);
 
-            // Scroll the tab body so a long tab (e.g. General) doesn't make the
-            // window tall. The tabs above stay pinned. Kept compact (≈430px), but
-            // shrinks further on very short screens so it never exceeds the window.
-            let max_h = (ui.ctx().content_rect().height() - 120.0).clamp(240.0, 430.0);
+            // Scroll the tab body so a long tab doesn't make the window tall; the
+            // header + tabs stay pinned.
+            let max_h = (ui.ctx().content_rect().height() - 140.0).clamp(240.0, 460.0);
             egui::ScrollArea::vertical()
                 .auto_shrink([false, true])
                 .max_height(max_h)
@@ -144,12 +199,12 @@ pub fn show(ctx: &egui::Context, settings: &mut Settings) {
                     match settings.tab {
                         SettingsTab::General => general_tab(ui, settings),
                         SettingsTab::Appearance => appearance_tab(ui, settings),
+                        SettingsTab::Updates => crate::update::updates_tab(ui, update, settings),
                     }
                 });
         });
 
-    // The title-bar close button flips `open` to false.
-    settings.open = open;
+    settings.open = !want_close;
 }
 
 /// The General tab: the original viewer / browser / files / about sections.
@@ -163,6 +218,18 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             ui,
             "The live CPU and memory graphs in the top bar. Turn off for a cleaner \
              bar (and to skip the periodic system sampling).",
+        );
+
+        ui.add_space(6.0);
+        ui.checkbox(
+            &mut settings.movable_popups,
+            egui::RichText::new("Movable popups").color(TEXT()),
+        );
+        hint(
+            ui,
+            "Let popups (Civitai settings, the LoRA picker, the image detail view, and \
+             Find Issues) be dragged around — and remember where you leave them next \
+             time. Turn off to keep them centred and fixed.",
         );
     });
 
@@ -263,6 +330,26 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
 /// The Appearance tab: pick the app colour theme. Changing it updates
 /// `settings.theme`; `main.rs` applies the new palette live next frame.
 fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
+    section(ui, "Layout", |ui| {
+        ui.radio_value(
+            &mut settings.layout,
+            Layout::Panels,
+            egui::RichText::new("Panels").color(TEXT()),
+        );
+        ui.add_space(2.0);
+        ui.radio_value(
+            &mut settings.layout,
+            Layout::Gallery,
+            egui::RichText::new("Gallery").color(TEXT()),
+        );
+        hint(
+            ui,
+            "Panels is the classic browser · viewer · details layout. Gallery hides \
+             the panels and shows every image in the open folder as a grid — click \
+             one to open it back in Panels view.",
+        );
+    });
+
     section(ui, "Theme", |ui| {
         ui.label(egui::RichText::new("Colour theme").color(TEXT()));
         ui.add_space(6.0);
@@ -312,7 +399,37 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Colour").color(TEXT()));
                 ui.add_space(6.0);
-                ui.color_edit_button_srgb(&mut settings.glass_bg);
+
+                // A pill-shaped colour swatch. egui's own colour button hard-caps
+                // its corner radius at 2px (the alpha checker grid can't round), so
+                // we paint our own pill and open the picker in a popup on click.
+                let mut col = {
+                    let [r, g, b] = settings.glass_bg;
+                    egui::Color32::from_rgb(r, g, b)
+                };
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(46.0, 18.0), egui::Sense::click());
+                let radius = rect.height() / 2.0;
+                ui.painter().rect_filled(rect, radius, col);
+                ui.painter().rect_stroke(
+                    rect,
+                    radius,
+                    egui::Stroke::new(1.0, EDGE()),
+                    egui::StrokeKind::Inside,
+                );
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                egui::Popup::from_toggle_button_response(&resp).show(|ui| {
+                    ui.set_min_width(220.0);
+                    if egui::widgets::color_picker::color_picker_color32(
+                        ui,
+                        &mut col,
+                        egui::widgets::color_picker::Alpha::Opaque,
+                    ) {
+                        settings.glass_bg = [col.r(), col.g(), col.b()];
+                    }
+                });
             });
             hint(ui, "Shows through the translucent panels and fills the gutters.");
 
@@ -354,28 +471,17 @@ fn tab_button(ui: &mut egui::Ui, settings: &mut Settings, tab: SettingsTab, labe
     }
 }
 
-/// A titled, rounded group card holding a few related controls.
-fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(6.0);
-    // Center the section title
-    ui.vertical_centered(|ui| {
-        ui.label(egui::RichText::new(title).color(MUTED()).strong().size(12.0));
-    });
+/// A flat section: an uppercase muted label with its controls directly below,
+/// left-aligned (matches the Civitai / Backup popups — no bordered card).
+pub(crate) fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(4.0);
-
-    egui::Frame::new()
-        .fill(FIELD())
-        .corner_radius(egui::CornerRadius::same(22)) // 22px to match the app's panels/viewer
-        .inner_margin(egui::Margin::symmetric(12, 10))
-        .stroke(egui::Stroke::new(1.0, EDGE()))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            // Center the inner controls
-            ui.vertical_centered(|ui| {
-                add(ui);
-            });
-        });
-    ui.add_space(2.0);
+    ui.label(egui::RichText::new(title.to_uppercase()).color(MUTED()).strong().size(11.0));
+    ui.add_space(6.0);
+    ui.scope(|ui| {
+        ui.set_width(ui.available_width());
+        add(ui);
+    });
+    ui.add_space(12.0);
 }
 
 /// A small muted explanatory line, shown under a control.
@@ -384,17 +490,18 @@ fn hint(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).color(MUTED()).size(11.0));
 }
 
-/// A themed frame for the settings window body (rounded, soft drop shadow).
+/// A themed frame for the settings window body (matches the Civitai / Backup
+/// popups: rounded-16 card with a soft drop shadow).
 fn window_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(PANEL())
-        .corner_radius(egui::CornerRadius::same(22)) // 22px to match the app's panels/viewer
-        .inner_margin(egui::Margin::same(12)) // Tighter padding
+        .corner_radius(egui::CornerRadius::same(16))
+        .inner_margin(egui::Margin::same(18))
         .stroke(egui::Stroke::new(1.0, EDGE()))
         .shadow(egui::epaint::Shadow {
-            offset: [0, 4], // Softened shadow depth
-            blur: 16,
+            offset: [0, 6],
+            blur: 20,
             spread: 0,
-            color: egui::Color32::from_black_alpha(140),
+            color: egui::Color32::from_black_alpha(150),
         })
 }

@@ -85,14 +85,15 @@ pub enum TopBarAction {
     OpenSettings,
     /// The user clicked "Create Backup".
     CreateBackup,
-    /// The user clicked "Find Issues". Carries the button's bottom-left so the
-    /// Deep Scan window can pop up just under it.
+    /// The user clicked "Find Issues". Carries the button's bottom-right so the
+    /// Deep Scan window can drop down right-aligned under it (extending left).
     FindIssues(egui::Pos2),
 }
 
 /// Render the top bar. Returns any action the app should perform. `show_stats`
-/// toggles the centre CPU/RAM graphs.
-pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool) -> TopBarAction {
+/// toggles the centre CPU/RAM graphs; `update_badge` paints a red dot on the
+/// settings gear when an app/ComfyUI update is available.
+pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool, update_badge: bool) -> TopBarAction {
     let mut action = TopBarAction::None;
 
     egui::Panel::top("topbar")
@@ -117,18 +118,38 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool) -> TopBarA
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             let settings_svg = egui::include_image!("../icons/top_settings.svg");
-                            if svg_button(ui, settings_svg, "Settings", 37.0, MUTED()).clicked() {
+                            let gear = svg_button(ui, settings_svg, "Settings", 37.0, MUTED());
+                            if gear.clicked() {
                                 action = TopBarAction::OpenSettings;
+                            }
+                            // Red "update available" dot on the gear's top-right corner.
+                            if update_badge {
+                                let center = gear.rect.center();
+                                let dot = egui::pos2(center.x + 14.0, center.y - 14.0);
+                                let p = ui.painter();
+                                p.circle_filled(dot, 5.5, BG());
+                                p.circle_filled(dot, 4.0, Color32::from_rgb(230, 70, 70));
                             }
 
                             ui.add_space(6.0);
-                            if bar_button(ui, "Create Backup", 150.0).clicked() {
+                            let backup = bar_button_icon(
+                                ui,
+                                egui::include_image!("../icons/backup.svg"),
+                                "Create Backup",
+                                150.0,
+                            );
+                            if backup.clicked() {
                                 action = TopBarAction::CreateBackup;
                             }
                             ui.add_space(6.0);
-                            let fi = bar_button(ui, "Find Issues", 130.0);
+                            let fi = bar_button_icon(
+                                ui,
+                                egui::include_image!("../icons/frame_inspect.svg"),
+                                "Find Issues",
+                                130.0,
+                            );
                             if fi.clicked() {
-                                action = TopBarAction::FindIssues(fi.rect.left_bottom());
+                                action = TopBarAction::FindIssues(fi.rect.right_bottom());
                             }
                             ui.add_space(14.0);
 
@@ -184,10 +205,14 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool) -> TopBarA
 /// A fixed-width top-bar button styled exactly like the right-details panel
 /// buttons: theme fill and hover (no accent, no drop shadow) and the theme text
 /// color — just rendered at a fixed width.
-fn bar_button(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
+/// A top-bar action button with a leading SVG icon (tinted to the button's label
+/// colour so it matches in every theme).
+fn bar_button_icon(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, label: &str, width: f32) -> egui::Response {
+    let tint = ui.visuals().widgets.inactive.fg_stroke.color;
+    let img = egui::Image::new(icon).fit_to_exact_size(egui::vec2(16.0, 16.0)).tint(tint);
     ui.add_sized(
         egui::vec2(width, 34.0),
-        egui::Button::new(egui::RichText::new(label).size(15.0))
+        egui::Button::image_and_text(img, egui::RichText::new(label).size(15.0))
             .corner_radius(CornerRadius::same(12)),
     )
 }

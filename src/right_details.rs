@@ -28,6 +28,22 @@ pub enum RightView {
     Downloader,
     /// The Civitai resource-info UI (replaces the details view).
     Civitai,
+    /// The Pixal3D image->3D requirement setup UI. Linux/Windows only — the
+    /// variant doesn't exist on macOS so the whole feature is compiled out.
+    #[cfg(not(target_os = "macos"))]
+    Pixal3D,
+    /// The Flux text-to-image generation (ComfyUI) view. NVIDIA-only, like Pixal3D.
+    #[cfg(not(target_os = "macos"))]
+    Generate,
+    /// The Z-Image Turbo generation view (same ComfyUI backend).
+    #[cfg(not(target_os = "macos"))]
+    ZImage,
+    /// The LTX-Video text/image-to-video generation view (same ComfyUI backend).
+    #[cfg(not(target_os = "macos"))]
+    Ltx,
+    /// The Wan 2.2 text/image-to-video generation view (same ComfyUI backend).
+    #[cfg(not(target_os = "macos"))]
+    Wan,
 }
 
 /// Read-only file metadata shown in the bottom "Image Details" card. A Rust
@@ -72,19 +88,69 @@ impl Default for ImageMeta {
     }
 }
 
+impl ImageMeta {
+    /// The placeholder shown in the details card while a background `load_meta`
+    /// (full decode + colour extraction) is still running.
+    pub(crate) fn loading() -> Self {
+        Self {
+            name: "Loading...".into(),
+            file_type: "...".into(),
+            dimensions: "...".into(),
+            size: "...".into(),
+            date: "...".into(),
+            colors: vec![],
+            ..Self::default()
+        }
+    }
+}
+
+/// Artist (username) + character tag names for the current image, looked up from
+/// the downloader's shared `tag_roles.json` (keyed by md5). Used to colour those
+/// tags in the tag box.
+#[derive(Default, Clone)]
+pub(crate) struct TagRoles {
+    pub(crate) artist: std::collections::HashSet<String>,
+    pub(crate) character: std::collections::HashSet<String>,
+}
+
 /// Maintains the UI state for the right panel, such as the loaded text buffer
 /// and whether the user is currently in edit mode.
 pub struct RightPanelState {
     pub current_tags: String,
+    /// Artist/character tags for the current image (looked up by md5 from the
+    /// shared tag_roles.json), so the tag box can colour artist orange / char green.
+    tag_roles: TagRoles,
+    /// Cached parse of the shared tag_roles.json (its mtime + md5->roles map),
+    /// reloaded only when the file changes — so selection changes don't re-parse it.
+    roles_cache: Option<(Option<SystemTime>, std::collections::HashMap<String, TagRoles>)>,
     /// Embedded Stable-Diffusion generation metadata for the selected image,
     /// or `None` when the image carries none. Read by `crate::sd_metadata`.
     pub sd_metadata: Option<String>,
+    /// The *raw* (unformatted) embedded metadata for the selected image — handed to
+    /// the Civitai panel so its `Hashes:` / `TI hashes:` blocks survive intact
+    /// (formatting them away hid embeddings). `None` when the image carries none.
+    pub sd_metadata_raw: Option<String>,
     /// When true, the tag box shows the (read-only) SD metadata instead of tags.
     pub showing_meta: bool,
     /// State for the Gelbooru downloader view.
     pub downloader: crate::download::DownloaderState,
     /// State for the Civitai resource-info view.
     pub civitai: crate::civitai::CivitaiState,
+    /// State for the Pixal3D requirement-setup view (Linux/Windows only).
+    #[cfg(not(target_os = "macos"))]
+    pub pixal3d: crate::pixal3d::Pixal3DState,
+    /// State for the Flux/ComfyUI generation view (Linux/Windows only).
+    #[cfg(not(target_os = "macos"))]
+    pub generate: crate::generate::GenerateState,
+    /// State for the Z-Image generation view (same backend, different model).
+    #[cfg(not(target_os = "macos"))]
+    pub zimage: crate::generate::GenerateState,
+    /// State for the LTX-Video generation view (same backend, video output).
+    #[cfg(not(target_os = "macos"))]
+    pub ltx: crate::generate::GenerateState,
+    /// State for the Wan 2.2 generation view (same backend, video output).
+    #[cfg(not(target_os = "macos"))]
+    pub wan: crate::generate::GenerateState,
     pub is_editing: bool,
 
     /// Which view the panel currently shows (Details vs Tag Manager).
@@ -119,10 +185,23 @@ impl Default for RightPanelState {
     fn default() -> Self {
         Self {
             current_tags: String::new(),
+            tag_roles: TagRoles::default(),
+            roles_cache: None,
             sd_metadata: None,
+            sd_metadata_raw: None,
             showing_meta: false,
             downloader: crate::download::DownloaderState::default(),
             civitai: crate::civitai::CivitaiState::default(),
+            #[cfg(not(target_os = "macos"))]
+            pixal3d: crate::pixal3d::Pixal3DState::default(),
+            #[cfg(not(target_os = "macos"))]
+            generate: crate::generate::GenerateState::default(),
+            #[cfg(not(target_os = "macos"))]
+            zimage: crate::generate::GenerateState::new(crate::generate::GenFamily::ZImage),
+            #[cfg(not(target_os = "macos"))]
+            ltx: crate::generate::GenerateState::new(crate::generate::GenFamily::Ltx),
+            #[cfg(not(target_os = "macos"))]
+            wan: crate::generate::GenerateState::new(crate::generate::GenFamily::Wan),
             is_editing: false,
             view: RightView::default(),
             show_delete_confirm: false,
@@ -178,9 +257,15 @@ pub fn show(
         if let Some(path) = current_image {
             let txt_path = sidecar_txt(path);
             state.current_tags = std::fs::read_to_string(&txt_path).unwrap_or_default();
+            // Look up this image's artist/character roles (by md5) from the shared
+            // tag_roles.json, so the tag box can colour those tags.
+            state.tag_roles = lookup_tag_roles(&mut state.roles_cache, path);
             // Read embedded SD generation metadata (PNG text chunks / EXIF
-            // UserComment). Cheap relative to the full-res decode below.
-            state.sd_metadata = crate::sd_metadata::read(path);
+            // UserComment) once — both the formatted display text and the raw
+            // string the Civitai panel parses. Cheap relative to the decode below.
+            let (disp, raw) = crate::sd_metadata::read_both(path);
+            state.sd_metadata = disp;
+            state.sd_metadata_raw = raw;
             // Default to the .txt tags, but when the image has no tags yet *and*
             // carries embedded generation metadata, open straight to the metadata
             // view so it isn't hidden behind a manual switch. With both present,
@@ -188,12 +273,7 @@ pub fn show(
             state.showing_meta = state.current_tags.trim().is_empty() && state.sd_metadata.is_some();
 
             // Set temporary loading state for the card
-            state.meta = ImageMeta {
-                name: "Loading...".into(), file_type: "...".into(),
-                dimensions: "...".into(), size: "...".into(),
-                date: "...".into(), colors: vec![],
-                ..ImageMeta::default()
-            };
+            state.meta = ImageMeta::loading();
 
             // Spawn a background thread to calculate metadata and heavy colors
             let (tx, rx) = mpsc::channel();
@@ -221,7 +301,9 @@ pub fn show(
 
         } else {
             state.current_tags.clear();
+            state.tag_roles = TagRoles::default();
             state.sd_metadata = None;
+            state.sd_metadata_raw = None;
             state.showing_meta = false;
             state.meta = ImageMeta::default();
         }
@@ -307,17 +389,100 @@ pub fn show(
                                 state.view = RightView::Downloader;
                                 ui.close();
                             }
+                            // Pixal3D — Linux/Windows only (hidden on macOS).
+                            #[cfg(not(target_os = "macos"))]
+                            if ui
+                                .selectable_label(state.view == RightView::Pixal3D, "Pixal3D")
+                                .clicked()
+                            {
+                                state.view = RightView::Pixal3D;
+                                ui.close();
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            if ui
+                                .selectable_label(state.view == RightView::Generate, "Generate (Flux)")
+                                .clicked()
+                            {
+                                state.view = RightView::Generate;
+                                ui.close();
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            if ui
+                                .selectable_label(state.view == RightView::ZImage, "Generate (Z-Image)")
+                                .clicked()
+                            {
+                                state.view = RightView::ZImage;
+                                ui.close();
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            if ui
+                                .selectable_label(state.view == RightView::Ltx, "LTX Director")
+                                .clicked()
+                            {
+                                state.view = RightView::Ltx;
+                                ui.close();
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            if ui
+                                .selectable_label(state.view == RightView::Wan, "Wan Director")
+                                .clicked()
+                            {
+                                state.view = RightView::Wan;
+                                ui.close();
+                            }
                         });
 
                     // --- Swap Views ---
                     // The Tag Manager view completely replaces the Details & Actions UI,
                     // but stays constrained perfectly within the 420px width and 22px rounded box.
-                    if state.view == RightView::TagManager {
+                    // Pixal3D is Linux/Windows only; on macOS the variant/field don't
+                    // exist, so gate the check behind a platform-safe boolean.
+                    #[cfg(not(target_os = "macos"))]
+                    let show_pixal3d = state.view == RightView::Pixal3D;
+                    #[cfg(target_os = "macos")]
+                    let show_pixal3d = false;
+
+                    #[cfg(not(target_os = "macos"))]
+                    let show_generate = state.view == RightView::Generate;
+                    #[cfg(target_os = "macos")]
+                    let show_generate = false;
+
+                    #[cfg(not(target_os = "macos"))]
+                    let show_zimage = state.view == RightView::ZImage;
+                    #[cfg(target_os = "macos")]
+                    let show_zimage = false;
+
+                    #[cfg(not(target_os = "macos"))]
+                    let show_ltx = state.view == RightView::Ltx;
+                    #[cfg(target_os = "macos")]
+                    let show_ltx = false;
+
+                    #[cfg(not(target_os = "macos"))]
+                    let show_wan = state.view == RightView::Wan;
+                    #[cfg(target_os = "macos")]
+                    let show_wan = false;
+
+                    if show_pixal3d {
+                        #[cfg(not(target_os = "macos"))]
+                        crate::pixal3d::show(ui, &mut state.pixal3d, current_image);
+                    } else if show_generate {
+                        #[cfg(not(target_os = "macos"))]
+                        crate::generate::show(ui, &mut state.generate, None);
+                    } else if show_zimage {
+                        #[cfg(not(target_os = "macos"))]
+                        crate::generate::show(ui, &mut state.zimage, None);
+                    } else if show_ltx {
+                        #[cfg(not(target_os = "macos"))]
+                        crate::generate::show(ui, &mut state.ltx, current_image);
+                    } else if show_wan {
+                        #[cfg(not(target_os = "macos"))]
+                        crate::generate::show(ui, &mut state.wan, current_image);
+                    } else if state.view == RightView::TagManager {
                         crate::tag_manager::show(ui, tag_manager, current_image, &mut state.current_tags, all_images);
                     } else if state.view == RightView::Downloader {
                         crate::download::show(ui, &mut state.downloader);
                     } else if state.view == RightView::Civitai {
-                        crate::civitai::show(ui, &mut state.civitai, current_image, state.sd_metadata.as_deref());
+                        crate::civitai::show(ui, &mut state.civitai, current_image, state.sd_metadata_raw.as_deref());
                     } else if let Some(img_path) = current_image {
                         // --- FOOTER SECTION (Strictly Bottom Anchored) ---
                         egui::Panel::bottom("right_footer")
@@ -347,15 +512,8 @@ pub fn show(
                                     // Copy flashes green when it copies tags, or amber
                                     // ("warning") when there's nothing to copy — then fades back.
                                     let mut copy_btn = egui::Button::new(label("Copy"));
-                                    if let Some((start, ok)) = state.copy_flash {
-                                        let elapsed = start.elapsed().as_secs_f32();
-                                        if elapsed < FLASH_SECS {
-                                            let intensity = 1.0 - elapsed / FLASH_SECS;
-                                            let target = if ok { FLASH_GREEN } else { FLASH_AMBER };
-                                            let base = ui.visuals().widgets.inactive.weak_bg_fill;
-                                            copy_btn = copy_btn.fill(lerp_color(base, target, intensity));
-                                            ui.ctx().request_repaint(); // animate the fade
-                                        }
+                                    if let Some(fill) = flash_fill(ui, state.copy_flash, FLASH_GREEN, FLASH_AMBER) {
+                                        copy_btn = copy_btn.fill(fill);
                                     }
 
                                     if ui
@@ -381,15 +539,8 @@ pub fn show(
                                     // red when the write fails (stays in edit mode to retry).
                                     let mut edit_btn =
                                         egui::Button::new(label(if state.is_editing { "Save" } else { "Edit Text" }));
-                                    if let Some((start, ok)) = state.save_flash {
-                                        let elapsed = start.elapsed().as_secs_f32();
-                                        if elapsed < FLASH_SECS {
-                                            let intensity = 1.0 - elapsed / FLASH_SECS;
-                                            let target = if ok { FLASH_GREEN } else { FLASH_RED };
-                                            let base = ui.visuals().widgets.inactive.weak_bg_fill;
-                                            edit_btn = edit_btn.fill(lerp_color(base, target, intensity));
-                                            ui.ctx().request_repaint();
-                                        }
+                                    if let Some(fill) = flash_fill(ui, state.save_flash, FLASH_GREEN, FLASH_RED) {
+                                        edit_btn = edit_btn.fill(fill);
                                     }
 
                                     if ui.add_sized(size, edit_btn).clicked() {
@@ -523,6 +674,14 @@ pub fn show(
                                     state.current_tags.clone()
                                 };
 
+                                // Artist/character colouring for the tag view (not
+                                // the metadata view). Cloned for the layouter closure.
+                                let artist_set = state.tag_roles.artist.clone();
+                                let character_set = state.tag_roles.character.clone();
+                                let highlight_roles = !showing_meta
+                                    && !(artist_set.is_empty() && character_set.is_empty());
+                                let role_color = if editable { TEXT() } else { TEXT().gamma_multiply(0.8) };
+
                                 // The box is a FIXED-size rounded frame that always
                                 // fills the remaining panel height — it never resizes
                                 // and never moves. Long text (e.g. SD metadata) scrolls
@@ -535,18 +694,7 @@ pub fn show(
 
                                 // Box background, with the "ready to edit" flash pulsing
                                 // it toward the accent just after entering edit mode.
-                                let mut box_fill = FIELD();
-                                if let Some(start) = state.edit_flash_start {
-                                    let elapsed = start.elapsed().as_secs_f32();
-                                    if elapsed < EDIT_FLASH_SECS {
-                                        let t = elapsed / EDIT_FLASH_SECS;          // 0..1
-                                        let envelope = 1.0 - t;                     // overall fade-out
-                                        let osc = (t * std::f32::consts::PI * 2.0).sin().abs(); // two pulses
-                                        let intensity = (envelope * osc).clamp(0.0, 1.0);
-                                        box_fill = lerp_color(FIELD(), ACCENT1(), intensity * 0.55);
-                                        ui.ctx().request_repaint(); // keep the animation smooth
-                                    }
-                                }
+                                let box_fill = edit_flash_fill(ui, state.edit_flash_start);
 
                                 // Lock the box height to the remaining space *before*
                                 // building the frame, so its size is independent of the
@@ -578,6 +726,15 @@ pub fn show(
                                                     text_edit = text_edit.text_color(TEXT().gamma_multiply(0.8));
                                                 }
 
+                                                // Colour artist (orange) / character
+                                                // (green) tags via a custom layouter.
+                                                let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+                                                    highlight_tags(ui, buf.as_str(), &artist_set, &character_set, role_color, wrap)
+                                                };
+                                                if highlight_roles {
+                                                    text_edit = text_edit.layouter(&mut layouter);
+                                                }
+
                                                 ui.add(text_edit);
                                             });
                                     });
@@ -601,92 +758,17 @@ pub fn show(
 
     // --- 3. Delete Confirmation UI (Smaller, Centered Modal) ---
     if state.show_delete_confirm {
-        let mut close_dialog = false;
-        let mut confirm_delete = false;
-
-        egui::Window::new("Confirm Delete")
-            .title_bar(false) // No title bar to keep the UI small and clean
-            .resizable(false)
-            .collapsible(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO) // Anchor directly in the middle of the screen
-            .frame(card_frame(22)) // match the rest of the UI (PANEL() fill, radius 22, shadow)
-            .show(ui.ctx(), |ui| {
-                ui.set_max_width(260.0); // Stop it from stretching too wide
-
-                // Wrap inner elements in vertical_centered so text and buttons line up perfectly
-                ui.vertical_centered(|ui| {
-                    let warn = egui::include_image!("../icons/warning.svg");
-                    ui.add(
-                        egui::Image::new(warn)
-                            .fit_to_exact_size(egui::vec2(32.0, 32.0))
-                            .tint(egui::Color32::from_rgb(220, 160, 50)),
-                    );
-                    ui.add_space(8.0);
-
-                    ui.label(
-                        egui::RichText::new("Are you sure you want to delete this file?")
-                            .size(15.0)
-                            .strong()
-                            .color(TEXT())
-                    );
-
-                    ui.add_space(16.0);
-
-                    // Scope for checkbox to ensure it acts as a true square
-                    // with slightly rounded 4px edges (instead of inheriting 12px pill curves)
-                    ui.scope(|ui| {
-                        let r = egui::CornerRadius::same(4);
-                        ui.visuals_mut().widgets.inactive.corner_radius = r;
-                        ui.visuals_mut().widgets.hovered.corner_radius = r;
-                        ui.visuals_mut().widgets.active.corner_radius = r;
-                        ui.visuals_mut().widgets.noninteractive.corner_radius = r;
-
-                        ui.checkbox(&mut state.skip_delete_confirm, "Don't ask again");
-                    });
-
-                    ui.add_space(20.0);
-
-                    ui.horizontal(|ui| {
-                        let btn_w = 80.0;
-                        let gap = 12.0;
-                        let total_w = btn_w * 2.0 + gap;
-
-                        // Push the buttons perfectly to the middle of the layout
-                        ui.add_space((ui.available_width() - total_w) / 2.0);
-                        ui.spacing_mut().item_spacing.x = gap;
-
-                        // Add matching soft-corners to the inner action buttons
-                        let r = egui::CornerRadius::same(8);
-                        ui.visuals_mut().widgets.inactive.corner_radius = r;
-                        ui.visuals_mut().widgets.hovered.corner_radius = r;
-                        ui.visuals_mut().widgets.active.corner_radius = r;
-
-                        if ui.add_sized(egui::vec2(btn_w, 30.0), egui::Button::new("Cancel")).clicked() {
-                            close_dialog = true;
-                        }
-
-                        let danger_bg = egui::Color32::from_rgb(180, 40, 40);
-                        let del_btn = egui::Button::new(
-                            egui::RichText::new("Delete").color(egui::Color32::WHITE)
-                        ).fill(danger_bg);
-
-                        if ui.add_sized(egui::vec2(btn_w, 30.0), del_btn).clicked() {
-                            confirm_delete = true;
-                        }
-                    });
-                });
-            });
-
-        // Resolve actions after the UI block concludes
-        if confirm_delete {
-            action = RightPanelAction::DeleteCurrent;
-            state.show_delete_confirm = false;
-            // "Don't ask again" disables (and persists, via Settings) future prompts.
-            if state.skip_delete_confirm {
-                *confirm_before_delete = false;
+        match delete_confirm_dialog(ui.ctx(), "right_panel_confirm_delete", &mut state.skip_delete_confirm) {
+            Some(true) => {
+                action = RightPanelAction::DeleteCurrent;
+                state.show_delete_confirm = false;
+                // "Don't ask again" disables (and persists, via Settings) future prompts.
+                if state.skip_delete_confirm {
+                    *confirm_before_delete = false;
+                }
             }
-        } else if close_dialog {
-            state.show_delete_confirm = false;
+            Some(false) => state.show_delete_confirm = false,
+            None => {}
         }
     }
 
@@ -700,7 +782,7 @@ pub fn show(
 const DETAIL_LABEL_W: f32 = 110.0;
 const DETAIL_ROW_VPAD: f32 = 3.0;
 
-fn image_details_section(ui: &mut egui::Ui, meta: &ImageMeta) {
+pub(crate) fn image_details_section(ui: &mut egui::Ui, meta: &ImageMeta) {
     // Swap the heading + icon to match the selection: "Video Info" (video icon)
     // for videos, "GIF Info" (gif icon) for animated GIFs, else "Image Info".
     ui.horizontal(|ui| {
@@ -824,7 +906,7 @@ fn detail_color_row(ui: &mut egui::Ui, label: &str, colors: &[egui::Color32]) {
 }
 
 /// Read the metadata shown in the details card, including extracting dominant colors.
-fn load_meta(path: &Path) -> ImageMeta {
+pub(crate) fn load_meta(path: &Path) -> ImageMeta {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -897,7 +979,7 @@ fn load_meta(path: &Path) -> ImageMeta {
         } else {
             #[cfg(feature = "avif")]
             {
-                if matches!(ext.as_str(), "avif" | "heic" | "heif" | "dng" | "arw" | "cr2" | "nef") {
+                if crate::is_extended_extension(&ext) {
                     crate::avif::decode_avif(path).map(image::DynamicImage::ImageRgba8)
                 } else {
                     None
@@ -1131,6 +1213,84 @@ pub(crate) fn sidecar_txt(img_path: &Path) -> PathBuf {
     img_path.with_extension("txt")
 }
 
+/// Tag-role highlight colours (Danbooru-style): artist orange, character green.
+const ARTIST_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 150, 50);
+const CHARACTER_COLOR: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
+
+/// Look up an image's artist/character roles by its md5 (the downloaded file's
+/// stem) from the shared `tag_roles.json`. The parsed map is cached and only
+/// re-read when the file's mtime changes, so rapid selection changes don't
+/// re-parse it. Returns empty roles for images not in the map.
+pub(crate) fn lookup_tag_roles(
+    cache: &mut Option<(Option<SystemTime>, std::collections::HashMap<String, TagRoles>)>,
+    img_path: &Path,
+) -> TagRoles {
+    let path = crate::download::tag_roles_path();
+    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    // (Re)load the map when the cache is empty or the file changed on disk.
+    let stale = cache.as_ref().map(|(m, _)| *m != mtime).unwrap_or(true);
+    if stale {
+        let map = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.as_object().cloned())
+            .map(|obj| {
+                let set = |entry: &serde_json::Value, key: &str| -> std::collections::HashSet<String> {
+                    entry
+                        .get(key)
+                        .and_then(|x| x.as_array())
+                        .map(|arr| arr.iter().filter_map(|e| e.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default()
+                };
+                obj.into_iter()
+                    .map(|(md5, entry)| {
+                        (md5, TagRoles { artist: set(&entry, "artist"), character: set(&entry, "character") })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        *cache = Some((mtime, map));
+    }
+    let key = img_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    cache
+        .as_ref()
+        .and_then(|(_, map)| map.get(key))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Build a colour-highlighted layout for the (comma-separated) tag text: artist
+/// tags orange, character tags green, everything else `default_color`.
+pub(crate) fn highlight_tags(
+    ui: &egui::Ui,
+    text: &str,
+    artist: &std::collections::HashSet<String>,
+    character: &std::collections::HashSet<String>,
+    default_color: egui::Color32,
+    wrap_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    // Keep the commas with their token so spacing/positions are preserved exactly.
+    for piece in text.split_inclusive(',') {
+        let name = piece.trim().trim_end_matches(',').trim();
+        let color = if artist.contains(name) {
+            ARTIST_COLOR
+        } else if character.contains(name) {
+            CHARACTER_COLOR
+        } else {
+            default_color
+        };
+        job.append(
+            piece,
+            0.0,
+            egui::TextFormat { font_id: font_id.clone(), color, ..Default::default() },
+        );
+    }
+    ui.fonts_mut(|f| f.layout_job(job))
+}
+
 fn format_time(t: SystemTime) -> String {
     let dt: chrono::DateTime<chrono::Local> = t.into();
     dt.format("%Y-%m-%d %H:%M:%S").to_string()
@@ -1142,9 +1302,138 @@ const EDIT_FLASH_SECS: f32 = 0.8;
 /// Duration (seconds) of the button result-flashes (Copy / Save).
 const FLASH_SECS: f32 = 1.0;
 /// Button flash colors: green = success, amber = nothing to do, red = failure.
-const FLASH_GREEN: egui::Color32 = egui::Color32::from_rgb(46, 160, 67);
-const FLASH_AMBER: egui::Color32 = egui::Color32::from_rgb(200, 145, 40);
-const FLASH_RED: egui::Color32 = egui::Color32::from_rgb(200, 55, 55);
+pub(crate) const FLASH_GREEN: egui::Color32 = egui::Color32::from_rgb(46, 160, 67);
+pub(crate) const FLASH_AMBER: egui::Color32 = egui::Color32::from_rgb(200, 145, 40);
+pub(crate) const FLASH_RED: egui::Color32 = egui::Color32::from_rgb(200, 55, 55);
+
+/// Fill for a button result-flash, fading from `ok`/`fail` back to the normal
+/// button colour over `FLASH_SECS`. `None` once the flash has expired (or there
+/// is no flash) — leave the button's default fill alone then. Shared by the
+/// right panel and the gallery detail popup.
+pub(crate) fn flash_fill(
+    ui: &egui::Ui,
+    flash: Option<(Instant, bool)>,
+    ok: egui::Color32,
+    fail: egui::Color32,
+) -> Option<egui::Color32> {
+    let (start, was_ok) = flash?;
+    let elapsed = start.elapsed().as_secs_f32();
+    if elapsed >= FLASH_SECS {
+        return None;
+    }
+    let intensity = 1.0 - elapsed / FLASH_SECS;
+    let target = if was_ok { ok } else { fail };
+    let base = ui.visuals().widgets.inactive.weak_bg_fill;
+    ui.ctx().request_repaint(); // animate the fade
+    Some(lerp_color(base, target, intensity))
+}
+
+/// The tag box's fill, with the "ready to edit" flash pulsing it toward the
+/// accent just after entering edit mode. Shared by the right panel and the
+/// gallery detail popup.
+pub(crate) fn edit_flash_fill(ui: &egui::Ui, start: Option<Instant>) -> egui::Color32 {
+    let mut fill = FIELD();
+    if let Some(start) = start {
+        let elapsed = start.elapsed().as_secs_f32();
+        if elapsed < EDIT_FLASH_SECS {
+            let t = elapsed / EDIT_FLASH_SECS;          // 0..1
+            let envelope = 1.0 - t;                     // overall fade-out
+            let osc = (t * std::f32::consts::PI * 2.0).sin().abs(); // two pulses
+            let intensity = (envelope * osc).clamp(0.0, 1.0);
+            fill = lerp_color(FIELD(), ACCENT1(), intensity * 0.55);
+            ui.ctx().request_repaint(); // keep the animation smooth
+        }
+    }
+    fill
+}
+
+/// The delete-confirmation modal (warning icon, "Don't ask again" checkbox,
+/// Cancel / Delete) — shared by the right panel and the gallery detail popup.
+/// Returns `Some(true)` when Delete is clicked, `Some(false)` on Cancel, and
+/// `None` while the dialog stays open.
+pub(crate) fn delete_confirm_dialog(
+    ctx: &egui::Context,
+    id: &str,
+    skip_confirm: &mut bool,
+) -> Option<bool> {
+    let mut result = None;
+
+    egui::Window::new("Confirm Delete")
+        .id(egui::Id::new(id))
+        .title_bar(false) // No title bar to keep the UI small and clean
+        .resizable(false)
+        .collapsible(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO) // Anchor directly in the middle of the screen
+        .frame(card_frame(22)) // match the rest of the UI (PANEL() fill, radius 22, shadow)
+        .show(ctx, |ui| {
+            ui.set_max_width(260.0); // Stop it from stretching too wide
+
+            // Wrap inner elements in vertical_centered so text and buttons line up perfectly
+            ui.vertical_centered(|ui| {
+                let warn = egui::include_image!("../icons/warning.svg");
+                ui.add(
+                    egui::Image::new(warn)
+                        .fit_to_exact_size(egui::vec2(32.0, 32.0))
+                        .tint(egui::Color32::from_rgb(220, 160, 50)),
+                );
+                ui.add_space(8.0);
+
+                ui.label(
+                    egui::RichText::new("Are you sure you want to delete this file?")
+                        .size(15.0)
+                        .strong()
+                        .color(TEXT())
+                );
+
+                ui.add_space(16.0);
+
+                // Scope for checkbox to ensure it acts as a true square
+                // with slightly rounded 4px edges (instead of inheriting 12px pill curves)
+                ui.scope(|ui| {
+                    let r = egui::CornerRadius::same(4);
+                    ui.visuals_mut().widgets.inactive.corner_radius = r;
+                    ui.visuals_mut().widgets.hovered.corner_radius = r;
+                    ui.visuals_mut().widgets.active.corner_radius = r;
+                    ui.visuals_mut().widgets.noninteractive.corner_radius = r;
+
+                    ui.checkbox(skip_confirm, "Don't ask again");
+                });
+
+                ui.add_space(20.0);
+
+                ui.horizontal(|ui| {
+                    let btn_w = 80.0;
+                    let gap = 12.0;
+                    let total_w = btn_w * 2.0 + gap;
+
+                    // Push the buttons perfectly to the middle of the layout
+                    ui.add_space((ui.available_width() - total_w) / 2.0);
+                    ui.spacing_mut().item_spacing.x = gap;
+
+                    // Add matching soft-corners to the inner action buttons
+                    let r = egui::CornerRadius::same(8);
+                    ui.visuals_mut().widgets.inactive.corner_radius = r;
+                    ui.visuals_mut().widgets.hovered.corner_radius = r;
+                    ui.visuals_mut().widgets.active.corner_radius = r;
+
+                    if ui.add_sized(egui::vec2(btn_w, 30.0), egui::Button::new("Cancel")).clicked() {
+                        result = Some(false);
+                    }
+
+                    let danger_bg = egui::Color32::from_rgb(180, 40, 40);
+                    let del_btn = egui::Button::new(
+                        egui::RichText::new("Delete").color(egui::Color32::WHITE)
+                    ).fill(danger_bg);
+
+                    if ui.add_sized(egui::vec2(btn_w, 30.0), del_btn).clicked() {
+                        result = Some(true);
+                    }
+                });
+            });
+        });
+
+    result
+}
 
 /// Linearly interpolate between two colors in sRGB component space.
 fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {

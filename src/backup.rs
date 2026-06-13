@@ -34,8 +34,8 @@ const FLASH: Duration = Duration::from_millis(450);
 /// auto-sized egui window the available width is infinite, which leaks into the
 /// persisted `last_content_size` as `inf` and reloads as a NaN rect that panics.
 const DIALOG_WIDTH: f32 = 380.0;
-/// Usable width inside a section card (DIALOG_WIDTH − window margin − card margin).
-const FIELD_WIDTH: f32 = DIALOG_WIDTH - 16.0 * 2.0 - 14.0 * 2.0;
+/// Usable content width — fields fill it (flat sections, like the Civitai popup).
+const FIELD_WIDTH: f32 = DIALOG_WIDTH - 4.0;
 
 /// GIF is animated — decode-validating only its first frame is pointless, so it's
 /// included as-is like videos rather than corruption-scanned as a still image.
@@ -212,6 +212,8 @@ impl BackupState {
         // an auto-sized window that width is infinite, which stores a NaN rect and
         // panics on the next frame.
         let window = egui::Window::new(window_title)
+            .id(egui::Id::new("backup_dialog"))
+            .title_bar(false) // custom header inside (matches the Civitai popup)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -253,12 +255,40 @@ impl BackupState {
             style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, Color32::from_gray(110));
             ui.set_style(style);
 
+            // Custom title row (Civitai-style): backup icon + phase title + close.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add(
+                    egui::Image::new(egui::include_image!("../icons/backup.svg"))
+                        .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                        .tint(TEXT()),
+                );
+                ui.heading(RichText::new(window_title).color(TEXT()).strong().size(17.0));
+                // No close while a backup runs — it must be cancelled, not orphaned.
+                if running.is_none() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(egui::Button::image(
+                                egui::Image::new(egui::include_image!("../icons/close.svg"))
+                                    .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                                    .tint(TEXT()),
+                            ).frame(false))
+                            .on_hover_text("Close")
+                            .clicked()
+                        {
+                            close_requested = true;
+                        }
+                    });
+                }
+            });
+            ui.add_space(12.0);
+
             if let Some(prog) = &running {
                 Self::running_body(ui, prog);
             } else if matches!(self.phase, Phase::Options) {
                 self.options_body(ui);
             } else if let Phase::Done(outcome) = &self.phase {
-                close_requested = done_body(ui, outcome);
+                close_requested |= done_body(ui, outcome);
             }
         });
 
@@ -274,12 +304,7 @@ impl BackupState {
         section(ui, "Details", |ui| {
             ui.label(RichText::new("Backup name").color(MUTED()).size(12.0));
             ui.add_space(4.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.name)
-                    .hint_text("e.g. my_dataset")
-                    .margin(egui::Margin::symmetric(8, 7))
-                    .desired_width(FIELD_WIDTH)
-            );
+            text_field(ui, &mut self.name, "e.g. my_dataset", false);
             hint(ui, "Saved to a \"backups\" folder inside the source, dated automatically.");
         });
 
@@ -293,21 +318,11 @@ impl BackupState {
                 ui.add_space(8.0);
                 ui.label(RichText::new("Password").color(MUTED()).size(12.0));
                 ui.add_space(4.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.password)
-                        .password(true)
-                        .margin(egui::Margin::symmetric(8, 7))
-                        .desired_width(FIELD_WIDTH)
-                );
+                text_field(ui, &mut self.password, "", true);
                 ui.add_space(8.0);
                 ui.label(RichText::new("Confirm password").color(MUTED()).size(12.0));
                 ui.add_space(4.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.confirm)
-                        .password(true)
-                        .margin(egui::Margin::symmetric(8, 7))
-                        .desired_width(FIELD_WIDTH)
-                );
+                text_field(ui, &mut self.confirm, "", true);
                 hint(ui, "Keep this password safe — it can't be recovered if lost.");
             }
         });
@@ -329,7 +344,7 @@ impl BackupState {
         let start_backup = self.create_flash.is_some_and(|t| t.elapsed() >= FLASH);
         let do_cancel = self.cancel_flash.is_some_and(|t| t.elapsed() >= FLASH);
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        footer_row(ui, |ui| {
             let create = footer_button(ui, "Create", create_flashing.then_some(FLASH_GREEN));
             if create.clicked() && self.create_flash.is_none() && !cancel_flashing {
                 self.create_flash = Some(Instant::now());
@@ -440,7 +455,7 @@ impl BackupState {
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(10.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        footer_row(ui, |ui| {
             let cancelling = prog.cancel.load(Relaxed);
             let btn_label = if cancelling { "Cancelling…" } else { "Cancel" };
             ui.add_enabled_ui(!cancelling, |ui| {
@@ -510,7 +525,7 @@ fn done_body(ui: &mut egui::Ui, outcome: &Outcome) -> bool {
     ui.separator();
     ui.add_space(10.0);
     let mut close = false;
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    footer_row(ui, |ui| {
         if accent_button(ui, "Close").clicked() {
             close = true;
         }
@@ -529,22 +544,18 @@ fn header(ui: &mut egui::Ui, subtitle: &str) {
     ui.add_space(10.0);
 }
 
-/// A titled, rounded group card holding related controls (matches Settings).
+/// A flat section: an uppercase muted label with controls directly below (matches
+/// the Civitai popup — no bordered card).
 fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    ui.label(RichText::new(title).color(MUTED()).strong().size(12.0));
-    ui.add_space(4.0);
-    egui::Frame::new()
-        .fill(FIELD())
-        .corner_radius(egui::CornerRadius::same(22))
-        .inner_margin(egui::Margin::symmetric(14, 12))
-        .stroke(egui::Stroke::new(1.0, EDGE()))
-        .show(ui, |ui| {
-            // Fixed width, never `available_width()` (which is infinite in an
-            // auto-sized window and would leak `inf` into the persisted state).
-            ui.set_width(FIELD_WIDTH);
-            add(ui);
-        });
-    ui.add_space(10.0);
+    ui.label(RichText::new(title.to_uppercase()).color(MUTED()).strong().size(11.0));
+    ui.add_space(6.0);
+    // Fixed width, never `available_width()` (which is infinite in an auto-sized
+    // window and would leak `inf` into the persisted state).
+    ui.scope(|ui| {
+        ui.set_width(FIELD_WIDTH);
+        add(ui);
+    });
+    ui.add_space(14.0);
 }
 
 /// A small muted explanatory line, shown under a control.
@@ -563,6 +574,40 @@ fn kv(ui: &mut egui::Ui, key: &str, value: &str) {
 
 /// A footer button — 90×32, radius 10. Plain themed style (so it keeps the app's
 /// default hover glow); pass `flash = Some(color)` to tint it for a click-flash.
+/// A single-line text field styled like the Civitai popup's (rounded 10px corners,
+/// roomier 10×8 padding, fills the available width).
+fn text_field(ui: &mut egui::Ui, value: &mut String, hint: &str, password: bool) {
+    ui.scope(|ui| {
+        // The dialog rounds all widgets to 4px for the square checkboxes; round the
+        // text fields back up to match Civitai.
+        let r = egui::CornerRadius::same(10);
+        let v = ui.visuals_mut();
+        v.widgets.inactive.corner_radius = r;
+        v.widgets.hovered.corner_radius = r;
+        v.widgets.active.corner_radius = r;
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .password(password)
+                .desired_width(f32::INFINITY)
+                .margin(egui::Margin::symmetric(10, 8))
+                .hint_text(hint),
+        );
+    });
+}
+
+/// The right-aligned footer button row. Allocated at a FIXED 380×32 — a bare
+/// `with_layout(right_to_left)` here would claim all the height left in the
+/// window, so once the window had grown (e.g. the password fields were shown)
+/// the auto-sizer saw that leftover space as "content" and never shrank back,
+/// leaving a big dead gap above the buttons.
+fn footer_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(DIALOG_WIDTH, 32.0),
+        egui::Layout::right_to_left(egui::Align::Center),
+        add,
+    );
+}
+
 fn footer_button(ui: &mut egui::Ui, label: &str, flash: Option<Color32>) -> egui::Response {
     let text = if flash.is_some() { Color32::WHITE } else { TEXT() };
     let mut btn = egui::Button::new(RichText::new(label).color(text).size(14.0))
@@ -760,17 +805,17 @@ fn write_zip(
     Ok(WriteResult::Written(written))
 }
 
-/// A themed frame for the dialog body (matches the settings window).
+/// A themed frame for the dialog body (matches the Civitai settings popup).
 fn window_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(PANEL())
-        .corner_radius(egui::CornerRadius::same(22))
-        .inner_margin(egui::Margin::same(16))
+        .corner_radius(egui::CornerRadius::same(16))
+        .inner_margin(egui::Margin::same(18))
         .stroke(egui::Stroke::new(1.0, EDGE()))
         .shadow(egui::epaint::Shadow {
-            offset: [0, 4],
-            blur: 16,
+            offset: [0, 6],
+            blur: 20,
             spread: 0,
-            color: egui::Color32::from_black_alpha(140),
+            color: egui::Color32::from_black_alpha(150),
         })
 }

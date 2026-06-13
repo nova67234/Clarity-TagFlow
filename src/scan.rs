@@ -1,15 +1,15 @@
-//! Deep Scan — finds problem files in a folder and quarantines them. A Rust port
-//! of terminus2's `Scan.java`, opened from the top bar's "Find Issues" button.
+//! Deep Scan — finds problem files in a folder. A Rust port of terminus2's
+//! `Scan.java`, opened from the top bar's "Find Issues" button.
 //!
 //! Two phases run on a background thread:
 //!   1. **Corruption scan** — every image is decoded; ones that fail (empty,
-//!      truncated, undecodable) are moved to a `corrupted_files/` subfolder.
+//!      truncated, undecodable) are **listed for review** in the window (Delete,
+//!      or — later — Fix, per file). They are *not* moved.
 //!   2. **Exact-duplicate scan** (optional) — remaining images are SHA-256
 //!      hashed; all but one of each identical group move to `duplicates/`.
 //!
 //! Videos/GIFs are listed but skipped (decode-validating a video frame-by-frame
-//! is pointless here). A timestamped `scan_log_…txt` report is written into the
-//! `corrupted_files/` folder.
+//! is pointless here). No log file is written — everything is shown in the UI.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +24,9 @@ use crate::theme::{ACCENT1, EDGE, FIELD, MUTED, PANEL, TEXT};
 const CORRUPTED_FOLDER: &str = "corrupted_files";
 const DUPLICATES_FOLDER: &str = "duplicates";
 
+/// Shared height for the two console column headers so their boxes line up.
+const HEADER_H: f32 = 22.0;
+
 /// Image extensions the corruption scan will try to decode.
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp", "ico", "hdr"];
 /// Extended formats only decodable when built with `--features avif`.
@@ -35,8 +38,8 @@ const SKIP_EXTS: &[&str] = &["gif", "mp4", "webm", "avi", "mov", "mkv", "m4v", "
 enum Msg {
     Log(String),
     Progress(f32, String),
-    /// A file found corrupt: (file name, reason).
-    Corrupt(String, String),
+    /// A file found corrupt: (path, reason). Listed for review (not moved).
+    Corrupt(PathBuf, String),
     Done(Summary),
 }
 
@@ -58,7 +61,8 @@ pub struct ScanState {
     scan_duplicates: bool,
 
     log: Vec<String>,
-    corrupt: Vec<String>,
+    /// Corrupt files found this scan (path + reason), shown in the review panel.
+    corrupt_files: Vec<(PathBuf, String)>,
     progress: f32,
     status: String,
 
@@ -67,8 +71,8 @@ pub struct ScanState {
     rx: Option<Receiver<Msg>>,
     /// Set true once after a scan finishes so the app can refresh the browser.
     pub finished_tick: bool,
-    /// Where to place the window's top-left — the Find Issues button's
-    /// bottom-left, captured when the window is opened.
+    /// Anchor for the window — the Find Issues button's bottom-right, captured
+    /// when opened. The window is right-aligned to it (drops down, extends left).
     anchor_pos: Option<egui::Pos2>,
 }
 
@@ -79,7 +83,7 @@ impl Default for ScanState {
             input_dir: String::new(),
             scan_duplicates: true,
             log: Vec::new(),
-            corrupt: Vec::new(),
+            corrupt_files: Vec::new(),
             progress: 0.0,
             status: "Ready.".to_string(),
             running: false,
@@ -92,7 +96,7 @@ impl Default for ScanState {
 }
 
 impl ScanState {
-    /// Open the window under `anchor` (the Find Issues button's bottom-left),
+    /// Open the window under `anchor` (the Find Issues button's bottom-right),
     /// pre-filling the folder with the currently-open one.
     pub fn open_with(&mut self, folder: Option<&Path>, anchor: Option<egui::Pos2>) {
         self.open = true;
@@ -115,11 +119,8 @@ impl ScanState {
 
 /// Render the Deep Scan window when open. Drains worker messages and draws the UI.
 pub fn show(ctx: &egui::Context, state: &mut ScanState) {
-    if !state.open {
-        return;
-    }
-
-    // Drain background messages.
+    // Drain background messages every frame — even while the window is minimised
+    // (closed), so a backgrounded scan keeps progressing and finishes.
     if let Some(rx) = &state.rx {
         let drained: Vec<Msg> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         for m in drained {
@@ -129,7 +130,12 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
                     state.progress = p;
                     state.status = s;
                 }
-                Msg::Corrupt(name, reason) => state.corrupt.push(format!("{name}  |  {reason}")),
+                Msg::Corrupt(path, reason) => {
+                    // The corrupt entry shows in BOTH the console (text) and the
+                    // review panel (actionable row).
+                    state.push_log(format!("Corrupt: {}  |  {reason}", file_name(&path)));
+                    state.corrupt_files.push((path, reason));
+                }
                 Msg::Done(sum) => {
                     state.running = false;
                     state.rx = None;
@@ -151,6 +157,11 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
         ctx.request_repaint_after(Duration::from_millis(100));
     }
 
+    // Minimised: keep draining (above) but don't draw the window.
+    if !state.open {
+        return;
+    }
+
     // A compact, fixed-size window. Shrink to fit only on tiny screens. The
     // inner content width is pinned to `content_w` so the window can't auto-grow
     // to fill a large display.
@@ -160,23 +171,28 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
     let content_w = win_w - 28.0; // minus the window's 14px inner margins
     let console_h = 110.0_f32;
 
-    // Pop the window just under the "Find Issues" button. The button's
-    // bottom-left was captured on click; clamp so the window stays on-screen.
+    // Drop the window down from the "Find Issues" button, right-aligned to it:
+    // the window's right edge sits under the button (its captured bottom-right),
+    // so it extends to the left. Clamped to stay on-screen.
     let anchor = state.anchor_pos.unwrap_or_else(|| {
-        egui::pos2(screen.center().x - win_w / 2.0, screen.top() + 80.0)
+        egui::pos2(screen.right() - 10.0, screen.top() + 80.0)
     });
-    let x = anchor.x.min(screen.right() - win_w - 10.0).max(screen.left() + 10.0);
+    let x = (anchor.x - win_w).min(screen.right() - win_w - 10.0).max(screen.left() + 10.0);
     let y = anchor.y.min(screen.bottom() - win_h - 10.0).max(screen.top() + 10.0);
 
-    let mut open = state.open;
-    egui::Window::new("Deep Scan")
-        .open(&mut open)
+    let mut want_minimize = false;
+    use crate::PopupPlacement;
+    egui::Window::new("Find Issues")
+        .id(egui::Id::new("deep_scan_window"))
+        .title_bar(false) // custom header inside (matches the Civitai / Backup popups)
         .collapsible(false)
         .resizable(false)
         .fixed_size([win_w, win_h])
-        .fixed_pos([x, y])
+        .placed_at([x, y])
         .frame(window_frame())
         .show(ctx, |ui| {
+            // Only the top strip drags the popup — not stray drags on the body.
+            crate::popup_drag_strip(ui, 30.0);
             ui.set_width(content_w);
             let radius = egui::CornerRadius::same(10);
             {
@@ -187,9 +203,36 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
                 v.widgets.noninteractive.corner_radius = radius;
             }
 
-            ui.add_space(2.0);
+            // Title row: frame-inspect icon + "Find Issues" + close (which just
+            // hides the window — a running scan keeps going in the background).
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add(
+                    egui::Image::new(egui::include_image!("../icons/frame_inspect.svg"))
+                        .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                        .tint(TEXT()),
+                );
+                ui.heading(egui::RichText::new("Find Issues").color(TEXT()).strong().size(17.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // click_and_drag so a click that slips a pixel is swallowed
+                    // by the button instead of dragging the popup.
+                    if ui
+                        .add(egui::Button::image(
+                            egui::Image::new(egui::include_image!("../icons/close.svg"))
+                                .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                                .tint(TEXT()),
+                        ).frame(false).sense(egui::Sense::click_and_drag()))
+                        .on_hover_text("Close (a running scan keeps going)")
+                        .clicked()
+                    {
+                        want_minimize = true;
+                    }
+                });
+            });
+            ui.add_space(10.0);
+
             ui.label(
-                egui::RichText::new("Find corrupt images and exact duplicates, then quarantine them.")
+                egui::RichText::new("Find corrupt images and exact duplicates.")
                     .color(MUTED())
                     .size(12.0),
             );
@@ -225,60 +268,107 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
             );
 
             ui.add_space(8.0);
-            ui.add(
-                egui::ProgressBar::new(state.progress.clamp(0.0, 1.0))
-                    .text(egui::RichText::new(state.status.clone()).size(12.0))
-                    .corner_radius(8)
-                    .desired_height(18.0),
-            );
+            // Status line (Gelbooru-downloader style — no progress bar): the
+            // frame-inspect icon + percentage while scanning, a green checkmark
+            // when done, plus the current status text.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let icon = egui::vec2(16.0, 16.0);
+                if state.running {
+                    ui.add(
+                        egui::Image::new(egui::include_image!("../icons/frame_inspect.svg"))
+                            .fit_to_exact_size(icon)
+                            .tint(ACCENT1()),
+                    );
+                    let pct = (state.progress.clamp(0.0, 1.0) * 100.0).round() as u32;
+                    ui.label(egui::RichText::new(format!("{pct}%")).color(ACCENT1()).strong().size(12.0));
+                } else if state.status.starts_with("Failed") {
+                    // Error → red warning.
+                    ui.add(
+                        egui::Image::new(egui::include_image!("../icons/warning.svg"))
+                            .fit_to_exact_size(icon)
+                            .tint(egui::Color32::from_rgb(220, 70, 70)),
+                    );
+                } else if !state.corrupt_files.is_empty() {
+                    // Corrupt images found → orange warning.
+                    ui.add(
+                        egui::Image::new(egui::include_image!("../icons/warning.svg"))
+                            .fit_to_exact_size(icon)
+                            .tint(egui::Color32::from_rgb(235, 150, 45)),
+                    );
+                } else if state.status.starts_with("Done") {
+                    // Clean → green checkmark.
+                    ui.add(
+                        egui::Image::new(egui::include_image!("../icons/checkmark.svg"))
+                            .fit_to_exact_size(icon)
+                            .tint(egui::Color32::from_rgb(46, 160, 67)),
+                    );
+                }
+                ui.label(egui::RichText::new(&state.status).color(MUTED()).size(12.0));
+            });
             ui.add_space(8.0);
 
-            // Two columns: console (left) and corrupt list (right). Fixed,
-            // bounded height so the window can't grow past the screen.
+            // Two columns: console (left, includes corrupt lines) and the corrupt
+            // review panel (right). Fixed, bounded height.
+            let mut to_open: Option<PathBuf> = None;
+            let mut to_delete: Option<usize> = None;
             ui.columns(2, |cols| {
                 console_box(&mut cols[0], "Console", &state.log, console_h, "scan_console");
-                console_box(
-                    &mut cols[1],
-                    &format!("Corrupt images ({})", state.corrupt.len()),
-                    &state.corrupt,
-                    console_h,
-                    "scan_corrupt",
-                );
+                corrupt_review(&mut cols[1], &state.corrupt_files, console_h, &mut to_open, &mut to_delete);
             });
+            if let Some(p) = to_open {
+                open_in_default(&p);
+            }
+            if let Some(i) = to_delete {
+                if i < state.corrupt_files.len() {
+                    let (p, _) = state.corrupt_files.remove(i);
+                    match std::fs::remove_file(&p) {
+                        Ok(_) => state.push_log(format!("Deleted: {}", file_name(&p))),
+                        Err(e) => state.push_log(format!("ERROR deleting {}: {e}", file_name(&p))),
+                    }
+                }
+            }
 
             ui.add_space(8.0);
 
-            // Start / Cancel.
-            ui.horizontal(|ui| {
-                let gap = 10.0;
-                ui.spacing_mut().item_spacing.x = gap;
-                let btn_w = (ui.available_width() - gap) / 2.0;
-                let size = egui::vec2(btn_w, 36.0);
-
-                let start = egui::Button::new(
-                    egui::RichText::new("Start Scan").color(egui::Color32::WHITE).strong(),
-                )
-                .fill(ACCENT1());
-                if ui.add_enabled_ui(!state.running, |ui| ui.add_sized(size, start)).inner.clicked() {
+            // Right-aligned footer buttons (matches the Create Backup popup):
+            // primary Start Scan / Cancel rightmost, Minimize to its left.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if state.running {
+                    if footer_button(ui, "Cancel", Some(egui::Color32::from_rgb(180, 40, 40))).clicked() {
+                        state.cancel.store(true, Ordering::SeqCst);
+                        state.status = "Cancelling…".to_string();
+                    }
+                } else if footer_button(ui, "Start Scan", Some(ACCENT1())).clicked() {
                     start_scan(state, ctx);
                 }
-
-                let cancel = egui::Button::new(
-                    egui::RichText::new("Cancel").color(egui::Color32::WHITE).strong(),
-                )
-                .fill(egui::Color32::from_rgb(180, 40, 40));
-                if ui.add_enabled_ui(state.running, |ui| ui.add_sized(size, cancel)).inner.clicked() {
-                    state.cancel.store(true, Ordering::SeqCst);
-                    state.status = "Cancelling…".to_string();
+                // Minimize: hide the window but keep any running scan going in the
+                // background (messages are still drained at the top of `show`).
+                if footer_button(ui, "Minimize", None).clicked() {
+                    want_minimize = true;
                 }
             });
         });
-    state.open = open;
+    // The ✕ and the Minimize button both just hide it (scan keeps running).
+    state.open = !want_minimize;
 }
 
 /// A titled, scrollable, dark console well.
 fn console_box(ui: &mut egui::Ui, title: &str, lines: &[String], height: f32, salt: &str) {
-    ui.label(egui::RichText::new(title).color(MUTED()).strong().size(11.0));
+    // Title row with a Copy button, so users can grab the log on an error. Fixed
+    // height (HEADER_H) so it lines up with the sibling column's header.
+    ui.horizontal(|ui| {
+        ui.set_min_height(HEADER_H);
+        ui.label(egui::RichText::new(title).color(MUTED()).strong().size(11.0));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let copy = egui::Button::new(egui::RichText::new("Copy").size(10.0))
+                .corner_radius(egui::CornerRadius::same(8));
+            if ui.add_enabled(!lines.is_empty(), copy).on_hover_text("Copy the log").clicked() {
+                ui.ctx().copy_text(lines.join("\n"));
+            }
+        });
+    });
     ui.add_space(2.0);
     let bg = if crate::theme::is_light() { FIELD() } else { egui::Color32::from_rgb(15, 15, 17) };
     egui::Frame::new()
@@ -296,14 +386,131 @@ fn console_box(ui: &mut egui::Ui, title: &str, lines: &[String], height: f32, sa
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     if lines.is_empty() {
-                        ui.label(egui::RichText::new("—").color(MUTED()).monospace().size(12.0));
+                        ui.label(egui::RichText::new("—").color(MUTED()).monospace().size(10.0));
                     } else {
                         for l in lines {
-                            ui.label(egui::RichText::new(l).color(TEXT()).monospace().size(12.0));
+                            ui.label(egui::RichText::new(l).color(TEXT()).monospace().size(10.0));
                         }
                     }
                 });
         });
+}
+
+/// The corrupt-image review panel: a scrollable list of corrupt files, each with
+/// a warning icon + filename (click to open in the default viewer), a Delete
+/// button, and a disabled Fix placeholder. Sets `to_open` / `to_delete` for the
+/// caller to apply (we can't mutate the list while it's borrowed for rendering).
+fn corrupt_review(
+    ui: &mut egui::Ui,
+    items: &[(PathBuf, String)],
+    height: f32,
+    to_open: &mut Option<PathBuf>,
+    to_delete: &mut Option<usize>,
+) {
+    // Fixed-height header so it lines up with the Console column's header.
+    ui.horizontal(|ui| {
+        ui.set_min_height(HEADER_H);
+        ui.label(
+            egui::RichText::new(format!("Corrupt images ({})", items.len()))
+                .color(MUTED())
+                .strong()
+                .size(11.0),
+        );
+    });
+    ui.add_space(2.0);
+    let bg = if crate::theme::is_light() { FIELD() } else { egui::Color32::from_rgb(15, 15, 17) };
+    egui::Frame::new()
+        .fill(bg)
+        .corner_radius(egui::CornerRadius::same(12))
+        .inner_margin(egui::Margin::same(10))
+        .stroke(egui::Stroke::new(1.0, EDGE()))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_height(height);
+            egui::ScrollArea::vertical()
+                .id_salt("scan_corrupt_review")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    if items.is_empty() {
+                        ui.label(egui::RichText::new("—").color(MUTED()).monospace().size(12.0));
+                        return;
+                    }
+                    for (i, (path, reason)) in items.iter().enumerate() {
+                        // Line 1: warning icon + filename (click to open / review).
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.add(
+                                egui::Image::new(egui::include_image!("../icons/warning.svg"))
+                                    .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                                    .tint(egui::Color32::from_rgb(220, 160, 60)),
+                            );
+                            let label = egui::Label::new(
+                                egui::RichText::new(file_name(path)).color(TEXT()).size(11.5),
+                            )
+                            .truncate()
+                            .sense(egui::Sense::click());
+                            if ui.add(label).on_hover_text(format!("{reason}\n(click to open)")).clicked() {
+                                *to_open = Some(path.clone());
+                            }
+                        });
+                        // Line 2: Delete (active) + Fix (placeholder — disabled).
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let del = egui::Button::new(
+                                egui::RichText::new("Delete")
+                                    .color(egui::Color32::from_rgb(230, 90, 90))
+                                    .size(11.0),
+                            )
+                            .corner_radius(egui::CornerRadius::same(8));
+                            if ui.add(del).clicked() {
+                                *to_delete = Some(i);
+                            }
+                            ui.add_enabled(
+                                false,
+                                egui::Button::new(egui::RichText::new("Fix").size(11.0))
+                                    .corner_radius(egui::CornerRadius::same(8)),
+                            )
+                            .on_disabled_hover_text("Coming soon");
+                        });
+                        ui.add_space(6.0);
+                    }
+                });
+        });
+}
+
+/// Open `path` in the OS default application (to review a flagged file).
+fn open_in_default(path: &Path) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // `start` uses the file's default association; CREATE_NO_WINDOW avoids a
+        // console flash.
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", &path.to_string_lossy()])
+            .creation_flags(0x0800_0000)
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
+/// A right-aligned footer button matching the Create Backup popup (corner-10,
+/// fixed size). `fill` Some → filled with white text; None → subtle TEXT label.
+fn footer_button(ui: &mut egui::Ui, label: &str, fill: Option<egui::Color32>) -> egui::Response {
+    let text = if fill.is_some() { egui::Color32::WHITE } else { TEXT() };
+    let mut btn = egui::Button::new(egui::RichText::new(label).color(text).strong().size(14.0))
+        .corner_radius(egui::CornerRadius::same(10));
+    if let Some(c) = fill {
+        btn = btn.fill(c);
+    }
+    ui.add_sized(egui::vec2(96.0, 32.0), btn)
 }
 
 fn window_frame() -> egui::Frame {
@@ -313,10 +520,10 @@ fn window_frame() -> egui::Frame {
         .inner_margin(egui::Margin::same(14))
         .stroke(egui::Stroke::new(1.0, EDGE()))
         .shadow(egui::epaint::Shadow {
-            offset: [0, 4],
-            blur: 16,
+            offset: [0, 6],
+            blur: 20,
             spread: 0,
-            color: egui::Color32::from_black_alpha(140),
+            color: egui::Color32::from_black_alpha(150),
         })
 }
 
@@ -334,7 +541,7 @@ fn start_scan(state: &mut ScanState, ctx: &egui::Context) {
     }
 
     state.log.clear();
-    state.corrupt.clear();
+    state.corrupt_files.clear();
     state.progress = 0.0;
     state.status = "Scanning…".to_string();
 
@@ -385,9 +592,8 @@ fn run_scan(dir: PathBuf, scan_dupes: bool, tx: Sender<Msg>, cancel: Arc<AtomicB
 
     // --- Phase 1: corruption ---
     log("--- Phase 1: corrupted-file scan ---".into());
-    let corrupted_dir = dir.join(CORRUPTED_FOLDER);
     let mut valid: Vec<PathBuf> = Vec::new();
-    let mut corrupt_items: Vec<(PathBuf, String)> = Vec::new();
+    let mut corrupt_count = 0u32;
 
     let total = images.len().max(1);
     for (i, p) in images.iter().enumerate() {
@@ -398,25 +604,21 @@ fn run_scan(dir: PathBuf, scan_dupes: bool, tx: Sender<Msg>, cancel: Arc<AtomicB
         prog(i as f32 / total as f32, format!("Scanning {} / {}", i + 1, images.len()));
 
         match validate_image(p) {
+            // Corrupt files are NOT moved — they're listed for review (the UI logs
+            // each one and offers Delete / Fix per file).
             Ok(()) => valid.push(p.clone()),
             Err(reason) => {
-                let name = file_name(p);
-                let _ = tx.send(Msg::Corrupt(name.clone(), reason.clone()));
-                corrupt_items.push((p.clone(), reason));
+                let _ = tx.send(Msg::Corrupt(p.clone(), reason));
+                corrupt_count += 1;
             }
         }
     }
     sum.scanned = images.len() as u32;
-    sum.corrupted = corrupt_items.len() as u32;
-
-    if !corrupt_items.is_empty() {
-        log(format!("Moving {} corrupt file(s) to '{CORRUPTED_FOLDER}'…", corrupt_items.len()));
-        let _ = std::fs::create_dir_all(&corrupted_dir);
-        for (p, _) in &corrupt_items {
-            move_into(p, &corrupted_dir, "corrupted_", &log);
-        }
-    } else {
+    sum.corrupted = corrupt_count;
+    if corrupt_count == 0 {
         log("No corrupted images found.".into());
+    } else {
+        log(format!("{corrupt_count} corrupt image(s) found — review them in the panel."));
     }
 
     // --- Phase 2: exact duplicates ---
@@ -462,9 +664,6 @@ fn run_scan(dir: PathBuf, scan_dupes: bool, tx: Sender<Msg>, cancel: Arc<AtomicB
         }
     }
     sum.duplicates_moved = dupes_moved;
-
-    // Write a small report alongside the quarantined files.
-    write_report(&dir, &corrupt_items, dupes_moved, &log);
 
     log("Scan complete.".into());
     finish(&tx, &ctx, sum, false);
@@ -544,30 +743,6 @@ fn move_into(file: &Path, dest: &Path, prefix: &str, log: &impl Fn(String)) -> b
     }
 }
 
-fn write_report(dir: &Path, corrupt: &[(PathBuf, String)], dupes_moved: u32, log: &impl Fn(String)) {
-    let report_dir = dir.join(CORRUPTED_FOLDER);
-    if std::fs::create_dir_all(&report_dir).is_err() {
-        return;
-    }
-    let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-    let path = report_dir.join(format!("scan_log_{stamp}.txt"));
-    let mut body = String::new();
-    body.push_str(&format!("Deep Scan Report — {}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")));
-    body.push_str(&format!("Scanned directory: {}\n", dir.display()));
-    body.push_str("============================================================\n\n");
-    body.push_str(&format!("Corrupted files moved: {}\n", corrupt.len()));
-    body.push_str(&format!("Exact duplicates moved: {dupes_moved}\n\n"));
-    if !corrupt.is_empty() {
-        body.push_str("--- CORRUPTED FILES ---\n");
-        for (p, reason) in corrupt {
-            body.push_str(&format!("MOVED: {}\n  REASON: {}\n\n", file_name(p), reason));
-        }
-    }
-    if std::fs::write(&path, body).is_ok() {
-        log(format!("Log saved to: {}", path.display()));
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -636,8 +811,8 @@ fn unique_target(dest: &Path, name: &str) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// SHA-256 of a file as lowercase hex, streamed in 64 KiB chunks. `None` on I/O
-/// error.
-fn sha256_file(path: &Path) -> Option<String> {
+/// error. (Also used by the Generate panels to look LoRAs up on Civitai.)
+pub(crate) fn sha256_file(path: &Path) -> Option<String> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
     let mut h = Sha256::new();

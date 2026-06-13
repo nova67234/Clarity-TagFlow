@@ -16,8 +16,9 @@
 //!   EXIF `UserComment`, usually UTF-16 — the scan finds it without a full EXIF
 //!   parser, exactly like the Java `UniversalMetadataScanner`.
 //!
-//! [`read`] returns the cleaned, display-ready text (or `None` when the image has
-//! no SD metadata).
+//! [`read_both`] returns both the cleaned, display-ready text and the raw original
+//! metadata string (the latter for the Civitai panel) — or `None` when the image
+//! has no SD metadata.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -28,9 +29,25 @@ use std::path::Path;
 /// memory and decoded as UTF-8/UTF-16, which froze (and could OOM-crash) the app.
 const MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 
-/// Read and format the embedded SD generation metadata for `path`.
-/// Returns `None` when the file has no recognisable metadata.
-pub fn read(path: &Path) -> Option<String> {
+/// Read the embedded metadata **once** and return both the formatted **display**
+/// string (what [`read`] yields) and the **raw** original metadata string.
+///
+/// The Civitai panel needs the raw string: formatting splits the parameter line on
+/// `", "`, which shreds blocks like `Hashes: {…}`, `Lora hashes:` and `TI hashes:`.
+/// Embeddings (textual inversions) are recorded *only* in those blocks, so handing
+/// the panel the formatted text left it unable to list them.
+pub fn read_both(path: &Path) -> (Option<String>, Option<String>) {
+    match metadata_map(path) {
+        Some(map) => (format_from_map(&map), raw_from_map(&map)),
+        None => (None, None),
+    }
+}
+
+/// Read `path` and collect its embedded metadata into a keyword → text map (PNG
+/// text chunks, or a raw byte-scan of the EXIF `UserComment` for JPEG/WebP/AVIF).
+/// `None` only when the file can't be read; a readable file with no metadata
+/// yields an empty (or prompt-less) map.
+fn metadata_map(path: &Path) -> Option<BTreeMap<String, String>> {
     // Never touch videos — they carry no SD generation metadata, and reading a
     // multi-MB/GB file in full (then scanning it as UTF-8/UTF-16) freezes and can
     // crash the app. Bail before any read.
@@ -64,6 +81,11 @@ pub fn read(path: &Path) -> Option<String> {
         }
     }
 
+    Some(text)
+}
+
+/// Pick the best metadata field from the map and format it for display.
+fn format_from_map(text: &BTreeMap<String, String>) -> Option<String> {
     // Prefer the A1111 `parameters` block whenever it's a real param block (has
     // the `Steps:` anchor). Civitai/A1111 embed this clean, human-readable summary
     // — and many ComfyUI-saved images carry BOTH it AND the raw `prompt`/`workflow`
@@ -90,13 +112,30 @@ pub fn read(path: &Path) -> Option<String> {
     }
 
     // A1111 / generic: format the first parameter-ish field we found.
-    let raw = first_non_blank(&text, &["parameters", "prompt", "workflow", "Comment", "Description"])?;
+    let raw = first_non_blank(text, &["parameters", "prompt", "workflow", "Comment", "Description"])?;
     let formatted = format_a1111(raw);
     if formatted.trim().is_empty() {
         None
     } else {
         Some(formatted)
     }
+}
+
+/// The **raw** original metadata string (no formatting), as the Civitai parser
+/// expects it — preserving the `Hashes:` / `… hashes:` / `<lora:…>` blocks intact.
+/// Mirrors [`format_from_map`]'s source-selection order so it returns the same
+/// underlying field, just unformatted.
+fn raw_from_map(text: &BTreeMap<String, String>) -> Option<String> {
+    if let Some(p) = text.get("parameters") {
+        if has_steps_anchor(p) {
+            return Some(p.clone());
+        }
+    }
+    if text.contains_key("prompt") && text.contains_key("workflow") {
+        return text.get("prompt").cloned().filter(|s| !s.trim().is_empty());
+    }
+    first_non_blank(text, &["parameters", "prompt", "workflow", "Comment", "Description"])
+        .map(|s| s.to_string())
 }
 
 /// Returns the first of `keys` whose value in `map` is non-blank.
@@ -220,19 +259,33 @@ fn inflate(compressed: &[u8]) -> Option<Vec<u8>> {
 // Raw byte scan (JPEG / WebP / AVIF / fallback) — UniversalMetadataScanner
 // ---------------------------------------------------------------------------
 
-/// Decode the whole file as UTF-8, then UTF-16LE, then UTF-16BE, and isolate the
-/// SD parameter block around the `Steps:` / `Civitai metadata:` anchor. A1111
-/// stores it in the EXIF UserComment (commonly UTF-16), so the multi-encoding
-/// pass finds it without a full EXIF parser.
+/// How far around an anchor hit the windowed decodes reach. The prompt text
+/// precedes `Steps:`; the parameter line / Civitai JSON follows it. Real-world
+/// blocks are well under 100 KiB, so these are very generous.
+const SCAN_BEFORE: usize = 1024 * 1024; // 1 MiB
+const SCAN_AFTER: usize = 4 * 1024 * 1024; // 4 MiB
+
+/// Find the SD parameter block around the `Steps:` / `Civitai metadata:`
+/// anchor, trying UTF-8, UTF-16LE and UTF-16BE. A1111 stores it in the EXIF
+/// UserComment (commonly UTF-16), so the multi-encoding pass finds it without a
+/// full EXIF parser.
+///
+/// Decoding the *whole* file in all three encodings (with `isolate_sd`'s
+/// per-char work on top) allocated several times the file size and froze the
+/// UI on hi-res images. Instead, each encoding's ANCHOR BYTES are searched
+/// first — a metadata-less file is never decoded at all — and a hit decodes
+/// only a generous window around the anchor.
 fn scan_raw_for_parameters(bytes: &[u8]) -> Option<String> {
     // EXIF stores the A1111 block in `UserComment`, prefixed by an 8-byte charset
-    // id ("UNICODE\0") and then UTF-16 text. Decoding the *whole* file as UTF-16
+    // id ("UNICODE\0") and then UTF-16 text. Decoding the whole file as UTF-16
     // drags that marker in as mojibake right before the prompt (e.g. a leading
     // "啎䥃佄䔀"). So if the marker is present, decode only the text that follows it
     // — that lands exactly on the prompt with no marker garbage. EXIF's text byte
-    // order varies, so try big- then little-endian.
+    // order varies, so try big- then little-endian. (A JPEG APP1 segment caps the
+    // comment at 64 KiB; the SCAN_AFTER cap is just a defensive bound.)
     if let Some(pos) = find_bytes(bytes, b"UNICODE\0") {
         let after = &bytes[pos + 8..];
+        let after = &after[..after.len().min(SCAN_AFTER)];
         if let Some(s) = isolate_sd(&decode_utf16(after, true)) {
             return Some(s);
         }
@@ -240,24 +293,69 @@ fn scan_raw_for_parameters(bytes: &[u8]) -> Option<String> {
             return Some(s);
         }
     }
-    if let Some(s) = isolate_sd(&String::from_utf8_lossy(bytes)) {
-        return Some(s);
+
+    // UTF-8, then UTF-16LE, then UTF-16BE — same order as before, but each only
+    // when its encoded anchor actually occurs, and decoding only a window.
+    if let Some(pos) = anchor_pos(bytes, Encoding::Utf8) {
+        if let Some(s) = isolate_sd(&String::from_utf8_lossy(anchor_window(bytes, pos, false))) {
+            return Some(s);
+        }
     }
-    if let Some(s) = isolate_sd(&decode_utf16(bytes, false)) {
-        return Some(s);
+    if let Some(pos) = anchor_pos(bytes, Encoding::Utf16Le) {
+        if let Some(s) = isolate_sd(&decode_utf16(anchor_window(bytes, pos, true), false)) {
+            return Some(s);
+        }
     }
-    if let Some(s) = isolate_sd(&decode_utf16(bytes, true)) {
-        return Some(s);
+    if let Some(pos) = anchor_pos(bytes, Encoding::Utf16Be) {
+        if let Some(s) = isolate_sd(&decode_utf16(anchor_window(bytes, pos, true), true)) {
+            return Some(s);
+        }
     }
     None
 }
 
+#[derive(Clone, Copy)]
+enum Encoding {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+}
+
+/// Byte position of the first `Steps:` / `Civitai metadata:` anchor in `enc`.
+fn anchor_pos(bytes: &[u8], enc: Encoding) -> Option<usize> {
+    for anchor in ["Steps:", "Civitai metadata:"] {
+        let needle: Vec<u8> = match enc {
+            Encoding::Utf8 => anchor.as_bytes().to_vec(),
+            Encoding::Utf16Le => anchor.bytes().flat_map(|b| [b, 0]).collect(),
+            Encoding::Utf16Be => anchor.bytes().flat_map(|b| [0, b]).collect(),
+        };
+        if let Some(pos) = find_bytes(bytes, &needle) {
+            return Some(pos);
+        }
+    }
+    None
+}
+
+/// The slice to decode around an anchor at `pos`: [`SCAN_BEFORE`] bytes back and
+/// [`SCAN_AFTER`] forward. For UTF-16 the start keeps the anchor's 2-byte
+/// alignment so the code-unit stream stays in phase.
+fn anchor_window(bytes: &[u8], pos: usize, utf16: bool) -> &[u8] {
+    let mut start = pos.saturating_sub(SCAN_BEFORE);
+    if utf16 {
+        start += (pos - start) % 2;
+    }
+    let end = (pos + SCAN_AFTER).min(bytes.len());
+    &bytes[start..end]
+}
+
 /// Index of the first occurrence of `needle` in `haystack` (raw bytes).
+/// memchr's memmem is SIMD-accelerated — the naive `windows().position()`
+/// version took ~1 s per pass on a 14 MB image.
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
+    if needle.is_empty() {
         return None;
     }
-    haystack.windows(needle.len()).position(|w| w == needle)
+    memchr::memmem::find(haystack, needle)
 }
 
 fn decode_utf16(bytes: &[u8], big_endian: bool) -> String {
@@ -269,36 +367,35 @@ fn decode_utf16(bytes: &[u8], big_endian: bool) -> String {
 }
 
 /// Find the `Steps:` (or `Civitai metadata:`) anchor and expand outward over
-/// "valid" text characters. Mirrors Java `isolateSDMetadata`.
+/// "valid" text characters. Mirrors Java `isolateSDMetadata`. Works directly on
+/// the string slice — collecting a multi-MB decode into a `Vec<char>` first
+/// allocated 4 bytes per char and was a large part of the hi-res freeze.
 fn isolate_sd(text: &str) -> Option<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let anchor = find_subsequence(&chars, "Steps:").or_else(|| find_subsequence(&chars, "Civitai metadata:"))?;
+    let anchor = text.find("Steps:").or_else(|| text.find("Civitai metadata:"))?;
 
     let mut start = anchor;
-    while start > 0 && is_valid_text(chars[start - 1]) {
-        start -= 1;
+    for (i, c) in text[..anchor].char_indices().rev() {
+        if is_valid_text(c) {
+            start = i;
+        } else {
+            break;
+        }
     }
     let mut end = anchor;
-    while end < chars.len() && is_valid_text(chars[end]) {
-        end += 1;
+    for (i, c) in text[anchor..].char_indices() {
+        if is_valid_text(c) {
+            end = anchor + i + c.len_utf8();
+        } else {
+            break;
+        }
     }
 
-    let s: String = chars[start..end].iter().collect();
-    let s = s.trim().to_string();
+    let s = text[start..end].trim();
     if s.is_empty() {
         None
     } else {
-        Some(s)
+        Some(s.to_string())
     }
-}
-
-/// Index (in `chars`) of the first occurrence of `needle`, or `None`.
-fn find_subsequence(chars: &[char], needle: &str) -> Option<usize> {
-    let n: Vec<char> = needle.chars().collect();
-    if n.is_empty() || chars.len() < n.len() {
-        return None;
-    }
-    (0..=chars.len() - n.len()).find(|&i| chars[i..i + n.len()] == n[..])
 }
 
 fn is_valid_text(c: char) -> bool {

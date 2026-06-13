@@ -242,7 +242,11 @@ pub fn show(
                             // right_to_left: text first (rightmost), orb to its left.
                             ui.label(egui::RichText::new(&state.status_msg).color(color).size(12.0));
                             ui.add_space(6.0);
-                            state.orb.set_state(if thinking {
+                            // An error bursts the orb apart (red); a retry — i.e.
+                            // going back to Thinking — re-forms it.
+                            state.orb.set_state(if state.status_is_error {
+                                crate::ai_orb::OrbState::Error
+                            } else if thinking {
                                 crate::ai_orb::OrbState::Thinking
                             } else {
                                 crate::ai_orb::OrbState::Idle
