@@ -1,0 +1,104 @@
+name: CI
+
+# Compile-check on all three platforms for every branch push and pull request, so
+# a platform-specific break (e.g. a macOS-only `#[cfg]` path) is caught here
+# instead of during a release-tag build. Each job mirrors the build flags of its
+# matching release workflow (no-default-features everywhere; libVLC only on
+# Windows). Tag pushes are intentionally excluded — those run the release builds,
+# which compile anyway.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# A newer push to the same ref cancels the in-flight check.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Same system libs the Linux release build links against (eframe/egui, rfd,
+      # native-tls).
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libssl-dev pkg-config
+      # Compile everything (incl. the test targets) and run the unit tests. The
+      # networked live-GitHub test is #[ignore]d, so this stays hermetic.
+      - name: Check + test (no VLC)
+        run: cargo test --all-targets --no-default-features
+
+  macos:
+    runs-on: macos-14 # Apple Silicon, like the release build.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      # Compile-check the macOS target — this is the path the v5.3.2 cfg break
+      # would have failed on. --all-targets also type-checks the test modules.
+      - name: Check (Apple Silicon, no VLC)
+        run: cargo check --all-targets --no-default-features --target aarch64-apple-darwin
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The vlc feature links `vlc`, so fetch libVLC's import library (same as the
+      # release build). We only need sdk\lib; the runtime is never bundled.
+      - name: Fetch libVLC import library
+        shell: pwsh
+        run: |
+          $ver = "3.0.21"
+          $url = "https://download.videolan.org/pub/videolan/vlc/$ver/win64/vlc-$ver-win64.7z"
+          $ok = $false
+          for ($i = 1; $i -le 6; $i++) {
+            try {
+              Write-Host "Attempt ${i}: $url"
+              Invoke-WebRequest -Uri $url -OutFile vlc.7z -UseBasicParsing -MaximumRedirection 10 -TimeoutSec 180
+            } catch {
+              Write-Host "  download failed: $($_.Exception.Message)"
+              Start-Sleep -Seconds 6
+              continue
+            }
+            $size = (Get-Item vlc.7z -ErrorAction SilentlyContinue).Length
+            $magic = ""
+            if ($size) {
+              $fs = [System.IO.File]::OpenRead((Resolve-Path vlc.7z))
+              $buf = New-Object byte[] 6
+              [void]$fs.Read($buf, 0, 6)
+              $fs.Close()
+              $magic = ($buf | ForEach-Object { $_.ToString('X2') }) -join ''
+            }
+            if ($size -gt 20MB -and $magic -eq '377ABCAF271C') {
+              Write-Host "  ok: valid 7z, $size bytes"
+              $ok = $true
+              break
+            }
+            Write-Host "  not a 7z archive (size=$size magic=$magic), retrying..."
+            Start-Sleep -Seconds 6
+          }
+          if (-not $ok) { throw "Could not download a valid VLC archive after retries" }
+          7z x vlc.7z -ovlc_sdk | Out-Null
+          $lib = (Get-ChildItem -Path vlc_sdk -Recurse -Directory -Filter lib | Where-Object { Test-Path (Join-Path $_.FullName 'libvlc.lib') } | Select-Object -First 1).FullName
+          if (-not $lib) { throw "libvlc.lib not found in the VLC archive" }
+          Copy-Item (Join-Path $lib 'libvlc.lib') (Join-Path $lib 'vlc.lib') -Force
+          "VLC_LIB=$lib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Check (with VLC)
+        shell: pwsh
+        env:
+          RUSTFLAGS: -L native=${{ env.VLC_LIB }}
+        run: cargo check --all-targets --no-default-features --features vlc
