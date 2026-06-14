@@ -310,6 +310,10 @@ struct EmbeddingEntry {
     negative: bool,
     /// Token weight — emitted as `(embedding:name:weight)` when not 1.0.
     strength: f32,
+    /// Civitai preview thumbnail (loaded from the on-disk cache when present).
+    thumb: Option<egui::TextureHandle>,
+    /// The cache says this file has no Civitai preview — stop checking.
+    thumb_missing: bool,
 }
 
 /// Human-readable metadata decoded from a LoRA's safetensors header.
@@ -715,8 +719,9 @@ fn scan_embeddings() -> Vec<(String, PathBuf)> {
 }
 
 /// Re-scan the embeddings dir, sniffing the architecture of new files and keeping
-/// cached results for known ones.
-fn refresh_embeddings(state: &mut GenerateState) {
+/// cached results (incl. selection/weight/thumbnail) for known ones. Kicks off the
+/// background Civitai-thumbnail fetch for any file without a cached preview.
+fn refresh_embeddings(state: &mut GenerateState, ctx: &egui::Context) {
     state.embeddings = scan_embeddings()
         .into_iter()
         .map(|(f, path)| {
@@ -726,10 +731,79 @@ fn refresh_embeddings(state: &mut GenerateState) {
                 selected: prev.map(|e| e.selected).unwrap_or(false),
                 negative: prev.map(|e| e.negative).unwrap_or(false),
                 strength: prev.map(|e| e.strength).unwrap_or(1.0),
+                thumb: prev.and_then(|e| e.thumb.clone()),
+                thumb_missing: prev.map(|e| e.thumb_missing).unwrap_or(false),
                 file: f,
             }
         })
         .collect();
+    spawn_embedding_thumb_fetch(state.embeddings.iter().map(|e| e.file.clone()).collect(), ctx.clone());
+}
+
+/// The filename with any embedding extension stripped — the cache key + the name
+/// shown in the picker.
+fn embed_stem(file: &str) -> &str {
+    file.trim_end_matches(".safetensors").trim_end_matches(".pt").trim_end_matches(".bin")
+}
+
+/// Where downloaded embedding preview thumbnails live: `<stem>.img` is the raw
+/// JPEG; `<stem>.none` remembers "this hash isn't on Civitai".
+fn embedding_thumbs_dir() -> PathBuf {
+    comfy_base().join("embedding_thumbs")
+}
+
+/// Set when the embeddings picker closes; the thumb worker checks it between files.
+static EMBED_THUMB_CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Stop the background embedding-thumbnail fetch (called when the picker closes).
+fn cancel_embedding_thumb_fetch() {
+    EMBED_THUMB_CANCEL.store(true, Ordering::SeqCst);
+}
+
+/// Background pass fetching Civitai preview thumbnails for embeddings without one:
+/// SHA-256 of the file → Civitai's by-hash endpoint → first still preview, saved
+/// to the thumbs cache. Single-flight; repaints as each thumb lands. Embeddings
+/// are tiny so hashing is near-instant. Runs only while the picker is open.
+fn spawn_embedding_thumb_fetch(files: Vec<String>, ctx: egui::Context) {
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    EMBED_THUMB_CANCEL.store(false, Ordering::SeqCst);
+    let tdir = embedding_thumbs_dir();
+    let todo: Vec<String> = files
+        .into_iter()
+        .filter(|f| {
+            let stem = embed_stem(f);
+            !tdir.join(format!("{stem}.img")).exists() && !tdir.join(format!("{stem}.none")).exists()
+        })
+        .collect();
+    if todo.is_empty() || RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                RUNNING.store(false, Ordering::SeqCst);
+            }
+        }
+        let _reset = Reset;
+
+        let dir = comfy_base().join("ComfyUI").join("models").join("embeddings");
+        let _ = std::fs::create_dir_all(&tdir);
+        for f in todo {
+            if EMBED_THUMB_CANCEL.load(Ordering::SeqCst) {
+                break; // picker closed — finish later, when it reopens
+            }
+            let stem = embed_stem(&f);
+            let bytes = crate::scan::sha256_file(&dir.join(&f))
+                .and_then(|sha| crate::civitai::preview_image_by_hash(&sha));
+            let write = match &bytes {
+                Some(b) => std::fs::write(tdir.join(format!("{stem}.img")), b),
+                None => std::fs::write(tdir.join(format!("{stem}.none")), b""),
+            };
+            let _ = write;
+            ctx.request_repaint();
+        }
+    });
 }
 
 /// The prompt token for a textual inversion (extension stripped): bare
@@ -1572,6 +1646,7 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
                         .clicked()
                     {
                         state.show_embeddings_popup = false;
+                        cancel_embedding_thumb_fetch();
                     }
                     ui.add_space(2.0);
                     // One-shot 0.5s ease-out spin on click (matches the LoRA popup).
@@ -1600,7 +1675,7 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
                         .clicked()
                     {
                         state.embeddings_refresh_spin = Some(std::time::Instant::now());
-                        refresh_embeddings(state);
+                        refresh_embeddings(state, ui.ctx());
                     }
                 });
             });
@@ -1665,6 +1740,7 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
                 let done = egui::Button::new(RichText::new("Done").color(Color32::WHITE).strong()).fill(ACCENT1());
                 if ui.add_sized(egui::vec2(90.0, 30.0), done).clicked() {
                     state.show_embeddings_popup = false;
+                    cancel_embedding_thumb_fetch();
                 }
             });
         });
@@ -1674,15 +1750,29 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
 /// selected, a Positive / Negative pill pair appears — clicking a pill assigns the
 /// embedding to that encoder. Off-family entries get a coloured base dot + label.
 fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, off_family: bool) {
-    let name = e
-        .file
-        .trim_end_matches(".safetensors")
-        .trim_end_matches(".pt")
-        .trim_end_matches(".bin")
-        .to_string();
+    let name = embed_stem(&e.file).to_string();
+
+    // Pick up a freshly downloaded thumbnail from the cache (lazy, like LoRAs).
+    if e.thumb.is_none() && !e.thumb_missing {
+        let tdir = embedding_thumbs_dir();
+        let stem = embed_stem(&e.file);
+        let img = tdir.join(format!("{stem}.img"));
+        if img.exists() {
+            match std::fs::read(&img).ok().and_then(|b| crate::civitai::decode_thumb(&b)) {
+                Some(ci) => {
+                    e.thumb = Some(ui.ctx().load_texture(format!("embed_thumb_{stem}"), ci, Default::default()));
+                }
+                None => e.thumb_missing = true,
+            }
+        } else if tdir.join(format!("{stem}.none")).exists() {
+            e.thumb_missing = true;
+        }
+    }
+
     let base = e.base;
     let selected = e.selected;
     let negative = e.negative;
+    let thumb = e.thumb.clone();
     // Rects captured so the card-level click can route a hit to a control instead
     // of toggling selection (the card swallows child clicks).
     let mut pos_rect = None;
@@ -1691,11 +1781,16 @@ fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, off_family: bool) {
 
     let inner = lora_card(ui, selected, |ui| {
         ui.horizontal(|ui| {
-            ui.add(
-                egui::Image::new(egui::include_image!("../icons/plugin.svg"))
-                    .fit_to_exact_size(egui::vec2(14.0, 14.0))
-                    .tint(icon_tint(if selected { TEXT() } else { MUTED() })),
-            );
+            ui.spacing_mut().item_spacing.x = 10.0;
+            if let Some(tex) = thumb {
+                ui.add(egui::Image::new(&tex).max_height(64.0).max_width(64.0).corner_radius(8));
+            } else {
+                ui.add(
+                    egui::Image::new(egui::include_image!("../icons/plugin.svg"))
+                        .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                        .tint(icon_tint(if selected { TEXT() } else { MUTED() })),
+                );
+            }
             ui.add(egui::Label::new(RichText::new(&name).color(TEXT()).size(12.5)).truncate());
             if off_family {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2131,7 +2226,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                                     .fit_to_exact_size(egui::vec2(16.0, 16.0))
                                     .tint(icon_tint(TEXT()));
                                 if ui.add(egui::Button::image_and_text(eicon, RichText::new(elabel).size(12.0)).frame(false)).clicked() {
-                                    refresh_embeddings(state);
+                                    refresh_embeddings(state, ui.ctx());
                                     state.show_embeddings_popup = true;
                                     ui.close();
                                 }
