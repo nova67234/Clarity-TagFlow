@@ -74,6 +74,13 @@ const ZIMAGE_VAE: &str = "https://huggingface.co/Comfy-Org/z_image_turbo/resolve
 /// the dual CLIP text encoders, and the VAE — all native ComfyUI nodes (~6.9 GB).
 const SDXL_CKPT: &str = "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors?download=true";
 
+/// Anima Base v1.0 (CircleStone Labs / Comfy Org, built on NVIDIA Cosmos 2) — a
+/// 2B anime text-to-image model. Three split files loaded with native ComfyUI
+/// UNETLoader + CLIPLoader(stable_diffusion) + VAELoader nodes.
+const ANIMA_UNET: &str = "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-base-v1.0.safetensors?download=true";
+const ANIMA_TE: &str = "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/text_encoders/qwen_3_06b_base.safetensors?download=true";
+const ANIMA_VAE: &str = "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/vae/qwen_image_vae.safetensors?download=true";
+
 /// Which model family a Generate tab drives.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GenFamily {
@@ -85,6 +92,8 @@ pub enum GenFamily {
     Wan,
     /// SDXL: Stable Diffusion XL text-to-image (single checkpoint, native nodes).
     Sdxl,
+    /// Anima: 2B anime text-to-image (Cosmos-2 DiT; UNet + Qwen3 encoder + VAE).
+    Anima,
 }
 
 impl GenFamily {
@@ -95,6 +104,7 @@ impl GenFamily {
             GenFamily::Ltx => "LTX Director",
             GenFamily::Wan => "Wan Director",
             GenFamily::Sdxl => "SDXL",
+            GenFamily::Anima => "Anima",
         }
     }
     /// Per-family outputs sub-folder, so each tab keeps its own history.
@@ -105,6 +115,7 @@ impl GenFamily {
             GenFamily::Ltx => "ltx",
             GenFamily::Wan => "wan",
             GenFamily::Sdxl => "sdxl",
+            GenFamily::Anima => "anima",
         }
     }
     fn default_model(self) -> GenModel {
@@ -114,6 +125,7 @@ impl GenFamily {
             GenFamily::Ltx => GenModel::LtxDistilled,
             GenFamily::Wan => GenModel::WanTi2v5bFast,
             GenFamily::Sdxl => GenModel::SdxlBase,
+            GenFamily::Anima => GenModel::AnimaBase,
         }
     }
     /// This family produces video (an .mp4) rather than a still image — drives
@@ -121,11 +133,28 @@ impl GenFamily {
     fn is_video(self) -> bool {
         matches!(self, GenFamily::Ltx | GenFamily::Wan)
     }
-    /// This family loads a single swappable checkpoint (CheckpointLoaderSimple),
-    /// so the model picker can offer auto-detected installed checkpoints. The
-    /// other families use multi-file GGUF/UNet setups that can't be swapped wholesale.
+    /// This family loads a single swappable model file, so the picker can offer
+    /// auto-detected installed models. SDXL swaps a full checkpoint (CheckpointLoaderSimple);
+    /// Anima swaps the diffusion model (UNETLoader). The other families use
+    /// multi-file GGUF/UNet setups that can't be swapped wholesale.
     fn uses_checkpoint_picker(self) -> bool {
-        matches!(self, GenFamily::Sdxl)
+        matches!(self, GenFamily::Sdxl | GenFamily::Anima)
+    }
+    /// The `models/` sub-dir holding this family's swappable model file, and that
+    /// file's built-in (downloaded) default name — used to route the installed-model
+    /// picker and skip the default from the installed list.
+    fn model_subdir(self) -> &'static str {
+        match self {
+            GenFamily::Anima => "diffusion_models",
+            _ => "checkpoints",
+        }
+    }
+    fn default_model_file(self) -> &'static str {
+        match self {
+            GenFamily::Sdxl => "sd_xl_base_1.0.safetensors",
+            GenFamily::Anima => "anima-base-v1.0.safetensors",
+            _ => "",
+        }
     }
 }
 
@@ -151,6 +180,8 @@ pub enum GenModel {
     WanTi2v5bQuality,
     // SDXL Base 1.0 (single checkpoint: UNet + dual CLIP + VAE).
     SdxlBase,
+    // Anima Base v1.0 (UNet + Qwen3 0.6B encoder + Qwen-Image VAE).
+    AnimaBase,
 }
 
 impl GenModel {
@@ -160,6 +191,7 @@ impl GenModel {
             GenModel::LtxDistilled | GenModel::Ltx2Distilled => GenFamily::Ltx,
             GenModel::WanTi2v5bFast | GenModel::WanTi2v5bQuality => GenFamily::Wan,
             GenModel::SdxlBase => GenFamily::Sdxl,
+            GenModel::AnimaBase => GenFamily::Anima,
             _ => GenFamily::Flux,
         }
     }
@@ -171,6 +203,7 @@ impl GenModel {
             GenFamily::Ltx => &[GenModel::LtxDistilled, GenModel::Ltx2Distilled],
             GenFamily::Wan => &[GenModel::WanTi2v5bFast, GenModel::WanTi2v5bQuality],
             GenFamily::Sdxl => &[GenModel::SdxlBase],
+            GenFamily::Anima => &[GenModel::AnimaBase],
         }
     }
 
@@ -187,6 +220,7 @@ impl GenModel {
             GenModel::WanTi2v5bFast => "Wan 2.2 · 5B TI2V · fp8 load (low VRAM)",
             GenModel::WanTi2v5bQuality => "Wan 2.2 · 5B TI2V · fp16 (quality)",
             GenModel::SdxlBase => "SDXL Base 1.0 (~6.9 GB)",
+            GenModel::AnimaBase => "Anima Base v1.0 (~5 GB)",
         }
     }
 
@@ -248,6 +282,8 @@ impl GenModel {
             GenModel::WanTi2v5bFast | GenModel::WanTi2v5bQuality => 20,
             // SDXL: 25-30 steps with a moderate CFG is the sweet spot.
             GenModel::SdxlBase => 28,
+            // Anima: the official template runs 30 steps (er_sde / simple).
+            GenModel::AnimaBase => 30,
         }
     }
 
@@ -260,6 +296,7 @@ impl GenModel {
             GenFamily::Ltx => 2.0,
             GenFamily::Wan => 5.0,
             GenFamily::Sdxl => 7.0,
+            GenFamily::Anima => 4.0,
         }
     }
 }
@@ -429,9 +466,7 @@ impl LoraBase {
             LoraBase::Flux => family == GenFamily::Flux,
             LoraBase::ZImage => family == GenFamily::ZImage,
             LoraBase::Sdxl => family == GenFamily::Sdxl,
-            // No Anima generation tab yet — never a match (shown only under
-            // "other models"), so it can't masquerade as an SDXL LoRA.
-            LoraBase::Anima => false,
+            LoraBase::Anima => family == GenFamily::Anima,
             LoraBase::Other => false,
             LoraBase::Unknown => true,
         }
@@ -666,17 +701,19 @@ fn refresh_checkpoints(state: &mut GenerateState) {
     }
 }
 
-/// Make ComfyUI's `CheckpointLoaderSimple` search all [`CKPT_DIRS`] (not just
-/// `checkpoints/`) by writing an `extra_model_paths.yaml` next to `main.py`.
-/// Returns `true` if the file was created or changed — the caller restarts the
-/// server so the new folders take effect (ComfyUI reads paths only at startup).
+/// Make both ComfyUI loaders find a model wherever it landed: cross-register all
+/// [`CKPT_DIRS`] under BOTH the `checkpoints` key (SDXL's CheckpointLoaderSimple)
+/// and the `diffusion_models` key (Anima's UNETLoader), via an `extra_model_paths
+/// .yaml` next to `main.py`. Returns `true` if the file was created or changed —
+/// the caller restarts the server so the new folders take effect (ComfyUI reads
+/// paths only at startup).
 fn ensure_checkpoint_paths(comfy: &Path) -> bool {
     let rel_dirs: String = CKPT_DIRS.iter().map(|d| format!("    models/{d}\n")).collect();
     let base = comfy.to_string_lossy().replace('\\', "/");
     let yaml = format!(
-        "# Auto-written by Clarity TagFlow — lets CheckpointLoaderSimple find full\n\
-         # checkpoints stored in the diffusion_models / unet folders too.\n\
-         clarity_tagflow:\n  base_path: {base}\n  checkpoints: |\n{rel_dirs}"
+        "# Auto-written by Clarity TagFlow — lets the checkpoint (SDXL) and\n\
+         # diffusion-model (Anima) loaders find models in any of these folders.\n\
+         clarity_tagflow:\n  base_path: {base}\n  checkpoints: |\n{rel_dirs}  diffusion_models: |\n{rel_dirs}"
     );
     let path = comfy.join("extra_model_paths.yaml");
     if std::fs::read_to_string(&path).ok().as_deref() == Some(yaml.as_str()) {
@@ -2331,7 +2368,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
     // quick aspect-ratio tiles (square/landscape/portrait) instead of fine
     // Width/Height sliders — the slider scales every preset live, and one click on
     // a tile picks the ratio. Video families keep the sliders.
-    if matches!(state.family, GenFamily::ZImage | GenFamily::Flux | GenFamily::Sdxl) {
+    if matches!(state.family, GenFamily::ZImage | GenFamily::Flux | GenFamily::Sdxl | GenFamily::Anima) {
         // The Size slider scales all three presets; recompute the active dims so the
         // current selection tracks the slider live (snapped to multiples of 64).
         let mut size = state.size;
@@ -2610,9 +2647,10 @@ fn model_selector(ui: &mut egui::Ui, state: &mut GenerateState) {
                 // Owned copies so the list isn't borrowed while we mutate `state`.
                 let mut compatible: Vec<(String, LoraBase)> = Vec::new();
                 let mut others: Vec<(String, LoraBase)> = Vec::new();
+                let base_file = family.default_model_file();
                 for c in &state.checkpoints {
                     // The built-in base is already listed above — don't duplicate it.
-                    if c.file == "sd_xl_base_1.0.safetensors" {
+                    if c.file == base_file {
                         continue;
                     }
                     if c.base.matches(family) || c.base == LoraBase::Unknown {
@@ -2873,6 +2911,11 @@ fn required_files(model: GenModel) -> Vec<(&'static str, String)> {
             ("vae", "wan2.2_vae.safetensors".into()),
         ],
         GenFamily::Sdxl => vec![("checkpoints", "sd_xl_base_1.0.safetensors".into())],
+        GenFamily::Anima => vec![
+            ("diffusion_models", "anima-base-v1.0.safetensors".into()),
+            ("text_encoders", "qwen_3_06b_base.safetensors".into()),
+            ("vae", "qwen_image_vae.safetensors".into()),
+        ],
     }
 }
 
@@ -2884,9 +2927,11 @@ fn missing_files(model: GenModel, custom_ckpt: Option<&str>) -> Vec<String> {
     if let Some(c) = custom_ckpt {
         let present = CKPT_DIRS.iter().any(|sub| models.join(sub).join(c).exists());
         let mut missing: Vec<String> = if present { Vec::new() } else { vec![c.to_string()] };
-        // Still verify any *other* (non-checkpoint) required files for this family.
+        // The custom file replaces the family's swappable model entry; still verify
+        // the other required files (text encoder, VAE, …) for this family.
+        let model_sub = model.family().model_subdir();
         for (sub, file) in required_files(model) {
-            if sub != "checkpoints" && !file.is_empty() && !models.join(sub).join(&file).exists() {
+            if sub != model_sub && !file.is_empty() && !models.join(sub).join(&file).exists() {
                 missing.push(file);
             }
         }
@@ -3121,6 +3166,16 @@ fn run_setup(
             status("Downloading SDXL Base 1.0 (~6.9 GB)…");
             let _ = std::fs::create_dir_all(m("checkpoints"));
             ok &= fetch(SDXL_CKPT, m("checkpoints").join("sd_xl_base_1.0.safetensors"), "SDXL Base 1.0", "", &send);
+        }
+        GenFamily::Anima => {
+            // Anima Base v1.0 — diffusion model + Qwen3 0.6B encoder + Qwen-Image VAE.
+            status("Downloading Anima Base v1.0 (~5 GB)…");
+            let _ = std::fs::create_dir_all(m("diffusion_models"));
+            let _ = std::fs::create_dir_all(m("text_encoders"));
+            let _ = std::fs::create_dir_all(m("vae"));
+            ok &= fetch(ANIMA_UNET, m("diffusion_models").join("anima-base-v1.0.safetensors"), "Anima Base v1.0", "", &send);
+            ok &= fetch(ANIMA_TE, m("text_encoders").join("qwen_3_06b_base.safetensors"), "Qwen3 0.6B encoder", "", &send);
+            ok &= fetch(ANIMA_VAE, m("vae").join("qwen_image_vae.safetensors"), "Qwen-Image VAE", "", &send);
         }
     }
 
@@ -3516,6 +3571,7 @@ fn build_params(job: &GenJob) -> String {
         GenModel::Ltx2Distilled => "LTX-2.3",
         GenModel::WanTi2v5bFast | GenModel::WanTi2v5bQuality => "Wan 2.2 5B",
         GenModel::SdxlBase => "SDXL 1.0",
+        GenModel::AnimaBase => "Anima v1.0",
     };
     let mut prompt = job.prompt.clone();
     // Surface selected LoRAs as A1111 tags so they show up too.
@@ -3577,8 +3633,61 @@ fn build_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
             GenFamily::Ltx => ltx_workflow(job, image_name),
             GenFamily::Wan => wan_workflow(job, image_name),
             GenFamily::Sdxl => sdxl_workflow(job),
+            GenFamily::Anima => anima_workflow(job),
         },
     }
+}
+
+/// Anima Base v1.0 text-to-image (CircleStone Labs / Comfy Org, NVIDIA Cosmos 2):
+/// UNETLoader + CLIPLoader(qwen3, type "stable_diffusion") + VAELoader(qwen image)
+/// + dual CLIPTextEncode + EmptyLatentImage + KSampler (er_sde/simple) + VAEDecode
+/// + SaveImage, with any selected LoRAs chained in model+clip. Mirrors ComfyUI's
+/// official `image_anima_base_v1` template.
+fn anima_workflow(job: &GenJob) -> serde_json::Value {
+    use serde_json::json;
+    let width = (job.width / 8).max(8) * 8;
+    let height = (job.height / 8).max(8) * 8;
+
+    // An auto-detected installed Anima model overrides the built-in base.
+    let unet = job.checkpoint.as_deref().unwrap_or("anima-base-v1.0.safetensors");
+    let mut wf = json!({
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": unet, "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_3_06b_base.safetensors", "type": "stable_diffusion"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
+    });
+    let obj = wf.as_object_mut().unwrap();
+
+    // Chain LoraLoader nodes (model + clip thread through), starting at the loaders.
+    let mut model_ref = json!(["1", 0]);
+    let mut clip_ref = json!(["2", 0]);
+    let mut id = 100;
+    for (file, strength) in &job.loras {
+        let node = id.to_string();
+        id += 1;
+        obj.insert(
+            node.clone(),
+            json!({"class_type": "LoraLoader", "inputs": {
+                "model": model_ref, "clip": clip_ref, "lora_name": file,
+                "strength_model": strength, "strength_clip": strength
+            }}),
+        );
+        model_ref = json!([node, 0]);
+        clip_ref = json!([node, 1]);
+    }
+
+    // A light anime-oriented negative (cfg 4 uses the negative conditioning).
+    const ANIMA_NEG: &str = "lowres, worst quality, low quality, bad anatomy, bad hands, text, watermark, jpeg artifacts, signature";
+    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
+    obj.insert("6".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(ANIMA_NEG, &job.neg_embeds), "clip": clip_ref}}));
+    obj.insert("7".into(), json!({"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}));
+    obj.insert("8".into(), json!({"class_type": "KSampler", "inputs": {
+        "model": model_ref, "positive": ["4", 0], "negative": ["6", 0], "latent_image": ["7", 0],
+        "seed": job.seed, "steps": job.steps, "cfg": job.guidance,
+        "sampler_name": "er_sde", "scheduler": "simple", "denoise": 1.0
+    }}));
+    obj.insert("9".into(), json!({"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["3", 0]}}));
+    obj.insert("10".into(), json!({"class_type": "SaveImage", "inputs": {"images": ["9", 0], "filename_prefix": "ClarityAnima"}}));
+    wf
 }
 
 /// SDXL Base 1.0 text-to-image: CheckpointLoaderSimple (UNet + dual CLIP + VAE) +
