@@ -414,6 +414,9 @@ enum LoraBase {
     ZImage,
     /// SDXL family (incl. Pony, Illustrious, NoobAI — all SDXL-based).
     Sdxl,
+    /// Anima — a 2B anime model (CircleStone Labs / Comfy Org, built on NVIDIA
+    /// Cosmos 2). Its own DiT architecture; not usable by the current tabs.
+    Anima,
     /// Identified as some other architecture (SD 1.5, …).
     Other,
     /// No recognisable signals — offered in every tab, marked with a caveat.
@@ -426,6 +429,9 @@ impl LoraBase {
             LoraBase::Flux => family == GenFamily::Flux,
             LoraBase::ZImage => family == GenFamily::ZImage,
             LoraBase::Sdxl => family == GenFamily::Sdxl,
+            // No Anima generation tab yet — never a match (shown only under
+            // "other models"), so it can't masquerade as an SDXL LoRA.
+            LoraBase::Anima => false,
             LoraBase::Other => false,
             LoraBase::Unknown => true,
         }
@@ -437,6 +443,7 @@ impl LoraBase {
             LoraBase::Flux => "Flux",
             LoraBase::ZImage => "Z-Image",
             LoraBase::Sdxl => "SDXL",
+            LoraBase::Anima => "Anima",
             LoraBase::Other => "SD / other",
             LoraBase::Unknown => "Unknown",
         }
@@ -449,6 +456,7 @@ impl LoraBase {
             LoraBase::Flux => Color32::from_rgb(232, 160, 60),
             LoraBase::ZImage => Color32::from_rgb(70, 180, 160),
             LoraBase::Sdxl => Color32::from_rgb(90, 150, 230),
+            LoraBase::Anima => Color32::from_rgb(220, 110, 180),
             LoraBase::Other => Color32::from_rgb(150, 120, 220),
             LoraBase::Unknown => MUTED(),
         }
@@ -485,6 +493,12 @@ fn sniff_lora_base(path: &Path) -> LoraBase {
                 {
                     return LoraBase::Sdxl;
                 }
+                // Anima (CircleStone Labs / Comfy Org, built on NVIDIA Cosmos 2):
+                // architecture "Anima/lora". Checked after the SDXL list so
+                // "animagine" (SDXL) above isn't misread as Anima.
+                if v.contains("anima") || v.contains("cosmos") {
+                    return LoraBase::Anima;
+                }
                 if ["stable-diffusion", "sd_v1", "sd_1", "sd15"]
                     .iter()
                     .any(|s| v.contains(s))
@@ -505,6 +519,11 @@ fn sniff_lora_base(path: &Path) -> LoraBase {
         // transformer.single_transformer_blocks…; comfy: diffusion_model.double_blocks…).
         if k.contains("double_blocks") || k.contains("single_blocks") || k.contains("single_transformer_blocks") {
             return LoraBase::Flux;
+        }
+        // Anima (Cosmos-2 DiT): flat block stack with split self/cross attention,
+        // e.g. lora_unet_blocks_0_cross_attn_k_proj / _self_attn_q_proj.
+        if k.contains("lora_unet_blocks_") && (k.contains("_cross_attn_") || k.contains("_self_attn_")) {
+            return LoraBase::Anima;
         }
         // SD / SDXL UNet naming.
         if k.contains("input_blocks") || k.contains("down_blocks") || k.contains("lora_te1") || k.contains("mid_block") {
@@ -552,6 +571,10 @@ fn sniff_checkpoint_base(path: &Path) -> LoraBase {
                     .any(|s| v.contains(s))
                 {
                     return LoraBase::Sdxl;
+                }
+                // Anima (Cosmos-2). After the SDXL list so "animagine" isn't caught.
+                if v.contains("anima") || v.contains("cosmos") {
+                    return LoraBase::Anima;
                 }
             }
         }
@@ -737,7 +760,7 @@ fn refresh_embeddings(state: &mut GenerateState, ctx: &egui::Context) {
             }
         })
         .collect();
-    spawn_embedding_thumb_fetch(state.embeddings.iter().map(|e| e.file.clone()).collect(), ctx.clone());
+    spawn_embedding_thumb_fetch(state.embeddings.iter().map(|e| e.file.clone()).collect(), ctx.clone(), false);
 }
 
 /// The filename with any embedding extension stripped — the cache key + the name
@@ -754,35 +777,44 @@ fn embedding_thumbs_dir() -> PathBuf {
 
 /// Set when the embeddings picker closes; the thumb worker checks it between files.
 static EMBED_THUMB_CANCEL: AtomicBool = AtomicBool::new(false);
+/// True while the embedding thumbnail worker is running (drives the spinner).
+static EMBED_THUMB_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Stop the background embedding-thumbnail fetch (called when the picker closes).
 fn cancel_embedding_thumb_fetch() {
     EMBED_THUMB_CANCEL.store(true, Ordering::SeqCst);
 }
 
+/// Whether the embedding preview fetch is currently running.
+fn embeddings_fetching() -> bool {
+    EMBED_THUMB_RUNNING.load(Ordering::SeqCst)
+}
+
 /// Background pass fetching Civitai preview thumbnails for embeddings without one:
 /// SHA-256 of the file → Civitai's by-hash endpoint → first still preview, saved
 /// to the thumbs cache. Single-flight; repaints as each thumb lands. Embeddings
 /// are tiny so hashing is near-instant. Runs only while the picker is open.
-fn spawn_embedding_thumb_fetch(files: Vec<String>, ctx: egui::Context) {
-    static RUNNING: AtomicBool = AtomicBool::new(false);
+/// `force` re-attempts files previously marked "not on Civitai".
+fn spawn_embedding_thumb_fetch(files: Vec<String>, ctx: egui::Context, force: bool) {
     EMBED_THUMB_CANCEL.store(false, Ordering::SeqCst);
     let tdir = embedding_thumbs_dir();
     let todo: Vec<String> = files
         .into_iter()
         .filter(|f| {
             let stem = embed_stem(f);
-            !tdir.join(format!("{stem}.img")).exists() && !tdir.join(format!("{stem}.none")).exists()
+            let have_img = tdir.join(format!("{stem}.img")).exists();
+            let have_none = tdir.join(format!("{stem}.none")).exists();
+            !have_img && (force || !have_none)
         })
         .collect();
-    if todo.is_empty() || RUNNING.swap(true, Ordering::SeqCst) {
+    if todo.is_empty() || EMBED_THUMB_RUNNING.swap(true, Ordering::SeqCst) {
         return;
     }
     std::thread::spawn(move || {
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
-                RUNNING.store(false, Ordering::SeqCst);
+                EMBED_THUMB_RUNNING.store(false, Ordering::SeqCst);
             }
         }
         let _reset = Reset;
@@ -1149,7 +1181,7 @@ fn refresh_loras(state: &mut GenerateState, ctx: &egui::Context) {
             }
         })
         .collect();
-    spawn_lora_thumb_fetch(state.loras.iter().map(|l| l.file.clone()).collect(), ctx.clone());
+    spawn_lora_thumb_fetch(state.loras.iter().map(|l| l.file.clone()).collect(), ctx.clone(), false);
 }
 
 /// Where downloaded LoRA preview thumbnails live: `<stem>.img` is the raw
@@ -1161,6 +1193,9 @@ fn lora_thumbs_dir() -> PathBuf {
 /// Set when the LoRA picker closes; the thumb worker checks it between files,
 /// so hashing/downloading only happens while the picker is actually open.
 static THUMB_FETCH_CANCEL: AtomicBool = AtomicBool::new(false);
+/// True while the LoRA thumbnail worker is running (drives the download glyph's
+/// spinner).
+static LORA_THUMB_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Stop the background thumbnail fetch (called when the picker closes; the
 /// current file finishes, then the worker exits).
@@ -1168,12 +1203,17 @@ fn cancel_lora_thumb_fetch() {
     THUMB_FETCH_CANCEL.store(true, Ordering::SeqCst);
 }
 
+/// Whether the LoRA preview fetch is currently running.
+fn lora_thumbs_fetching() -> bool {
+    LORA_THUMB_RUNNING.load(Ordering::SeqCst)
+}
+
 /// Background pass fetching Civitai preview thumbnails for LoRAs without one:
 /// SHA-256 of the file → Civitai's by-hash endpoint → first still preview,
 /// saved to the thumbs cache. Single-flight; repaints as each thumb lands.
-/// Runs only while the picker is open (see [`cancel_lora_thumb_fetch`]).
-fn spawn_lora_thumb_fetch(files: Vec<String>, ctx: egui::Context) {
-    static RUNNING: AtomicBool = AtomicBool::new(false);
+/// Runs only while the picker is open (see [`cancel_lora_thumb_fetch`]). `force`
+/// re-attempts files previously marked "not on Civitai" (the download button).
+fn spawn_lora_thumb_fetch(files: Vec<String>, ctx: egui::Context, force: bool) {
     // (Re)opening the picker un-cancels, which also lets a still-running worker
     // from a quick close/reopen resume instead of dying.
     THUMB_FETCH_CANCEL.store(false, Ordering::SeqCst);
@@ -1182,10 +1222,12 @@ fn spawn_lora_thumb_fetch(files: Vec<String>, ctx: egui::Context) {
         .into_iter()
         .filter(|f| {
             let stem = f.trim_end_matches(".safetensors");
-            !tdir.join(format!("{stem}.img")).exists() && !tdir.join(format!("{stem}.none")).exists()
+            let have_img = tdir.join(format!("{stem}.img")).exists();
+            let have_none = tdir.join(format!("{stem}.none")).exists();
+            !have_img && (force || !have_none)
         })
         .collect();
-    if todo.is_empty() || RUNNING.swap(true, Ordering::SeqCst) {
+    if todo.is_empty() || LORA_THUMB_RUNNING.swap(true, Ordering::SeqCst) {
         return;
     }
     std::thread::spawn(move || {
@@ -1194,7 +1236,7 @@ fn spawn_lora_thumb_fetch(files: Vec<String>, ctx: egui::Context) {
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
-                RUNNING.store(false, Ordering::SeqCst);
+                LORA_THUMB_RUNNING.store(false, Ordering::SeqCst);
             }
         }
         let _reset = Reset;
@@ -1447,6 +1489,12 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
                         .tint(TEXT()),
                 );
                 ui.heading(RichText::new("LoRAs").color(TEXT()).strong().size(17.0));
+                // While the background fetch is pulling Civitai previews, show a
+                // spinning download glyph so it's clear thumbnails are loading.
+                if lora_thumbs_fetching() {
+                    ui.add_space(4.0);
+                    fetch_indicator(ui);
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // click_and_drag so a click that slips a pixel is swallowed
                     // by the button instead of dragging the popup.
@@ -1635,6 +1683,10 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
                         .tint(TEXT()),
                 );
                 ui.heading(RichText::new("Embeddings").color(TEXT()).strong().size(17.0));
+                if embeddings_fetching() {
+                    ui.add_space(4.0);
+                    fetch_indicator(ui);
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
                         .add(egui::Button::image(
@@ -2640,6 +2692,40 @@ fn round_icon_button(
             .tint(tint)
             .paint_at(ui, egui::Rect::from_center_size(rect.center(), egui::vec2(icon_size, icon_size)));
     }
+    resp
+}
+
+/// A non-interactive Gelbooru-style "downloading previews" indicator: a blue
+/// filled circle with a white down-arrow, wrapped in an animated spinning ring.
+/// Shown in the LoRA / embeddings picker titles only while the background preview
+/// fetch is running, so it's clear thumbnails are being pulled automatically.
+fn fetch_indicator(ui: &mut egui::Ui) -> egui::Response {
+    let size = 24.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let resp = resp.on_hover_text("Downloading preview cards…");
+    let painter = ui.painter().clone();
+    let center = rect.center();
+
+    // Filled blue circle + white down-arrow.
+    painter.circle_filled(center, 9.0, ACCENT1());
+    let icon = 13.0;
+    egui::Image::new(egui::include_image!("../icons/Arrow Downward Alt.svg"))
+        .tint(Color32::WHITE)
+        .paint_at(ui, egui::Rect::from_center_size(center, egui::vec2(icon, icon)));
+    // Spinning arc around it (this is only drawn while a fetch is in flight).
+    let radius = 11.0;
+    let t = ui.input(|i| i.time) as f32;
+    painter.circle_stroke(center, radius, egui::Stroke::new(2.0, ACCENT1().gamma_multiply(0.25)));
+    let start = (t * 3.0) % std::f32::consts::TAU;
+    let sweep = std::f32::consts::PI * 0.6;
+    let pts: Vec<egui::Pos2> = (0..=24)
+        .map(|k| {
+            let a = start + sweep * (k as f32 / 24.0);
+            center + radius * egui::vec2(a.cos(), a.sin())
+        })
+        .collect();
+    painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0, ACCENT1())));
+    ui.ctx().request_repaint();
     resp
 }
 
