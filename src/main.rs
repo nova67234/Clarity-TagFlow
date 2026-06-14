@@ -715,12 +715,13 @@ impl ViewerApp {
         {
             if in_flux {
                 // Which generation tab is active picks the source list (0 = Flux,
-                // 1 = Z-Image, 2 = LTX, 3 = Wan); the index is folded into `sig` so
-                // a tab switch refreshes the browser.
+                // 1 = Z-Image, 2 = LTX, 3 = Wan, 4 = SDXL); the index is folded into
+                // `sig` so a tab switch refreshes the browser.
                 let (tab, gen_list) = match self.right_state.view {
                     right_details::RightView::ZImage => (1u8, self.right_state.zimage.gen_images().to_vec()),
                     right_details::RightView::Ltx => (2u8, self.right_state.ltx.gen_images().to_vec()),
                     right_details::RightView::Wan => (3u8, self.right_state.wan.gen_images().to_vec()),
+                    right_details::RightView::Sdxl => (4u8, self.right_state.sdxl.gen_images().to_vec()),
                     _ => (0u8, self.right_state.generate.gen_images().to_vec()),
                 };
                 let sig = (tab, gen_list.len());
@@ -1090,6 +1091,7 @@ impl eframe::App for ViewerApp {
                     | right_details::RightView::ZImage
                     | right_details::RightView::Ltx
                     | right_details::RightView::Wan
+                    | right_details::RightView::Sdxl
             );
         #[cfg(target_os = "macos")]
         let in_flux = false;

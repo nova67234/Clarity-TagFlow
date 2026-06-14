@@ -317,7 +317,9 @@ impl ZoomState {
         let mut want_copy = false;
         let mut want_spatial = false;
         let mut want_bgremove = false;
-        resp.context_menu(|ui| {
+        egui::Popup::context_menu(&resp)
+            .frame(egui::Frame::menu(&resp.ctx.global_style()).corner_radius(CornerRadius::same(22)))
+            .show(|ui| {
             let (fav_icon, fav_label) = if is_favorite {
                 (egui::include_image!("../icons/heart_minus.svg"), "Remove favorite")
             } else {
@@ -605,7 +607,9 @@ impl ZoomState {
         let mut want_exit = false;
         let mut want_favorite = false;
         let mut want_copy = false;
-        resp.context_menu(|ui| {
+        egui::Popup::context_menu(&resp)
+            .frame(egui::Frame::menu(&resp.ctx.global_style()).corner_radius(CornerRadius::same(22)))
+            .show(|ui| {
             if menu_item(ui, egui::include_image!("../icons/spatial_scene.svg"), "Exit Spatial Scene") {
                 want_exit = true;
                 ui.close();
