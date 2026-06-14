@@ -70,6 +70,10 @@ const FLUX_VAE: &str =
 const ZIMAGE_DIFFUSION: &str = "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/diffusion_models/z_image_turbo_bf16.safetensors?download=true";
 const ZIMAGE_VAE: &str = "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors?download=true";
 
+/// SDXL Base 1.0 checkpoint (stabilityai, ungated). One file bundles the UNet,
+/// the dual CLIP text encoders, and the VAE — all native ComfyUI nodes (~6.9 GB).
+const SDXL_CKPT: &str = "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors?download=true";
+
 /// Which model family a Generate tab drives.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GenFamily {
@@ -79,15 +83,18 @@ pub enum GenFamily {
     Ltx,
     /// Wan 2.2: text/image-to-video generation (single 5B TI2V model; .webm out).
     Wan,
+    /// SDXL: Stable Diffusion XL text-to-image (single checkpoint, native nodes).
+    Sdxl,
 }
 
 impl GenFamily {
     fn title(self) -> &'static str {
         match self {
-            GenFamily::Flux => "Generate",
+            GenFamily::Flux => "Flux",
             GenFamily::ZImage => "Z-Image",
             GenFamily::Ltx => "LTX Director",
             GenFamily::Wan => "Wan Director",
+            GenFamily::Sdxl => "SDXL",
         }
     }
     /// Per-family outputs sub-folder, so each tab keeps its own history.
@@ -97,6 +104,7 @@ impl GenFamily {
             GenFamily::ZImage => "zimage",
             GenFamily::Ltx => "ltx",
             GenFamily::Wan => "wan",
+            GenFamily::Sdxl => "sdxl",
         }
     }
     fn default_model(self) -> GenModel {
@@ -105,12 +113,19 @@ impl GenFamily {
             GenFamily::ZImage => GenModel::ZImageFast,
             GenFamily::Ltx => GenModel::LtxDistilled,
             GenFamily::Wan => GenModel::WanTi2v5bFast,
+            GenFamily::Sdxl => GenModel::SdxlBase,
         }
     }
     /// This family produces video (an .mp4) rather than a still image — drives
     /// the video-only UI controls and the run loop's output handling.
     fn is_video(self) -> bool {
         matches!(self, GenFamily::Ltx | GenFamily::Wan)
+    }
+    /// This family loads a single swappable checkpoint (CheckpointLoaderSimple),
+    /// so the model picker can offer auto-detected installed checkpoints. The
+    /// other families use multi-file GGUF/UNet setups that can't be swapped wholesale.
+    fn uses_checkpoint_picker(self) -> bool {
+        matches!(self, GenFamily::Sdxl)
     }
 }
 
@@ -134,6 +149,8 @@ pub enum GenModel {
     // (fp8 cast for lower VRAM vs. full fp16 for quality).
     WanTi2v5bFast,
     WanTi2v5bQuality,
+    // SDXL Base 1.0 (single checkpoint: UNet + dual CLIP + VAE).
+    SdxlBase,
 }
 
 impl GenModel {
@@ -142,6 +159,7 @@ impl GenModel {
             GenModel::ZImageFast | GenModel::ZImageQuality => GenFamily::ZImage,
             GenModel::LtxDistilled | GenModel::Ltx2Distilled => GenFamily::Ltx,
             GenModel::WanTi2v5bFast | GenModel::WanTi2v5bQuality => GenFamily::Wan,
+            GenModel::SdxlBase => GenFamily::Sdxl,
             _ => GenFamily::Flux,
         }
     }
@@ -152,6 +170,7 @@ impl GenModel {
             GenFamily::ZImage => &[GenModel::ZImageFast, GenModel::ZImageQuality],
             GenFamily::Ltx => &[GenModel::LtxDistilled, GenModel::Ltx2Distilled],
             GenFamily::Wan => &[GenModel::WanTi2v5bFast, GenModel::WanTi2v5bQuality],
+            GenFamily::Sdxl => &[GenModel::SdxlBase],
         }
     }
 
@@ -167,6 +186,7 @@ impl GenModel {
             GenModel::Ltx2Distilled => "LTX-2.3 · 22B distilled (quality video+audio, ~3min)",
             GenModel::WanTi2v5bFast => "Wan 2.2 · 5B TI2V · fp8 load (low VRAM)",
             GenModel::WanTi2v5bQuality => "Wan 2.2 · 5B TI2V · fp16 (quality)",
+            GenModel::SdxlBase => "SDXL Base 1.0 (~6.9 GB)",
         }
     }
 
@@ -226,6 +246,8 @@ impl GenModel {
             GenModel::Ltx2Distilled => 8,
             // Wan 2.2 5B: the official template runs 20 steps with uni_pc/simple.
             GenModel::WanTi2v5bFast | GenModel::WanTi2v5bQuality => 20,
+            // SDXL: 25-30 steps with a moderate CFG is the sweet spot.
+            GenModel::SdxlBase => 28,
         }
     }
 
@@ -237,6 +259,7 @@ impl GenModel {
             GenFamily::ZImage => 1.0,
             GenFamily::Ltx => 2.0,
             GenFamily::Wan => 5.0,
+            GenFamily::Sdxl => 7.0,
         }
     }
 }
@@ -263,6 +286,30 @@ struct LoraEntry {
     thumb: Option<egui::TextureHandle>,
     /// The cache says this file has no Civitai preview — stop checking.
     thumb_missing: bool,
+}
+
+/// One full checkpoint found in ComfyUI's `models/checkpoints/` dir, with its
+/// sniffed architecture so each tab only offers compatible files (like LoRAs).
+struct CkptEntry {
+    file: String,
+    /// Architecture sniffed from the file header (reuses [`LoraBase`]'s families).
+    base: LoraBase,
+}
+
+/// One textual-inversion embedding found in ComfyUI's `models/embeddings/` dir.
+/// Like a LoRA it carries a multi-select state; the selected ones are injected as
+/// `embedding:<name>` tokens into the workflow's positive or negative encoder at
+/// generation time (never shown in the prompt box).
+struct EmbeddingEntry {
+    file: String,
+    /// Architecture sniffed from the embedding's tensor shapes (reuses [`LoraBase`]).
+    base: LoraBase,
+    /// Included in the next generation.
+    selected: bool,
+    /// Apply to the negative prompt instead of the positive one.
+    negative: bool,
+    /// Token weight — emitted as `(embedding:name:weight)` when not 1.0.
+    strength: f32,
 }
 
 /// Human-readable metadata decoded from a LoRA's safetensors header.
@@ -361,7 +408,9 @@ fn read_lora_info(path: &Path) -> LoraInfo {
 enum LoraBase {
     Flux,
     ZImage,
-    /// Identified as some other architecture (SD 1.5, SDXL, Pony, …).
+    /// SDXL family (incl. Pony, Illustrious, NoobAI — all SDXL-based).
+    Sdxl,
+    /// Identified as some other architecture (SD 1.5, …).
     Other,
     /// No recognisable signals — offered in every tab, marked with a caveat.
     Unknown,
@@ -372,6 +421,7 @@ impl LoraBase {
         match self {
             LoraBase::Flux => family == GenFamily::Flux,
             LoraBase::ZImage => family == GenFamily::ZImage,
+            LoraBase::Sdxl => family == GenFamily::Sdxl,
             LoraBase::Other => false,
             LoraBase::Unknown => true,
         }
@@ -382,6 +432,7 @@ impl LoraBase {
         match self {
             LoraBase::Flux => "Flux",
             LoraBase::ZImage => "Z-Image",
+            LoraBase::Sdxl => "SDXL",
             LoraBase::Other => "SD / other",
             LoraBase::Unknown => "Unknown",
         }
@@ -393,6 +444,7 @@ impl LoraBase {
         match self {
             LoraBase::Flux => Color32::from_rgb(232, 160, 60),
             LoraBase::ZImage => Color32::from_rgb(70, 180, 160),
+            LoraBase::Sdxl => Color32::from_rgb(90, 150, 230),
             LoraBase::Other => Color32::from_rgb(150, 120, 220),
             LoraBase::Unknown => MUTED(),
         }
@@ -423,7 +475,13 @@ fn sniff_lora_base(path: &Path) -> LoraBase {
                 if v.contains("flux") {
                     return LoraBase::Flux;
                 }
-                if ["sdxl", "stable-diffusion", "sd_v1", "sd_1", "sd15", "pony", "illustrious", "noobai"]
+                if ["sdxl", "sd_xl", "pony", "illustrious", "noobai", "animagine"]
+                    .iter()
+                    .any(|s| v.contains(s))
+                {
+                    return LoraBase::Sdxl;
+                }
+                if ["stable-diffusion", "sd_v1", "sd_1", "sd15"]
                     .iter()
                     .any(|s| v.contains(s))
                 {
@@ -457,6 +515,275 @@ fn sniff_lora_base(path: &Path) -> LoraBase {
         LoraBase::ZImage
     } else {
         LoraBase::Unknown
+    }
+}
+
+/// Sniff a *full checkpoint's* architecture from its safetensors header — used to
+/// filter the model picker to compatible files (an SD 1.5 checkpoint on the SDXL
+/// tab produces garbage). The signals differ from LoRAs: full checkpoints carry
+/// the whole UNet + text-encoder(s), so the text-encoder layout is the giveaway —
+/// SDXL is the only family with a *dual* encoder (`conditioner.embedders.1`).
+fn sniff_checkpoint_base(path: &Path) -> LoraBase {
+    // Non-safetensors checkpoints (.ckpt pickles) can't be header-sniffed.
+    let Some(header) = read_safetensors_header(path) else {
+        return LoraBase::Unknown;
+    };
+    let Some(obj) = header.as_object() else {
+        return LoraBase::Unknown;
+    };
+
+    // 1 — explicit modelspec metadata, when the trainer stamped it.
+    if let Some(meta) = obj.get("__metadata__").and_then(|m| m.as_object()) {
+        for key in ["modelspec.architecture", "ss_base_model_version", "modelspec.title"] {
+            if let Some(v) = meta.get(key).and_then(|v| v.as_str()) {
+                let v = v.to_ascii_lowercase();
+                if v.contains("flux") {
+                    return LoraBase::Flux;
+                }
+                if v.contains("zimage") || v.contains("z-image") || v.contains("z_image") {
+                    return LoraBase::ZImage;
+                }
+                if ["sdxl", "sd_xl", "stable-diffusion-xl", "pony", "illustrious", "noobai", "animagine"]
+                    .iter()
+                    .any(|s| v.contains(s))
+                {
+                    return LoraBase::Sdxl;
+                }
+            }
+        }
+    }
+
+    // 2 — tensor-name fingerprints.
+    let mut saw_cond_stage = false; // SD 1.x / 2.x single encoder
+    for k in obj.keys() {
+        if k == "__metadata__" {
+            continue;
+        }
+        // Flux full checkpoint: DiT double/single blocks in the diffusion model.
+        if k.contains("double_blocks") || k.contains("single_blocks") {
+            return LoraBase::Flux;
+        }
+        // Z-Image (S3-DiT): flat layer stack.
+        if k.starts_with("model.diffusion_model.layers.") || k.starts_with("diffusion_model.layers.") {
+            return LoraBase::ZImage;
+        }
+        // SDXL: the second text encoder (OpenCLIP bigG) — unique to SDXL.
+        if k.starts_with("conditioner.embedders.1") {
+            return LoraBase::Sdxl;
+        }
+        // SD 1.x/2.x single encoder naming.
+        if k.starts_with("cond_stage_model.") || k.starts_with("conditioner.embedders.0") {
+            saw_cond_stage = true;
+        }
+    }
+    if saw_cond_stage {
+        // A UNet checkpoint with a single CLIP encoder — SD 1.5 / 2.x family.
+        LoraBase::Other
+    } else {
+        LoraBase::Unknown
+    }
+}
+
+/// The `models/` sub-dirs scanned for full checkpoints. Users (reasonably) drop
+/// SDXL models into whichever folder they think of as "models", so we look in
+/// all three — and register the same set with ComfyUI (see [`ensure_checkpoint_paths`])
+/// so `CheckpointLoaderSimple` can actually load them wherever they landed.
+const CKPT_DIRS: [&str; 3] = ["checkpoints", "diffusion_models", "unet"];
+
+/// Full `.safetensors` / `.ckpt` checkpoints across all [`CKPT_DIRS`], as
+/// (filename, full path), de-duplicated by filename (first folder wins) and sorted.
+fn scan_checkpoints() -> Vec<(String, PathBuf)> {
+    let models = comfy_base().join("ComfyUI").join("models");
+    let mut seen = std::collections::HashSet::new();
+    let mut v: Vec<(String, PathBuf)> = Vec::new();
+    for sub in CKPT_DIRS {
+        let entries = std::fs::read_dir(models.join(sub))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("safetensors") || x.eq_ignore_ascii_case("ckpt"))
+            });
+        for p in entries {
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()).map(String::from) {
+                if seen.insert(name.clone()) {
+                    v.push((name, p));
+                }
+            }
+        }
+    }
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// Re-scan the checkpoint dirs, sniffing the architecture of new files (cheap
+/// header read) and keeping cached results for known ones. Drops the current
+/// custom-checkpoint selection if that file has gone away.
+fn refresh_checkpoints(state: &mut GenerateState) {
+    state.checkpoints = scan_checkpoints()
+        .into_iter()
+        .map(|(f, path)| {
+            let prev = state.checkpoints.iter().find(|c| c.file == f);
+            CkptEntry {
+                base: prev.map(|c| c.base).unwrap_or_else(|| sniff_checkpoint_base(&path)),
+                file: f,
+            }
+        })
+        .collect();
+    if let Some(sel) = &state.checkpoint {
+        if !state.checkpoints.iter().any(|c| &c.file == sel) {
+            state.checkpoint = None;
+        }
+    }
+}
+
+/// Make ComfyUI's `CheckpointLoaderSimple` search all [`CKPT_DIRS`] (not just
+/// `checkpoints/`) by writing an `extra_model_paths.yaml` next to `main.py`.
+/// Returns `true` if the file was created or changed — the caller restarts the
+/// server so the new folders take effect (ComfyUI reads paths only at startup).
+fn ensure_checkpoint_paths(comfy: &Path) -> bool {
+    let rel_dirs: String = CKPT_DIRS.iter().map(|d| format!("    models/{d}\n")).collect();
+    let base = comfy.to_string_lossy().replace('\\', "/");
+    let yaml = format!(
+        "# Auto-written by Clarity TagFlow — lets CheckpointLoaderSimple find full\n\
+         # checkpoints stored in the diffusion_models / unet folders too.\n\
+         clarity_tagflow:\n  base_path: {base}\n  checkpoints: |\n{rel_dirs}"
+    );
+    let path = comfy.join("extra_model_paths.yaml");
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(yaml.as_str()) {
+        return false; // already current
+    }
+    std::fs::write(&path, &yaml).is_ok()
+}
+
+/// Sniff a textual-inversion embedding's architecture from its tensor shapes.
+/// SDXL embeddings carry a 1280-dim vector (the OpenCLIP-bigG encoder) — often
+/// alongside a 768-dim one; SD 1.5 embeddings are 768-dim only. `.pt`/`.bin`
+/// pickles can't be header-read, so they come back Unknown (still offered).
+fn sniff_embedding_base(path: &Path) -> LoraBase {
+    let Some(header) = read_safetensors_header(path) else {
+        return LoraBase::Unknown;
+    };
+    let Some(obj) = header.as_object() else {
+        return LoraBase::Unknown;
+    };
+    let mut saw_768 = false;
+    for (k, v) in obj {
+        if k == "__metadata__" {
+            continue;
+        }
+        if let Some(shape) = v.get("shape").and_then(|s| s.as_array()) {
+            for dim in shape {
+                match dim.as_i64() {
+                    Some(1280) | Some(2560) => return LoraBase::Sdxl, // bigG (SDXL)
+                    Some(4096) => return LoraBase::Flux,              // T5-XXL (Flux)
+                    Some(768) | Some(1024) => saw_768 = true,        // CLIP-L / SD 2.x
+                    _ => {}
+                }
+            }
+        }
+    }
+    if saw_768 {
+        LoraBase::Other
+    } else {
+        LoraBase::Unknown
+    }
+}
+
+/// Textual-inversion embeddings in ComfyUI's `models/embeddings/` dir, as
+/// (filename, full path), alphabetical. Accepts `.safetensors`, `.pt`, `.bin`.
+fn scan_embeddings() -> Vec<(String, PathBuf)> {
+    let dir = comfy_base().join("ComfyUI").join("models").join("embeddings");
+    let mut v: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.extension().is_some_and(|x| {
+                x.eq_ignore_ascii_case("safetensors")
+                    || x.eq_ignore_ascii_case("pt")
+                    || x.eq_ignore_ascii_case("bin")
+            })
+        })
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(|n| (n.to_string(), p.clone())))
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// Re-scan the embeddings dir, sniffing the architecture of new files and keeping
+/// cached results for known ones.
+fn refresh_embeddings(state: &mut GenerateState) {
+    state.embeddings = scan_embeddings()
+        .into_iter()
+        .map(|(f, path)| {
+            let prev = state.embeddings.iter().find(|e| e.file == f);
+            EmbeddingEntry {
+                base: prev.map(|e| e.base).unwrap_or_else(|| sniff_embedding_base(&path)),
+                selected: prev.map(|e| e.selected).unwrap_or(false),
+                negative: prev.map(|e| e.negative).unwrap_or(false),
+                strength: prev.map(|e| e.strength).unwrap_or(1.0),
+                file: f,
+            }
+        })
+        .collect();
+}
+
+/// The prompt token for a textual inversion (extension stripped): bare
+/// `embedding:<name>` at weight 1.0, or the weighted form `(embedding:<name>:w)`
+/// otherwise — ComfyUI's emphasis syntax.
+fn embedding_token(file: &str, strength: f32) -> String {
+    let stem = file
+        .trim_end_matches(".safetensors")
+        .trim_end_matches(".pt")
+        .trim_end_matches(".bin");
+    if (strength - 1.0).abs() < 0.001 {
+        format!("embedding:{stem}")
+    } else {
+        format!("(embedding:{stem}:{strength:.2})")
+    }
+}
+
+/// The space-joined `embedding:<name>` tokens for the selected embeddings of the
+/// requested polarity (`negative`), filtered to the current family — what gets
+/// appended to that polarity's encoder text at generation time.
+fn embed_tokens(state: &GenerateState, negative: bool) -> String {
+    state
+        .embeddings
+        .iter()
+        .filter(|e| e.selected && e.negative == negative && e.base.matches(state.family))
+        .map(|e| embedding_token(&e.file, e.strength))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Append embedding tokens to a prompt-encode text (positive or negative), so the
+/// embeddings affect generation without ever appearing in the user's prompt box.
+fn with_embeds(base: &str, tokens: &str) -> String {
+    match (base.is_empty(), tokens.is_empty()) {
+        (_, true) => base.to_string(),
+        (true, false) => tokens.to_string(),
+        (false, false) => format!("{base} {tokens}"),
+    }
+}
+
+/// Kill the running ComfyUI server (if any) and wait until it stops responding,
+/// so a fresh start picks up changed config. Used after [`ensure_checkpoint_paths`].
+fn stop_server() {
+    if let Ok(mut lock) = SERVER.lock() {
+        if let Some(mut child) = lock.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    for _ in 0..30 {
+        if !ping() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
 
@@ -566,6 +893,28 @@ pub struct GenerateState {
     /// Reveal LoRAs trained for other model families in the picker (off by
     /// default — they're hidden behind a checkbox at the bottom of the popup).
     show_other_loras: bool,
+    /// Installed full checkpoints (auto-detected from `models/checkpoints/`),
+    /// sniffed + filtered per family — offered alongside the built-in download
+    /// options in the model picker.
+    checkpoints: Vec<CkptEntry>,
+    /// The selected installed checkpoint filename, or `None` to use the built-in
+    /// model's default checkpoint. Only meaningful for families that use a single
+    /// swappable checkpoint (SDXL).
+    checkpoint: Option<String>,
+    /// Reveal checkpoints sniffed as other families in the model picker.
+    show_other_ckpts: bool,
+    /// Tracks the model-picker open/closed edge so the checkpoint scan runs once
+    /// per open, not every frame.
+    ckpt_menu_was_open: bool,
+    /// Installed textual-inversion embeddings (auto-detected from
+    /// `models/embeddings/`), filtered per family — inserted into the prompt as
+    /// `embedding:<name>` tokens from the + menu.
+    embeddings: Vec<EmbeddingEntry>,
+    show_embeddings_popup: bool,
+    /// Reveal embeddings sniffed as other families in the picker.
+    show_other_embeddings: bool,
+    /// When the embeddings-popup Refresh icon was last clicked (one-shot spin).
+    embeddings_refresh_spin: Option<std::time::Instant>,
     show_log: bool,
     /// Brief tint flash on the Copy-log button: (when, was_ok). Green on success,
     /// red on failure; fades out after a short window.
@@ -588,6 +937,9 @@ pub struct GenerateState {
     /// Z-Image: the reference square-edge size (px) the aspect tiles scale to, so
     /// one "Size" slider resizes every ratio at once. Unused by other families.
     size: i32,
+    /// When the LoRA-popup Refresh icon was last clicked — drives its one-shot
+    /// spin animation. `None` when not spinning.
+    lora_refresh_spin: Option<std::time::Instant>,
 }
 
 impl Default for GenerateState {
@@ -638,6 +990,14 @@ impl GenerateState {
             loras: Vec::new(),
             show_lora_popup: false,
             show_other_loras: false,
+            checkpoints: Vec::new(),
+            checkpoint: None,
+            show_other_ckpts: false,
+            ckpt_menu_was_open: false,
+            embeddings: Vec::new(),
+            show_embeddings_popup: false,
+            show_other_embeddings: false,
+            embeddings_refresh_spin: None,
             show_log: false,
             copy_flash: None,
             spell: crate::spellcheck::SpellcheckState::default(),
@@ -647,6 +1007,7 @@ impl GenerateState {
             fps: 24,
             i2v: false,
             size: 1024,
+            lora_refresh_spin: None,
         }
     }
 
@@ -989,7 +1350,7 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
         .collapsible(false)
         .resizable(false)
         .placed_centered(ctx)
-        .frame(window_frame())
+        .frame(window_frame().corner_radius(CornerRadius::same(22)))
         .show(ctx, |ui| {
             // Only the top strip drags the popup — not stray drags on the body.
             crate::popup_drag_strip(ui, 30.0);
@@ -1028,11 +1389,32 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
                         cancel_lora_thumb_fetch();
                     }
                     ui.add_space(2.0);
+                    // One-shot spin animation: 0.5s ease-out single turn on click.
+                    let spin = match state.lora_refresh_spin {
+                        Some(start) => {
+                            let t = start.elapsed().as_secs_f32() / 0.5;
+                            if t >= 1.0 {
+                                state.lora_refresh_spin = None;
+                                0.0
+                            } else {
+                                ui.ctx().request_repaint();
+                                let ease = 1.0 - (1.0 - t).powi(3); // ease-out
+                                ease * std::f32::consts::TAU
+                            }
+                        }
+                        None => 0.0,
+                    };
                     if ui
-                        .add(egui::Button::new(RichText::new("Refresh").size(11.0))
-                            .sense(egui::Sense::click_and_drag()))
+                        .add(egui::Button::image(
+                            egui::Image::new(egui::include_image!("../icons/refresh.svg"))
+                                .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                                .rotate(spin, egui::Vec2::splat(0.5))
+                                .tint(icon_tint(TEXT())),
+                        ).frame(false).sense(egui::Sense::click_and_drag()))
+                        .on_hover_text("Refresh")
                         .clicked()
                     {
+                        state.lora_refresh_spin = Some(std::time::Instant::now());
                         refresh_loras(state, ui.ctx());
                     }
                 });
@@ -1144,6 +1526,238 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
                 }
             });
         });
+}
+
+/// The embeddings (textual-inversion) picker. Mirrors the LoRA popup, but each
+/// row inserts an `embedding:<name>` token into the prompt on click (embeddings
+/// are prompt tokens, not separate loader nodes). Compatible embeddings list
+/// first; off-family ones hide behind a checkbox.
+fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
+    use crate::PopupPlacement;
+    egui::Window::new("")
+        .id(egui::Id::new("embeddings_popup"))
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .placed_centered(ctx)
+        .frame(window_frame().corner_radius(CornerRadius::same(22)))
+        .show(ctx, |ui| {
+            crate::popup_drag_strip(ui, 30.0);
+            ui.set_width(380.0);
+            let radius = CornerRadius::same(10);
+            {
+                let v = ui.visuals_mut();
+                v.widgets.inactive.corner_radius = radius;
+                v.widgets.hovered.corner_radius = radius;
+                v.widgets.active.corner_radius = radius;
+            }
+
+            // Title row: icon + title + Refresh + close ✕.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add(
+                    egui::Image::new(egui::include_image!("../icons/plugin.svg"))
+                        .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                        .tint(TEXT()),
+                );
+                ui.heading(RichText::new("Embeddings").color(TEXT()).strong().size(17.0));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::image(
+                            egui::Image::new(egui::include_image!("../icons/close.svg"))
+                                .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                                .tint(TEXT()),
+                        ).frame(false).sense(egui::Sense::click_and_drag()))
+                        .on_hover_text("Close")
+                        .clicked()
+                    {
+                        state.show_embeddings_popup = false;
+                    }
+                    ui.add_space(2.0);
+                    // One-shot 0.5s ease-out spin on click (matches the LoRA popup).
+                    let spin = match state.embeddings_refresh_spin {
+                        Some(start) => {
+                            let t = start.elapsed().as_secs_f32() / 0.5;
+                            if t >= 1.0 {
+                                state.embeddings_refresh_spin = None;
+                                0.0
+                            } else {
+                                ui.ctx().request_repaint();
+                                let ease = 1.0 - (1.0 - t).powi(3);
+                                ease * std::f32::consts::TAU
+                            }
+                        }
+                        None => 0.0,
+                    };
+                    if ui
+                        .add(egui::Button::image(
+                            egui::Image::new(egui::include_image!("../icons/refresh.svg"))
+                                .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                                .rotate(spin, egui::Vec2::splat(0.5))
+                                .tint(icon_tint(TEXT())),
+                        ).frame(false).sense(egui::Sense::click_and_drag()))
+                        .on_hover_text("Refresh")
+                        .clicked()
+                    {
+                        state.embeddings_refresh_spin = Some(std::time::Instant::now());
+                        refresh_embeddings(state);
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Select embeddings, then set each to Positive or Negative. They're applied at generation — not added to your prompt.")
+                    .color(MUTED())
+                    .size(11.0),
+            );
+            ui.add_space(10.0);
+
+            let family = state.family;
+            if state.embeddings.is_empty() {
+                ui.label(
+                    RichText::new("No embeddings found. Drop files into models/embeddings/.")
+                        .color(MUTED())
+                        .size(12.0),
+                );
+            } else {
+                let shown = state.embeddings.iter().filter(|e| e.base.matches(family)).count();
+                let hidden = state.embeddings.len() - shown;
+                let show_other = state.show_other_embeddings;
+                egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, false]).show(ui, |ui| {
+                    if shown == 0 {
+                        ui.label(
+                            RichText::new(format!("No {} embeddings found.", family.title()))
+                                .color(MUTED())
+                                .size(12.0),
+                        );
+                        ui.add_space(6.0);
+                    }
+                    for e in state.embeddings.iter_mut().filter(|e| e.base.matches(family)) {
+                        embedding_row(ui, e, false);
+                    }
+                    if hidden > 0 && show_other {
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(format!("For other models ({hidden})"))
+                                .color(MUTED())
+                                .strong()
+                                .size(11.0),
+                        );
+                        ui.add_space(6.0);
+                        for e in state.embeddings.iter_mut().filter(|e| !e.base.matches(family)) {
+                            embedding_row(ui, e, true);
+                        }
+                    }
+                });
+                if hidden > 0 {
+                    ui.add_space(6.0);
+                    ui.checkbox(
+                        &mut state.show_other_embeddings,
+                        RichText::new(format!("Show {hidden} embedding(s) for other models"))
+                            .color(MUTED())
+                            .size(11.5),
+                    );
+                }
+            }
+
+            ui.add_space(10.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let done = egui::Button::new(RichText::new("Done").color(Color32::WHITE).strong()).fill(ACCENT1());
+                if ui.add_sized(egui::vec2(90.0, 30.0), done).clicked() {
+                    state.show_embeddings_popup = false;
+                }
+            });
+        });
+}
+
+/// One embedding row: a LoRA-style card. A click anywhere (de)selects it; when
+/// selected, a Positive / Negative pill pair appears — clicking a pill assigns the
+/// embedding to that encoder. Off-family entries get a coloured base dot + label.
+fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, off_family: bool) {
+    let name = e
+        .file
+        .trim_end_matches(".safetensors")
+        .trim_end_matches(".pt")
+        .trim_end_matches(".bin")
+        .to_string();
+    let base = e.base;
+    let selected = e.selected;
+    let negative = e.negative;
+    // Rects captured so the card-level click can route a hit to a control instead
+    // of toggling selection (the card swallows child clicks).
+    let mut pos_rect = None;
+    let mut neg_rect = None;
+    let mut slider_rect = None;
+
+    let inner = lora_card(ui, selected, |ui| {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Image::new(egui::include_image!("../icons/plugin.svg"))
+                    .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                    .tint(icon_tint(if selected { TEXT() } else { MUTED() })),
+            );
+            ui.add(egui::Label::new(RichText::new(&name).color(TEXT()).size(12.5)).truncate());
+            if off_family {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(base.label()).color(base.dot_color()).size(10.5));
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 4.0, base.dot_color());
+                });
+            }
+        });
+        if selected {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                pos_rect = Some(polarity_pill(ui, "Positive", !negative, Color32::from_rgb(70, 160, 90)));
+                neg_rect = Some(polarity_pill(ui, "Negative", negative, Color32::from_rgb(200, 80, 80)));
+            });
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("weight").color(MUTED()).size(10.5));
+                let sr = ui.add(egui::Slider::new(&mut e.strength, 0.0..=2.0));
+                slider_rect = Some(sr.rect);
+            });
+        }
+    });
+
+    let resp = inner.interact(egui::Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if resp.clicked() {
+        let p = resp.interact_pointer_pos();
+        let hit = |r: Option<egui::Rect>| matches!((p, r), (Some(p), Some(r)) if r.contains(p));
+        if hit(slider_rect) {
+            // The slider handled its own drag — don't toggle selection.
+        } else if hit(pos_rect) {
+            e.selected = true;
+            e.negative = false;
+        } else if hit(neg_rect) {
+            e.selected = true;
+            e.negative = true;
+        } else {
+            e.selected = !e.selected;
+        }
+    }
+}
+
+/// Draw a small rounded "Positive"/"Negative" pill (active = filled with `accent`,
+/// inactive = faint). Returns its rect for the parent card's click hit-testing.
+fn polarity_pill(ui: &mut egui::Ui, text: &str, active: bool, accent: Color32) -> egui::Rect {
+    let font = egui::FontId::proportional(11.0);
+    let galley = ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), font, if active { Color32::WHITE } else { MUTED() }));
+    let pad = egui::vec2(10.0, 4.0);
+    let (rect, _) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let fill = if active { accent } else { PANEL().gamma_multiply(1.4) };
+        ui.painter().rect_filled(rect, CornerRadius::same(9), fill);
+        if !active {
+            ui.painter().rect_stroke(rect, CornerRadius::same(9), egui::Stroke::new(1.0, EDGE()), egui::StrokeKind::Inside);
+        }
+        ui.painter().galley(rect.min + pad, galley, Color32::WHITE);
+    }
+    rect
 }
 
 fn window_frame() -> egui::Frame {
@@ -1419,6 +2033,10 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
     if state.show_lora_popup {
         lora_popup(ui.ctx(), state);
     }
+    // Embeddings (textual inversion) picker.
+    if state.show_embeddings_popup {
+        embeddings_popup(ui.ctx(), state);
+    }
 
     ui.add_space(10.0);
 
@@ -1504,6 +2122,19 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                                     state.show_lora_popup = true;
                                     ui.close();
                                 }
+
+                                // Embeddings (textual inversion): selected ones are
+                                // injected into the workflow's pos/neg encoder.
+                                let en = state.embeddings.iter().filter(|e| e.selected && e.base.matches(state.family)).count();
+                                let elabel = if en > 0 { format!("Embeddings ({en})") } else { "Embeddings".to_string() };
+                                let eicon = egui::Image::new(egui::include_image!("../icons/plugin.svg"))
+                                    .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                                    .tint(icon_tint(TEXT()));
+                                if ui.add(egui::Button::image_and_text(eicon, RichText::new(elabel).size(12.0)).frame(false)).clicked() {
+                                    refresh_embeddings(state);
+                                    state.show_embeddings_popup = true;
+                                    ui.close();
+                                }
                             });
                     }
 
@@ -1549,11 +2180,11 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
     // --- Settings. ---
     slider(ui, "Steps", &mut state.steps, 1..=50);
     slider(ui, "Guidance (CFG)", &mut state.cfg, 1.0..=8.0);
-    // Resolution: Z-Image uses a single "Size" slider + quick aspect-ratio tiles
-    // (square/landscape/portrait) instead of fine Width/Height sliders — the slider
-    // scales every preset live, and one click on a tile picks the ratio. Other
-    // families keep the sliders.
-    if state.family == GenFamily::ZImage {
+    // Resolution: the image families (Z-Image, Flux) use a single "Size" slider +
+    // quick aspect-ratio tiles (square/landscape/portrait) instead of fine
+    // Width/Height sliders — the slider scales every preset live, and one click on
+    // a tile picks the ratio. Video families keep the sliders.
+    if matches!(state.family, GenFamily::ZImage | GenFamily::Flux | GenFamily::Sdxl) {
         // The Size slider scales all three presets; recompute the active dims so the
         // current selection tracks the slider live (snapped to multiples of 64).
         let mut size = state.size;
@@ -1764,17 +2395,29 @@ fn round_menu_rows(ui: &mut egui::Ui) {
 /// with … past 150px — hover shows the full name) plus an up/down chevron.
 /// Clicking opens the model list in a rounded-22 popup above the footer.
 fn model_selector(ui: &mut egui::Ui, state: &mut GenerateState) {
-    let full = state.model.label();
+    // When an installed checkpoint is selected, the footer shows its (extension-
+    // stripped) filename; otherwise the built-in model's label.
+    let full: String = match &state.checkpoint {
+        Some(f) => ckpt_display_name(f).to_string(),
+        None => state.model.label().to_string(),
+    };
     let menu_id = ui.id().with(("model_menu", state.family.title()));
     let open = egui::Popup::is_id_open(ui.ctx(), menu_id);
 
-    let mut job = egui::text::LayoutJob::simple_singleline(full.to_owned(), egui::FontId::proportional(12.0), TEXT());
+    // Auto-detect installed checkpoints once each time the picker opens (cheap
+    // header reads), so newly-downloaded checkpoints show up without a restart.
+    if state.family.uses_checkpoint_picker() && open && !state.ckpt_menu_was_open {
+        refresh_checkpoints(state);
+    }
+    state.ckpt_menu_was_open = open;
+
+    let mut job = egui::text::LayoutJob::simple_singleline(full.clone(), egui::FontId::proportional(12.0), TEXT());
     job.wrap = egui::text::TextWrapping::truncate_at_width(150.0);
     let galley = ui.fonts_mut(|f| f.layout_job(job));
     let (arrow, gap) = (14.0, 2.0);
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(galley.size().x + gap + arrow, 28.0), egui::Sense::click());
-    let resp = resp.on_hover_text(full).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let resp = resp.on_hover_text(full.clone()).on_hover_cursor(egui::CursorIcon::PointingHand);
     if ui.is_rect_visible(rect) {
         let text_pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
         ui.painter().galley(text_pos, galley, TEXT());
@@ -1796,15 +2439,89 @@ fn model_selector(ui: &mut egui::Ui, state: &mut GenerateState) {
         .show(|ui| {
             ui.set_min_width(240.0);
             round_menu_rows(ui);
+            // Built-in (downloadable) model variants. Selecting one clears any
+            // custom-checkpoint override.
             for &m in GenModel::all_for(state.family) {
-                if ui.selectable_label(state.model == m, m.label()).clicked() {
+                let selected = state.checkpoint.is_none() && state.model == m;
+                if ui.selectable_label(selected, m.label()).clicked() {
                     state.model = m;
+                    state.checkpoint = None;
                     state.steps = m.default_steps();
                     state.cfg = m.default_cfg();
                     ui.close();
                 }
             }
+
+            // Auto-detected installed checkpoints, filtered to this family (like
+            // the LoRA picker). Only families that load a single swappable
+            // checkpoint show this section.
+            if state.family.uses_checkpoint_picker() {
+                let family = state.family;
+                let show_other = state.show_other_ckpts;
+                let sel = state.checkpoint.clone();
+                // Partition into compatible (this family / unknown) vs off-family.
+                // Owned copies so the list isn't borrowed while we mutate `state`.
+                let mut compatible: Vec<(String, LoraBase)> = Vec::new();
+                let mut others: Vec<(String, LoraBase)> = Vec::new();
+                for c in &state.checkpoints {
+                    // The built-in base is already listed above — don't duplicate it.
+                    if c.file == "sd_xl_base_1.0.safetensors" {
+                        continue;
+                    }
+                    if c.base.matches(family) || c.base == LoraBase::Unknown {
+                        compatible.push((c.file.clone(), c.base));
+                    } else {
+                        others.push((c.file.clone(), c.base));
+                    }
+                }
+
+                let mut pick: Option<String> = None;
+                if !compatible.is_empty() || (!others.is_empty() && show_other) {
+                    ui.separator();
+                    ui.label(RichText::new("Installed checkpoints").color(MUTED()).size(11.0));
+                }
+                for (file, _) in &compatible {
+                    let selected = sel.as_deref() == Some(file.as_str());
+                    if ui.selectable_label(selected, ckpt_display_name(file)).clicked() {
+                        pick = Some(file.clone());
+                    }
+                }
+                if show_other {
+                    for (file, base) in &others {
+                        let selected = sel.as_deref() == Some(file.as_str());
+                        let label = format!("{}  ·  {}", ckpt_display_name(file), base.label());
+                        let resp = ui.selectable_label(selected, RichText::new(label).color(MUTED()));
+                        if resp.clicked() {
+                            pick = Some(file.clone());
+                        }
+                    }
+                }
+                if let Some(file) = pick {
+                    // A custom checkpoint runs through the family's default model
+                    // node config; keep that model's default steps/cfg.
+                    let m = family.default_model();
+                    state.model = m;
+                    state.steps = m.default_steps();
+                    state.cfg = m.default_cfg();
+                    state.checkpoint = Some(file);
+                    ui.close();
+                }
+
+                if !others.is_empty() {
+                    ui.separator();
+                    let mut v = state.show_other_ckpts;
+                    if ui.checkbox(&mut v, RichText::new("Show other-family checkpoints").size(11.0)).changed() {
+                        state.show_other_ckpts = v;
+                    }
+                }
+            }
         });
+}
+
+/// A checkpoint's display name: the filename with its `.safetensors` / `.ckpt`
+/// extension stripped.
+fn ckpt_display_name(file: &str) -> &str {
+    file.trim_end_matches(".safetensors").trim_end_matches(".ckpt")
 }
 
 /// A bare icon button on a 28px click target: the SVG is painted dead-centre,
@@ -1974,12 +2691,26 @@ fn required_files(model: GenModel) -> Vec<(&'static str, String)> {
             ("text_encoders", "umt5_xxl_fp8_e4m3fn_scaled.safetensors".into()),
             ("vae", "wan2.2_vae.safetensors".into()),
         ],
+        GenFamily::Sdxl => vec![("checkpoints", "sd_xl_base_1.0.safetensors".into())],
     }
 }
 
 /// Filenames `model` needs that aren't on disk yet — empty means good to generate.
-fn missing_files(model: GenModel) -> Vec<String> {
+fn missing_files(model: GenModel, custom_ckpt: Option<&str>) -> Vec<String> {
     let models = comfy_base().join("ComfyUI").join("models");
+    // A user-picked installed checkpoint can live in any of the checkpoint dirs
+    // (we register them all with ComfyUI), so look for it across the whole set.
+    if let Some(c) = custom_ckpt {
+        let present = CKPT_DIRS.iter().any(|sub| models.join(sub).join(c).exists());
+        let mut missing: Vec<String> = if present { Vec::new() } else { vec![c.to_string()] };
+        // Still verify any *other* (non-checkpoint) required files for this family.
+        for (sub, file) in required_files(model) {
+            if sub != "checkpoints" && !file.is_empty() && !models.join(sub).join(&file).exists() {
+                missing.push(file);
+            }
+        }
+        return missing;
+    }
     required_files(model)
         .into_iter()
         .filter(|(sub, file)| !file.is_empty() && !models.join(sub).join(file).exists())
@@ -2204,6 +2935,12 @@ fn run_setup(
             ok &= fetch(WAN_UMT5, m("text_encoders").join("umt5_xxl_fp8_e4m3fn_scaled.safetensors"), "umt5-xxl encoder", "", &send);
             ok &= fetch(WAN_VAE, m("vae").join("wan2.2_vae.safetensors"), "Wan 2.2 VAE", "", &send);
         }
+        GenFamily::Sdxl => {
+            // SDXL Base 1.0 — a single checkpoint (UNet + dual CLIP + VAE).
+            status("Downloading SDXL Base 1.0 (~6.9 GB)…");
+            let _ = std::fs::create_dir_all(m("checkpoints"));
+            ok &= fetch(SDXL_CKPT, m("checkpoints").join("sd_xl_base_1.0.safetensors"), "SDXL Base 1.0", "", &send);
+        }
     }
 
     if ok {
@@ -2248,12 +2985,15 @@ fn start_generate(state: &mut GenerateState, ctx: &egui::Context, cur_image: Opt
         width: state.width,
         height: state.height,
         seed,
+        checkpoint: state.checkpoint.clone(),
         loras: state
             .loras
             .iter()
             .filter(|l| l.selected && l.base.matches(state.family))
             .map(|l| (l.file.clone(), l.strength))
             .collect(),
+        pos_embeds: embed_tokens(state, false),
+        neg_embeds: embed_tokens(state, true),
         frames: state.frames,
         fps: state.fps,
         i2v,
@@ -2275,8 +3015,15 @@ struct GenJob {
     width: i32,
     height: i32,
     seed: i64,
+    /// An auto-detected installed checkpoint to use instead of the model's
+    /// built-in default (SDXL only); `None` uses the built-in checkpoint.
+    checkpoint: Option<String>,
     /// Selected LoRAs (filename, weight) — chained into the workflow.
     loras: Vec<(String, f32)>,
+    /// Selected embeddings as `embedding:<name>` tokens, split by polarity and
+    /// space-joined — appended to the positive / negative encoder text.
+    pos_embeds: String,
+    neg_embeds: String,
     /// Video (LTX): frame count + playback rate.
     frames: i32,
     fps: i32,
@@ -2306,7 +3053,7 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
     // 0 — pre-flight: make sure this variant's model files are actually on disk.
     // Without this, a missing file only surfaces as an opaque HTTP 400 from the
     // queue endpoint (e.g. picking the bf16 encoder before it was downloaded).
-    let missing = missing_files(job.model);
+    let missing = missing_files(job.model, job.checkpoint.as_deref());
     if !missing.is_empty() {
         send(format!(
             "ERROR: this model isn't fully downloaded — select this variant and click \
@@ -2316,7 +3063,13 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
         return false;
     }
 
-    // 1 — make sure the ComfyUI server is up.
+    // 1 — make sure the ComfyUI server is up. For checkpoint-picker families,
+    // register the extra checkpoint folders first; if that config changed, the
+    // running server must be restarted to pick it up (paths load at startup only).
+    if job.model.family().uses_checkpoint_picker() && ensure_checkpoint_paths(&comfy) && ping() {
+        status("Updating model folders — restarting ComfyUI…");
+        stop_server();
+    }
     if !ping() {
         status("Starting ComfyUI…");
         if let Err(e) = start_server(&comfy, &py, &send) {
@@ -2581,6 +3334,7 @@ fn build_params(job: &GenJob) -> String {
         GenModel::LtxDistilled => "LTX-Video",
         GenModel::Ltx2Distilled => "LTX-2.3",
         GenModel::WanTi2v5bFast | GenModel::WanTi2v5bQuality => "Wan 2.2 5B",
+        GenModel::SdxlBase => "SDXL 1.0",
     };
     let mut prompt = job.prompt.clone();
     // Surface selected LoRAs as A1111 tags so they show up too.
@@ -2641,8 +3395,63 @@ fn build_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
             GenFamily::ZImage => zimage_workflow(job),
             GenFamily::Ltx => ltx_workflow(job, image_name),
             GenFamily::Wan => wan_workflow(job, image_name),
+            GenFamily::Sdxl => sdxl_workflow(job),
         },
     }
+}
+
+/// SDXL Base 1.0 text-to-image: CheckpointLoaderSimple (UNet + dual CLIP + VAE) +
+/// CLIPTextEncode ×2 + EmptyLatentImage + KSampler + VAEDecode + SaveImage, with
+/// any selected LoRAs chained in model+clip via LoraLoader nodes.
+fn sdxl_workflow(job: &GenJob) -> serde_json::Value {
+    use serde_json::json;
+    // SDXL is trained at ~1 MP; width/height should be multiples of 8.
+    let width = (job.width / 8).max(8) * 8;
+    let height = (job.height / 8).max(8) * 8;
+
+    // An auto-detected installed checkpoint overrides the built-in base.
+    let ckpt = job.checkpoint.as_deref().unwrap_or("sd_xl_base_1.0.safetensors");
+    let mut wf = json!({
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
+    });
+    let obj = wf.as_object_mut().unwrap();
+
+    // Chain LoraLoader nodes (model + clip thread through), starting at the ckpt.
+    let mut model_ref = json!(["1", 0]);
+    let mut clip_ref = json!(["1", 1]);
+    let mut id = 100;
+    for (file, strength) in &job.loras {
+        let node = id.to_string();
+        id += 1;
+        obj.insert(
+            node.clone(),
+            json!({"class_type": "LoraLoader", "inputs": {
+                "model": model_ref, "clip": clip_ref, "lora_name": file,
+                "strength_model": strength, "strength_clip": strength
+            }}),
+        );
+        model_ref = json!([node, 0]);
+        clip_ref = json!([node, 1]);
+    }
+
+    let vae_ref = json!(["1", 2]);
+    // A standard SDXL quality negative.
+    const SDXL_NEG: &str = "ugly, low quality, worst quality, blurry, jpeg artifacts, watermark, text, deformed, bad anatomy";
+    obj.insert("3".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
+    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(SDXL_NEG, &job.neg_embeds), "clip": clip_ref}}));
+    obj.insert("5".into(), json!({"class_type": "EmptyLatentImage", "inputs": {
+        "width": width, "height": height, "batch_size": 1
+    }}));
+    obj.insert("6".into(), json!({"class_type": "KSampler", "inputs": {
+        "model": model_ref, "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["5", 0],
+        "seed": job.seed, "steps": job.steps, "cfg": job.guidance,
+        "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1.0
+    }}));
+    obj.insert("7".into(), json!({"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": vae_ref}}));
+    obj.insert("8".into(), json!({"class_type": "SaveImage", "inputs": {
+        "images": ["7", 0], "filename_prefix": "ClaritySDXL"
+    }}));
+    wf
 }
 
 /// LTX-2.3 22B distilled (video **with audio**). This pipeline is far more
@@ -2665,7 +3474,7 @@ fn ltx2_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
         }
     };
     use serde_json::json;
-    set(obj, "305", "text", json!(job.prompt)); // positive prompt
+    set(obj, "305", "text", json!(with_embeds(&job.prompt, &job.pos_embeds))); // positive prompt
     set(obj, "278", "noise_seed", json!(job.seed)); // stage-1 noise
     set(obj, "279", "noise_seed", json!(job.seed)); // stage-2 noise
     set(obj, "297", "length", json!(frames)); // base video latent
@@ -2724,8 +3533,8 @@ fn ltx_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
     let vae_ref = json!(["1", 2]);
     // A standard video negative (used because LTX runs with a little CFG here).
     const LTX_NEG: &str = "worst quality, inconsistent motion, blurry, jittery, distorted, washed out, overexposed";
-    obj.insert("3".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": job.prompt, "clip": clip_ref.clone()}}));
-    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": LTX_NEG, "clip": clip_ref}}));
+    obj.insert("3".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
+    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(LTX_NEG, &job.neg_embeds), "clip": clip_ref}}));
 
     // Conditioning + latent: image-to-video seeds the latent from the uploaded
     // image (LTXVImgToVideo also rewrites the conditioning); text-to-video uses an
@@ -2831,8 +3640,8 @@ fn wan_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
     // Wan's recommended (Chinese) negative — the one shipped in the official
     // template; it markedly improves motion stability and reduces artifacts.
     const WAN_NEG: &str = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走";
-    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": job.prompt, "clip": clip_ref.clone()}}));
-    obj.insert("5".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": WAN_NEG, "clip": clip_ref}}));
+    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
+    obj.insert("5".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(WAN_NEG, &job.neg_embeds), "clip": clip_ref}}));
 
     // ModelSamplingSD3 (shift 8) — Wan's sampling-shift node.
     obj.insert("6".into(), json!({"class_type": "ModelSamplingSD3", "inputs": {"model": model_ref, "shift": 8.0}}));
@@ -2892,8 +3701,8 @@ fn zimage_workflow(job: &GenJob) -> serde_json::Value {
         clip_ref = json!([node, 1]);
     }
 
-    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": job.prompt, "clip": clip_ref.clone()}}));
-    obj.insert("6".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": clip_ref}}));
+    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
+    obj.insert("6".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds("", &job.neg_embeds), "clip": clip_ref}}));
     obj.insert("7".into(), json!({"class_type": "EmptySD3LatentImage", "inputs": {"width": job.width, "height": job.height, "batch_size": 1}}));
     obj.insert("8".into(), json!({"class_type": "KSampler", "inputs": {
         "model": model_ref, "positive": ["4", 0], "negative": ["6", 0], "latent_image": ["7", 0],
@@ -2938,9 +3747,9 @@ fn flux_workflow(job: &GenJob) -> serde_json::Value {
         clip_ref = json!([node, 1]);
     }
 
-    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": job.prompt, "clip": clip_ref.clone()}}));
+    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
     obj.insert("5".into(), json!({"class_type": "FluxGuidance", "inputs": {"conditioning": ["4", 0], "guidance": job.guidance}}));
-    obj.insert("6".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": clip_ref}}));
+    obj.insert("6".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds("", &job.neg_embeds), "clip": clip_ref}}));
     obj.insert("7".into(), json!({"class_type": "EmptySD3LatentImage", "inputs": {"width": job.width, "height": job.height, "batch_size": 1}}));
     obj.insert("8".into(), json!({"class_type": "KSampler", "inputs": {
         "model": model_ref, "positive": ["5", 0], "negative": ["6", 0], "latent_image": ["7", 0],

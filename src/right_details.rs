@@ -44,6 +44,9 @@ pub enum RightView {
     /// The Wan 2.2 text/image-to-video generation view (same ComfyUI backend).
     #[cfg(not(target_os = "macos"))]
     Wan,
+    /// The SDXL Base 1.0 text-to-image generation view (same ComfyUI backend).
+    #[cfg(not(target_os = "macos"))]
+    Sdxl,
 }
 
 /// Read-only file metadata shown in the bottom "Image Details" card. A Rust
@@ -151,6 +154,9 @@ pub struct RightPanelState {
     /// State for the Wan 2.2 generation view (same backend, video output).
     #[cfg(not(target_os = "macos"))]
     pub wan: crate::generate::GenerateState,
+    /// State for the SDXL Base 1.0 generation view (same backend, image output).
+    #[cfg(not(target_os = "macos"))]
+    pub sdxl: crate::generate::GenerateState,
     pub is_editing: bool,
 
     /// Which view the panel currently shows (Details vs Tag Manager).
@@ -202,6 +208,8 @@ impl Default for RightPanelState {
             ltx: crate::generate::GenerateState::new(crate::generate::GenFamily::Ltx),
             #[cfg(not(target_os = "macos"))]
             wan: crate::generate::GenerateState::new(crate::generate::GenFamily::Wan),
+            #[cfg(not(target_os = "macos"))]
+            sdxl: crate::generate::GenerateState::new(crate::generate::GenFamily::Sdxl),
             is_editing: false,
             view: RightView::default(),
             show_delete_confirm: false,
@@ -353,6 +361,13 @@ pub fn show(
                     // The fully functional Dropdown
                     egui::Popup::menu(&menu_resp)
                         .align(egui::RectAlign::BOTTOM_END)
+                        .frame(
+                            egui::Frame::new()
+                                .fill(PANEL())
+                                .corner_radius(egui::CornerRadius::same(22))
+                                .inner_margin(egui::Margin::same(12))
+                                .stroke(egui::Stroke::new(1.0, EDGE())),
+                        )
                         .show(|ui| {
                             ui.set_min_width(160.0);
 
@@ -360,6 +375,7 @@ pub fn show(
                             let radius = egui::CornerRadius::same(6);
                             ui.visuals_mut().widgets.inactive.corner_radius = radius;
                             ui.visuals_mut().widgets.hovered.corner_radius = radius;
+                            ui.visuals_mut().widgets.active.corner_radius = radius;
 
                             if ui
                                 .selectable_label(state.view == RightView::Details, "Details & Actions")
@@ -396,6 +412,14 @@ pub fn show(
                                 .clicked()
                             {
                                 state.view = RightView::Pixal3D;
+                                ui.close();
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            if ui
+                                .selectable_label(state.view == RightView::Sdxl, "Generate (SDXL)")
+                                .clicked()
+                            {
+                                state.view = RightView::Sdxl;
                                 ui.close();
                             }
                             #[cfg(not(target_os = "macos"))]
@@ -462,6 +486,11 @@ pub fn show(
                     #[cfg(target_os = "macos")]
                     let show_wan = false;
 
+                    #[cfg(not(target_os = "macos"))]
+                    let show_sdxl = state.view == RightView::Sdxl;
+                    #[cfg(target_os = "macos")]
+                    let show_sdxl = false;
+
                     if show_pixal3d {
                         #[cfg(not(target_os = "macos"))]
                         crate::pixal3d::show(ui, &mut state.pixal3d, current_image);
@@ -477,6 +506,9 @@ pub fn show(
                     } else if show_wan {
                         #[cfg(not(target_os = "macos"))]
                         crate::generate::show(ui, &mut state.wan, current_image);
+                    } else if show_sdxl {
+                        #[cfg(not(target_os = "macos"))]
+                        crate::generate::show(ui, &mut state.sdxl, None);
                     } else if state.view == RightView::TagManager {
                         crate::tag_manager::show(ui, tag_manager, current_image, &mut state.current_tags, all_images);
                     } else if state.view == RightView::Downloader {
