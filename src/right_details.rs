@@ -47,6 +47,9 @@ pub enum RightView {
     /// The SDXL Base 1.0 text-to-image generation view (same ComfyUI backend).
     #[cfg(not(target_os = "macos"))]
     Sdxl,
+    /// The Anima Base v1.0 text-to-image generation view (same ComfyUI backend).
+    #[cfg(not(target_os = "macos"))]
+    Anima,
 }
 
 /// Read-only file metadata shown in the bottom "Image Details" card. A Rust
@@ -157,6 +160,9 @@ pub struct RightPanelState {
     /// State for the SDXL Base 1.0 generation view (same backend, image output).
     #[cfg(not(target_os = "macos"))]
     pub sdxl: crate::generate::GenerateState,
+    /// State for the Anima Base v1.0 generation view (same backend, image output).
+    #[cfg(not(target_os = "macos"))]
+    pub anima: crate::generate::GenerateState,
     pub is_editing: bool,
 
     /// Which view the panel currently shows (Details vs Tag Manager).
@@ -210,6 +216,8 @@ impl Default for RightPanelState {
             wan: crate::generate::GenerateState::new(crate::generate::GenFamily::Wan),
             #[cfg(not(target_os = "macos"))]
             sdxl: crate::generate::GenerateState::new(crate::generate::GenFamily::Sdxl),
+            #[cfg(not(target_os = "macos"))]
+            anima: crate::generate::GenerateState::new(crate::generate::GenFamily::Anima),
             is_editing: false,
             view: RightView::default(),
             show_delete_confirm: false,
@@ -424,6 +432,14 @@ pub fn show(
                             }
                             #[cfg(not(target_os = "macos"))]
                             if ui
+                                .selectable_label(state.view == RightView::Anima, "Generate (Anima)")
+                                .clicked()
+                            {
+                                state.view = RightView::Anima;
+                                ui.close();
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            if ui
                                 .selectable_label(state.view == RightView::Generate, "Generate (Flux)")
                                 .clicked()
                             {
@@ -491,6 +507,11 @@ pub fn show(
                     #[cfg(target_os = "macos")]
                     let show_sdxl = false;
 
+                    #[cfg(not(target_os = "macos"))]
+                    let show_anima = state.view == RightView::Anima;
+                    #[cfg(target_os = "macos")]
+                    let show_anima = false;
+
                     if show_pixal3d {
                         #[cfg(not(target_os = "macos"))]
                         crate::pixal3d::show(ui, &mut state.pixal3d, current_image);
@@ -509,6 +530,9 @@ pub fn show(
                     } else if show_sdxl {
                         #[cfg(not(target_os = "macos"))]
                         crate::generate::show(ui, &mut state.sdxl, None);
+                    } else if show_anima {
+                        #[cfg(not(target_os = "macos"))]
+                        crate::generate::show(ui, &mut state.anima, None);
                     } else if state.view == RightView::TagManager {
                         crate::tag_manager::show(ui, tag_manager, current_image, &mut state.current_tags, all_images);
                     } else if state.view == RightView::Downloader {
