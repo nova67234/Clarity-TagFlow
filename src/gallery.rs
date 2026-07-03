@@ -215,6 +215,9 @@ pub fn search_pill(
         )
         .show(ctx, |ui| {
             ui.set_width(pill_w - 32.0);
+            // The pill's content rect — the Filter Settings popup anchors to this
+            // (not the gear) so it opens centred over the search bar.
+            let pill_rect = ui.max_rect();
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 // Gear first in a right-to-left layout so it pins to the right
@@ -229,46 +232,48 @@ pub fn search_pill(
                         crate::theme::icon_tint(MUTED()),
                     );
                     // The filters popup opens UPWARD (the pill sits at the
-                    // bottom of the screen).
-                    egui::Popup::menu(&gear_resp)
-                        .align(egui::RectAlign::TOP_END)
+                    // bottom of the screen). Same look as the left panel's Filter
+                    // Settings (card frame, title, radio dots) but landscape —
+                    // the options in one row. (Thumbnail size lives in the main
+                    // Settings → Browser only.)
+                    egui::Popup::from_toggle_button_response(&gear_resp)
+                        // Anchor to the whole pill and centre-align above it, so
+                        // the popup lines up with the middle of the search bar.
+                        .anchor(pill_rect)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .align(egui::RectAlign::TOP)
+                        .gap(12.0)
+                        .frame(crate::card_frame(22))
                         .show(|ui| {
-                            ui.set_min_width(210.0);
-                            let r = CornerRadius::same(8);
-                            ui.visuals_mut().widgets.inactive.corner_radius = r;
-                            ui.visuals_mut().widgets.hovered.corner_radius = r;
-                            ui.visuals_mut().widgets.active.corner_radius = r;
-
                             ui.label(
-                                egui::RichText::new("SHOW").color(MUTED()).strong().size(10.5),
+                                egui::RichText::new("Filter Settings")
+                                    .color(TEXT())
+                                    .strong()
+                                    .size(14.0),
                             );
-                            ui.add_space(2.0);
-                            for opt in MediaFilter::OPTIONS {
-                                if ui
-                                    .selectable_label(settings.media_filter == opt, opt.label())
-                                    .clicked()
-                                {
-                                    if settings.media_filter != opt {
-                                        settings.media_filter = opt;
-                                        changed = true;
-                                    }
-                                    ui.close();
-                                }
-                            }
-
                             ui.add_space(8.0);
                             ui.label(
-                                egui::RichText::new("THUMBNAIL SIZE")
+                                egui::RichText::new("MEDIA CONTENT")
                                     .color(MUTED())
                                     .strong()
-                                    .size(10.5),
+                                    .size(10.0),
                             );
-                            ui.add_space(2.0);
-                            ui.spacing_mut().slider_width = ui.available_width() - 8.0;
-                            ui.add(
-                                egui::Slider::new(&mut settings.thumbnail_size, 120.0..=400.0)
-                                    .show_value(false),
-                            );
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 12.0;
+                                for opt in MediaFilter::OPTIONS {
+                                    if ui
+                                        .radio_value(
+                                            &mut settings.media_filter,
+                                            opt,
+                                            egui::RichText::new(opt.label()).color(TEXT()),
+                                        )
+                                        .changed()
+                                    {
+                                        changed = true;
+                                    }
+                                }
+                            });
                         });
 
                     // Search field fills the remaining pill width.
