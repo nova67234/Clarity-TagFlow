@@ -358,17 +358,12 @@ fn draw_tile(
     }
 
     if is_selected {
-        // Blue outline in the dark themes (Dark / Space / Glass); pink under Aurora
-        // to match its warm glow; grey under Light.
-        let sel_color = if crate::theme::is_light() {
-            crate::theme::icon_tint(egui::Color32::GRAY)
-        } else {
-            crate::theme::ACCENT1()
-        };
+        // Accent-blue outline in every theme (light modes use their deeper
+        // accent); pink under Aurora to match its warm glow.
         ui.painter().rect_stroke(
             rect,
             radius,
-            Stroke::new(3.0, sel_color),
+            Stroke::new(3.0, crate::theme::selection_outline()),
             egui::StrokeKind::Inside,
         );
     }

@@ -74,6 +74,9 @@ pub struct Settings {
     pub glass_bg: [u8; 3],
     /// Which animated backdrop the Glass theme paints over `glass_bg`.
     pub glass_backdrop: Backdrop,
+    /// Light-mode Glass: the frosted panels turn translucent white with dark-grey
+    /// text/icons. Off keeps the original dark glass.
+    pub glass_light: bool,
     /// Loop videos: restart playback from the beginning when a video reaches its
     /// end. Read by the embedded video player when a clip starts.
     pub loop_video: bool,
@@ -117,6 +120,7 @@ impl Default for Settings {
             // A deep navy reads well behind the glass panels by default.
             glass_bg: [20, 22, 34],
             glass_backdrop: Backdrop::default(),
+            glass_light: false,
             loop_video: false,
             video_thumbnail_play: false,
             show_stats: true,
@@ -387,6 +391,27 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
     // backdrop. Only shown when Glass is the active theme, since they don't apply
     // to the other themes.
     if settings.theme == Theme::Glass {
+        section(ui, "Glass panels", |ui| {
+            // Dark keeps the original translucent-dark glass exactly as it is;
+            // Light swaps to frosted-white panels with dark-grey text and icons.
+            ui.radio_value(
+                &mut settings.glass_light,
+                false,
+                egui::RichText::new("Dark").color(TEXT()),
+            );
+            ui.add_space(2.0);
+            ui.radio_value(
+                &mut settings.glass_light,
+                true,
+                egui::RichText::new("Light").color(TEXT()),
+            );
+            hint(
+                ui,
+                "Dark is the classic translucent-dark glass; Light turns the panels \
+                 frosted white with dark-grey text and icons. Applies instantly.",
+            );
+        });
+
         section(ui, "Glass background", |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Colour").color(TEXT()));
@@ -413,7 +438,11 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
                 egui::Popup::from_toggle_button_response(&resp).show(|ui| {
-                    ui.set_min_width(220.0);
+                    // The picker's saturation square / hue bar are sized by
+                    // `slider_width`; the default leaves them much narrower than
+                    // the U8/RGB header row, so the popup showed a big empty gap
+                    // on the right. Widen them to fill the popup instead.
+                    ui.spacing_mut().slider_width = 260.0;
                     if egui::widgets::color_picker::color_picker_color32(
                         ui,
                         &mut col,
@@ -455,17 +484,22 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
 /// painted just after the label (vertically centred) — the "update waiting" mark.
 fn tab_button(ui: &mut egui::Ui, settings: &mut Settings, tab: SettingsTab, label: &str, badge: bool) {
     let selected = settings.tab == tab;
-    // Selected → a filled accent pill (large corner radius clamps to a full
-    // pill) with white text; unselected → plain, frameless muted text.
-    let text_color = if selected { egui::Color32::WHITE } else { MUTED() };
-    let mut btn = egui::Button::new(egui::RichText::new(label).color(text_color).strong())
-        .corner_radius(egui::CornerRadius::same(255));
-    btn = if selected {
-        btn.fill(crate::theme::ACCENT1())
-    } else {
-        btn.frame(false)
-    };
-    let resp = ui.add(btn);
+    // Every tab is a real pill button: the active one filled with the accent
+    // (white text), the others with the theme's normal button fill + hover.
+    let text_color = if selected { egui::Color32::WHITE } else { TEXT() };
+    let resp = ui
+        .scope(|ui| {
+            // Roomier padding than the default so the pills read as buttons.
+            ui.spacing_mut().button_padding = egui::vec2(14.0, 6.0);
+            let mut btn = egui::Button::new(egui::RichText::new(label).color(text_color).strong())
+                .corner_radius(egui::CornerRadius::same(255))
+                .min_size(egui::vec2(0.0, 30.0));
+            if selected {
+                btn = btn.fill(crate::theme::ACCENT1());
+            }
+            ui.add(btn)
+        })
+        .inner;
     if resp.clicked() {
         settings.tab = tab;
     }

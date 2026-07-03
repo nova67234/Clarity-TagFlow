@@ -394,7 +394,9 @@ fn tile(
         ui.painter().rect_stroke(
             rect,
             radius,
-            Stroke::new(2.0, ACCENT1()),
+            // Same weight + colour rules as the browser tiles (accent blue,
+            // Aurora pink).
+            Stroke::new(3.0, crate::theme::selection_outline()),
             egui::StrokeKind::Inside,
         );
     }
