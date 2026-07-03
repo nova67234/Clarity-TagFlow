@@ -796,28 +796,54 @@ pub fn show(
                                             .auto_shrink([false, false])
                                             .max_height(inner_h)
                                             .show(ui, |ui| {
-                                                let mut text_edit = egui::TextEdit::multiline(&mut display_text)
-                                                    .desired_width(f32::INFINITY)
-                                                    .font(egui::TextStyle::Monospace)
-                                                    .frame(egui::Frame::NONE) // the Frame above is the box
-                                                    // Only selectable/editable in edit
-                                                    // mode — otherwise display only.
-                                                    .interactive(editable);
-
-                                                if !editable {
-                                                    text_edit = text_edit.text_color(TEXT().gamma_multiply(0.8));
-                                                }
-
                                                 // Colour artist (orange) / character
                                                 // (green) tags via a custom layouter.
                                                 let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
                                                     highlight_tags(ui, buf.as_str(), &artist_set, &character_set, role_color, wrap)
                                                 };
-                                                if highlight_roles {
-                                                    text_edit = text_edit.layouter(&mut layouter);
-                                                }
 
-                                                ui.add(text_edit);
+                                                if editable {
+                                                    let mut text_edit = egui::TextEdit::multiline(&mut display_text)
+                                                        .desired_width(f32::INFINITY)
+                                                        .font(egui::TextStyle::Monospace)
+                                                        .frame(egui::Frame::NONE) // the Frame above is the box
+                                                        // Fill the whole box so clicking
+                                                        // anywhere inside it (not just on
+                                                        // the first lines) focuses the
+                                                        // editor and places the caret.
+                                                        .min_size(egui::vec2(0.0, inner_h));
+                                                    if highlight_roles {
+                                                        text_edit = text_edit.layouter(&mut layouter);
+                                                    }
+                                                    ui.add(text_edit);
+                                                } else {
+                                                    // Display mode: an immutable `&str`
+                                                    // buffer ignores every edit, so the
+                                                    // text can be highlighted and copied
+                                                    // but never changed.
+                                                    let meta_color = TEXT().gamma_multiply(0.8);
+                                                    // In the metadata view, colour the app
+                                                    // stamp ("Clarity TagFlow" green, the
+                                                    // version blue) so images made with
+                                                    // this app stand out.
+                                                    let stamp_meta = showing_meta
+                                                        && display_text.contains("Clarity TagFlow");
+                                                    let mut stamp_layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+                                                        highlight_app_stamp(ui, buf.as_str(), meta_color, wrap)
+                                                    };
+                                                    let mut read_only = display_text.as_str();
+                                                    let mut text_edit = egui::TextEdit::multiline(&mut read_only)
+                                                        .desired_width(f32::INFINITY)
+                                                        .font(egui::TextStyle::Monospace)
+                                                        .frame(egui::Frame::NONE) // the Frame above is the box
+                                                        .text_color(meta_color);
+                                                    if highlight_roles {
+                                                        text_edit = text_edit.layouter(&mut layouter);
+                                                    } else if stamp_meta {
+                                                        text_edit = text_edit.layouter(&mut stamp_layouter);
+                                                    }
+                                                    ui.add(text_edit);
+                                                }
                                             });
                                     });
 
@@ -1370,6 +1396,55 @@ pub(crate) fn highlight_tags(
             egui::TextFormat { font_id: font_id.clone(), color, ..Default::default() },
         );
     }
+    ui.fonts_mut(|f| f.layout_job(job))
+}
+
+/// Colour of the "Clarity TagFlow" app name in the metadata view (green) and of
+/// the version number after it (blue) — the stamp generated images carry, so
+/// it's obvious at a glance an image was made with this app.
+const STAMP_NAME_COLOR: egui::Color32 = egui::Color32::from_rgb(46, 160, 67);
+const STAMP_VERSION_COLOR: egui::Color32 = egui::Color32::from_rgb(83, 156, 255);
+
+/// Layouter for the metadata view: paints every "Clarity TagFlow" occurrence
+/// green and a following "vX.Y.Z" version token blue; everything else keeps
+/// `default_color`. Positions/wrapping are unchanged (text is appended verbatim),
+/// so selection and copying still line up exactly.
+pub(crate) fn highlight_app_stamp(
+    ui: &egui::Ui,
+    text: &str,
+    default_color: egui::Color32,
+    wrap_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    const APP: &str = "Clarity TagFlow";
+    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    let fmt = |color: egui::Color32| egui::TextFormat {
+        font_id: font_id.clone(),
+        color,
+        ..Default::default()
+    };
+
+    let mut rest = text;
+    while let Some(pos) = rest.find(APP) {
+        job.append(&rest[..pos], 0.0, fmt(default_color));
+        job.append(APP, 0.0, fmt(STAMP_NAME_COLOR));
+        rest = &rest[pos + APP.len()..];
+        // A " vX.Y…" version token right after the name turns blue.
+        if let Some(stripped) = rest.strip_prefix(' ') {
+            let is_version = stripped.starts_with('v')
+                && stripped[1..].starts_with(|c: char| c.is_ascii_digit());
+            if is_version {
+                let end = stripped
+                    .find(char::is_whitespace)
+                    .unwrap_or(stripped.len());
+                job.append(" ", 0.0, fmt(default_color));
+                job.append(&stripped[..end], 0.0, fmt(STAMP_VERSION_COLOR));
+                rest = &stripped[end..];
+            }
+        }
+    }
+    job.append(rest, 0.0, fmt(default_color));
     ui.fonts_mut(|f| f.layout_job(job))
 }
 

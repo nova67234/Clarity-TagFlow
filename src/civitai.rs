@@ -199,6 +199,14 @@ pub struct CivitaiState {
     /// Civitai reachability: 0 = checking, 1 = online, 2 = offline.
     api_status: Arc<AtomicU8>,
     monitor_started: bool,
+    /// Flipped true every frame the view renders; the API monitor only pings
+    /// while it keeps getting set, so leaving the view pauses the polling
+    /// (instead of hitting civitai.com every 5s for the rest of the session).
+    api_view_visible: Arc<AtomicBool>,
+    /// Set by [`show`] each frame it renders, consumed by [`CivitaiState::end_frame`]
+    /// — detects the view being hidden so an in-flight lookup (which downloads
+    /// preview thumbnails) can be cancelled instead of running on in the background.
+    shown_this_frame: bool,
 
     /// Civitai API key (plaintext in memory; stored encrypted on disk). Used for
     /// authenticated model downloads. Loaded once on first show.
@@ -233,6 +241,8 @@ impl Default for CivitaiState {
             cancel: Arc::new(AtomicBool::new(false)),
             api_status: Arc::new(AtomicU8::new(API_CHECKING)),
             monitor_started: false,
+            api_view_visible: Arc::new(AtomicBool::new(false)),
+            shown_this_frame: false,
             api_key: String::new(),
             download_dirs: DownloadDirs::default(),
             key_loaded: false,
@@ -241,6 +251,27 @@ impl Default for CivitaiState {
             show_settings: false,
             show_folders: false,
             downloads: Vec::new(),
+        }
+    }
+}
+
+impl CivitaiState {
+    /// Call once per frame AFTER every host (right panel, gallery-detail popup)
+    /// has rendered. If nothing showed the view this frame while a lookup was in
+    /// flight, the worker is cancelled so it stops downloading resource info and
+    /// preview thumbnails in the background; the lookup restarts fresh the next
+    /// time the view opens. (Model downloads are unaffected — they finish.)
+    pub fn end_frame(&mut self) {
+        if self.shown_this_frame {
+            self.shown_this_frame = false;
+            return;
+        }
+        if self.rx.is_some() {
+            self.cancel.store(true, Ordering::SeqCst);
+            self.rx = None;
+            self.result = None;
+            self.loaded_key = None; // re-lookup when the view is next shown
+            self.status = "Loading Civitai data…".into();
         }
     }
 }
@@ -257,10 +288,19 @@ pub fn show(
     current_image: Option<&Path>,
     metadata: Option<&str>,
 ) {
+    // Mark the view visible this frame — the monitor pauses when this stops
+    // getting set (i.e. when another right-panel view is selected), and
+    // `end_frame` (main.rs) cancels in-flight lookups when it stays false.
+    state.api_view_visible.store(true, Ordering::Relaxed);
+    state.shown_this_frame = true;
     // Spawn the API-status monitor once per session.
     if !state.monitor_started {
         state.monitor_started = true;
-        start_api_monitor(Arc::clone(&state.api_status), ui.ctx().clone());
+        start_api_monitor(
+            Arc::clone(&state.api_status),
+            Arc::clone(&state.api_view_visible),
+            ui.ctx().clone(),
+        );
     }
     // Load the saved (encrypted) API key + download folder once.
     if !state.key_loaded {
@@ -1668,7 +1708,7 @@ fn run_fetch(
 }
 
 /// Poll civitai.com every 5s and store the reachability in `status`.
-fn start_api_monitor(status: Arc<AtomicU8>, ctx: egui::Context) {
+fn start_api_monitor(status: Arc<AtomicU8>, visible: Arc<AtomicBool>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .tls_config(native_tls_config())
@@ -1678,6 +1718,14 @@ fn start_api_monitor(status: Arc<AtomicU8>, ctx: egui::Context) {
             .into();
 
         loop {
+            // Only ping while the Civitai view has rendered since the last cycle
+            // — switching to another right-panel view pauses the polling entirely
+            // (no network traffic in the background); it resumes within half a
+            // second of the view being shown again.
+            if !visible.swap(false, Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
             let online = agent
                 .get(API_PING)
                 .header("User-Agent", USER_AGENT)

@@ -102,6 +102,10 @@ pub struct DownloaderState {
     api_status: Arc<AtomicU8>,
     /// Whether the monitor thread has been spawned (only once per session).
     monitor_started: bool,
+    /// Flipped true every frame the view renders; the API monitor only pings
+    /// while it keeps getting set, so leaving the view pauses the polling
+    /// (matching the Civitai panel's monitor).
+    api_view_visible: Arc<AtomicBool>,
 }
 
 /// API-status codes shared with the monitor thread.
@@ -131,6 +135,7 @@ impl Default for DownloaderState {
             loaded: false,
             api_status: Arc::new(AtomicU8::new(API_CHECKING)),
             monitor_started: false,
+            api_view_visible: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -166,11 +171,18 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
         }
     }
 
+    // Mark the view visible this frame — the monitor pauses when this stops
+    // getting set (i.e. when another right-panel view is selected).
+    state.api_view_visible.store(true, Ordering::Relaxed);
     // Spawn the API-status monitor once: it polls gelbooru.com every few seconds
     // and updates `api_status`, which drives the pill in the Destination header.
     if !state.monitor_started {
         state.monitor_started = true;
-        start_api_monitor(Arc::clone(&state.api_status), ui.ctx().clone());
+        start_api_monitor(
+            Arc::clone(&state.api_status),
+            Arc::clone(&state.api_view_visible),
+            ui.ctx().clone(),
+        );
     }
 
     // Drain any messages from the worker.
@@ -547,9 +559,10 @@ fn api_pill(ui: &mut egui::Ui, api: u8) {
     });
 }
 
-/// Spawn a daemon-style thread that probes gelbooru.com every 5s and stores the
-/// result in `status`, repainting the UI when it changes.
-fn start_api_monitor(status: Arc<AtomicU8>, ctx: egui::Context) {
+/// Spawn a daemon-style thread that probes gelbooru.com every 5s while the view
+/// is visible and stores the result in `status`, repainting the UI when it
+/// changes. Polling pauses whenever `visible` stops being set (view not shown).
+fn start_api_monitor(status: Arc<AtomicU8>, visible: Arc<AtomicBool>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .tls_config(
@@ -567,6 +580,12 @@ fn start_api_monitor(status: Arc<AtomicU8>, ctx: egui::Context) {
             .into();
 
         loop {
+            // Only ping while the Downloader view has rendered since the last
+            // cycle — leaving the view pauses the polling entirely.
+            if !visible.swap(false, Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
             let online = agent
                 .get(SITE_HOME)
                 .header("User-Agent", USER_AGENT)

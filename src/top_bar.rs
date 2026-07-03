@@ -33,6 +33,10 @@ pub struct SystemStats {
     gpu_pct: f32,
     gpu_mem_used_gb: f64,
     gpu_mem_total_gb: f64,
+    /// CPU brand string (from sysinfo, captured once) and the GPU's product name
+    /// (from nvidia-smi) — shown beside the metric names in the stat labels.
+    cpu_name: String,
+    gpu_name: String,
     /// True once the background sampler has seen a GPU (drives whether the GPU
     /// graph is shown at all).
     gpu_available: bool,
@@ -59,6 +63,8 @@ impl Default for SystemStats {
             gpu_pct: 0.0,
             gpu_mem_used_gb: 0.0,
             gpu_mem_total_gb: 0.0,
+            cpu_name: String::new(),
+            gpu_name: String::new(),
             gpu_available: false,
             gpu_started: false,
             gpu_shared: Arc::new(Mutex::new(GpuInfo::default())),
@@ -76,6 +82,16 @@ impl SystemStats {
 
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
+
+        // The CPU brand string never changes — grab it from the first refresh.
+        if self.cpu_name.is_empty() {
+            self.cpu_name = self
+                .sys
+                .cpus()
+                .first()
+                .map(|c| c.brand().trim().to_string())
+                .unwrap_or_default();
+        }
 
         self.cpu_pct = self.sys.global_cpu_usage();
         let used = self.sys.used_memory() as f64;
@@ -98,6 +114,9 @@ impl SystemStats {
             self.gpu_pct = g.util * 100.0;
             self.gpu_mem_used_gb = g.mem_used_gb;
             self.gpu_mem_total_gb = g.mem_total_gb;
+            if self.gpu_name != g.name {
+                self.gpu_name = g.name.clone();
+            }
         }
         if self.gpu_available {
             push_capped(&mut self.gpu, (self.gpu_pct / 100.0).clamp(0.0, 1.0));
@@ -121,6 +140,8 @@ fn push_capped(buf: &mut VecDeque<f32>, v: f32) {
 #[derive(Clone, Default)]
 struct GpuInfo {
     available: bool,
+    /// Product name as nvidia-smi reports it (e.g. "NVIDIA GeForce RTX 4080").
+    name: String,
     util: f32, // 0.0..=1.0
     mem_used_gb: f64,
     mem_total_gb: f64,
@@ -131,7 +152,7 @@ struct GpuInfo {
 fn query_gpu() -> Option<GpuInfo> {
     let mut cmd = std::process::Command::new("nvidia-smi");
     cmd.args([
-        "--query-gpu=utilization.gpu,memory.used,memory.total",
+        "--query-gpu=name,utilization.gpu,memory.used,memory.total",
         "--format=csv,noheader,nounits",
     ]);
     crate::pixal3d::hide_window(&mut cmd);
@@ -143,11 +164,13 @@ fn query_gpu() -> Option<GpuInfo> {
     // First GPU only (multi-GPU boxes report one line each).
     let line = text.lines().next()?;
     let mut parts = line.split(',').map(|s| s.trim());
+    let name = parts.next()?.to_string();
     let util = parts.next()?.parse::<f32>().ok()?;
     let used_mib = parts.next()?.parse::<f64>().ok()?;
     let total_mib = parts.next()?.parse::<f64>().ok()?;
     Some(GpuInfo {
         available: true,
+        name,
         util: (util / 100.0).clamp(0.0, 1.0),
         mem_used_gb: used_mib / 1024.0,
         mem_total_gb: total_mib / 1024.0,
@@ -220,6 +243,49 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool, update_bad
 
                     if svg_button(ui, folder_svg, "Open folder", 37.0, icon_tint(Color32::GRAY)).clicked() {
                         action = TopBarAction::OpenFolder;
+                    }
+
+                    // Hardware names stacked in the left corner next to the folder
+                    // button: CPU brand (muted) over the GPU product name, which is
+                    // colour-coded by its VRAM tier (green / orange / red). Names
+                    // truncate to the column; hover shows the full string.
+                    if show_stats && !stats.cpu_name.is_empty() {
+                        ui.add_space(8.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(150.0, 42.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_max_width(150.0);
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                // Optically centre one or two 10.5px lines in the row.
+                                ui.add_space(if stats.gpu_available { 6.0 } else { 13.0 });
+                                let cpu = ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(short_cpu_name(&stats.cpu_name))
+                                            .color(MUTED())
+                                            .size(10.5)
+                                            .strong(),
+                                    )
+                                    .truncate(),
+                                );
+                                cpu.on_hover_text(&stats.cpu_name);
+                                if stats.gpu_available && !stats.gpu_name.is_empty() {
+                                    let gpu = ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(short_gpu_name(&stats.gpu_name))
+                                                .color(vram_color(stats.gpu_mem_total_gb))
+                                                .size(10.5)
+                                                .strong(),
+                                        )
+                                        .truncate(),
+                                    );
+                                    gpu.on_hover_text(format!(
+                                        "{} — {:.0} GB VRAM",
+                                        stats.gpu_name, stats.gpu_mem_total_gb
+                                    ));
+                                }
+                            },
+                        );
                     }
 
                     // RIGHT (laid out right-to-left): settings, the two
@@ -322,23 +388,36 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool, update_bad
                                         - (n - 1.0) * gap)
                                         / n)
                                         .clamp(90.0, 240.0);
+                                    // As the window narrows, the charts shrink all the
+                                    // way down (not stopping at the comfortable 90px
+                                    // minimum). Below a useful width they're dropped
+                                    // entirely (labels + values remain), and if even
+                                    // those don't fit the stats are skipped rather than
+                                    // overlapping the action buttons.
+                                    let raw =
+                                        (avail - sum_label - n * inner - (n - 1.0) * gap) / n;
+                                    let show_charts = raw >= 28.0;
+                                    let chart_w = if show_charts { chart_w.min(raw) } else { 0.0 };
+                                    let inner_w = if show_charts { inner } else { 0.0 };
                                     let total =
-                                        sum_label + n * inner + chart_w * n + gap * (n - 1.0);
+                                        sum_label + n * inner_w + chart_w * n + gap * (n - 1.0);
 
-                                    // Bias the block toward the right (closer to the
-                                    // action buttons) instead of centring it in the
-                                    // leftover gap.
-                                    let slack = (avail - total).max(0.0);
-                                    let left_padding = slack * 0.70;
-                                    if left_padding > 0.0 {
-                                        ui.add_space(left_padding);
-                                    }
-
-                                    for (i, c) in cells.iter().enumerate() {
-                                        if i > 0 {
-                                            ui.add_space(gap);
+                                    if total <= avail + 0.5 {
+                                        // Bias the block toward the right (closer to the
+                                        // action buttons) instead of centring it in the
+                                        // leftover gap.
+                                        let slack = (avail - total).max(0.0);
+                                        let left_padding = slack * 0.54;
+                                        if left_padding > 0.0 {
+                                            ui.add_space(left_padding);
                                         }
-                                        stat_cell(ui, c, chart_w);
+
+                                        for (i, c) in cells.iter().enumerate() {
+                                            if i > 0 {
+                                                ui.add_space(gap);
+                                            }
+                                            stat_cell(ui, c, chart_w);
+                                        }
                                     }
                                 },
                             );
@@ -382,6 +461,41 @@ struct StatCell<'a> {
     tooltip: Option<String>,
 }
 
+/// Trim marketing noise from a CPU brand string so it fits the label
+/// ("AMD Ryzen 9 7950X 16-Core Processor" → "AMD Ryzen 9 7950X",
+///  "Intel(R) Core(TM) i7-12700H @ 2.30GHz" → "Intel Core i7-12700H").
+fn short_cpu_name(full: &str) -> String {
+    let mut s = full.replace("(R)", "").replace("(TM)", "").replace("(tm)", "");
+    if let Some(at) = s.find('@') {
+        s.truncate(at);
+    }
+    s.split_whitespace()
+        .filter(|w| !matches!(*w, "CPU" | "Processor") && !w.ends_with("-Core"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Trim the vendor prefixes from a GPU name ("NVIDIA GeForce RTX 4080" → "RTX 4080").
+fn short_gpu_name(full: &str) -> String {
+    full.split_whitespace()
+        .filter(|w| !matches!(*w, "NVIDIA" | "GeForce"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Colour-code the GPU name by how much VRAM the card has: 16 GB or more is
+/// green, 8–16 GB orange, under 8 GB red. (Thresholds use a small tolerance —
+/// a "16 GB" card can report 15.99 GB.)
+fn vram_color(total_gb: f64) -> Color32 {
+    if total_gb >= 15.5 {
+        Color32::from_rgb(46, 160, 67) // green
+    } else if total_gb >= 7.5 {
+        Color32::from_rgb(235, 150, 45) // orange
+    } else {
+        Color32::from_rgb(210, 70, 70) // red
+    }
+}
+
 /// A stat cell: a two-line label (muted name over coloured value) beside a modern
 /// gradient-area sparkline.
 fn stat_cell(ui: &mut egui::Ui, cell: &StatCell, chart_w: f32) {
@@ -408,10 +522,14 @@ fn stat_cell(ui: &mut egui::Ui, cell: &StatCell, chart_w: f32) {
             ui.label(egui::RichText::new(&cell.value).color(cell.color).size(13.5).strong());
         },
     );
-    ui.add_space(8.0);
-    let resp = modern_chart(ui, cell.data, cell.color, chart_w);
-    if let Some(tip) = &cell.tooltip {
-        resp.on_hover_text(tip);
+    // On very narrow windows the charts are dropped (chart_w == 0) and only the
+    // label + value remain.
+    if chart_w > 0.0 {
+        ui.add_space(8.0);
+        let resp = modern_chart(ui, cell.data, cell.color, chart_w);
+        if let Some(tip) = &cell.tooltip {
+            resp.on_hover_text(tip);
+        }
     }
 }
 

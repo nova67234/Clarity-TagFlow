@@ -482,7 +482,7 @@ fn details_content(
                         .fit_to_exact_size(egui::vec2(18.0, 18.0))
                         .tint(TEXT()),
                 );
-                let title = if popup.showing_meta { "Metadata:" } else { "Tags:" };
+                let title = if popup.showing_meta { "Metadata" } else { "Tags" };
                 ui.label(egui::RichText::new(title).color(TEXT()).strong());
 
                 let has_tags = !popup.tags.trim().is_empty();
@@ -661,21 +661,44 @@ fn tags_box_fill(ui: &mut egui::Ui, popup: &mut DetailPopup) {
                 .auto_shrink([false, false])
                 .max_height(inner_h)
                 .show(ui, |ui| {
-                    let mut text_edit = egui::TextEdit::multiline(&mut display_text)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace)
-                        .frame(egui::Frame::NONE)
-                        .interactive(editable);
-                    if !editable {
-                        text_edit = text_edit.text_color(TEXT().gamma_multiply(0.8));
-                    }
                     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
                         right_details::highlight_tags(ui, buf.as_str(), &artist, &character, role_color, wrap)
                     };
-                    if highlight_roles {
-                        text_edit = text_edit.layouter(&mut layouter);
+                    if editable {
+                        let mut text_edit = egui::TextEdit::multiline(&mut display_text)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace)
+                            .frame(egui::Frame::NONE)
+                            // Fill the whole box so clicking anywhere inside it (not
+                            // just on the first lines) focuses the editor.
+                            .min_size(egui::vec2(0.0, inner_h));
+                        if highlight_roles {
+                            text_edit = text_edit.layouter(&mut layouter);
+                        }
+                        ui.add(text_edit);
+                    } else {
+                        // Display mode: an immutable `&str` buffer ignores every edit,
+                        // so the text can be highlighted and copied but never changed.
+                        let meta_color = TEXT().gamma_multiply(0.8);
+                        // In the metadata view, colour the app stamp ("Clarity
+                        // TagFlow" green, the version blue) — same as the right panel.
+                        let stamp_meta = showing_meta && display_text.contains("Clarity TagFlow");
+                        let mut stamp_layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+                            right_details::highlight_app_stamp(ui, buf.as_str(), meta_color, wrap)
+                        };
+                        let mut read_only = display_text.as_str();
+                        let mut text_edit = egui::TextEdit::multiline(&mut read_only)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace)
+                            .frame(egui::Frame::NONE)
+                            .text_color(meta_color);
+                        if highlight_roles {
+                            text_edit = text_edit.layouter(&mut layouter);
+                        } else if stamp_meta {
+                            text_edit = text_edit.layouter(&mut stamp_layouter);
+                        }
+                        ui.add(text_edit);
                     }
-                    ui.add(text_edit);
                 });
         });
 

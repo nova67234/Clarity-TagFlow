@@ -1354,6 +1354,11 @@ impl eframe::App for ViewerApp {
             gallery_detail::DetailAction::None => {}
         }
 
+        // Both Civitai hosts (right panel + detail popup) have rendered by now —
+        // if neither showed the view this frame, cancel any in-flight lookup so
+        // it stops fetching resource info / preview thumbnails in the background.
+        self.right_state.civitai.end_frame();
+
         // Deep Scan window. When a scan finishes it may have moved files out of
         // the current folder, so refresh the browser list once.
         scan::show(ui.ctx(), &mut self.scan);
