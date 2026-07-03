@@ -24,65 +24,53 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
-      # Fetch the official libVLC build *only* for its import library (sdk\lib).
-      # We do NOT bundle the runtime: the app delay-loads libVLC and uses the
-      # user's installed VLC at runtime (prompting to install it if missing).
-      - name: Fetch libVLC import library
+      # Generate an MSVC import library for libVLC from the checked-in export
+      # list (ci/vlc.def). The official VLC SDK's libvlc.lib is a MinGW/dlltool-
+      # format import library that MSVC's /DELAYLOAD cannot process — link.exe
+      # silently keeps libvlc.dll as a LOAD-TIME import, and the shipped exe then
+      # fails to start ("libvlc.dll was not found") on machines where VLC isn't
+      # on the loader's search path. lib.exe from a .def produces a proper MSVC
+      # import lib that delay-loads correctly (matching local dev setups). We do
+      # NOT bundle the runtime: the app delay-loads libVLC and uses the user's
+      # installed VLC at runtime (prompting to install it if missing).
+      - name: Generate libVLC import library
         shell: pwsh
         run: |
-          $ver = "3.0.21"
-          # Use the canonical origin (download.videolan.org), NOT get.videolan.org:
-          # the latter load-balances across mirrors and was redirecting CI to a
-          # mirror that served an HTML error page instead of the 7z. The retry +
-          # 7z-magic validation below stays as a guard against transient blips.
-          $url = "https://download.videolan.org/pub/videolan/vlc/$ver/win64/vlc-$ver-win64.7z"
-          $ok = $false
-          for ($i = 1; $i -le 6; $i++) {
-            try {
-              Write-Host "Attempt ${i}: $url"
-              Invoke-WebRequest -Uri $url -OutFile vlc.7z -UseBasicParsing -MaximumRedirection 10 -TimeoutSec 180
-            } catch {
-              Write-Host "  download failed: $($_.Exception.Message)"
-              Start-Sleep -Seconds 6
-              continue
-            }
-            $size = (Get-Item vlc.7z -ErrorAction SilentlyContinue).Length
-            $magic = ""
-            if ($size) {
-              $fs = [System.IO.File]::OpenRead((Resolve-Path vlc.7z))
-              $buf = New-Object byte[] 6
-              [void]$fs.Read($buf, 0, 6)
-              $fs.Close()
-              $magic = ($buf | ForEach-Object { $_.ToString('X2') }) -join ''
-            }
-            # 7z magic = 37 7A BC AF 27 1C; the real archive is ~38 MB.
-            if ($size -gt 20MB -and $magic -eq '377ABCAF271C') {
-              Write-Host "  ok: valid 7z, $size bytes"
-              $ok = $true
-              break
-            }
-            Write-Host "  not a 7z archive (size=$size magic=$magic), retrying..."
-            Start-Sleep -Seconds 6
-          }
-          if (-not $ok) { throw "Could not download a valid VLC archive after retries" }
-          7z x vlc.7z -ovlc_sdk | Out-Null
-          $lib = (Get-ChildItem -Path vlc_sdk -Recurse -Directory -Filter lib | Where-Object { Test-Path (Join-Path $_.FullName 'libvlc.lib') } | Select-Object -First 1).FullName
-          if (-not $lib) { throw "libvlc.lib not found in the VLC archive" }
-          # The crate links `vlc`, so MSVC needs vlc.lib (the SDK ships libvlc.lib).
-          Copy-Item (Join-Path $lib 'libvlc.lib') (Join-Path $lib 'vlc.lib') -Force
-          "VLC_LIB=$lib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $libexe = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find "VC\Tools\MSVC\*\bin\Hostx64\x64\lib.exe" | Select-Object -First 1
+          if (-not $libexe) { throw "lib.exe not found on the runner" }
+          New-Item -ItemType Directory -Force vlc_lib | Out-Null
+          & $libexe /nologo /machine:x64 /def:ci\vlc.def /out:vlc_lib\vlc.lib
+          if ($LASTEXITCODE -ne 0) { throw "lib.exe failed with exit code $LASTEXITCODE" }
+          "VLC_LIB=$((Resolve-Path vlc_lib).Path)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # Build with the vlc feature. RUSTFLAGS overrides the machine-specific path
-      # in .cargo/config.toml, pointing the linker at the import lib fetched above.
-      # The /DELAYLOAD:libvlc.dll + delayimp.lib link args are emitted by build.rs
-      # (so the exe still launches when VLC isn't installed) and need not be repeated
-      # here — repeating them in RUSTFLAGS is what previously left libvlc as a
-      # load-time import in some builds.
+      # in .cargo/config.toml, pointing the linker at the import lib generated
+      # above. The /DELAYLOAD:libvlc.dll + delayimp.lib link args are emitted by
+      # build.rs (so the exe still launches when VLC isn't installed) and need not
+      # be repeated here — repeating them in RUSTFLAGS is what previously left
+      # libvlc as a load-time import in some builds.
       - name: Build
         shell: pwsh
         env:
           RUSTFLAGS: -L native=${{ env.VLC_LIB }}
         run: cargo build --release --no-default-features --features vlc
+
+      # Guard: libvlc.dll must be DELAY-loaded, never a load-time import — a
+      # load-time import means the exe can't even start without VLC installed.
+      # Fails the build outright so a broken artifact can never ship again.
+      - name: Verify libVLC is delay-loaded
+        shell: pwsh
+        run: |
+          $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find "VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found on the runner" }
+          $out = & $dumpbin /dependents target/release/Clarity_TagFlow.exe | Out-String
+          Write-Host $out
+          $parts = $out -split 'delay load dependencies'
+          if ($parts[0] -match 'libvlc') { throw "libvlc.dll is a LOAD-TIME import - the delay-load was not applied" }
+          if ($parts.Count -lt 2 -or $parts[1] -notmatch 'libvlc\.dll') { throw "libvlc.dll missing from the delay-load imports" }
+          Write-Host "OK: libvlc.dll is delay-loaded."
 
       - name: Package into a .zip
         shell: pwsh
