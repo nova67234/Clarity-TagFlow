@@ -695,10 +695,13 @@ mod tests {
     #[test]
     fn glass_config_round_trips() {
         for backdrop in [Backdrop::Solid, Backdrop::Starfield, Backdrop::Aurora] {
-            set_glass_config([10, 200, 255], backdrop);
-            let (c, b) = glass_config();
-            assert_eq!((c.r(), c.g(), c.b()), (10, 200, 255));
-            assert_eq!(b, backdrop);
+            for light in [false, true] {
+                set_glass_config([10, 200, 255], backdrop, light);
+                let (c, b) = glass_config();
+                assert_eq!((c.r(), c.g(), c.b()), (10, 200, 255));
+                assert_eq!(b, backdrop);
+                assert_eq!(GLASS_LIGHT_ON.load(Ordering::Relaxed), light);
+            }
         }
     }
 
