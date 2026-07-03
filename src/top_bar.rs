@@ -594,14 +594,23 @@ fn modern_chart(ui: &mut egui::Ui, data: &VecDeque<f32>, accent: Color32, width:
     let painter = ui.painter_at(rect);
     let radius = CornerRadius::same(12);
 
-    // Card + hairline border.
-    painter.rect_filled(rect, radius, Color32::from_rgba_unmultiplied(255, 255, 255, 10));
-    painter.rect_stroke(
-        rect,
-        radius,
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 20)),
-        egui::StrokeKind::Inside,
-    );
+    // Card + hairline border — white-tinted on dark themes, black-tinted on the
+    // light ones (white-on-light would be invisible).
+    let (card, border, guide) = if crate::theme::is_light() {
+        (
+            Color32::from_rgba_unmultiplied(0, 0, 0, 10),
+            Color32::from_rgba_unmultiplied(0, 0, 0, 24),
+            Color32::from_rgba_unmultiplied(0, 0, 0, 14),
+        )
+    } else {
+        (
+            Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+        )
+    };
+    painter.rect_filled(rect, radius, card);
+    painter.rect_stroke(rect, radius, Stroke::new(1.0, border), egui::StrokeKind::Inside);
 
     let pad = 6.0;
     let top = rect.top() + pad;
@@ -609,7 +618,6 @@ fn modern_chart(ui: &mut egui::Ui, data: &VecDeque<f32>, accent: Color32, width:
     let inner_h = bottom - top;
 
     // Two faint horizontal guides at 1/3 and 2/3.
-    let guide = Color32::from_rgba_unmultiplied(255, 255, 255, 12);
     for k in 1..=2 {
         let y = top + inner_h * k as f32 / 3.0;
         painter.hline(rect.left() + pad..=rect.right() - pad, y, Stroke::new(1.0, guide));

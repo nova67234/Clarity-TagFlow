@@ -185,8 +185,34 @@ static GLASS: Palette = Palette {
     glass: true,
 };
 
+/// The light-mode Glass palette: the same frosted-glass treatment, but the panels
+/// are translucent *white* and the ink is dark grey — text, muted labels, and
+/// (via [`icon_tint`]) the SVG icons. Accents match the Light theme so buttons
+/// stay readable white-on-blue. Selected from the Appearance tab's "Glass panels"
+/// switch; the dark variant above is untouched.
+static GLASS_LIGHT: Palette = Palette {
+    bg: Color32::TRANSPARENT,
+    panel: glass(246, 247, 250, 185),
+    field: glass(233, 235, 240, 205),
+    field2: glass(222, 225, 231, 205),
+    text: Color32::from_rgb(55, 58, 64),
+    muted: Color32::from_rgb(108, 113, 121),
+    accent1: Color32::from_rgb(28, 110, 235),
+    accent2: Color32::from_rgb(20, 140, 200),
+    // No panel outline — the translucent fill carries the glass look on its own.
+    edge: Color32::TRANSPARENT,
+    is_dark: false,
+    starfield: false,
+    aurora: false,
+    glass: true,
+};
+
 /// 0 = Dark, 1 = Light, 2 = Space, 3 = Aurora, 4 = Glass.
 static ACTIVE: AtomicU8 = AtomicU8::new(0);
+
+/// Whether the Glass theme uses its light palette ([`GLASS_LIGHT`]) instead of
+/// the dark one. Pushed each frame with [`set_glass_config`].
+static GLASS_LIGHT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The Glass theme's background, packed for atomic access: the low 24 bits are
 /// the RGB colour; the next 8 bits are the [`Backdrop`] discriminant. Updated by
@@ -205,10 +231,11 @@ pub fn set(theme: Theme) {
     ACTIVE.store(v, Ordering::Relaxed);
 }
 
-/// Set the Glass theme's background: a flat `rgb` colour plus an animated
-/// `backdrop` painted over it. Cheap (a single atomic store) so callers push it
-/// every frame from the persisted settings, letting the colour picker update live.
-pub fn set_glass_config(rgb: [u8; 3], backdrop: Backdrop) {
+/// Set the Glass theme's background — a flat `rgb` colour plus an animated
+/// `backdrop` painted over it — and whether the panels use the light palette.
+/// Cheap (atomic stores) so callers push it every frame from the persisted
+/// settings, letting the colour picker update live.
+pub fn set_glass_config(rgb: [u8; 3], backdrop: Backdrop, light: bool) {
     let b = match backdrop {
         Backdrop::Solid => 0u32,
         Backdrop::Starfield => 1,
@@ -216,6 +243,7 @@ pub fn set_glass_config(rgb: [u8; 3], backdrop: Backdrop) {
     };
     let packed = (b << 24) | ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32;
     GLASS_CONFIG.store(packed, Ordering::Relaxed);
+    GLASS_LIGHT_ON.store(light, Ordering::Relaxed);
 }
 
 /// Unpack the current Glass background into its colour and backdrop.
@@ -250,12 +278,28 @@ pub fn is_light() -> bool {
 }
 
 /// Tint for icon buttons (e.g. the folder icon): a soft pink under Aurora so the
-/// icons match its warm glow, otherwise the caller's normal colour `fallback`.
+/// icons match its warm glow, dark grey under light Glass so the SVGs read on the
+/// white frosted panels, otherwise the caller's normal colour `fallback`.
 pub fn icon_tint(fallback: Color32) -> Color32 {
-    if palette().aurora {
+    let p = palette();
+    if p.aurora {
         Color32::from_rgb(235, 130, 175) // matches the Aurora pink buttons
+    } else if p.glass && !p.is_dark {
+        Color32::from_rgb(75, 78, 85) // dark-grey icons on light glass
     } else {
         fallback
+    }
+}
+
+/// Colour for the selected-tile outline in the browser: the theme's accent blue
+/// everywhere (light modes use their deeper accent so it reads on white panels),
+/// except Aurora's pink so it matches that theme's warm glow.
+pub fn selection_outline() -> Color32 {
+    let p = palette();
+    if p.aurora {
+        Color32::from_rgb(235, 130, 175)
+    } else {
+        p.accent1
     }
 }
 
@@ -264,7 +308,13 @@ fn palette() -> &'static Palette {
         1 => &LIGHT,
         2 => &SPACE,
         3 => &AURORA,
-        4 => &GLASS,
+        4 => {
+            if GLASS_LIGHT_ON.load(Ordering::Relaxed) {
+                &GLASS_LIGHT
+            } else {
+                &GLASS
+            }
+        }
         _ => &DARK,
     }
 }
@@ -343,6 +393,34 @@ pub fn apply(ctx: &egui::Context) {
         &mut v.widgets.open,
     ] {
         w.corner_radius = CornerRadius::same(8);
+    }
+
+    // Light glass gets its own QUIET widget styling instead of the Light theme's
+    // accent-blue: panel-toned grey fills with a grey outline and dark-ink text.
+    // - toggles (radio/checkbox) render grey, not blue
+    // - widget/menu text is dark ink, not white (white-on-light was unreadable)
+    // - the slider rail/knob match the panel tone, ringed grey ("outer layer")
+    if p.glass && !p.is_dark {
+        let ink = p.text;
+        let outline = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 40));
+        let tune = |w: &mut egui::style::WidgetVisuals, fill: Color32, weak: Color32| {
+            w.bg_fill = fill;
+            w.weak_bg_fill = weak;
+            w.fg_stroke.color = ink;
+            w.bg_stroke = outline;
+        };
+        tune(&mut v.widgets.inactive, Color32::from_rgb(226, 229, 234), Color32::from_rgb(214, 218, 224));
+        tune(&mut v.widgets.hovered, Color32::from_rgb(214, 218, 224), Color32::from_rgb(202, 206, 213));
+        tune(&mut v.widgets.active, Color32::from_rgb(202, 206, 213), Color32::from_rgb(190, 194, 201));
+        tune(&mut v.widgets.open, Color32::from_rgb(214, 218, 224), Color32::from_rgb(202, 206, 213));
+
+        // Same override handling as the Light branch below: ordinary labels pin
+        // to the dark ink, while widget text follows the fg_stroke set above.
+        v.override_text_color = None;
+        v.widgets.noninteractive.fg_stroke.color = ink;
+
+        ctx.set_visuals(v);
+        return;
     }
 
     // Light mode: paint the otherwise-grey buttons in the accent blue with white

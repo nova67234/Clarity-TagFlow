@@ -159,9 +159,12 @@ fn main() -> eframe::Result {
                 }
             }
             // Apply the saved colour theme before the first paint so a Light-mode
-            // user doesn't see a dark flash on launch.
+            // user doesn't see a dark flash on launch. The Glass config (incl.
+            // dark/light panels) must be pushed first — the palette reads it.
+            set_glass_config(app.settings.glass_bg, app.settings.glass_backdrop, app.settings.glass_light);
             set(app.settings.theme);
             app.last_theme = app.settings.theme;
+            app.last_glass_light = app.settings.glass_light;
             apply_theme(&cc.egui_ctx);
             // Optional: open a folder passed on the command line (e.g. "Open with").
             if let Some(arg) = std::env::args().nth(1) {
@@ -244,6 +247,9 @@ struct ViewerApp {
     /// Last-applied colour theme, so we re-push the egui visuals only when the
     /// user actually changes it in the Appearance tab.
     last_theme: Theme,
+    /// Last-applied Glass dark/light panel mode — a palette change that doesn't
+    /// change `theme`, so it needs its own re-apply tracking.
+    last_glass_light: bool,
     /// Last-applied media-type filter (Filter tab), so we re-filter the browser
     /// only when the user actually changes it.
     last_media_filter: left_panel_settings::MediaFilter,
@@ -325,6 +331,7 @@ impl Default for ViewerApp {
             current_folder: None,
             last_extended_formats: settings::Settings::default().enable_extended_formats,
             last_theme: Theme::default(),
+            last_glass_light: false,
             last_media_filter: left_panel_settings::MediaFilter::default(),
             filtered: Vec::new(),
             selected: None,
@@ -1142,8 +1149,9 @@ impl eframe::App for ViewerApp {
         self.viewer.begin_frame(ui.ctx());
 
         // Push the Glass theme's user-configurable background (colour + backdrop)
-        // so the colour picker updates live; cheap, so done every frame.
-        set_glass_config(self.settings.glass_bg, self.settings.glass_backdrop);
+        // and its dark/light panel mode so the pickers update live; cheap, so
+        // done every frame.
+        set_glass_config(self.settings.glass_bg, self.settings.glass_backdrop, self.settings.glass_light);
 
         // Paint the theme's full-window background (the Space theme's animated
         // starfield, the Glass theme's configured backdrop) on the bottom layer,
@@ -1374,9 +1382,17 @@ impl eframe::App for ViewerApp {
         }
 
         // Apply a theme change from the Appearance tab live (only when it
-        // actually changed, so we don't re-push visuals every frame).
-        if self.settings.theme != self.last_theme {
+        // actually changed, so we don't re-push visuals every frame). The Glass
+        // dark/light switch changes the palette without changing `theme`, so it
+        // re-applies the visuals too. CRITICAL: re-push the glass config FIRST —
+        // the frame-start push used this frame's pre-settings value, and apply()
+        // derives every widget colour from the palette it reads. Applying before
+        // the flag lands bakes the stale palette into the visuals permanently
+        // (e.g. dark glass stuck with the light theme's blue toggles).
+        if self.settings.theme != self.last_theme || self.settings.glass_light != self.last_glass_light {
             self.last_theme = self.settings.theme;
+            self.last_glass_light = self.settings.glass_light;
+            set_glass_config(self.settings.glass_bg, self.settings.glass_backdrop, self.settings.glass_light);
             set(self.settings.theme);
             apply(ui.ctx());
             ui.ctx().request_repaint();

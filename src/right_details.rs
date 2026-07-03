@@ -949,10 +949,15 @@ pub(crate) fn image_details_section(ui: &mut egui::Ui, meta: &ImageMeta) {
         .fill(FIELD())
         .corner_radius(egui::CornerRadius::same(22)) // match the tag box
         .inner_margin(egui::Margin::symmetric(16, 12))
-        // Use the same soft light edge the tag box gets from egui's default field
-        // border (the gentle highlight), instead of the very faint EDGE() — so both
-        // inset boxes look identical.
-        .stroke(ui.visuals().widgets.noninteractive.bg_stroke);
+        // On the dark themes, borrow the same soft light edge the tag box gets
+        // from egui's default field border (a gentle highlight). On the light
+        // themes that default stroke is a plainly visible grey outline — drop it
+        // there; the field tint separates the card on its own.
+        .stroke(if crate::theme::is_light() {
+            egui::Stroke::NONE
+        } else {
+            ui.visuals().widgets.noninteractive.bg_stroke
+        });
 
     frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
