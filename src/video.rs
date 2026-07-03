@@ -230,9 +230,32 @@ impl VideoPlayer {
         None
     }
 
+    #[allow(dead_code)] // the stub VideoPreviews never starts a player
+    pub fn start_preview(_path: &Path, _ctx: &egui::Context) -> Option<VideoPlayer> {
+        None
+    }
+
     pub fn frame(&mut self, _ctx: &egui::Context) -> Option<egui::TextureHandle> {
         None
     }
+}
+
+/// Stub thumbnail-preview manager when the `vlc` feature is off — always returns
+/// `None`, so tiles show the static poster.
+#[cfg(not(feature = "vlc"))]
+pub struct VideoPreviews;
+
+#[cfg(not(feature = "vlc"))]
+impl VideoPreviews {
+    pub fn new() -> Self {
+        VideoPreviews
+    }
+    pub fn set_enabled(&mut self, _on: bool) {}
+    pub fn begin_frame(&mut self) {}
+    pub fn frame(&mut self, _path: &Path, _ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        None
+    }
+    pub fn end_frame(&mut self) {}
 }
 
 /// Stub video-thumbnail cache when the `vlc` feature is off — always returns
@@ -255,13 +278,15 @@ impl VideoThumbs {
     }
 
     pub fn set_busy(&mut self, _path: Option<&Path>) {}
+
+    pub fn set_max_edge(&mut self, _max_edge: u32) {}
 }
 
 // ---------------------------------------------------------------------------
 // Real libVLC-backed player (feature = "vlc").
 // ---------------------------------------------------------------------------
 #[cfg(feature = "vlc")]
-pub use backend::{VideoPlayer, VideoThumbs};
+pub use backend::{VideoPlayer, VideoPreviews, VideoThumbs};
 
 #[cfg(feature = "vlc")]
 mod backend {
@@ -296,14 +321,34 @@ mod backend {
     }
 
     impl VideoPlayer {
+        /// Start normal playback (audio on; loops per the user's Settings).
         pub fn start(path: &Path, ctx: &egui::Context) -> Option<VideoPlayer> {
+            Self::start_with(path, ctx, loop_enabled(), false)
+        }
+
+        /// Start a muted thumbnail preview (no audio, loops so a short clip keeps
+        /// moving instead of freezing) — used by [`VideoPreviews`] for the
+        /// auto-playing tiles.
+        pub fn start_preview(path: &Path, ctx: &egui::Context) -> Option<VideoPlayer> {
+            Self::start_with(path, ctx, true, true)
+        }
+
+        fn start_with(path: &Path, ctx: &egui::Context, looping: bool, muted: bool) -> Option<VideoPlayer> {
             let instance = vlc::Instance::new()?;
             let media = vlc::Media::new_path(&instance, path)?;
-            // Loop the clip when the user enabled it in Settings. A large repeat
-            // count stands in for "infinite" (libVLC has no unbounded value).
-            if loop_enabled() {
+            // Loop the clip when requested. A large repeat count stands in for
+            // "infinite" (libVLC has no unbounded value).
+            if looping {
                 unsafe {
                     let opt = std::ffi::CString::new(":input-repeat=65535").unwrap();
+                    sys::libvlc_media_add_option(media.raw(), opt.as_ptr());
+                }
+            }
+            // Preview tiles never play sound (a grid of chattering clips would be
+            // unbearable) — disable audio output for this media.
+            if muted {
+                unsafe {
+                    let opt = std::ffi::CString::new(":no-audio").unwrap();
                     sys::libvlc_media_add_option(media.raw(), opt.as_ptr());
                 }
             }
@@ -473,12 +518,24 @@ mod backend {
         /// isn't doing the same work twice. Every other video still loads its
         /// poster normally, and a cached poster for this file is still served.
         busy: Option<PathBuf>,
+        /// Poster decode resolution (longest side, px). Mirrors the image
+        /// thumbnail setting so "HD thumbnails" makes video posters crisp too.
+        max_edge: u32,
     }
 
     impl VideoThumbs {
         pub fn new() -> Self {
             let (tx, rx) = mpsc::channel();
-            VideoThumbs { entries: HashMap::new(), tx, rx, in_flight: 0, busy: None }
+            VideoThumbs { entries: HashMap::new(), tx, rx, in_flight: 0, busy: None, max_edge: 320 }
+        }
+
+        /// Change the poster decode resolution (longest side, px). If it actually
+        /// changes, cached posters are dropped so they re-capture at the new size.
+        pub fn set_max_edge(&mut self, max_edge: u32) {
+            if self.max_edge != max_edge {
+                self.max_edge = max_edge;
+                self.entries.clear();
+            }
         }
 
         /// Tell the cache which video is playing (so it won't double-decode it),
@@ -533,8 +590,9 @@ mod backend {
                 let tx = self.tx.clone();
                 let p = path.to_path_buf();
                 let ctx = ctx.clone();
+                let max_edge = self.max_edge;
                 std::thread::spawn(move || {
-                    let img = capture_poster(&p, 320);
+                    let img = capture_poster(&p, max_edge);
                     let _ = tx.send((p, img));
                     ctx.request_repaint();
                 });
@@ -557,6 +615,78 @@ mod backend {
                 }
                 _ => None,
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto-playing thumbnail previews.
+    // -----------------------------------------------------------------------
+
+    /// Plays muted, looping previews on visible video tiles (the "Video thumbnail
+    /// play" setting). Bounded in count so a folder of clips can't spin up dozens
+    /// of decoders. A preview keeps playing the whole time its tile is on screen
+    /// and is stopped as soon as the tile scrolls out of view.
+    pub struct VideoPreviews {
+        players: HashMap<PathBuf, VideoPlayer>,
+        /// Paths a tile asked to preview this frame (mark-and-sweep for offscreen).
+        requested: std::collections::HashSet<PathBuf>,
+        enabled: bool,
+    }
+
+    /// Most previews decoding at once (each is a full libVLC pipeline).
+    const MAX_PREVIEWS: usize = 6;
+
+    impl VideoPreviews {
+        pub fn new() -> Self {
+            VideoPreviews {
+                players: HashMap::new(),
+                requested: std::collections::HashSet::new(),
+                enabled: false,
+            }
+        }
+
+        /// Push the current "Video thumbnail play" setting. Turning it off stops
+        /// and frees every running preview at once.
+        pub fn set_enabled(&mut self, on: bool) {
+            if self.enabled && !on {
+                self.players.clear();
+            }
+            self.enabled = on;
+        }
+
+        /// Call once per frame before drawing tiles: reset the visibility marks.
+        pub fn begin_frame(&mut self) {
+            self.requested.clear();
+        }
+
+        /// The live preview texture for `path`, or `None` to show the poster
+        /// instead (disabled, or over the concurrency cap, or still warming up).
+        /// A tile calls this every frame it is visible; the preview plays for as
+        /// long as the tile keeps calling (i.e. stays on screen).
+        pub fn frame(&mut self, path: &Path, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+            if !self.enabled || !super::vlc_runtime_available() {
+                return None;
+            }
+            self.requested.insert(path.to_path_buf());
+
+            if let Some(player) = self.players.get_mut(path) {
+                return player.frame(ctx);
+            }
+            // Not previewing yet — start one if we're under the cap.
+            if self.players.len() < MAX_PREVIEWS {
+                if let Some(player) = VideoPlayer::start_preview(path, ctx) {
+                    self.players.insert(path.to_path_buf(), player);
+                }
+            }
+            None
+        }
+
+        /// Call once per frame after drawing tiles: drop previews for tiles that
+        /// were not visible this frame so they stop decoding (and replay fresh if
+        /// they scroll back into view).
+        pub fn end_frame(&mut self) {
+            let req = &self.requested;
+            self.players.retain(|p, _| req.contains(p));
         }
     }
 

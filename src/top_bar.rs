@@ -2,6 +2,7 @@
 //! backup / find-issues / settings action buttons. Split out of `main.rs`.
 
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -12,6 +13,11 @@ use crate::{card_frame, svg_button};
 
 const GRAPH_POINTS: usize = 120;
 
+/// Per-metric accent colours for the live graphs (line + gradient fill + value).
+const CPU_COLOR: Color32 = Color32::from_rgb(83, 156, 255); // blue
+const RAM_COLOR: Color32 = Color32::from_rgb(180, 132, 255); // violet
+const GPU_COLOR: Color32 = Color32::from_rgb(60, 210, 140); // green
+
 // ---------------------------------------------------------------------------
 // Live CPU / RAM sampling for the center graphs.
 // ---------------------------------------------------------------------------
@@ -20,9 +26,20 @@ pub struct SystemStats {
     last_sample: Instant,
     cpu: VecDeque<f32>, // each value 0.0..=1.0
     ram: VecDeque<f32>, // each value 0.0..=1.0
+    gpu: VecDeque<f32>, // each value 0.0..=1.0 (only filled when a GPU is found)
     cpu_pct: f32,
     ram_used_gb: f64,
     ram_total_gb: f64,
+    gpu_pct: f32,
+    gpu_mem_used_gb: f64,
+    gpu_mem_total_gb: f64,
+    /// True once the background sampler has seen a GPU (drives whether the GPU
+    /// graph is shown at all).
+    gpu_available: bool,
+    /// The GPU sampler thread is spawned lazily on first `update()`.
+    gpu_started: bool,
+    /// Latest GPU reading, written by the background sampler thread.
+    gpu_shared: Arc<Mutex<GpuInfo>>,
 }
 
 impl Default for SystemStats {
@@ -35,9 +52,16 @@ impl Default for SystemStats {
             last_sample: Instant::now() - Duration::from_secs(60),
             cpu: VecDeque::with_capacity(GRAPH_POINTS),
             ram: VecDeque::with_capacity(GRAPH_POINTS),
+            gpu: VecDeque::with_capacity(GRAPH_POINTS),
             cpu_pct: 0.0,
             ram_used_gb: 0.0,
             ram_total_gb: 0.0,
+            gpu_pct: 0.0,
+            gpu_mem_used_gb: 0.0,
+            gpu_mem_total_gb: 0.0,
+            gpu_available: false,
+            gpu_started: false,
+            gpu_shared: Arc::new(Mutex::new(GpuInfo::default())),
         }
     }
 }
@@ -62,6 +86,22 @@ impl SystemStats {
 
         push_capped(&mut self.cpu, (self.cpu_pct / 100.0).clamp(0.0, 1.0));
         push_capped(&mut self.ram, (used / total).clamp(0.0, 1.0) as f32);
+
+        // GPU is sampled off-thread (nvidia-smi blocks for tens of ms), started
+        // lazily so it only runs while the stats are actually being shown.
+        if !self.gpu_started {
+            self.gpu_started = true;
+            spawn_gpu_sampler(Arc::clone(&self.gpu_shared));
+        }
+        if let Ok(g) = self.gpu_shared.lock() {
+            self.gpu_available = g.available;
+            self.gpu_pct = g.util * 100.0;
+            self.gpu_mem_used_gb = g.mem_used_gb;
+            self.gpu_mem_total_gb = g.mem_total_gb;
+        }
+        if self.gpu_available {
+            push_capped(&mut self.gpu, (self.gpu_pct / 100.0).clamp(0.0, 1.0));
+        }
     }
 }
 
@@ -70,6 +110,76 @@ fn push_capped(buf: &mut VecDeque<f32>, v: f32) {
         buf.pop_front();
     }
     buf.push_back(v);
+}
+
+// ---------------------------------------------------------------------------
+// GPU sampling (NVIDIA via nvidia-smi). Runs on a background thread so the
+// process spawn never stalls the UI. AMD/Intel GPUs aren't covered — the graph
+// simply doesn't appear when no NVIDIA GPU is present.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+struct GpuInfo {
+    available: bool,
+    util: f32, // 0.0..=1.0
+    mem_used_gb: f64,
+    mem_total_gb: f64,
+}
+
+/// One `nvidia-smi` reading. `None` means the tool is missing / errored (no
+/// usable NVIDIA GPU); `Some` carries the current utilisation and VRAM.
+fn query_gpu() -> Option<GpuInfo> {
+    let mut cmd = std::process::Command::new("nvidia-smi");
+    cmd.args([
+        "--query-gpu=utilization.gpu,memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ]);
+    crate::pixal3d::hide_window(&mut cmd);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // First GPU only (multi-GPU boxes report one line each).
+    let line = text.lines().next()?;
+    let mut parts = line.split(',').map(|s| s.trim());
+    let util = parts.next()?.parse::<f32>().ok()?;
+    let used_mib = parts.next()?.parse::<f64>().ok()?;
+    let total_mib = parts.next()?.parse::<f64>().ok()?;
+    Some(GpuInfo {
+        available: true,
+        util: (util / 100.0).clamp(0.0, 1.0),
+        mem_used_gb: used_mib / 1024.0,
+        mem_total_gb: total_mib / 1024.0,
+    })
+}
+
+/// Poll the GPU on a background thread, publishing the latest reading into
+/// `shared`. Stops itself if the very first query fails (no NVIDIA GPU); once it
+/// has seen a GPU it keeps retrying through transient failures.
+fn spawn_gpu_sampler(shared: Arc<Mutex<GpuInfo>>) {
+    std::thread::spawn(move || {
+        let mut seen_ok = false;
+        loop {
+            match query_gpu() {
+                Some(info) => {
+                    seen_ok = true;
+                    if let Ok(mut g) = shared.lock() {
+                        *g = info;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                None if !seen_ok => {
+                    // No NVIDIA GPU / tool unavailable — leave it hidden and stop.
+                    if let Ok(mut g) = shared.lock() {
+                        g.available = false;
+                    }
+                    return;
+                }
+                None => std::thread::sleep(Duration::from_secs(1)),
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -153,43 +263,83 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool, update_bad
                             }
                             ui.add_space(14.0);
 
-                            // CENTRE: CPU / RAM live graphs in the leftover space.
-                            // Hidden when the user disables stats in Settings.
+                            // CENTRE: CPU / RAM / GPU live graphs in the leftover
+                            // space. Hidden when the user disables stats in Settings;
+                            // the GPU cell only appears when an NVIDIA GPU is found.
                             if show_stats {
                             ui.with_layout(
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     let avail = ui.available_width();
 
-                                    // Stretch dynamically, but max out at 280px so it isn't massive.
-                                    let chart_w = (avail * 0.35).clamp(150.0, 280.0);
+                                    // The metrics to show this frame.
+                                    let mut cells: Vec<StatCell> = vec![
+                                        StatCell {
+                                            name: "CPU",
+                                            value: format!("{:.0}%", stats.cpu_pct),
+                                            data: &stats.cpu,
+                                            color: CPU_COLOR,
+                                            label_w: 44.0,
+                                            tooltip: None,
+                                        },
+                                        StatCell {
+                                            name: "RAM",
+                                            value: format!(
+                                                "{:.1}/{:.0} GB",
+                                                stats.ram_used_gb, stats.ram_total_gb
+                                            ),
+                                            data: &stats.ram,
+                                            color: RAM_COLOR,
+                                            label_w: 74.0,
+                                            tooltip: Some(format!(
+                                                "{:.1} / {:.1} GB used",
+                                                stats.ram_used_gb, stats.ram_total_gb
+                                            )),
+                                        },
+                                    ];
+                                    if stats.gpu_available {
+                                        cells.push(StatCell {
+                                            name: "GPU",
+                                            value: format!("{:.0}%", stats.gpu_pct),
+                                            data: &stats.gpu,
+                                            color: GPU_COLOR,
+                                            label_w: 44.0,
+                                            tooltip: Some(format!(
+                                                "{:.0}% · VRAM {:.1} / {:.1} GB",
+                                                stats.gpu_pct,
+                                                stats.gpu_mem_used_gb,
+                                                stats.gpu_mem_total_gb
+                                            )),
+                                        });
+                                    }
 
-                                    // Math to perfectly center the two stats in the remaining gap
-                                    let text_w = 65.0; // Estimate for label width
-                                    let gap_w = 32.0;  // Gap between CPU and RAM
-                                    let total_center_w = (text_w + 8.0 + chart_w) * 2.0 + gap_w;
+                                    let n = cells.len() as f32;
+                                    let gap = 16.0;
+                                    let inner = 8.0; // between a label and its chart
+                                    let sum_label: f32 = cells.iter().map(|c| c.label_w).sum();
+                                    // Charts share the leftover space equally so all fit.
+                                    let chart_w = ((avail - sum_label - n * inner
+                                        - (n - 1.0) * gap)
+                                        / n)
+                                        .clamp(90.0, 240.0);
+                                    let total =
+                                        sum_label + n * inner + chart_w * n + gap * (n - 1.0);
 
-                                    let left_padding = (avail - total_center_w) / 2.0;
+                                    // Bias the block toward the right (closer to the
+                                    // action buttons) instead of centring it in the
+                                    // leftover gap.
+                                    let slack = (avail - total).max(0.0);
+                                    let left_padding = slack * 0.70;
                                     if left_padding > 0.0 {
                                         ui.add_space(left_padding);
                                     }
 
-                                    stat_graph(
-                                        ui,
-                                        &format!("CPU: {:.0}%", stats.cpu_pct),
-                                        &stats.cpu,
-                                        chart_w
-                                    );
-                                    ui.add_space(gap_w);
-                                    stat_graph(
-                                        ui,
-                                        &format!(
-                                            "RAM: {:.1} / {:.1} GB",
-                                            stats.ram_used_gb, stats.ram_total_gb
-                                        ),
-                                        &stats.ram,
-                                        chart_w
-                                    );
+                                    for (i, c) in cells.iter().enumerate() {
+                                        if i > 0 {
+                                            ui.add_space(gap);
+                                        }
+                                        stat_cell(ui, c, chart_w);
+                                    }
                                 },
                             );
                             }
@@ -217,47 +367,125 @@ fn bar_button_icon(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, label: &str, 
     )
 }
 
-/// CPU/RAM label + live line graph, matching the top bar's center stats.
-fn stat_graph(ui: &mut egui::Ui, label: &str, data: &VecDeque<f32>, graph_width: f32) {
-    ui.label(egui::RichText::new(label).color(MUTED()).size(12.0));
+/// One metric to render in the centre stats: a short name, its formatted value,
+/// the history buffer, and the accent colour.
+struct StatCell<'a> {
+    name: &'a str,
+    value: String,
+    data: &'a VecDeque<f32>,
+    color: Color32,
+    /// Fixed width of this metric's label column. Sized per-metric (narrow for a
+    /// "9%" value, wider for "15.0/31 GB") so the number sits snug to its chart
+    /// and the metrics stay evenly spaced.
+    label_w: f32,
+    /// Extra detail shown when hovering the sparkline (e.g. exact GB).
+    tooltip: Option<String>,
+}
+
+/// A stat cell: a two-line label (muted name over coloured value) beside a modern
+/// gradient-area sparkline.
+fn stat_cell(ui: &mut egui::Ui, cell: &StatCell, chart_w: f32) {
+    let label_w = cell.label_w;
+    ui.allocate_ui_with_layout(
+        egui::vec2(label_w, 42.0),
+        // Right-align so the value hugs the chart to its right (a tight, readable
+        // pairing) rather than floating far to the left of it.
+        egui::Layout::top_down(egui::Align::Max),
+        |ui| {
+            // Pin the label column to a fixed width so the chart never shifts when
+            // the value's digit count changes (e.g. 8% → 10% → 100%).
+            ui.set_min_width(label_w);
+            ui.set_max_width(label_w);
+            ui.spacing_mut().item_spacing.y = 1.0;
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(cell.name)
+                    .color(MUTED())
+                    .size(10.5)
+                    .strong()
+                    .extra_letter_spacing(1.0),
+            );
+            ui.label(egui::RichText::new(&cell.value).color(cell.color).size(13.5).strong());
+        },
+    );
     ui.add_space(8.0);
-
-    // Replaced the hardcoded 150.0 width with our dynamic parameter
-    let size = egui::vec2(graph_width, 36.0);
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let painter = ui.painter_at(rect);
-
-    let bg = Color32::from_rgba_unmultiplied(235, 235, 235, 15);
-    let guide = Color32::from_rgba_unmultiplied(235, 235, 235, 25);
-    let border = Color32::from_rgba_unmultiplied(235, 235, 235, 35);
-    let line = Color32::from_rgba_unmultiplied(64, 140, 255, 220);
-
-    painter.rect_filled(rect, CornerRadius::same(10), bg);
-
-    let pad = 6.0;
-    for k in 1..=2 {
-        let y = rect.top() + pad + (rect.height() - 2.0 * pad) * k as f32 / 3.0;
-        painter.hline(rect.left() + pad..=rect.right() - pad, y, Stroke::new(1.0, guide));
+    let resp = modern_chart(ui, cell.data, cell.color, chart_w);
+    if let Some(tip) = &cell.tooltip {
+        resp.on_hover_text(tip);
     }
+}
+
+/// A modern sparkline: rounded translucent card, a gradient area fading down from
+/// the accent-coloured line, faint guides, and a glowing dot at the latest value.
+fn modern_chart(ui: &mut egui::Ui, data: &VecDeque<f32>, accent: Color32, width: f32) -> egui::Response {
+    let size = egui::vec2(width, 42.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let radius = CornerRadius::same(12);
+
+    // Card + hairline border.
+    painter.rect_filled(rect, radius, Color32::from_rgba_unmultiplied(255, 255, 255, 10));
     painter.rect_stroke(
         rect,
-        CornerRadius::same(10),
-        Stroke::new(1.0, border),
+        radius,
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 20)),
         egui::StrokeKind::Inside,
     );
+
+    let pad = 6.0;
+    let top = rect.top() + pad;
+    let bottom = rect.bottom() - pad;
+    let inner_h = bottom - top;
+
+    // Two faint horizontal guides at 1/3 and 2/3.
+    let guide = Color32::from_rgba_unmultiplied(255, 255, 255, 12);
+    for k in 1..=2 {
+        let y = top + inner_h * k as f32 / 3.0;
+        painter.hline(rect.left() + pad..=rect.right() - pad, y, Stroke::new(1.0, guide));
+    }
 
     if data.len() >= 2 {
         let n = data.len();
         let step = (rect.width() - 2.0 * pad) / (n - 1) as f32;
-        let points: Vec<egui::Pos2> = data
+        let pts: Vec<egui::Pos2> = data
             .iter()
             .enumerate()
             .map(|(i, &v)| {
                 let x = rect.left() + pad + i as f32 * step;
-                let y = rect.top() + pad + (1.0 - v) * (rect.height() - 2.0 * pad);
+                let y = bottom - v.clamp(0.0, 1.0) * inner_h;
                 egui::pos2(x, y)
             })
             .collect();
-        painter.add(egui::Shape::line(points, Stroke::new(1.4, line)));
+
+        // Gradient area: accent near the line, fading to transparent at the base.
+        let fill_top =
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 70);
+        let fill_bot = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 0);
+        let mut mesh = egui::Mesh::default();
+        for (i, p) in pts.iter().enumerate() {
+            let base = mesh.vertices.len() as u32;
+            mesh.colored_vertex(*p, fill_top);
+            mesh.colored_vertex(egui::pos2(p.x, bottom), fill_bot);
+            if i > 0 {
+                mesh.add_triangle(base - 2, base - 1, base);
+                mesh.add_triangle(base - 1, base + 1, base);
+            }
+        }
+        painter.add(egui::Shape::mesh(mesh));
+
+        // The line itself.
+        painter.add(egui::Shape::line(pts.clone(), Stroke::new(1.8, accent)));
+
+        // Glowing dot at the current (rightmost) value.
+        if let Some(last) = pts.last() {
+            painter.circle_filled(
+                *last,
+                5.0,
+                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 55),
+            );
+            painter.circle_filled(*last, 2.6, accent);
+        }
     }
+
+    resp
 }
