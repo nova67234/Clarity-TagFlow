@@ -559,7 +559,7 @@ fn has_steps_anchor(raw: &str) -> bool {
 /// Format a ComfyUI `prompt` node-graph JSON into a readable summary, walking the
 /// graph the same way the Java `formatComfyUIMetadata` does.
 fn format_comfyui(prompt_json: &str) -> Option<String> {
-    let root: serde_json::Value = serde_json::from_str(prompt_json).ok()?;
+    let root: serde_json::Value = parse_comfy_json(prompt_json)?;
     let nodes = root.as_object()?;
 
     let mut positive = String::new();
@@ -715,4 +715,690 @@ fn trace_prompt(nodes: &serde_json::Map<String, serde_json::Value>, link: Option
         }
     }
     String::new()
+}
+
+// ---------------------------------------------------------------------------
+// Structured extraction for the generator's drag-and-drop import — the prompt
+// text, the core generation settings, and the ComfyUI custom nodes a workflow
+// depends on (so they can be downloaded/installed on drop).
+// ---------------------------------------------------------------------------
+
+/// One custom node a dropped ComfyUI workflow depends on. Populated from the
+/// `workflow` chunk's per-node `properties`: `aux_id` is the GitHub `owner/repo`
+/// it was installed from, `cnr_id` its Comfy-registry id. Core ComfyUI nodes
+/// carry neither, so collecting only the nodes that have one naturally yields
+/// just the custom (downloadable) ones.
+#[derive(Clone, Debug)]
+pub struct CustomNodeRef {
+    /// Display / install-folder name (the repo name, or the registry id).
+    pub name: String,
+    /// `owner/repo` when known (from `aux_id`) — directly clonable from GitHub.
+    pub repo: Option<String>,
+    /// Comfy-registry id (from `cnr_id`), resolved to a repo via the registry
+    /// API when no `aux_id` is present.
+    pub cnr_id: Option<String>,
+}
+
+/// A Civitai resource the image was made with, from the `Civitai resources:`
+/// block an Image-Saver node writes (`urn:air:…:<kind>:civitai:<model>@<version>`).
+/// Lets the importer resolve+download the exact model/LoRA files by version id.
+#[derive(Clone, Debug)]
+pub struct CivitaiRef {
+    pub version_id: i64,
+    /// AIR resource kind: `checkpoint`, `lora`, `vae`, … (drives the target folder).
+    pub kind: String,
+}
+
+/// Everything a drag-and-drop import pulls out of a generated image/video: the
+/// prompt text, the core settings, and the custom nodes the workflow used.
+#[derive(Clone, Debug, Default)]
+pub struct DroppedMeta {
+    pub positive: String,
+    pub negative: String,
+    pub steps: Option<i64>,
+    pub cfg: Option<f64>,
+    pub seed: Option<i64>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub custom_nodes: Vec<CustomNodeRef>,
+    /// LoRAs the generation used: `(name, strength)`. `name` is as recorded
+    /// (often with a `.safetensors` extension); the importer matches it against
+    /// installed LoRAs by file stem and auto-selects them.
+    pub loras: Vec<(String, f32)>,
+    /// The **runnable** ComfyUI API graph (the `prompt` chunk) — the exact
+    /// node graph that produced the image, custom nodes and all. When present,
+    /// Generate can run *this* graph (with the prompt/seed swapped in) instead of
+    /// the app's built-in pipeline, so the imported custom nodes are actually
+    /// used. `None` for files that only carry a UI `workflow` graph or A1111 text.
+    pub workflow_api: Option<String>,
+    /// Civitai resources the image was generated with (checkpoint + LoRAs, by
+    /// version id) — used to auto-download the missing model files.
+    pub civitai: Vec<CivitaiRef>,
+}
+
+impl DroppedMeta {
+    /// Nothing worth importing (no prompt, no settings, no nodes, no LoRAs).
+    pub fn is_empty(&self) -> bool {
+        self.positive.trim().is_empty()
+            && self.negative.trim().is_empty()
+            && self.steps.is_none()
+            && self.cfg.is_none()
+            && self.seed.is_none()
+            && self.width.is_none()
+            && self.height.is_none()
+            && self.custom_nodes.is_empty()
+            && self.loras.is_empty()
+    }
+}
+
+/// Read a file's embedded generation metadata into a structured form for the
+/// generator's drag-and-drop import. Handles both ComfyUI (`prompt` + `workflow`
+/// node graphs) and A1111-style `parameters` blocks. `None` only when the file
+/// can't be read or carries no recognisable metadata.
+pub fn read_generation(path: &Path) -> Option<DroppedMeta> {
+    // A dropped ComfyUI workflow / API-prompt `.json` (exported from ComfyUI),
+    // not an image: parse it directly.
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")) {
+        return read_generation_json(path);
+    }
+
+    // Videos carry the workflow inside the container (Matroska/MP4 tags), not in
+    // PNG/EXIF, and are too large for `metadata_map` (which refuses them). Scan a
+    // bounded window of the file for the embedded ComfyUI `workflow` object.
+    if crate::is_video(path) {
+        return read_generation_video(path);
+    }
+
+    let map = metadata_map(path)?;
+    let mut out = DroppedMeta::default();
+
+    // ComfyUI: the API `prompt` graph gives the prompt + settings; the `workflow`
+    // graph names the custom nodes it depends on.
+    if let Some(prompt_json) = map.get("prompt").filter(|s| !s.trim().is_empty()) {
+        comfy_prompt_into(prompt_json, &mut out);
+        // The API graph is runnable — keep it (sanitised of NaN/Infinity so it
+        // re-parses) so Generate can run this exact workflow (custom nodes
+        // included) rather than the built-in pipeline.
+        out.workflow_api = Some(sanitize_json(prompt_json));
+    }
+    if let Some(workflow_json) = map.get("workflow").filter(|s| !s.trim().is_empty()) {
+        out.custom_nodes = comfy_custom_nodes(workflow_json);
+        // If the API graph had no prompt (rare), recover it from the UI graph.
+        if out.positive.trim().is_empty() {
+            workflow_widgets_into(workflow_json, &mut out);
+        }
+    }
+
+    // A1111: a `parameters` block with a `Steps:` anchor (no custom nodes).
+    if out.positive.trim().is_empty() {
+        if let Some(p) = map.get("parameters").filter(|p| has_steps_anchor(p)) {
+            a1111_into(p, &mut out);
+        }
+    }
+
+    // Civitai resources (checkpoint + LoRAs by version id) — written by the
+    // Image-Saver node into the `parameters` block; independent of prompt-fill.
+    if let Some(p) = map.get("parameters") {
+        out.civitai = parse_civitai_resources(p);
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Parse the `Civitai resources: [ {…"air":"urn:air:…:<kind>:civitai:<m>@<v>"} ]`
+/// block from an A1111 parameter string into resolvable `(version_id, kind)`s.
+fn parse_civitai_resources(raw: &str) -> Vec<CivitaiRef> {
+    let Some(i) = ci_find(raw, "civitai resources:") else { return Vec::new() };
+    let after = &raw["civitai resources:".len() + i..];
+    let Some(open) = after.find('[') else { return Vec::new() };
+    let Some(arr_str) = balanced_span(after, open, b'[', b']') else { return Vec::new() };
+    let Ok(arr) = serde_json::from_str::<serde_json::Value>(&arr_str) else { return Vec::new() };
+    let Some(items) = arr.as_array() else { return Vec::new() };
+
+    let mut out = Vec::new();
+    for it in items {
+        let Some(air) = it.get("air").and_then(|v| v.as_str()) else { continue };
+        // urn:air:<eco>:<kind>:civitai:<modelId>@<versionId>
+        let parts: Vec<&str> = air.split(':').collect();
+        let kind = parts.get(3).copied().unwrap_or("").to_string();
+        if let Some(tail) = air.rsplit("civitai:").next() {
+            if let Some(ver) = tail.split('@').nth(1) {
+                if let Ok(version_id) = ver.trim().parse::<i64>() {
+                    out.push(CivitaiRef { version_id, kind });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Balanced `open_char … close_char` slice starting at byte `open`, string-aware
+/// (so brackets inside JSON strings don't unbalance it). `None` if never closed.
+fn balanced_span(text: &str, open: usize, open_char: u8, close_char: u8) -> Option<String> {
+    let bytes = text.as_bytes();
+    let (mut depth, mut in_str, mut escaped) = (0i32, false, false);
+    let mut i = open;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+        } else if b == b'"' {
+            in_str = true;
+        } else if b == open_char {
+            depth += 1;
+        } else if b == close_char {
+            depth -= 1;
+            if depth == 0 {
+                return text.get(open..=i).map(str::to_string);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Import a dropped ComfyUI `.json` directly: a **UI workflow** export (has a
+/// top-level `nodes` array → custom nodes + best-effort prompt/settings) or an
+/// **API prompt** graph (a map of id → `{class_type, inputs}` → prompt/settings,
+/// but no custom-node source info).
+fn read_generation_json(path: &Path) -> Option<DroppedMeta> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = parse_comfy_json(&text)?;
+    let mut out = DroppedMeta::default();
+    if v.get("nodes").and_then(|n| n.as_array()).is_some() {
+        out.custom_nodes = comfy_custom_nodes(&text);
+        workflow_widgets_into(&text, &mut out);
+    } else if v.is_object() {
+        comfy_prompt_into(&text, &mut out);
+        // An API-format graph is runnable (sanitised so it re-parses cleanly).
+        out.workflow_api = Some(sanitize_json(&text));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Bounded read of the head + tail of a (potentially huge) video file. ComfyUI
+/// writes the workflow/prompt as container tags near the start or end, so a
+/// capped window finds them without ever loading the whole clip into memory.
+const VIDEO_HEAD: usize = 24 * 1024 * 1024;
+const VIDEO_TAIL: usize = 8 * 1024 * 1024;
+
+/// Drag-and-drop import for a generated **video**: pull the ComfyUI `workflow`
+/// object out of the container and read its custom nodes + (best-effort) prompt
+/// and settings from the nodes' `widgets_values`.
+fn read_generation_video(path: &Path) -> Option<DroppedMeta> {
+    use std::io::{Read, Seek, SeekFrom};
+    let len = std::fs::metadata(path).ok()?.len();
+    let mut file = std::fs::File::open(path).ok()?;
+
+    let head_n = (len as usize).min(VIDEO_HEAD);
+    let mut head = vec![0u8; head_n];
+    file.read_exact(&mut head).ok()?;
+    let mut text = String::from_utf8_lossy(&head).into_owned();
+    if len as usize > VIDEO_HEAD {
+        let tail_start = len.saturating_sub(VIDEO_TAIL as u64).max(VIDEO_HEAD as u64);
+        if file.seek(SeekFrom::Start(tail_start)).is_ok() {
+            let mut tail = vec![0u8; (len - tail_start) as usize];
+            if file.read_exact(&mut tail).is_ok() {
+                text.push_str(&String::from_utf8_lossy(&tail));
+            }
+        }
+    }
+
+    // The workflow object opens with `{"last_node_id": …}` — a key unique to the
+    // top level — so the brace right before it is the object's start.
+    let marker = ci_find(&text, "\"last_node_id\"")?;
+    let open = text[..marker].rfind('{')?;
+    let workflow_json = balanced_object(&text, open)?;
+
+    let mut out = DroppedMeta::default();
+    out.custom_nodes = comfy_custom_nodes(&workflow_json);
+    workflow_widgets_into(&workflow_json, &mut out);
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Return the balanced `{ … }` slice starting at byte `open` (which must index a
+/// `{`), tracking JSON string state + escapes so braces inside strings don't
+/// throw off the depth count. `None` if the object never closes within `text`.
+fn balanced_object(text: &str, open: usize) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut i = open;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+        } else {
+            match b {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return text.get(open..=i).map(str::to_string);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Best-effort prompt + settings from a ComfyUI **UI** (`workflow`) graph, read
+/// from each node's positional `widgets_values`. Used for videos (and images
+/// lacking an API graph), where the clean API `prompt` graph isn't available.
+/// Widget layouts vary, so this is a heuristic: the positive prompt is taken as
+/// the longest `CLIPTextEncode` text.
+fn workflow_widgets_into(workflow_json: &str, out: &mut DroppedMeta) {
+    let Some(root) = parse_comfy_json(workflow_json) else { return };
+    let Some(nodes) = root.get("nodes").and_then(|v| v.as_array()) else { return };
+
+    let num_i = |v: Option<&serde_json::Value>| -> Option<i64> {
+        v.and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)).or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+    };
+    let num_f = |v: Option<&serde_json::Value>| -> Option<f64> {
+        v.and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+    };
+
+    let mut prompts: Vec<String> = Vec::new();
+    for node in nodes {
+        let ty = node.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let wv = node.get("widgets_values").and_then(|v| v.as_array());
+        match ty {
+            "CLIPTextEncode" | "CLIPTextEncodeSDXL" => {
+                if let Some(s) = wv.and_then(|a| a.first()).and_then(|v| v.as_str()) {
+                    if !s.trim().is_empty() {
+                        prompts.push(s.trim().to_string());
+                    }
+                }
+            }
+            // KSampler widgets: [seed, control_after_generate, steps, cfg, …].
+            "KSampler" | "KSamplerAdvanced" => {
+                if let Some(a) = wv {
+                    if out.seed.is_none() {
+                        out.seed = num_i(a.first());
+                    }
+                    if out.steps.is_none() {
+                        out.steps = num_i(a.get(2));
+                    }
+                    if out.cfg.is_none() {
+                        out.cfg = num_f(a.get(3));
+                    }
+                }
+            }
+            "EmptyLatentImage" | "EmptySD3LatentImage" => {
+                if let Some(a) = wv {
+                    if out.width.is_none() {
+                        out.width = num_i(a.first()).filter(|&w| w > 0);
+                    }
+                    if out.height.is_none() {
+                        out.height = num_i(a.get(1)).filter(|&h| h > 0);
+                    }
+                }
+            }
+            // LoraLoader UI widgets: [lora_name, strength_model, strength_clip].
+            ty if ty.contains("LoraLoader") => {
+                if let Some(a) = wv {
+                    if let Some(name) = a.first().and_then(|v| v.as_str()) {
+                        if !name.is_empty() {
+                            let strength = num_f(a.get(1)).unwrap_or(1.0) as f32;
+                            out.loras.push((name.to_string(), strength));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Positive = the longest text-encode value; negative = the next longest.
+    prompts.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    if out.positive.trim().is_empty() {
+        if let Some(p) = prompts.first() {
+            out.positive = p.clone();
+        }
+    }
+    if out.negative.trim().is_empty() {
+        if let Some(n) = prompts.get(1) {
+            out.negative = n.clone();
+        }
+    }
+}
+
+/// Walk a ComfyUI API `prompt` graph, filling the prompt text + generation
+/// settings into `out`. Mirrors [`format_comfyui`]'s node walk.
+fn comfy_prompt_into(prompt_json: &str, out: &mut DroppedMeta) {
+    let Some(root) = parse_comfy_json(prompt_json) else { return };
+    let Some(nodes) = root.as_object() else { return };
+
+    let as_i = |v: &serde_json::Value| -> Option<i64> {
+        v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)).or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+    };
+    let as_f = |v: &serde_json::Value| -> Option<f64> {
+        v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+    };
+
+    for node in nodes.values() {
+        let class_type = node.get("class_type").and_then(|v| v.as_str()).unwrap_or("");
+        let inputs = node.get("inputs").cloned().unwrap_or(serde_json::Value::Null);
+        match class_type {
+            "EmptyLatentImage" | "EmptySD3LatentImage" => {
+                if out.width.is_none() {
+                    out.width = inputs.get("width").and_then(&as_i).filter(|&w| w > 0);
+                }
+                if out.height.is_none() {
+                    out.height = inputs.get("height").and_then(&as_i).filter(|&h| h > 0);
+                }
+            }
+            "KSampler" | "KSamplerAdvanced" => {
+                if out.seed.is_none() {
+                    out.seed = inputs.get("seed").and_then(&as_i).or_else(|| inputs.get("noise_seed").and_then(&as_i));
+                }
+                if out.steps.is_none() {
+                    out.steps = inputs.get("steps").and_then(&as_i);
+                }
+                if out.cfg.is_none() {
+                    out.cfg = inputs.get("cfg").and_then(&as_f);
+                }
+                if out.positive.trim().is_empty() {
+                    let p = trace_prompt(nodes, inputs.get("positive"));
+                    if !p.is_empty() {
+                        out.positive = p;
+                    }
+                }
+                if out.negative.trim().is_empty() {
+                    let n = trace_prompt(nodes, inputs.get("negative"));
+                    if !n.is_empty() {
+                        out.negative = n;
+                    }
+                }
+            }
+            ct if ct.contains("LoraLoader") => {
+                if let Some(name) = inputs.get("lora_name").and_then(|v| v.as_str()) {
+                    if !name.is_empty() {
+                        let strength = inputs.get("strength_model").and_then(&as_f).unwrap_or(1.0) as f32;
+                        out.loras.push((name.to_string(), strength));
+                    }
+                }
+            }
+            "Power Lora Loader (rgthree)" => {
+                if let Some(obj) = inputs.as_object() {
+                    for (field, lnode) in obj {
+                        if field.starts_with("lora_") && lnode.is_object() {
+                            let on = lnode.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
+                            if on {
+                                if let Some(name) = lnode.get("lora").and_then(|v| v.as_str()) {
+                                    if !name.is_empty() {
+                                        let strength = lnode.get("strength").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                                        out.loras.push((name.to_string(), strength));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collect the custom nodes a ComfyUI `workflow` (UI) graph depends on, from each
+/// node's `properties.aux_id` / `properties.cnr_id`. Core ComfyUI nodes carry
+/// neither (or `cnr_id == "comfy-core"`), so they're skipped — only the
+/// installable custom nodes come back, de-duplicated.
+fn comfy_custom_nodes(workflow_json: &str) -> Vec<CustomNodeRef> {
+    let Some(root) = parse_comfy_json(workflow_json) else { return Vec::new() };
+    let Some(nodes) = root.get("nodes").and_then(|v| v.as_array()) else { return Vec::new() };
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for node in nodes {
+        let Some(props) = node.get("properties") else { continue };
+        let aux = props
+            .get("aux_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty() && s.contains('/') && s != "comfyanonymous/ComfyUI");
+        let cnr = props
+            .get("cnr_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty() && s != "comfy-core");
+        if aux.is_none() && cnr.is_none() {
+            continue;
+        }
+        // De-dupe by repo when known, else by registry id.
+        let key = aux.clone().or_else(|| cnr.clone()).unwrap();
+        if !seen.insert(key) {
+            continue;
+        }
+        let name = match (&aux, &cnr) {
+            (Some(repo), _) => repo.rsplit('/').next().unwrap_or(repo).to_string(),
+            (None, Some(id)) => id.clone(),
+            _ => continue,
+        };
+        out.push(CustomNodeRef { name, repo: aux, cnr_id: cnr });
+    }
+    out
+}
+
+/// Parse an A1111 `parameters` block into the prompt + negative + settings +
+/// LoRAs. The positive prompt's `<lora:name:weight>` tags are pulled into
+/// `out.loras` and stripped from the text (the app applies LoRAs via node
+/// selection, not inline tags).
+fn a1111_into(raw: &str, out: &mut DroppedMeta) {
+    const NEG_KEY: &str = "\nnegative prompt:";
+    let neg_idx = ci_find(raw, NEG_KEY);
+    let steps_idx = ci_find(raw, "steps:");
+
+    // Positive = everything before the "Negative prompt:" line or the "Steps:"
+    // line, whichever comes first.
+    let pos_end = [neg_idx, steps_idx].into_iter().flatten().min();
+    let pos = match pos_end {
+        Some(i) => &raw[..i],
+        None => raw,
+    };
+    out.positive = extract_and_strip_loras(pos.trim(), out);
+
+    // Negative = between the "Negative prompt:" line and the "Steps:" line.
+    if let Some(ni) = neg_idx {
+        let after = &raw[ni + NEG_KEY.len()..];
+        let neg = match ci_find(after, "steps:") {
+            Some(j) => &after[..j],
+            None => after,
+        };
+        out.negative = neg.trim().to_string();
+    }
+
+    out.steps = a1111_field(raw, "Steps:").and_then(|s| s.parse().ok());
+    out.cfg = a1111_field(raw, "CFG scale:").and_then(|s| s.parse().ok());
+    out.seed = a1111_field(raw, "Seed:").and_then(|s| s.parse().ok());
+    if let Some(size) = a1111_field(raw, "Size:") {
+        if let Some((w, h)) = size.split_once('x') {
+            out.width = w.trim().parse().ok();
+            out.height = h.trim().parse().ok();
+        }
+    }
+}
+
+/// Pull `<lora:name:weight>` tags out of `text` into `out.loras` and return the
+/// text with those tags removed (A1111 inline-LoRA syntax; the app selects the
+/// matching installed LoRAs instead of passing the tags to the encoder).
+fn extract_and_strip_loras(text: &str, out: &mut DroppedMeta) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<lora:") {
+        result.push_str(&rest[..start]);
+        let after = &rest[start + "<lora:".len()..];
+        let Some(end) = after.find('>') else {
+            // Unterminated tag — keep the remainder verbatim and stop.
+            result.push_str(&rest[start..]);
+            return result.trim().to_string();
+        };
+        let inner = &after[..end];
+        let (name, weight) = match inner.rsplit_once(':') {
+            Some((n, w)) => (n.trim(), w.trim().parse::<f32>().unwrap_or(1.0)),
+            None => (inner.trim(), 1.0),
+        };
+        if !name.is_empty() {
+            out.loras.push((name.to_string(), weight));
+        }
+        rest = &after[end + 1..];
+    }
+    result.push_str(rest);
+    result.trim().to_string()
+}
+
+/// Read a single A1111 key's value (`Steps: 30, ...`) — the text after the key up
+/// to the next comma or newline.
+fn a1111_field(raw: &str, key: &str) -> Option<String> {
+    let i = ci_find(raw, key)?;
+    let after = &raw[i + key.len()..];
+    let val: String = after.trim_start().chars().take_while(|&c| c != ',' && c != '\n').collect();
+    let val = val.trim().to_string();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val)
+    }
+}
+
+/// Case-insensitive substring search that returns a **byte index valid in the
+/// original** `haystack`. Unlike [`index_of_ignore_case`] it only folds ASCII, so
+/// the index never lands mid-multibyte-character (safe for slicing prompts that
+/// contain Unicode).
+fn ci_find(haystack: &str, needle: &str) -> Option<usize> {
+    haystack.to_ascii_lowercase().find(&needle.to_ascii_lowercase())
+}
+
+/// Parse a ComfyUI graph string, tolerating the non-standard `NaN` / `Infinity`
+/// literals that Python's `json.dumps` (ComfyUI's writer) emits but `serde_json`
+/// rejects. Returns `None` only on genuinely broken JSON.
+pub(crate) fn parse_comfy_json(s: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(s).ok().or_else(|| serde_json::from_str(&sanitize_json(s)).ok())
+}
+
+/// Replace the bare `NaN`, `Infinity`, `-Infinity` value literals (illegal in
+/// strict JSON) with `null`, but only **outside** string literals so prompt text
+/// containing those words is untouched. ComfyUI emits these for fields like a
+/// node's `is_changed`; `null` parses and the executor ignores the field anyway.
+pub(crate) fn sanitize_json(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_str {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_str = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // Outside a string, JSON has no bare identifiers except true/false/null
+        // and numbers — so these tokens are always the illegal literals.
+        let matches = |lit: &str| chars[i..].iter().take(lit.len()).copied().eq(lit.chars());
+        if matches("-Infinity") {
+            out.push_str("null");
+            i += "-Infinity".len();
+        } else if matches("Infinity") {
+            out.push_str("null");
+            i += "Infinity".len();
+        } else if matches("NaN") {
+            out.push_str("null");
+            i += "NaN".len();
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+pub(crate) mod drop_import_tests {
+    use super::*;
+
+    /// The committed sample image under `tests/example/` (whatever it is) must
+    /// parse into a prompt + a runnable API graph for drag-drop import. Found
+    /// dynamically so swapping the sample image doesn't break the test.
+    pub(crate) fn example_png() -> Option<std::path::PathBuf> {
+        std::fs::read_dir("tests/example")
+            .ok()?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("png")))
+    }
+
+    #[test]
+    fn reads_example_png() {
+        let Some(p) = example_png() else { return };
+        let meta = read_generation(&p).expect("example png should have metadata");
+        assert!(!meta.positive.trim().is_empty(), "a prompt was extracted");
+        assert!(meta.workflow_api.is_some(), "runnable API graph captured");
+        // Inline <lora:> tags must never survive in the prompt text.
+        assert!(!meta.positive.contains("<lora:"), "lora tags stripped");
+    }
+
+    #[test]
+    fn parses_civitai_resources() {
+        let Some(p) = example_png() else { return };
+        let meta = read_generation(&p).expect("metadata");
+        // Skip gracefully if the committed sample has no Civitai resources block.
+        if meta.civitai.is_empty() {
+            return;
+        }
+        assert!(meta.civitai.iter().all(|c| c.version_id > 0), "version ids parsed");
+        assert!(
+            meta.civitai.iter().any(|c| c.kind == "checkpoint"),
+            "a checkpoint resource present"
+        );
+    }
+
+    #[test]
+    fn strips_inline_lora_tags() {
+        let mut m = DroppedMeta::default();
+        let out = extract_and_strip_loras("a cat <lora:Foo:0.8> on a mat <lora:Bar Baz:0.5>", &mut m);
+        assert_eq!(out, "a cat  on a mat");
+        assert_eq!(m.loras, vec![("Foo".to_string(), 0.8), ("Bar Baz".to_string(), 0.5)]);
+    }
 }
