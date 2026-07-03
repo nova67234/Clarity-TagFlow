@@ -40,6 +40,7 @@ pub fn show(
     selected: &mut Option<usize>,
     thumbs: &mut ImageCache,
     video_thumbs: &mut crate::video::VideoThumbs,
+    video_previews: &mut crate::video::VideoPreviews,
     favorites: &mut crate::favorites::Favorites,
     thumb_max_h: f32,
     media_filter: &mut crate::left_panel_settings::MediaFilter,
@@ -142,7 +143,7 @@ pub fn show(
                     return;
                 }
 
-                thumbnail_list(ui, images, filtered, selected, thumbs, video_thumbs, favorites, thumb_max_h);
+                thumbnail_list(ui, images, filtered, selected, thumbs, video_thumbs, video_previews, favorites, thumb_max_h);
             });
         });
 
@@ -158,6 +159,7 @@ fn thumbnail_list(
     selected: &mut Option<usize>,
     thumbs: &mut ImageCache,
     video_thumbs: &mut crate::video::VideoThumbs,
+    video_previews: &mut crate::video::VideoPreviews,
     favorites: &mut crate::favorites::Favorites,
     thumb_max_h: f32,
 ) {
@@ -256,7 +258,7 @@ fn thumbnail_list(
                 let resp = ui.interact(rect, id, egui::Sense::click());
 
                 let is_favorite = favorites.is_favorite(&images[i]);
-                draw_tile(ui, thumbs, video_thumbs, &images[i], rect, *selected == Some(i), is_favorite);
+                draw_tile(ui, thumbs, video_thumbs, video_previews, &images[i], rect, *selected == Some(i), is_favorite);
 
                 if resp.clicked() {
                     *selected = Some(i);
@@ -289,6 +291,7 @@ fn draw_tile(
     ui: &egui::Ui,
     thumbs: &mut ImageCache,
     video_thumbs: &mut crate::video::VideoThumbs,
+    video_previews: &mut crate::video::VideoPreviews,
     path: &Path,
     rect: egui::Rect,
     is_selected: bool,
@@ -297,9 +300,10 @@ fn draw_tile(
     let radius = CornerRadius::same(CORNER);
 
     if crate::is_video(path) {
-        // Show the decoded poster frame; until it's ready (or if VLC isn't
-        // available) fall back to a placeholder tile with a video glyph.
-        match video_thumbs.request(path, ui.ctx()) {
+        // Prefer a live preview frame (the "Video thumbnail play" setting); else
+        // the decoded poster; else a placeholder tile with a video glyph.
+        let live = video_previews.frame(path, ui.ctx());
+        match live.or_else(|| video_thumbs.request(path, ui.ctx())) {
             Some(tex) => {
                 egui::Image::from_texture(&tex)
                     .corner_radius(radius)
@@ -386,14 +390,35 @@ fn heart_badge(ui: &egui::Ui, rect: egui::Rect) {
     // No tint — show the heart SVG's own colour (`#FF5FA0`). Tinting multiplies,
     // which would darken the pink toward red.
     let icon = egui::include_image!("../icons/heart.svg");
-    egui::Image::new(icon).paint_at(ui, badge);
+    paint_pulsing_heart(ui, icon, badge, BASE);
 
-    // Keep animating while a heart is on screen.
-    ui.ctx().request_repaint();
+    // Animate at ~30 FPS rather than unbounded — plenty for a gentle pulse, and it
+    // stops a single on-screen heart from pegging the whole app's redraw rate.
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+}
+
+/// Draw a heart SVG into `badge`, rasterizing it ONCE at a fixed size (with a
+/// little headroom for the pulse peak) and GPU-scaling that cached texture to the
+/// current pulse size. Painting the `Image` directly at the ever-changing pulse
+/// size re-rasterizes the SVG every frame, which pegs the CPU when many favorited
+/// tiles are visible. Shared by the browser and gallery heart badges.
+pub(crate) fn paint_pulsing_heart(
+    ui: &egui::Ui,
+    icon: egui::ImageSource<'_>,
+    badge: egui::Rect,
+    base: f32,
+) {
+    let raster = egui::vec2(base * 1.2, base * 1.2);
+    if let Ok(egui::load::TexturePoll::Ready { texture }) =
+        egui::Image::new(icon).load_for_size(ui.ctx(), raster)
+    {
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        ui.painter().image(texture.id, badge, uv, egui::Color32::WHITE);
+    }
 }
 
 /// True if `path` has a `.gif` extension.
-fn is_gif(path: &Path) -> bool {
+pub(crate) fn is_gif(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("gif"))
@@ -402,7 +427,7 @@ fn is_gif(path: &Path) -> bool {
 
 /// Draw a small "GIF" badge (SVG) in the tile's top-left corner, on a dark
 /// rounded backdrop so it reads on any image.
-fn gif_badge(ui: &egui::Ui, rect: egui::Rect) {
+pub(crate) fn gif_badge(ui: &egui::Ui, rect: egui::Rect) {
     // Square so the GIF wordmark in the (square) SVG keeps its proportions.
     let badge = egui::Rect::from_min_size(rect.min + egui::vec2(6.0, 6.0), egui::vec2(24.0, 24.0));
     ui.painter()
@@ -415,7 +440,7 @@ fn gif_badge(ui: &egui::Ui, rect: egui::Rect) {
 
 /// Draw a small "video" badge (SVG) in the tile's top-left corner, on a dark
 /// rounded backdrop — same treatment as the GIF badge.
-fn video_badge(ui: &egui::Ui, rect: egui::Rect) {
+pub(crate) fn video_badge(ui: &egui::Ui, rect: egui::Rect) {
     let badge = egui::Rect::from_min_size(rect.min + egui::vec2(6.0, 6.0), egui::vec2(24.0, 24.0));
     ui.painter()
         .rect_filled(badge, CornerRadius::same(6), egui::Color32::from_black_alpha(150));

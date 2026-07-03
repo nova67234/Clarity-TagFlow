@@ -471,7 +471,7 @@ fn notes_box(ui: &mut egui::Ui, id: &str, text: &str) {
     let body = if body.is_empty() { "(no notes provided)" } else { body };
     egui::Frame::new()
         .fill(FIELD())
-        .corner_radius(CornerRadius::same(8))
+        .corner_radius(CornerRadius::same(22))
         .inner_margin(Margin::same(8))
         .stroke(Stroke::new(1.0, EDGE()))
         .show(ui, |ui| {

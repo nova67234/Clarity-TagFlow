@@ -33,6 +33,7 @@ pub fn show(
     selected: Option<usize>,
     thumbs: &mut ImageCache,
     video_thumbs: &mut crate::video::VideoThumbs,
+    video_previews: &mut crate::video::VideoPreviews,
     favorites: &mut crate::favorites::Favorites,
     // Target tile/column width, driven by the Thumbnail-size setting.
     target_col_w: f32,
@@ -113,7 +114,7 @@ pub fn show(
                                 // Only decode/paint tiles actually in view (lazy).
                                 if col_ui.is_rect_visible(rect) {
                                     let is_fav = favorites.is_favorite(path);
-                                    tile(col_ui, thumbs, video_thumbs, path, rect, selected == Some(i), is_fav);
+                                    tile(col_ui, thumbs, video_thumbs, video_previews, path, rect, selected == Some(i), is_fav);
                                 } else {
                                     col_ui
                                         .painter()
@@ -326,6 +327,7 @@ fn tile(
     ui: &mut egui::Ui,
     thumbs: &mut ImageCache,
     video_thumbs: &mut crate::video::VideoThumbs,
+    video_previews: &mut crate::video::VideoPreviews,
     path: &Path,
     rect: egui::Rect,
     selected: bool,
@@ -333,7 +335,10 @@ fn tile(
 ) {
     let radius = CornerRadius::same(CORNER);
     if crate::is_video(path) {
-        match video_thumbs.request(path, ui.ctx()) {
+        // A live preview frame (the "Video thumbnail play" setting) wins over the
+        // static poster when one is playing for this tile.
+        let live = video_previews.frame(path, ui.ctx());
+        match live.or_else(|| video_thumbs.request(path, ui.ctx())) {
             Some(tex) => {
                 egui::Image::from_texture(&tex).corner_radius(radius).paint_at(ui, rect);
             }
@@ -346,6 +351,8 @@ fn tile(
                     .paint_at(ui, icon);
             }
         }
+        // A "video" badge in the top-left corner, matching the left browser.
+        crate::left_browser::video_badge(ui, rect);
     } else {
         let now = ui.input(|i| i.time);
         match thumbs.request(path, now) {
@@ -367,6 +374,10 @@ fn tile(
                     MUTED(),
                 );
             }
+        }
+        // A "GIF" badge marks animated files, matching the left browser.
+        if crate::left_browser::is_gif(path) {
+            crate::left_browser::gif_badge(ui, rect);
         }
     }
     // A heart in the top-right corner marks favorited files.
@@ -396,6 +407,9 @@ fn heart_badge(ui: &egui::Ui, rect: egui::Rect) {
     let size = base * scale;
 
     let badge = egui::Rect::from_center_size(center, egui::vec2(size, size));
-    egui::Image::new(egui::include_image!("../icons/heart.svg")).paint_at(ui, badge);
-    ui.ctx().request_repaint();
+    // Rasterize once + GPU-scale (see `left_browser::paint_pulsing_heart`) instead
+    // of re-rasterizing the SVG every frame as the pulse size changes.
+    let icon = egui::include_image!("../icons/heart.svg");
+    crate::left_browser::paint_pulsing_heart(ui, icon, badge, base);
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
 }

@@ -176,6 +176,14 @@ impl UiResult {
     }
 }
 
+/// Default / min / max preview-thumbnail height (px) for resource cards. The
+/// default matches the original fixed size; the width follows the aspect ratio,
+/// capped at [`THUMB_WIDTH_RATIO`]× the height (as the original 80/130 pair did).
+const THUMB_SIZE_DEFAULT: f32 = 80.0;
+const THUMB_SIZE_MIN: f32 = 60.0;
+const THUMB_SIZE_MAX: f32 = 220.0;
+const THUMB_WIDTH_RATIO: f32 = 130.0 / 80.0;
+
 /// All UI + runtime state for the Civitai view. Lives on `RightPanelState`.
 pub struct CivitaiState {
     /// The image path we last kicked off a lookup for (so we refetch on change).
@@ -199,6 +207,14 @@ pub struct CivitaiState {
     /// Embeddings, …) — set via the folders popup off the settings folder icon.
     download_dirs: DownloadDirs,
     key_loaded: bool,
+    /// Preview-thumbnail height (px) for resource cards. User-adjustable from the
+    /// Civitai Settings popup, persisted to disk. Loaded once on first show.
+    thumb_size: f32,
+    /// Decode preview thumbnails at a higher resolution (and request a larger
+    /// render from the CDN) for crisper cards, at the cost of more bandwidth and
+    /// memory. Persisted; a change forces a refetch so images come back sized to
+    /// match. Loaded once on first show.
+    thumb_hd: bool,
     /// Whether the API-key / download settings popup is open.
     show_settings: bool,
     /// Whether the per-category download-folders popup is open.
@@ -220,6 +236,8 @@ impl Default for CivitaiState {
             api_key: String::new(),
             download_dirs: DownloadDirs::default(),
             key_loaded: false,
+            thumb_size: THUMB_SIZE_DEFAULT,
+            thumb_hd: false,
             show_settings: false,
             show_folders: false,
             downloads: Vec::new(),
@@ -249,6 +267,8 @@ pub fn show(
         state.key_loaded = true;
         state.api_key = load_civitai_key();
         state.download_dirs = load_download_dirs();
+        state.thumb_size = load_thumb_size();
+        state.thumb_hd = load_thumb_hd();
     }
 
     // Drain model-download progress.
@@ -380,7 +400,7 @@ pub fn show(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             match &state.result {
-                Some(res) => render_result(ui, res, &state.downloads, &state.download_dirs, &mut download_req),
+                Some(res) => render_result(ui, res, &state.downloads, &state.download_dirs, state.thumb_size, &mut download_req),
                 None => {
                     ui.add_space(24.0);
                     ui.vertical_centered(|ui| {
@@ -403,6 +423,7 @@ fn render_result(
     res: &UiResult,
     downloads: &[Download],
     dirs: &DownloadDirs,
+    thumb_size: f32,
     download_req: &mut Option<DownloadRequest>,
 ) {
     if let Some(url) = &res.source_url {
@@ -415,7 +436,7 @@ fn render_result(
         }
         section_label(ui, &section.title);
         for item in &section.items {
-            resource_card(ui, item, downloads, dirs, download_req);
+            resource_card(ui, item, downloads, dirs, thumb_size, download_req);
         }
     }
 }
@@ -453,6 +474,7 @@ fn resource_card(
     data: &UiResource,
     downloads: &[Download],
     dirs: &DownloadDirs,
+    thumb_size: f32,
     download_req: &mut Option<DownloadRequest>,
 ) {
     // Latest download for this resource (any state), driving the right-slot icon.
@@ -477,12 +499,13 @@ fn resource_card(
             ui.spacing_mut().item_spacing.x = 10.0;
 
             if let Some(tex) = &data.tex {
-                // Match the Java card: preview scaled to ~80px tall on the left,
-                // width following the aspect ratio (capped so the text keeps room).
+                // Like the Java card: preview scaled to `thumb_size` px tall on the
+                // left (user-adjustable), width following the aspect ratio (capped
+                // proportionally so the text keeps room).
                 ui.add(
                     egui::Image::from_texture(egui::load::SizedTexture::from_handle(tex))
-                        .max_height(80.0)
-                        .max_width(130.0)
+                        .max_height(thumb_size)
+                        .max_width(thumb_size * THUMB_WIDTH_RATIO)
                         .corner_radius(8),
                 );
             } else if data.has_video_only {
@@ -692,6 +715,7 @@ fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
             crate::popup_drag_strip(ui, 30.0);
             ui.set_width(380.0);
             let radius = egui::CornerRadius::same(10);
+
             {
                 let v = ui.visuals_mut();
                 v.widgets.inactive.corner_radius = radius;
@@ -771,6 +795,25 @@ fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
                 }
             });
 
+            ui.add_space(16.0);
+
+            // Preview thumbnail size — same styled slider as the main app's
+            // browser Thumbnail-size control. Applies live to the resource cards.
+            ui.label(egui::RichText::new("THUMBNAIL SIZE").color(MUTED()).strong().size(11.0));
+            ui.add_space(4.0);
+            ui.spacing_mut().slider_width = ui.available_width() - 8.0;
+            ui.add(
+                egui::Slider::new(&mut state.thumb_size, THUMB_SIZE_MIN..=THUMB_SIZE_MAX)
+                    .show_value(false),
+            );
+
+            ui.add_space(8.0);
+            ui.checkbox(
+                &mut state.thumb_hd,
+                egui::RichText::new("HD thumbnails").color(TEXT()).size(12.5),
+            )
+            .on_hover_text("Decode previews at a higher resolution for crisper cards (more bandwidth and memory).");
+
             ui.add_space(18.0);
 
             // Actions (right-aligned: Save, then Clear key).
@@ -788,6 +831,14 @@ fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
                     if ui.add_sized(egui::vec2(90.0, 32.0), save).clicked() {
                         save_civitai_key(&state.api_key);
                         save_download_dirs(&state.download_dirs);
+                        save_thumb_size(state.thumb_size);
+                        // A changed HD setting needs a refetch so previews come back
+                        // at the new resolution — clearing loaded_key re-runs the
+                        // lookup for the current image next frame.
+                        if load_thumb_hd() != state.thumb_hd {
+                            state.loaded_key = None;
+                        }
+                        save_thumb_hd(state.thumb_hd);
                         state.show_settings = false;
                     }
                 });
@@ -965,12 +1016,7 @@ fn run_download(
     }
 
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .provider(ureq::tls::TlsProvider::NativeTls)
-                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                .build(),
-        )
+        .tls_config(native_tls_config())
         .max_redirects(10)
         .http_status_as_error(false)
         // No global/body timeout — model files are large; only bound setup phases.
@@ -1327,6 +1373,55 @@ fn save_download_dirs(dirs: &DownloadDirs) {
     }
 }
 
+/// Path of the saved preview-thumbnail size (a plain-text float).
+fn thumb_size_path() -> std::path::PathBuf {
+    dirs::config_dir()
+        .map(|p| p.join("Clarity TagFlow").join("civitai_thumb_size.txt"))
+        .unwrap_or_else(|| std::path::PathBuf::from("civitai_thumb_size.txt"))
+}
+
+/// Load the saved preview-thumbnail size, clamped to the allowed range, falling
+/// back to the default when unset or unreadable.
+fn load_thumb_size() -> f32 {
+    std::fs::read_to_string(thumb_size_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .map(|v| v.clamp(THUMB_SIZE_MIN, THUMB_SIZE_MAX))
+        .unwrap_or(THUMB_SIZE_DEFAULT)
+}
+
+/// Persist the preview-thumbnail size.
+fn save_thumb_size(size: f32) {
+    let path = thumb_size_path();
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(&path, format!("{size}"));
+}
+
+/// Path of the saved HD-thumbnail flag (a plain-text "1"/"0").
+fn thumb_hd_path() -> std::path::PathBuf {
+    dirs::config_dir()
+        .map(|p| p.join("Clarity TagFlow").join("civitai_thumb_hd.txt"))
+        .unwrap_or_else(|| std::path::PathBuf::from("civitai_thumb_hd.txt"))
+}
+
+/// Load the saved HD-thumbnail flag (default off).
+fn load_thumb_hd() -> bool {
+    std::fs::read_to_string(thumb_hd_path())
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Persist the HD-thumbnail flag.
+fn save_thumb_hd(hd: bool) {
+    let path = thumb_hd_path();
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(&path, if hd { "1" } else { "0" });
+}
+
 /// Path of the encrypted Civitai API key file in the app config dir.
 fn civitai_key_path() -> std::path::PathBuf {
     dirs::config_dir()
@@ -1335,7 +1430,7 @@ fn civitai_key_path() -> std::path::PathBuf {
 }
 
 /// Load the saved Civitai API key (decrypted), or "" if none/unreadable.
-fn load_civitai_key() -> String {
+pub(crate) fn load_civitai_key() -> String {
     std::fs::read_to_string(civitai_key_path())
         .ok()
         .map(|s| crate::secret::unprotect(s.trim()))
@@ -1429,13 +1524,15 @@ fn start_fetch(state: &mut CivitaiState, path: &Path, metadata: Option<&str>, ct
         .and_then(|n| n.to_str())
         .map(|s| s.to_string());
     let ctx = ctx.clone();
+    let hd = state.thumb_hd;
 
-    std::thread::spawn(move || run_fetch(meta, filename, cancel, tx, ctx));
+    std::thread::spawn(move || run_fetch(meta, filename, hd, cancel, tx, ctx));
 }
 
 fn run_fetch(
     metadata: Option<String>,
     filename: Option<String>,
+    hd: bool,
     cancel: Arc<AtomicBool>,
     tx: Sender<CivMsg>,
     ctx: egui::Context,
@@ -1464,12 +1561,7 @@ fn run_fetch(
     // roots in the final cert chain"), so without this the preview thumbnails
     // never download even though the api.civitai.com JSON lookups succeed.
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .provider(ureq::tls::TlsProvider::NativeTls)
-                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                .build(),
-        )
+        .tls_config(native_tls_config())
         .timeout_global(Some(Duration::from_secs(15)))
         .max_redirects(10)
         .http_status_as_error(false)
@@ -1492,20 +1584,20 @@ fn run_fetch(
         let mut info = None;
         if let Some(v) = &task.version_id {
             if !v.is_empty() {
-                info = fetch_resource_info(&agent, task.kind, LookupMethod::VersionId, v);
+                info = fetch_resource_info(&agent, task.kind, LookupMethod::VersionId, v, hd);
             }
         }
         if info.is_none() {
             if let Some(h) = &task.hash {
                 if !h.is_empty() {
-                    info = fetch_resource_info(&agent, task.kind, LookupMethod::Hash, h);
+                    info = fetch_resource_info(&agent, task.kind, LookupMethod::Hash, h, hd);
                 }
             }
         }
         if info.is_none() {
             if let Some(n) = &task.name {
                 if !n.is_empty() {
-                    info = fetch_resource_info(&agent, task.kind, LookupMethod::Name, n);
+                    info = fetch_resource_info(&agent, task.kind, LookupMethod::Name, n, hd);
                 }
             }
         }
@@ -1579,12 +1671,7 @@ fn run_fetch(
 fn start_api_monitor(status: Arc<AtomicU8>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
-            .tls_config(
-                ureq::tls::TlsConfig::builder()
-                    .provider(ureq::tls::TlsProvider::NativeTls)
-                    .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                    .build(),
-            )
+            .tls_config(native_tls_config())
             .timeout_global(Some(Duration::from_secs(8)))
             .http_status_as_error(false)
             .build()
@@ -1615,6 +1702,7 @@ fn fetch_resource_info(
     kind: ItemType,
     method: LookupMethod,
     value: &str,
+    hd: bool,
 ) -> Option<Fetched> {
     let mut model_id: Option<String> = None;
     let mut version_id: Option<String> = None;
@@ -1670,7 +1758,7 @@ fn fetch_resource_info(
     }
 
     let model_id = model_id?;
-    get_formatted_model_data(agent, &model_id, version_id.as_deref())
+    get_formatted_model_data(agent, &model_id, version_id.as_deref(), hd)
 }
 
 /// The fuzzy name-match the Java used to reject obviously-wrong search hits.
@@ -1697,6 +1785,7 @@ fn get_formatted_model_data(
     agent: &ureq::Agent,
     model_id: &str,
     specific_version_id: Option<&str>,
+    hd: bool,
 ) -> Option<Fetched> {
     let url = format!("https://civitai.com/api/v1/models/{model_id}");
     let model_data = get_json(agent, &url)?;
@@ -1740,29 +1829,35 @@ fn get_formatted_model_data(
         .and_then(|f| f.get("name").and_then(|v| v.as_str()))
         .map(|s| s.to_string());
 
-    // Pick the first still-image preview; note if the version only has videos.
+    // Pick the first still-image preview; keep the first video's URL as a
+    // fallback so video-only versions can still show a (poster-frame) thumbnail.
     let mut image_url: Option<String> = None;
-    let mut has_video = false;
-    let mut has_image = false;
+    let mut video_url: Option<String> = None;
     if let Some(images) = version.get("images").and_then(|v| v.as_array()) {
         for img in images {
             let ty = img.get("type").and_then(|v| v.as_str()).unwrap_or("image").to_lowercase();
+            let url = img.get("url").and_then(|v| v.as_str());
             if ty == "video" {
-                has_video = true;
-                continue;
-            }
-            if image_url.is_none() {
-                image_url = img.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
-                has_image = true;
+                if video_url.is_none() {
+                    video_url = url.map(|s| s.to_string());
+                }
+            } else if image_url.is_none() {
+                image_url = url.map(|s| s.to_string());
             }
         }
     }
-    let has_video_only = has_video && !has_image;
+    let has_video_only = image_url.is_none() && video_url.is_some();
 
-    let image = image_url.and_then(|u| {
-        let sized = sized_image_url(&u, 200);
-        get_bytes(agent, &sized).and_then(|b| decode_thumb(&b))
-    });
+    // Prefer a real still preview; for video-only resources, ask the CDN for the
+    // video's poster frame (transcode=true,anim=false → a static JPEG), which
+    // decode_thumb reads like any other image. If that fetch fails, the card
+    // falls back to the "Video" placeholder via `has_video_only`.
+    // HD requests a larger CDN render and decodes at a higher resolution.
+    let (cdn_width, decode_edge) = if hd { (450, 512) } else { (200, 200) };
+    let image = image_url
+        .map(|u| sized_image_url(&u, cdn_width))
+        .or_else(|| video_url.map(|u| poster_image_url(&u, cdn_width)))
+        .and_then(|sized| get_bytes(agent, &sized).and_then(|b| decode_thumb(&b, decode_edge)));
 
     let model_name = model_data.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let version_name = version.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -1818,21 +1913,42 @@ fn sized_image_url(url: &str, width: u32) -> String {
     parts.join("/")
 }
 
+/// Build a CDN URL for a *video* preview's poster frame — a single still JPEG.
+///
+/// Civitai stores video previews as mp4/webm, but its Cloudflare-Images CDN can
+/// flatten one to a still via the `transcode=true,anim=false` transform (the same
+/// request civitai.com makes for a video thumbnail). The output container is keyed
+/// off the filename extension, so we also re-point it to `.jpeg` — the bytes then
+/// come back as an ordinary JPEG that [`decode_thumb`] reads like any other image.
+fn poster_image_url(url: &str, width: u32) -> String {
+    let mut parts: Vec<String> = url.split('/').map(|s| s.to_string()).collect();
+    if parts.len() < 2 {
+        return url.to_string();
+    }
+    let last = parts.len() - 1;
+    let transform = format!("transcode=true,anim=false,width={width}");
+    if parts[last - 1].contains('=') {
+        parts[last - 1] = transform;
+    } else {
+        parts.insert(last, transform);
+    }
+    // Re-point the filename to a .jpeg so the CDN returns a still JPEG, not video.
+    if let Some(name) = parts.last_mut() {
+        if let Some(dot) = name.rfind('.') {
+            name.truncate(dot);
+        }
+        name.push_str(".jpeg");
+    }
+    parts.join("/")
+}
+
 /// First preview image (~200px render) of the Civitai model version matching a
 /// file hash — used by the Generate panels for LoRA thumbnails. Returns the raw
 /// downloaded bytes (a small JPEG), or None when the hash isn't on Civitai.
 pub(crate) fn preview_image_by_hash(sha256: &str) -> Option<Vec<u8>> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        // Match the other agents: we build ureq with only the native-tls feature,
-        // so the provider MUST be set explicitly — its default (Rustls) isn't
-        // compiled in and panics at connect time on an https URL.
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .provider(ureq::tls::TlsProvider::NativeTls)
-                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                .build(),
-        )
-        .timeout_global(Some(std::time::Duration::from_secs(20)))
+        .tls_config(native_tls_config())
+        .timeout_global(Some(Duration::from_secs(20)))
         .build()
         .into();
     let url = format!("https://civitai.com/api/v1/model-versions/by-hash/{sha256}");
@@ -1844,12 +1960,30 @@ pub(crate) fn preview_image_by_hash(sha256: &str) -> Option<Vec<u8>> {
     get_bytes(&agent, &sized_image_url(img_url, 200))
 }
 
-/// Decode downloaded preview bytes into a small `ColorImage` (max ~200px).
-pub(crate) fn decode_thumb(bytes: &[u8]) -> Option<egui::ColorImage> {
+/// Decode downloaded preview bytes into a `ColorImage`, downscaled so its longest
+/// side is at most `max_edge` px (never upscaled). ~200 for standard cards, larger
+/// for HD.
+pub(crate) fn decode_thumb(bytes: &[u8], max_edge: u32) -> Option<egui::ColorImage> {
     let img = image::load_from_memory(bytes).ok()?;
-    let thumb = img.thumbnail(200, 200).to_rgba8();
+    let thumb = img.thumbnail(max_edge, max_edge).to_rgba8();
     let size = [thumb.width() as usize, thumb.height() as usize];
     Some(egui::ColorImage::from_rgba_unmultiplied(size, thumb.as_raw()))
+}
+
+/// Shared TLS config for every Civitai `ureq::Agent`.
+///
+/// We build ureq with only the native-tls feature, so the provider MUST be set
+/// explicitly — its default (Rustls) isn't compiled in and panics at connect
+/// time on an https URL. PlatformVerifier validates against the OS cert store
+/// (with its AIA intermediate fetching) rather than ureq's bundled webpki roots;
+/// Civitai's image CDN (image.civitai.com / image-b2.civitai.com) serves an
+/// incomplete chain that fails webpki path-building, so without this the preview
+/// thumbnails never download even though the api.civitai.com JSON lookups succeed.
+fn native_tls_config() -> ureq::tls::TlsConfig {
+    ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::NativeTls)
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build()
 }
 
 fn get_json(agent: &ureq::Agent, url: &str) -> Option<serde_json::Value> {

@@ -52,6 +52,20 @@ pub enum RightView {
     Anima,
 }
 
+/// Map a generation family (chosen from a Generate header dropdown) to the
+/// right-panel view that hosts it.
+#[cfg(not(target_os = "macos"))]
+fn family_view(family: crate::generate::GenFamily) -> RightView {
+    match family {
+        crate::generate::GenFamily::Sdxl => RightView::Sdxl,
+        crate::generate::GenFamily::Anima => RightView::Anima,
+        crate::generate::GenFamily::Flux => RightView::Generate,
+        crate::generate::GenFamily::ZImage => RightView::ZImage,
+        crate::generate::GenFamily::Ltx => RightView::Ltx,
+        crate::generate::GenFamily::Wan => RightView::Wan,
+    }
+}
+
 /// Read-only file metadata shown in the bottom "Image Details" card. A Rust
 /// port of the fields surfaced by terminus2's `ImageDetails` Swing panel.
 pub struct ImageMeta {
@@ -422,53 +436,35 @@ pub fn show(
                                 state.view = RightView::Pixal3D;
                                 ui.close();
                             }
+                            // One "Text to Image" entry for the four image models
+                            // (SDXL / Anima / Flux / Z-Image). It opens SDXL first;
+                            // the view's header dropdown switches between them. Stays
+                            // highlighted while any of those models is showing.
                             #[cfg(not(target_os = "macos"))]
-                            if ui
-                                .selectable_label(state.view == RightView::Sdxl, "Generate (SDXL)")
-                                .clicked()
                             {
-                                state.view = RightView::Sdxl;
-                                ui.close();
+                                let t2i_active = matches!(
+                                    state.view,
+                                    RightView::Sdxl | RightView::Anima | RightView::Generate | RightView::ZImage
+                                );
+                                if ui.selectable_label(t2i_active, "Text to Image").clicked() {
+                                    if !t2i_active {
+                                        state.view = RightView::Sdxl;
+                                    }
+                                    ui.close();
+                                }
                             }
+                            // One "Text to Video" entry for the two video Directors
+                            // (LTX / Wan). It opens LTX first; the view's header
+                            // dropdown switches between them.
                             #[cfg(not(target_os = "macos"))]
-                            if ui
-                                .selectable_label(state.view == RightView::Anima, "Generate (Anima)")
-                                .clicked()
                             {
-                                state.view = RightView::Anima;
-                                ui.close();
-                            }
-                            #[cfg(not(target_os = "macos"))]
-                            if ui
-                                .selectable_label(state.view == RightView::Generate, "Generate (Flux)")
-                                .clicked()
-                            {
-                                state.view = RightView::Generate;
-                                ui.close();
-                            }
-                            #[cfg(not(target_os = "macos"))]
-                            if ui
-                                .selectable_label(state.view == RightView::ZImage, "Generate (Z-Image)")
-                                .clicked()
-                            {
-                                state.view = RightView::ZImage;
-                                ui.close();
-                            }
-                            #[cfg(not(target_os = "macos"))]
-                            if ui
-                                .selectable_label(state.view == RightView::Ltx, "LTX Director")
-                                .clicked()
-                            {
-                                state.view = RightView::Ltx;
-                                ui.close();
-                            }
-                            #[cfg(not(target_os = "macos"))]
-                            if ui
-                                .selectable_label(state.view == RightView::Wan, "Wan Director")
-                                .clicked()
-                            {
-                                state.view = RightView::Wan;
-                                ui.close();
+                                let t2v_active = matches!(state.view, RightView::Ltx | RightView::Wan);
+                                if ui.selectable_label(t2v_active, "Text to Video").clicked() {
+                                    if !t2v_active {
+                                        state.view = RightView::Ltx;
+                                    }
+                                    ui.close();
+                                }
                             }
                         });
 
@@ -517,22 +513,52 @@ pub fn show(
                         crate::pixal3d::show(ui, &mut state.pixal3d, current_image);
                     } else if show_generate {
                         #[cfg(not(target_os = "macos"))]
-                        crate::generate::show(ui, &mut state.generate, None);
+                        {
+                            crate::generate::show(ui, &mut state.generate, None);
+                            if let Some(f) = state.generate.family_switch.take() {
+                                state.view = family_view(f);
+                            }
+                        }
                     } else if show_zimage {
                         #[cfg(not(target_os = "macos"))]
-                        crate::generate::show(ui, &mut state.zimage, None);
+                        {
+                            crate::generate::show(ui, &mut state.zimage, None);
+                            if let Some(f) = state.zimage.family_switch.take() {
+                                state.view = family_view(f);
+                            }
+                        }
                     } else if show_ltx {
                         #[cfg(not(target_os = "macos"))]
-                        crate::generate::show(ui, &mut state.ltx, current_image);
+                        {
+                            crate::generate::show(ui, &mut state.ltx, current_image);
+                            if let Some(f) = state.ltx.family_switch.take() {
+                                state.view = family_view(f);
+                            }
+                        }
                     } else if show_wan {
                         #[cfg(not(target_os = "macos"))]
-                        crate::generate::show(ui, &mut state.wan, current_image);
+                        {
+                            crate::generate::show(ui, &mut state.wan, current_image);
+                            if let Some(f) = state.wan.family_switch.take() {
+                                state.view = family_view(f);
+                            }
+                        }
                     } else if show_sdxl {
                         #[cfg(not(target_os = "macos"))]
-                        crate::generate::show(ui, &mut state.sdxl, None);
+                        {
+                            crate::generate::show(ui, &mut state.sdxl, None);
+                            if let Some(f) = state.sdxl.family_switch.take() {
+                                state.view = family_view(f);
+                            }
+                        }
                     } else if show_anima {
                         #[cfg(not(target_os = "macos"))]
-                        crate::generate::show(ui, &mut state.anima, None);
+                        {
+                            crate::generate::show(ui, &mut state.anima, None);
+                            if let Some(f) = state.anima.family_switch.take() {
+                                state.view = family_view(f);
+                            }
+                        }
                     } else if state.view == RightView::TagManager {
                         crate::tag_manager::show(ui, tag_manager, current_image, &mut state.current_tags, all_images);
                     } else if state.view == RightView::Downloader {
@@ -681,7 +707,7 @@ pub fn show(
                                             .fit_to_exact_size(egui::vec2(18.0, 18.0))
                                             .tint(TEXT()),
                                     );
-                                    let title = if state.showing_meta { "Metadata:" } else { "Tags:" };
+                                    let title = if state.showing_meta { "Metadata" } else { "Tags" };
                                     ui.label(egui::RichText::new(title).color(TEXT()).strong());
 
                                     // Only offer the switch when there are two views to

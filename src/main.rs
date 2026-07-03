@@ -288,6 +288,9 @@ struct ViewerApp {
     viewer: image_cache::ImageCache,
     /// Poster-frame thumbnails for video files in the left browser.
     video_thumbs: video::VideoThumbs,
+    /// Auto-playing muted previews on visible video tiles (the "Video thumbnail
+    /// play" setting).
+    video_previews: video::VideoPreviews,
 
     /// Embedded video player for the current selection (only ever `Some` when
     /// built with `--features vlc` and VLC starts successfully).
@@ -345,6 +348,7 @@ impl Default for ViewerApp {
             thumbs: image_cache::ImageCache::new(THUMB_MAX_EDGE, 400, false, 2),
             viewer: image_cache::ImageCache::new(2048, 8, true, 1),
             video_thumbs: video::VideoThumbs::new(),
+            video_previews: video::VideoPreviews::new(),
             video_player: None,
             last_video_path: None,
             zoom: zoom::ZoomState::default(),
@@ -725,19 +729,50 @@ impl ViewerApp {
                     right_details::RightView::Anima => (5u8, self.right_state.anima.gen_images().to_vec()),
                     _ => (0u8, self.right_state.generate.gen_images().to_vec()),
                 };
+                // The LTX and Wan Directors are image-to-video, so they keep the
+                // loaded input folder visible in the browser alongside their
+                // generated videos (appended below) — you can pick another input
+                // image and make more videos without reopening the folder. The
+                // other (text-to-image) views just show their generated results.
+                let combine = matches!(
+                    self.right_state.view,
+                    right_details::RightView::Ltx | right_details::RightView::Wan
+                );
                 let sig = (tab, gen_list.len());
                 if !self.flux_active {
-                    // Entering: stash the folder list, show the generated images.
+                    // Entering: stash the folder list.
                     self.images_backup = Some((std::mem::take(&mut self.images), self.selected.take()));
-                    self.images = gen_list;
-                    self.selected = if self.images.is_empty() { None } else { Some(self.images.len() - 1) };
+                    if combine {
+                        // Show folder images, then the generated videos under them;
+                        // keep the input image the user already had selected.
+                        let orig = self.images_backup.as_ref().map(|(v, _)| v.clone()).unwrap_or_default();
+                        let keep = self.images_backup.as_ref().and_then(|(_, s)| *s);
+                        self.images = orig;
+                        self.images.extend(gen_list);
+                        self.selected = keep;
+                    } else {
+                        self.images = gen_list;
+                        self.selected = if self.images.is_empty() { None } else { Some(self.images.len() - 1) };
+                    }
                     self.update_filtered();
                     self.flux_active = true;
                     self.flux_sig = sig;
                 } else if self.flux_sig != sig {
-                    // Switched gen tab or a new image arrived — refresh + select newest.
-                    self.images = gen_list;
-                    self.selected = if self.images.is_empty() { None } else { Some(self.images.len() - 1) };
+                    // Switched gen tab or a new output arrived — refresh + select newest.
+                    if combine {
+                        let orig = self.images_backup.as_ref().map(|(v, _)| v.clone()).unwrap_or_default();
+                        let orig_len = orig.len();
+                        self.images = orig;
+                        self.images.extend(gen_list);
+                        // A generated video is present → select the newest (at the
+                        // end); otherwise keep whatever input image is selected.
+                        if self.images.len() > orig_len {
+                            self.selected = Some(self.images.len() - 1);
+                        }
+                    } else {
+                        self.images = gen_list;
+                        self.selected = if self.images.is_empty() { None } else { Some(self.images.len() - 1) };
+                    }
                     self.update_filtered();
                     self.flux_sig = sig;
                 }
@@ -841,6 +876,13 @@ impl ViewerApp {
         if dropped.is_empty() {
             return;
         }
+        // A drop onto a generator's prompt box is consumed by that view (it
+        // imports the file's metadata + installs the workflow's custom nodes),
+        // so don't also add the file to the gallery.
+        let drop_pos = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
+        if crate::generate::generator_claims_drop(ctx, drop_pos) {
+            return;
+        }
         // A dropped folder loads all media inside it; dropped files are added directly.
         let mut to_add = Vec::new();
         for p in dropped {
@@ -860,6 +902,34 @@ impl ViewerApp {
         // Remember the centre-panel rect so overlays (e.g. the background-removal
         // loader) can be centred over the image rather than the whole window.
         self.last_center_rect = Some(ui.available_rect_before_wrap());
+
+        // The centre viewer only actively PLAYS video while the right panel is on a
+        // media-focused view: Details & Actions, Civitai Resources, or the LTX / Wan
+        // Directors (which work with videos). On any other view (Generate,
+        // Downloader, Tag Manager, Pixal3D, …) the player is released so a clip
+        // doesn't keep decoding — and playing audio — in the background; the viewer
+        // shows the still poster instead.
+        let plays_media = matches!(
+            self.right_state.view,
+            right_details::RightView::Details | right_details::RightView::Civitai
+        ) || {
+            #[cfg(not(target_os = "macos"))]
+            {
+                matches!(
+                    self.right_state.view,
+                    right_details::RightView::Ltx | right_details::RightView::Wan
+                )
+            }
+            #[cfg(target_os = "macos")]
+            {
+                false
+            }
+        };
+        if !plays_media {
+            self.video_player = None;
+            self.last_video_path = None;
+        }
+
         egui::CentralPanel::default()
             // Match the side panels' margins (top: 0) so the viewer rises to the
             // top bar and is the same height as the left/right panels.
@@ -890,10 +960,42 @@ impl ViewerApp {
                 let now = ui.input(|i| i.time);
                 let path = self.images[idx].clone();
 
+                // The LTX / Wan Directors play videos but leave the centre blank for
+                // still images — clicking through images doesn't load or show them.
+                // Release any player so a clip stops when you move onto an image.
+                #[cfg(not(target_os = "macos"))]
+                if matches!(
+                    self.right_state.view,
+                    right_details::RightView::Ltx | right_details::RightView::Wan
+                ) && !is_video(&path)
+                {
+                    self.video_player = None;
+                    self.last_video_path = None;
+                    return;
+                }
+
                 // Videos play in-app via libVLC. Only touch the player when a
                 // libVLC runtime is actually available — otherwise we'd trigger the
                 // delay-loaded DLL and crash; the notice below offers to install it.
                 if is_video(&path) {
+                    // On a non-media right-panel view, don't play — show the still
+                    // poster frame (the player was already released above).
+                    if !plays_media {
+                        match self.video_thumbs.request(&path, ui.ctx()) {
+                            Some(tex) => show_fitted(ui, &tex, false),
+                            None => {
+                                ui.centered_and_justified(|ui| {
+                                    ui.add(
+                                        egui::Image::new(egui::include_image!("../icons/video.svg"))
+                                            .fit_to_exact_size(egui::vec2(64.0, 64.0))
+                                            .tint(MUTED()),
+                                    );
+                                });
+                            }
+                        }
+                        return;
+                    }
+
                     let support = video::support();
 
                     if matches!(support, video::VideoSupport::Available) {
@@ -1021,11 +1123,15 @@ impl eframe::App for ViewerApp {
         MOVABLE_POPUPS.store(self.settings.movable_popups, std::sync::atomic::Ordering::Relaxed);
 
         // Apply the HD-thumbnail setting (cheap; only clears the cache on change).
-        self.thumbs.set_max_edge(if self.settings.hd_thumbnails {
+        // Video poster frames follow the same setting so they're HD in step with
+        // image tiles.
+        let thumb_edge = if self.settings.hd_thumbnails {
             THUMB_MAX_EDGE_HD
         } else {
             THUMB_MAX_EDGE
-        });
+        };
+        self.thumbs.set_max_edge(thumb_edge);
+        self.video_thumbs.set_max_edge(thumb_edge);
 
         self.thumbs.begin_frame(ui.ctx());
         self.viewer.begin_frame(ui.ctx());
@@ -1099,6 +1205,12 @@ impl eframe::App for ViewerApp {
         let in_flux = false;
         self.sync_flux_browser(in_flux);
 
+        // Drive the auto-playing video-tile previews: push the setting and reset
+        // the per-frame visibility marks before drawing any tiles. `end_frame`
+        // (after the layout below) stops previews for tiles that scrolled away.
+        self.video_previews.set_enabled(self.settings.video_thumbnail_play);
+        self.video_previews.begin_frame();
+
         // When the Gallery layout is active, replace the three panels with a
         // full-window masonry grid of the open folder's images.
         if self.settings.layout == settings::Layout::Gallery {
@@ -1116,6 +1228,7 @@ impl eframe::App for ViewerApp {
                 self.selected,
                 &mut self.thumbs,
                 &mut self.video_thumbs,
+                &mut self.video_previews,
                 &mut self.favorites,
                 self.settings.thumbnail_size,
             ) {
@@ -1143,6 +1256,7 @@ impl eframe::App for ViewerApp {
             &mut self.selected,
             &mut self.thumbs,
             &mut self.video_thumbs,
+            &mut self.video_previews,
             &mut self.favorites,
             self.settings.thumbnail_size,
             &mut self.settings.media_filter,
@@ -1189,6 +1303,10 @@ impl eframe::App for ViewerApp {
         // 3. Central Panel (Fills remaining space)
         self.center(ui);
         } // end of the classic Panels layout
+
+        // Stop previews for any video tile that wasn't drawn this frame (scrolled
+        // off-screen, or the other layout), freeing their decoders.
+        self.video_previews.end_frame();
 
         // 4. Settings window (floats on top when opened from the gear).
         // Keep the global extended-formats flag in sync with the setting so the

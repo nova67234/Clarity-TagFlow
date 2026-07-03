@@ -19,6 +19,33 @@ use crate::theme::*;
 
 const GREEN: Color32 = Color32::from_rgb(46, 160, 67);
 const RED: Color32 = Color32::from_rgb(220, 70, 70);
+/// Drag-and-drop import accent (the blue the prompt box turns when a file with
+/// metadata is dragged over it).
+const DROP_BLUE: Color32 = Color32::from_rgb(56, 132, 255);
+
+/// The on-screen rect of the currently-visible generator prompt box, plus the
+/// `ctx.input(time)` it was last published. The gallery's global drop handler
+/// reads this to tell when a file was dropped onto the prompt (→ this view
+/// imports it) rather than onto the gallery. Guarded by a freshness check so a
+/// stale rect from a no-longer-visible Generate view is ignored.
+static PROMPT_DROP_RECT: std::sync::Mutex<Option<(egui::Rect, f64)>> = std::sync::Mutex::new(None);
+
+/// True when a *currently-visible* generator prompt box claims a file dropped at
+/// `pos`, so the gallery shouldn't also add it as media. `pos` is `None` when the
+/// platform didn't report the cursor position during the drag (common on
+/// Windows, where winit emits no cursor-move events mid-drag) — then any fresh,
+/// visible generator prompt claims the drop, since it was showing the highlight.
+pub fn generator_claims_drop(ctx: &egui::Context, pos: Option<egui::Pos2>) -> bool {
+    if let Ok(guard) = PROMPT_DROP_RECT.lock() {
+        if let Some((rect, t)) = *guard {
+            // Only trust a rect published this frame or last (view is live).
+            if (ctx.input(|i| i.time) - t).abs() < 0.5 {
+                return pos.map_or(true, |p| rect.contains(p));
+            }
+        }
+    }
+    false
+}
 
 /// ComfyUI download (master zip) and the GGUF custom-node.
 const COMFYUI_ZIP: &str = "https://github.com/comfyanonymous/ComfyUI/archive/refs/heads/master.zip";
@@ -55,6 +82,16 @@ const WAN_UMT5: &str =
     "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors?download=true";
 const WAN_VAE: &str =
     "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan2.2_vae.safetensors?download=true";
+/// The Wan 2.1 VAE — used by custom installed Wan 2.2 *14B* models (the A14B
+/// architecture shares Wan 2.1's 16-channel VAE, unlike the built-in 5B TI2V which
+/// has its own higher-compression VAE). Fetched so 14B finetunes from the picker
+/// can decode (~254 MB).
+const WAN_VAE_21: &str =
+    "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors?download=true";
+/// Wan's recommended (Chinese) negative — the one shipped in the official
+/// templates; it markedly improves motion stability and reduces artifacts. Shared
+/// by both the 5B TI2V and 14B I2V workflows.
+const WAN_NEG: &str = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走";
 
 /// Shared Flux text-encoders + VAE (all ungated).
 const CLIP_L: &str =
@@ -135,25 +172,35 @@ impl GenFamily {
     }
     /// This family loads a single swappable model file, so the picker can offer
     /// auto-detected installed models. SDXL swaps a full checkpoint (CheckpointLoaderSimple);
-    /// Anima swaps the diffusion model (UNETLoader). The other families use
-    /// multi-file GGUF/UNet setups that can't be swapped wholesale.
+    /// Anima swaps the diffusion model (UNETLoader); LTX swaps the transformer
+    /// checkpoint (CheckpointLoaderSimple) while keeping the shared t5xxl encoder +
+    /// spatial upscaler — so a custom file is treated as an LTX-Video 0.9.x finetune
+    /// and run through that pipeline. The other families use multi-file GGUF/UNet
+    /// setups that can't be swapped wholesale.
     fn uses_checkpoint_picker(self) -> bool {
-        matches!(self, GenFamily::Sdxl | GenFamily::Anima)
+        matches!(self, GenFamily::Sdxl | GenFamily::Anima | GenFamily::Ltx | GenFamily::Wan)
     }
-    /// The `models/` sub-dir holding this family's swappable model file, and that
-    /// file's built-in (downloaded) default name — used to route the installed-model
-    /// picker and skip the default from the installed list.
+    /// The `models/` sub-dir holding this family's swappable model file — used to
+    /// route the installed-model picker.
     fn model_subdir(self) -> &'static str {
         match self {
-            GenFamily::Anima => "diffusion_models",
+            GenFamily::Anima | GenFamily::Wan => "diffusion_models",
             _ => "checkpoints",
         }
     }
-    fn default_model_file(self) -> &'static str {
+    /// The built-in (downloaded) checkpoint filenames for this family. They live in
+    /// the scanned checkpoint dirs, so the installed-checkpoint picker skips them to
+    /// avoid duplicating the named model entries listed above it. LTX has two (the
+    /// 0.9.6 transformer and the LTX-2.3 fp8 bundle) — a custom file is anything else.
+    fn builtin_ckpt_files(self) -> &'static [&'static str] {
         match self {
-            GenFamily::Sdxl => "sd_xl_base_1.0.safetensors",
-            GenFamily::Anima => "anima-base-v1.0.safetensors",
-            _ => "",
+            GenFamily::Sdxl => &["sd_xl_base_1.0.safetensors"],
+            GenFamily::Anima => &["anima-base-v1.0.safetensors"],
+            GenFamily::Ltx => {
+                &["ltxv-2b-0.9.6-distilled-04-25.safetensors", "ltx-2.3-22b-distilled-fp8.safetensors"]
+            }
+            GenFamily::Wan => &["wan2.2_ti2v_5B_fp16.safetensors"],
+            _ => &[],
         }
     }
 }
@@ -306,6 +353,9 @@ enum RunnerMsg {
     Status(String),
     Output(PathBuf),
     Done(bool),
+    /// Update the "custom nodes added / being used" label beside the Prompt
+    /// header (drag-and-drop import of a workflow's tools).
+    Nodes(String),
 }
 
 /// One LoRA found in ComfyUI's `models/loras/` dir, with its selection + weight.
@@ -454,6 +504,11 @@ enum LoraBase {
     /// Anima — a 2B anime model (CircleStone Labs / Comfy Org, built on NVIDIA
     /// Cosmos 2). Its own DiT architecture; not usable by the current tabs.
     Anima,
+    /// LTX-Video (Lightricks) — DiT video model loaded via CheckpointLoaderSimple.
+    Ltx,
+    /// Wan (Alibaba) — DiT video model (5B TI2V / 14B I2V), `model.diffusion_model.
+    /// blocks.*` with cross/self-attention; loaded via UNETLoader.
+    Wan,
     /// Identified as some other architecture (SD 1.5, …).
     Other,
     /// No recognisable signals — offered in every tab, marked with a caveat.
@@ -467,6 +522,8 @@ impl LoraBase {
             LoraBase::ZImage => family == GenFamily::ZImage,
             LoraBase::Sdxl => family == GenFamily::Sdxl,
             LoraBase::Anima => family == GenFamily::Anima,
+            LoraBase::Ltx => family == GenFamily::Ltx,
+            LoraBase::Wan => family == GenFamily::Wan,
             LoraBase::Other => false,
             LoraBase::Unknown => true,
         }
@@ -479,6 +536,8 @@ impl LoraBase {
             LoraBase::ZImage => "Z-Image",
             LoraBase::Sdxl => "SDXL",
             LoraBase::Anima => "Anima",
+            LoraBase::Ltx => "LTX",
+            LoraBase::Wan => "Wan",
             LoraBase::Other => "SD / other",
             LoraBase::Unknown => "Unknown",
         }
@@ -492,6 +551,8 @@ impl LoraBase {
             LoraBase::ZImage => Color32::from_rgb(70, 180, 160),
             LoraBase::Sdxl => Color32::from_rgb(90, 150, 230),
             LoraBase::Anima => Color32::from_rgb(220, 110, 180),
+            LoraBase::Ltx => Color32::from_rgb(160, 200, 90),
+            LoraBase::Wan => Color32::from_rgb(80, 190, 210),
             LoraBase::Other => Color32::from_rgb(150, 120, 220),
             LoraBase::Unknown => MUTED(),
         }
@@ -533,6 +594,10 @@ fn sniff_lora_base(path: &Path) -> LoraBase {
                 // "animagine" (SDXL) above isn't misread as Anima.
                 if v.contains("anima") || v.contains("cosmos") {
                     return LoraBase::Anima;
+                }
+                // Wan (Alibaba): "wan2.1"/"wan2.2"/"wanvideo".
+                if v.contains("wan2") || v.contains("wanvideo") || v.contains("wan-video") || v.contains("wan_video") {
+                    return LoraBase::Wan;
                 }
                 if ["stable-diffusion", "sd_v1", "sd_1", "sd15"]
                     .iter()
@@ -611,6 +676,14 @@ fn sniff_checkpoint_base(path: &Path) -> LoraBase {
                 if v.contains("anima") || v.contains("cosmos") {
                     return LoraBase::Anima;
                 }
+                // LTX-Video (Lightricks). Stamped finetunes carry "ltxv"/"ltx-video".
+                if v.contains("ltxv") || v.contains("ltx-video") || v.contains("ltx_video") {
+                    return LoraBase::Ltx;
+                }
+                // Wan (Alibaba): "wan2.1"/"wan2.2"/"wanvideo".
+                if v.contains("wan2") || v.contains("wanvideo") || v.contains("wan-video") || v.contains("wan_video") {
+                    return LoraBase::Wan;
+                }
             }
         }
     }
@@ -628,6 +701,18 @@ fn sniff_checkpoint_base(path: &Path) -> LoraBase {
         // Z-Image (S3-DiT): flat layer stack.
         if k.starts_with("model.diffusion_model.layers.") || k.starts_with("diffusion_model.layers.") {
             return LoraBase::ZImage;
+        }
+        // LTX-Video (PixArt-derived DiT): the patchify projection is unique to it
+        // among the families offered here. Catches finetunes that lack metadata.
+        if k.contains("patchify_proj") {
+            return LoraBase::Ltx;
+        }
+        // Wan (Alibaba) DiT: transformer blocks with cross-attention to the umt5
+        // text embeddings, e.g. model.diffusion_model.blocks.0.cross_attn.k.weight.
+        // (The built-in 5B base shares this shape but is filtered out of the picker
+        // by builtin_ckpt_files, so classifying it as Wan is harmless.)
+        if k.starts_with("model.diffusion_model.blocks.") && k.contains(".cross_attn.") {
+            return LoraBase::Wan;
         }
         // SDXL: the second text encoder (OpenCLIP bigG) — unique to SDXL.
         if k.starts_with("conditioner.embedders.1") {
@@ -913,6 +998,19 @@ fn with_embeds(base: &str, tokens: &str) -> String {
     }
 }
 
+/// Build a negative encoder's text: the user's negative prompt first (if any),
+/// then the family's built-in quality negative `default_neg`, then any negative
+/// embeddings. Mirrors how the positive prompt is built with [`with_embeds`].
+fn neg_with(job: &GenJob, default_neg: &str) -> String {
+    let user = job.negative.trim();
+    let base = match (user.is_empty(), default_neg.is_empty()) {
+        (true, _) => default_neg.to_string(),
+        (false, true) => user.to_string(),
+        (false, false) => format!("{user}, {default_neg}"),
+    };
+    with_embeds(&base, &job.neg_embeds)
+}
+
 /// Kill the running ComfyUI server (if any) and wait until it stops responding,
 /// so a fresh start picks up changed config. Used after [`ensure_checkpoint_paths`].
 fn stop_server() {
@@ -960,7 +1058,9 @@ mod lora_sniff_tests {
             "sdxl_meta",
             serde_json::json!({"__metadata__": {"ss_base_model_version": "sdxl_base_v1-0"}}),
         );
-        assert!(matches!(sniff_lora_base(&p), LoraBase::Other));
+        // SDXL LoRAs classify as their own family now that there's an SDXL tab to
+        // offer them on (they predate it — this used to fall through to Other).
+        assert!(matches!(sniff_lora_base(&p), LoraBase::Sdxl));
     }
 
     #[test]
@@ -1012,6 +1112,12 @@ pub struct GenerateState {
     family: GenFamily,
     model: GenModel,
     prompt: String,
+    /// User's negative prompt (what to avoid). Edited in a popup opened from the
+    /// "+" menu; combined with each family's built-in quality negative + any
+    /// negative embeddings at generation. Empty = just the built-in negative.
+    negative: String,
+    /// The negative-prompt editor popup is open.
+    show_negative_popup: bool,
     steps: i32,
     cfg: f32,
     width: i32,
@@ -1064,6 +1170,9 @@ pub struct GenerateState {
     copy_flash: Option<(std::time::Instant, bool)>,
     /// Spell-check state for the prompt box (right-click suggestion menu).
     spell: crate::spellcheck::SpellcheckState,
+    /// Separate spell-check state for the negative-prompt popup, so its
+    /// right-click menu never crosses into the positive prompt box.
+    neg_spell: crate::spellcheck::SpellcheckState,
     /// Cooperative cancel flag for the in-flight generation (the in-prompt stop
     /// button sets it; the runner thread polls it and interrupts ComfyUI).
     cancel: Arc<AtomicBool>,
@@ -1083,6 +1192,21 @@ pub struct GenerateState {
     /// When the LoRA-popup Refresh icon was last clicked — drives its one-shot
     /// spin animation. `None` when not spinning.
     lora_refresh_spin: Option<std::time::Instant>,
+    /// Last frame's on-screen rect of the prompt box, used to decide whether a
+    /// drag/drop landed on the prompt (→ import metadata + install its tools)
+    /// rather than the gallery. Published to [`PROMPT_DROP_RECT`] each frame.
+    prompt_rect: Option<egui::Rect>,
+    /// Drag-and-drop import status shown beside the Prompt header — e.g.
+    /// "Installing 3 custom nodes…" then "3 custom nodes added". `None` hides it.
+    nodes_status: Option<String>,
+    /// The runnable ComfyUI API graph imported from a dropped image. When set,
+    /// Generate runs *this* graph (custom nodes and all) with the prompt/seed
+    /// swapped in, instead of the built-in pipeline. Cleared by dropping a
+    /// non-workflow image or via the "+" menu.
+    imported_workflow: Option<String>,
+    /// Set by the header's Text-to-Image model dropdown when the user picks a
+    /// different family; the right panel reads and clears it to switch views.
+    pub family_switch: Option<GenFamily>,
 }
 
 impl Default for GenerateState {
@@ -1096,11 +1220,11 @@ impl GenerateState {
     pub fn new(family: GenFamily) -> Self {
         let model = family.default_model();
         // Video models are trained on landscape; a square/portrait canvas degrades
-        // badly (washed-out, incoherent). LTX defaults to 768×512; Wan 2.2 5B is
-        // trained at 1280×704, its native (and best-looking) resolution.
+        // badly (washed-out, incoherent). Both LTX (its ×2 upscaler targets 1280×704)
+        // and Wan 2.2 5B default to that 16:9 native (and best-looking) resolution —
+        // matching the Landscape aspect tile so the initial state isn't a mismatch.
         let (width, height) = match family {
-            GenFamily::Wan => (1280, 704),
-            GenFamily::Ltx => (768, 512),
+            GenFamily::Wan | GenFamily::Ltx => (1280, 704),
             _ => (1024, 1024),
         };
         // Default clip length (snapped to each model's stride later). Wan 2.2 5B at
@@ -1115,6 +1239,8 @@ impl GenerateState {
             family,
             model,
             prompt: String::new(),
+            negative: String::new(),
+            show_negative_popup: false,
             steps: model.default_steps(),
             cfg: model.default_cfg(),
             width,
@@ -1144,6 +1270,7 @@ impl GenerateState {
             show_log: false,
             copy_flash: None,
             spell: crate::spellcheck::SpellcheckState::default(),
+            neg_spell: crate::spellcheck::SpellcheckState::default(),
             cancel: Arc::new(AtomicBool::new(false)),
             below_h: 210.0,
             frames,
@@ -1151,6 +1278,10 @@ impl GenerateState {
             i2v: false,
             size: 1024,
             lora_refresh_spin: None,
+            prompt_rect: None,
+            nodes_status: None,
+            imported_workflow: None,
+            family_switch: None,
         }
     }
 
@@ -1348,7 +1479,7 @@ fn lora_row(
         let stem = l.file.trim_end_matches(".safetensors");
         let img = tdir.join(format!("{stem}.img"));
         if img.exists() {
-            match std::fs::read(&img).ok().and_then(|b| crate::civitai::decode_thumb(&b)) {
+            match std::fs::read(&img).ok().and_then(|b| crate::civitai::decode_thumb(&b, 200)) {
                 Some(ci) => {
                     l.thumb = Some(ui.ctx().load_texture(
                         format!("lora_thumb_{stem}"),
@@ -1494,6 +1625,87 @@ fn lora_row(
 }
 
 /// The LoRA multi-select popup: an accent-highlighted card + weight slider per
+/// Negative-prompt editor popup (opened from the "+" menu). The text edits
+/// `state.negative` live, so closing the popup keeps whatever was typed — there's
+/// no explicit Save. Applied to the workflow's negative encoder at generation.
+fn negative_popup(ctx: &egui::Context, state: &mut GenerateState) {
+    use crate::PopupPlacement;
+    egui::Window::new("")
+        .id(egui::Id::new("gen_negative_popup"))
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .placed_centered(ctx)
+        .frame(window_frame().corner_radius(CornerRadius::same(22)))
+        .show(ctx, |ui| {
+            // Only the top strip drags the popup — not stray drags on the body.
+            crate::popup_drag_strip(ui, 30.0);
+            ui.set_width(380.0);
+            let radius = CornerRadius::same(10);
+            {
+                let v = ui.visuals_mut();
+                v.widgets.inactive.corner_radius = radius;
+                v.widgets.hovered.corner_radius = radius;
+                v.widgets.active.corner_radius = radius;
+            }
+
+            // Title row: icon + title + close ✕ (auto-saves on close).
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add(
+                    egui::Image::new(egui::include_image!("../icons/edit.svg"))
+                        .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                        .tint(TEXT()),
+                );
+                ui.heading(RichText::new("Negative prompt").color(TEXT()).strong().size(17.0));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::image(
+                            egui::Image::new(egui::include_image!("../icons/close.svg"))
+                                .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                                .tint(TEXT()),
+                        ).frame(false).sense(egui::Sense::click_and_drag()))
+                        .on_hover_text("Close (saved automatically)")
+                        .clicked()
+                    {
+                        state.show_negative_popup = false;
+                    }
+                });
+            });
+            ui.add_space(10.0);
+
+            ui.label(
+                RichText::new("What to avoid in the image. Saved automatically — just close when done.")
+                    .color(MUTED())
+                    .size(12.0),
+            );
+            ui.add_space(8.0);
+
+            // The editor. Edits land straight in state.negative (live save).
+            let out = egui::TextEdit::multiline(&mut state.negative)
+                .desired_width(f32::INFINITY)
+                .desired_rows(6)
+                .hint_text("blurry, low quality, watermark, extra fingers…")
+                .show(ui);
+            // Spell-check the negative prompt too (right-click suggestions).
+            crate::spellcheck::attach(ui, &out, &mut state.negative, &mut state.neg_spell);
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if !state.negative.trim().is_empty()
+                    && ui.add(egui::Button::new(RichText::new("Clear").size(12.0))).clicked()
+                {
+                    state.negative.clear();
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add(egui::Button::new(RichText::new("Done").size(12.0).strong())).clicked() {
+                        state.show_negative_popup = false;
+                    }
+                });
+            });
+        });
+}
+
 /// installed LoRA.
 fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
     use crate::PopupPlacement;
@@ -1715,7 +1927,7 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.add(
-                    egui::Image::new(egui::include_image!("../icons/plugin.svg"))
+                    egui::Image::new(egui::include_image!("../icons/extension.svg"))
                         .fit_to_exact_size(egui::vec2(20.0, 20.0))
                         .tint(TEXT()),
                 );
@@ -1847,7 +2059,7 @@ fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, off_family: bool) {
         let stem = embed_stem(&e.file);
         let img = tdir.join(format!("{stem}.img"));
         if img.exists() {
-            match std::fs::read(&img).ok().and_then(|b| crate::civitai::decode_thumb(&b)) {
+            match std::fs::read(&img).ok().and_then(|b| crate::civitai::decode_thumb(&b, 200)) {
                 Some(ci) => {
                     e.thumb = Some(ui.ctx().load_texture(format!("embed_thumb_{stem}"), ci, Default::default()));
                 }
@@ -1875,7 +2087,7 @@ fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, off_family: bool) {
                 ui.add(egui::Image::new(&tex).max_height(64.0).max_width(64.0).corner_radius(8));
             } else {
                 ui.add(
-                    egui::Image::new(egui::include_image!("../icons/plugin.svg"))
+                    egui::Image::new(egui::include_image!("../icons/extension.svg"))
                         .fit_to_exact_size(egui::vec2(14.0, 14.0))
                         .tint(icon_tint(if selected { TEXT() } else { MUTED() })),
                 );
@@ -2128,6 +2340,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                     finished = true;
                     state.status_err = !ok;
                 }
+                RunnerMsg::Nodes(s) => state.nodes_status = Some(s),
             }
         }
         if finished {
@@ -2146,7 +2359,55 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
         .show(ui, |ui| {
             ui.set_height(40.0);
             ui.horizontal_centered(|ui| {
-                ui.label(RichText::new(state.family.title()).color(TEXT()).strong().size(14.0));
+                {
+                    // A dropdown to switch model within this group — Text-to-Video
+                    // (LTX / Wan) for the video Directors, Text-to-Image (SDXL /
+                    // Anima / Flux / Z-Image) otherwise — with an arrow glyph to the
+                    // left of the model name.
+                    let options: &[GenFamily] = if state.family.is_video() {
+                        &[GenFamily::Ltx, GenFamily::Wan]
+                    } else {
+                        &[GenFamily::Sdxl, GenFamily::Anima, GenFamily::Flux, GenFamily::ZImage]
+                    };
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let menu_id = ui.id().with("family_menu");
+                    // Point down while the menu is open, then flip to a right-
+                    // pointing arrow once it closes — so clicking it visibly "moves".
+                    let arrow_src = if egui::Popup::is_id_open(ui.ctx(), menu_id) {
+                        egui::include_image!("../icons/arrow_drop_down.svg")
+                    } else {
+                        egui::include_image!("../icons/arrow_right.svg")
+                    };
+                    let arrow = egui::Image::new(arrow_src)
+                        .fit_to_exact_size(egui::vec2(18.0, 18.0))
+                        .tint(TEXT());
+                    let resp = ui
+                        .add(
+                            egui::Button::image_and_text(
+                                arrow,
+                                RichText::new(state.family.title()).color(TEXT()).strong().size(14.0),
+                            )
+                            .frame(false)
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    egui::Popup::menu(&resp)
+                        .id(menu_id)
+                        .align(egui::RectAlign::BOTTOM_START)
+                        .frame(menu_frame())
+                        .show(|ui| {
+                            ui.set_min_width(150.0);
+                            round_menu_rows(ui);
+                            for &fam in options {
+                                if ui.selectable_label(state.family == fam, fam.title()).clicked() {
+                                    if state.family != fam {
+                                        state.family_switch = Some(fam);
+                                    }
+                                    ui.close();
+                                }
+                            }
+                        });
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let color = if state.status_err {
                         RED
@@ -2221,11 +2482,51 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
     if state.show_embeddings_popup {
         embeddings_popup(ui.ctx(), state);
     }
+    // Negative-prompt editor.
+    if state.show_negative_popup {
+        negative_popup(ui.ctx(), state);
+    }
 
     ui.add_space(10.0);
 
+    // Is a file being dragged over the window right now? On Windows, winit
+    // (0.30) doesn't emit cursor-move events during an OS file drag, so the
+    // pointer position is unknown/stale — we can't reliably tell *where* over the
+    // window the file is. So highlight whenever a file is over the window and the
+    // pointer (if known at all) is over the box; the box is the drop target while
+    // a generator is open. (Uses last frame's box rect — the header row below is
+    // drawn before this frame's box exists.)
+    let dragging_files = ui.input(|i| !i.raw.hovered_files.is_empty());
+    if dragging_files {
+        ui.ctx().request_repaint();
+    }
+    let hover_pos = ui.input(|i| i.pointer.hover_pos());
+    let drag_over_prompt = dragging_files
+        && state.prompt_rect.map_or(true, |r| hover_pos.map_or(true, |p| r.contains(p)));
+
     // --- Prompt (stretched to the panel; long text scrolls inside). ---
-    ui.label(RichText::new("Prompt").color(MUTED()).size(12.0));
+    // Header row: "Prompt" on the left; on the right, the drag-and-drop import
+    // hint while a file is over the box, otherwise the "custom nodes added /
+    // being used" status from the last import.
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Prompt").color(MUTED()).size(12.0));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if drag_over_prompt {
+                ui.label(RichText::new("Drop to import prompt + install its tools").color(DROP_BLUE).size(12.0));
+            } else if state.running {
+                // While installing/generating, show the live status.
+                if let Some(s) = &state.nodes_status {
+                    ui.label(RichText::new(s).color(DROP_BLUE).size(12.0));
+                }
+            } else if state.imported_workflow.is_some() {
+                // Persistent indicator: Generate will run the dropped workflow.
+                ui.label(RichText::new("⚡ Custom nodes active — using imported workflow").color(GREEN).size(12.0))
+                    .on_hover_text("Generate runs the dropped image's own ComfyUI graph (custom nodes and all).\nClear it from the + menu to use the built-in pipeline.");
+            } else if let Some(s) = &state.nodes_status {
+                ui.label(RichText::new(s).color(GREEN).size(12.0));
+            }
+        });
+    });
     ui.add_space(2.0);
     // Both Flux and Z-Image dress the prompt box in the "Details & Actions" panel
     // styling (PANEL fill, rounded-22 corners, faint edge). No drop shadow: the
@@ -2248,7 +2549,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
     // allocation comes from desired_rows — so the row count is the only lever.)
     let row_h = ui.text_style_height(&egui::TextStyle::Body);
     let prompt_rows = (((prompt_max_h - btn_strip - 4.0) / row_h).floor() as usize).max(4);
-    prompt_frame
+    let prompt_resp = prompt_frame
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::ScrollArea::vertical()
@@ -2311,13 +2612,41 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                                 // injected into the workflow's pos/neg encoder.
                                 let en = state.embeddings.iter().filter(|e| e.selected && e.base.matches(state.family)).count();
                                 let elabel = if en > 0 { format!("Embeddings ({en})") } else { "Embeddings".to_string() };
-                                let eicon = egui::Image::new(egui::include_image!("../icons/plugin.svg"))
+                                let eicon = egui::Image::new(egui::include_image!("../icons/extension.svg"))
                                     .fit_to_exact_size(egui::vec2(16.0, 16.0))
                                     .tint(icon_tint(TEXT()));
                                 if ui.add(egui::Button::image_and_text(eicon, RichText::new(elabel).size(12.0)).frame(false)).clicked() {
                                     refresh_embeddings(state, ui.ctx());
                                     state.show_embeddings_popup = true;
                                     ui.close();
+                                }
+
+                                // Negative prompt: opens an editor popup; the text
+                                // is saved live and applied to the negative encoder.
+                                let nlabel = if state.negative.trim().is_empty() {
+                                    "Negative prompt".to_string()
+                                } else {
+                                    "Negative prompt (set)".to_string()
+                                };
+                                let nicon = egui::Image::new(egui::include_image!("../icons/edit.svg"))
+                                    .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                                    .tint(icon_tint(TEXT()));
+                                if ui.add(egui::Button::image_and_text(nicon, RichText::new(nlabel).size(12.0)).frame(false)).clicked() {
+                                    state.show_negative_popup = true;
+                                    ui.close();
+                                }
+
+                                // Shown only when a dropped image's workflow is in
+                                // use — lets the user revert to the built-in pipeline.
+                                if state.imported_workflow.is_some() {
+                                    let cicon = egui::Image::new(egui::include_image!("../icons/close.svg"))
+                                        .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                                        .tint(icon_tint(TEXT()));
+                                    if ui.add(egui::Button::image_and_text(cicon, RichText::new("Clear imported workflow").size(12.0)).frame(false)).clicked() {
+                                        state.imported_workflow = None;
+                                        state.nodes_status = None;
+                                        ui.close();
+                                    }
                                 }
                             });
                     }
@@ -2359,18 +2688,63 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
         });
     let after_prompt_y = ui.cursor().min.y;
 
+    // Remember the box rect for next frame's drag-over hit-test, and publish it
+    // so the gallery's global drop handler knows a drop here is ours, not media.
+    let prompt_rect = prompt_resp.response.rect;
+    state.prompt_rect = Some(prompt_rect);
+    if let Ok(mut g) = PROMPT_DROP_RECT.lock() {
+        *g = Some((prompt_rect, ui.input(|i| i.time)));
+    }
+
+    // While a file is dragged over the box, tint it blue and show the attach
+    // icon centred — the visual cue that dropping will import its metadata.
+    if drag_over_prompt {
+        let p = ui.painter();
+        p.rect_filled(prompt_rect, CornerRadius::same(22), DROP_BLUE.gamma_multiply(0.18));
+        p.rect_stroke(
+            prompt_rect,
+            CornerRadius::same(22),
+            egui::Stroke::new(2.0, DROP_BLUE),
+            egui::StrokeKind::Inside,
+        );
+        let side = 56.0_f32.min(prompt_rect.height() * 0.5);
+        let icon_rect = egui::Rect::from_center_size(prompt_rect.center(), egui::vec2(side, side));
+        egui::Image::new(egui::include_image!("../icons/attach_file.svg"))
+            .tint(DROP_BLUE)
+            .paint_at(ui, icon_rect);
+    }
+
+    // Handle a drop that landed on the box (only when idle). The first dropped
+    // file is imported: prompt + settings filled, and its workflow's custom
+    // nodes downloaded into ComfyUI.
+    if !state.running {
+        let dropped: Option<PathBuf> = ui.input(|i| {
+            i.raw.dropped_files.iter().find_map(|f| f.path.clone())
+        });
+        if let Some(path) = dropped {
+            // Same tolerance as the highlight: when the release position is
+            // unknown (typical for Windows DnD), accept the drop — this
+            // generator's box was the highlighted target.
+            let release_pos = ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
+            if release_pos.map_or(true, |p| prompt_rect.contains(p)) {
+                import_dropped_file(state, &path, ui.ctx());
+            }
+        }
+    }
+
     ui.add_space(8.0);
 
     // --- Settings. ---
     slider(ui, "Steps", &mut state.steps, 1..=50);
     slider(ui, "Guidance (CFG)", &mut state.cfg, 1.0..=8.0);
-    // Resolution: the image families (Z-Image, Flux) use a single "Size" slider +
-    // quick aspect-ratio tiles (square/landscape/portrait) instead of fine
-    // Width/Height sliders — the slider scales every preset live, and one click on
-    // a tile picks the ratio. Video families keep the sliders.
-    if matches!(state.family, GenFamily::ZImage | GenFamily::Flux | GenFamily::Sdxl | GenFamily::Anima) {
+    // Resolution: every family uses a single "Size" slider + quick aspect-ratio
+    // tiles (square/landscape/portrait) instead of fine Width/Height sliders — the
+    // slider scales every preset live, and one click on a tile picks the ratio.
+    // The presets are family-aware (see `aspect_dims`) so each model's landscape
+    // tile sits on its native, best-looking resolution.
+    {
         // The Size slider scales all three presets; recompute the active dims so the
-        // current selection tracks the slider live (snapped to multiples of 64).
+        // current selection tracks the slider live (snapped to the family's grid).
         let mut size = state.size;
         ui.horizontal(|ui| {
             ui.label(RichText::new("Size").color(MUTED()).size(12.0));
@@ -2381,18 +2755,11 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
         if size != state.size {
             state.size = size;
             let idx = aspect_idx(state.width, state.height);
-            let (w, h) = zimage_aspect_dims(idx, size);
+            let (w, h) = aspect_dims(state.family, idx, size);
             state.width = w;
             state.height = h;
         }
         aspect_selector(ui, state);
-    } else {
-        ui.horizontal(|ui| {
-            slider(ui, "Width", &mut state.width, 512..=1536);
-        });
-        ui.horizontal(|ui| {
-            slider(ui, "Height", &mut state.height, 512..=1536);
-        });
     }
     // Video families (LTX): length + frame rate, and the text/image-to-video
     // mode toggle.
@@ -2405,12 +2772,12 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
             if ui.radio(!state.i2v, "").clicked() {
                 state.i2v = false;
             }
-            ui.label(RichText::new("Text → video").color(TEXT()).size(12.0));
+            mode_label(ui, "Text", "video");
             ui.add_space(10.0);
             if ui.radio(state.i2v, "").clicked() {
                 state.i2v = true;
             }
-            ui.label(RichText::new("Image → video").color(TEXT()).size(12.0));
+            mode_label(ui, "Image", "video");
         });
         if state.i2v {
             let txt = match current_image {
@@ -2647,10 +3014,10 @@ fn model_selector(ui: &mut egui::Ui, state: &mut GenerateState) {
                 // Owned copies so the list isn't borrowed while we mutate `state`.
                 let mut compatible: Vec<(String, LoraBase)> = Vec::new();
                 let mut others: Vec<(String, LoraBase)> = Vec::new();
-                let base_file = family.default_model_file();
+                let base_files = family.builtin_ckpt_files();
                 for c in &state.checkpoints {
-                    // The built-in base is already listed above — don't duplicate it.
-                    if c.file == base_file {
+                    // The built-in base(s) are already listed above — don't duplicate.
+                    if base_files.contains(&c.file.as_str()) {
                         continue;
                     }
                     if c.base.matches(family) || c.base == LoraBase::Unknown {
@@ -2777,23 +3144,36 @@ fn aspect_idx(width: i32, height: i32) -> usize {
     }
 }
 
-/// Z-Image: the (width, height) for an aspect tile at the reference `size`.
-/// `idx`: 0 square, 1 landscape, 2 portrait. Square is `size`² exactly; the others
-/// scale the 1216×832 (≈3:2) bucket proportionally, snapped to multiples of 64.
-fn zimage_aspect_dims(idx: usize, size: i32) -> (i32, i32) {
-    let snap = |v: f32| (((v / 64.0).round() as i32).max(1)) * 64;
+/// The (width, height) for an aspect tile at the reference `size`.
+/// `idx`: 0 square, 1 landscape, 2 portrait. The landscape "bucket" is each
+/// family's native, best-looking resolution, scaled by the Size slider and
+/// snapped to the family's latent grid — so the landscape tile lands exactly on
+/// the native dims rather than degrading them:
+///   • Wan 2.2 5B → 1280×704 (16:9), multiples of 32
+///   • LTX        → 768×512  (3:2),  multiples of 32
+///   • image families (Z-Image/Flux/SDXL/Anima) → 1216×832 (≈3:2), multiples of 64
+fn aspect_dims(family: GenFamily, idx: usize, size: i32) -> (i32, i32) {
+    let grid = if family.is_video() { 32 } else { 64 };
+    let snap = |v: f32| (((v / grid as f32).round() as i32).max(1)) * grid;
     let scale = size as f32 / 1024.0;
+    let (lw, lh) = match family {
+        // Both video families render landscape best at 16:9; LTX-2.3 upscales a
+        // half-res base to exactly 1280×704, and Wan 2.2 5B is native there.
+        GenFamily::Wan | GenFamily::Ltx => (1280.0, 704.0),
+        _ => (1216.0, 832.0),
+    };
     match idx {
-        1 => (snap(1216.0 * scale), snap(832.0 * scale)),
-        2 => (snap(832.0 * scale), snap(1216.0 * scale)),
-        _ => (size, size),
+        1 => (snap(lw * scale), snap(lh * scale)),
+        2 => (snap(lh * scale), snap(lw * scale)),
+        _ => (snap(size as f32), snap(size as f32)),
     }
 }
 
-/// Z-Image resolution picker: three equal-width tiles (square / landscape /
-/// portrait) replacing the Width/Height sliders. Each shows its live pixel size
-/// (scaled by the Size slider) and sets the dimensions on click; the tile matching
-/// the current orientation is highlighted with the accent border.
+/// Resolution picker: three equal-width tiles (square / landscape / portrait)
+/// replacing the Width/Height sliders. Each shows its live pixel size (scaled by
+/// the Size slider, family-aware via `aspect_dims`) and sets the dimensions on
+/// click; the tile matching the current orientation is highlighted with the
+/// accent border.
 fn aspect_selector(ui: &mut egui::Ui, state: &mut GenerateState) {
     let tiles = [
         (egui::include_image!("../icons/square.svg"), "Square"),
@@ -2806,7 +3186,7 @@ fn aspect_selector(ui: &mut egui::Ui, state: &mut GenerateState) {
     ui.add_space(4.0);
     ui.columns(3, |cols| {
         for (i, (icon, label)) in tiles.into_iter().enumerate() {
-            let (w, h) = zimage_aspect_dims(i, state.size);
+            let (w, h) = aspect_dims(state.family, i, state.size);
             if aspect_tile(&mut cols[i], icon, label, &format!("{w}×{h}"), i == active) {
                 state.width = w;
                 state.height = h;
@@ -2857,6 +3237,21 @@ fn slider<N: egui::emath::Numeric>(ui: &mut egui::Ui, label: &str, value: &mut N
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add(egui::Slider::new(value, range));
         });
+    });
+}
+
+/// A "<from> → <to>" mode label using the arrow_right_alt SVG glyph in place of a
+/// literal "→" (e.g. "Text → video"). Rendered inline with tight spacing.
+fn mode_label(ui: &mut egui::Ui, from: &str, to: &str) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(RichText::new(from).color(TEXT()).size(12.0));
+        ui.add(
+            egui::Image::new(egui::include_image!("../icons/arrow_right_alt.svg"))
+                .fit_to_exact_size(egui::vec2(16.0, 14.0))
+                .tint(TEXT()),
+        );
+        ui.label(RichText::new(to).color(TEXT()).size(12.0));
     });
 }
 
@@ -2933,6 +3328,14 @@ fn missing_files(model: GenModel, custom_ckpt: Option<&str>) -> Vec<String> {
         for (sub, file) in required_files(model) {
             if sub != model_sub && !file.is_empty() && !models.join(sub).join(&file).exists() {
                 missing.push(file);
+            }
+        }
+        // A custom Wan model is a 14B I2V finetune: it needs the Wan 2.1 VAE, not the
+        // 5B TI2V's 2.2 VAE that required_files() lists. Swap the requirement.
+        if model.family() == GenFamily::Wan {
+            missing.retain(|f| f != "wan2.2_vae.safetensors");
+            if !models.join("vae").join("wan_2.1_vae.safetensors").exists() {
+                missing.push("wan_2.1_vae.safetensors".to_string());
             }
         }
         return missing;
@@ -3160,6 +3563,9 @@ fn run_setup(
             ok &= fetch(WAN_TI2V_5B, m("diffusion_models").join("wan2.2_ti2v_5B_fp16.safetensors"), "Wan 2.2 5B model", "", &send);
             ok &= fetch(WAN_UMT5, m("text_encoders").join("umt5_xxl_fp8_e4m3fn_scaled.safetensors"), "umt5-xxl encoder", "", &send);
             ok &= fetch(WAN_VAE, m("vae").join("wan2.2_vae.safetensors"), "Wan 2.2 VAE", "", &send);
+            // The Wan 2.1 VAE — needed by custom 14B I2V models selected from the
+            // picker (the 5B itself doesn't use it). Small (~254 MB).
+            ok &= fetch(WAN_VAE_21, m("vae").join("wan_2.1_vae.safetensors"), "Wan 2.1 VAE", "", &send);
         }
         GenFamily::Sdxl => {
             // SDXL Base 1.0 — a single checkpoint (UNet + dual CLIP + VAE).
@@ -3199,6 +3605,7 @@ fn start_generate(state: &mut GenerateState, ctx: &egui::Context, cur_image: Opt
     state.running = true;
     state.status = "Generating…".into();
     state.status_err = false;
+    state.nodes_status = None;
     state.cancel.store(false, Ordering::SeqCst);
     let cancel = state.cancel.clone();
 
@@ -3230,10 +3637,12 @@ fn start_generate(state: &mut GenerateState, ctx: &egui::Context, cur_image: Opt
             .collect(),
         pos_embeds: embed_tokens(state, false),
         neg_embeds: embed_tokens(state, true),
+        negative: state.negative.clone(),
         frames: state.frames,
         fps: state.fps,
         i2v,
         src_image: if i2v { cur_image.map(|p| p.to_path_buf()) } else { None },
+        imported_workflow: state.imported_workflow.clone(),
     };
     let ctx = ctx.clone();
     std::thread::spawn(move || {
@@ -3241,6 +3650,781 @@ fn start_generate(state: &mut GenerateState, ctx: &egui::Context, cur_image: Opt
         let _ = tx.send(RunnerMsg::Done(ok));
         ctx.request_repaint();
     });
+}
+
+/// Drag-and-drop import: read the dropped file's generation metadata, fill the
+/// prompt + settings, and (when its workflow used custom nodes) download/install
+/// them into ComfyUI on a background thread. Only called when idle.
+fn import_dropped_file(state: &mut GenerateState, path: &Path, ctx: &egui::Context) {
+    let Some(meta) = crate::sd_metadata::read_generation(path) else {
+        state.nodes_status = Some("No generation metadata in that file".into());
+        return;
+    };
+
+    // Adopt the dropped image's runnable graph so Generate runs *its* workflow
+    // (custom nodes and all). Dropping a non-workflow image clears it.
+    state.imported_workflow = meta.workflow_api.clone();
+
+    // Fill the prompt + settings (the user opted into both).
+    if !meta.positive.trim().is_empty() {
+        state.prompt = meta.positive.clone();
+    }
+    if !meta.negative.trim().is_empty() {
+        state.negative = meta.negative.clone();
+    }
+    if let Some(s) = meta.steps {
+        state.steps = (s as i32).clamp(1, 50);
+    }
+    if let Some(c) = meta.cfg {
+        state.cfg = (c as f32).clamp(1.0, 8.0);
+    }
+    if let Some(seed) = meta.seed {
+        if seed >= 0 {
+            state.seed = seed;
+            state.randomize_seed = false;
+        }
+    }
+    if let (Some(w), Some(h)) = (meta.width, meta.height) {
+        if w > 0 && h > 0 {
+            state.width = w as i32;
+            state.height = h as i32;
+            // Image families drive every aspect tile off a single "Size" edge.
+            state.size = (w.max(h) as i32).clamp(256, 2048);
+        }
+    }
+
+    // Auto-select the LoRAs the generation used, matching installed files by stem
+    // (case-insensitive) and applying the recorded strength.
+    if !meta.loras.is_empty() {
+        refresh_loras(state, ctx);
+        let mut matched = 0usize;
+        for (name, weight) in &meta.loras {
+            let want = name.trim_end_matches(".safetensors");
+            if let Some(l) = state
+                .loras
+                .iter_mut()
+                .find(|l| l.file.trim_end_matches(".safetensors").eq_ignore_ascii_case(want))
+            {
+                l.selected = true;
+                l.strength = *weight;
+                matched += 1;
+            }
+        }
+        let total = meta.loras.len();
+        state.log.push(if matched == total {
+            format!("== Selected {total} LoRA(s) from the dropped image")
+        } else {
+            format!("== Selected {matched}/{total} LoRA(s); the rest aren't installed in models/loras/")
+        });
+    }
+
+    ctx.request_repaint();
+
+    let nodes = meta.custom_nodes;
+    let graph = state.imported_workflow.clone();
+    let civitai = meta.civitai.clone();
+    // Nothing to fetch (no custom nodes, no runnable graph) → just report.
+    if nodes.is_empty() && graph.is_none() {
+        state.nodes_status = Some("Imported — no custom nodes used".into());
+        return;
+    }
+
+    // Download/install the workflow's custom nodes AND any referenced model files
+    // it's missing, on a worker — reusing the Log + `running` machinery so
+    // progress shows and the orb spins.
+    let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
+    let (tx, rx) = mpsc::channel();
+    state.rx = Some(rx);
+    state.running = true;
+    state.status = if nodes.is_empty() { "Fetching models…".into() } else { "Installing custom nodes…".into() };
+    state.status_err = false;
+    let n = nodes.len();
+    state.nodes_status = Some(if n == 0 {
+        "Fetching models…".to_string()
+    } else {
+        format!("Installing {n} custom node{}…", if n == 1 { "" } else { "s" })
+    });
+    if !names.is_empty() {
+        state.log.push(format!("== Importing workflow tools: {}", names.join(", ")));
+    }
+
+    let ctx2 = ctx.clone();
+    std::thread::spawn(move || {
+        let ok = nodes.is_empty() || install_custom_nodes(nodes, &tx, &ctx2);
+        // Then resolve + download any model files the workflow needs.
+        if let Some(graph) = graph {
+            download_missing_models(&graph, &civitai, &tx, &ctx2);
+        }
+        let _ = tx.send(RunnerMsg::Done(ok));
+        ctx2.request_repaint();
+    });
+}
+
+/// ComfyUI-Manager's canonical model index: maps a model `filename` to a download
+/// `url` + `save_path`/`type`. The standard way the ComfyUI ecosystem resolves a
+/// bare model filename to a source.
+const MODEL_LIST_URL: &str = "https://raw.githubusercontent.com/Comfy-Org/ComfyUI-Manager/main/model-list.json";
+
+/// Resolve + download the model files an imported workflow references but that
+/// aren't installed, using ComfyUI-Manager's model index. Best-effort: well-known
+/// models (VAEs, SAM, upscalers, common CLIP) resolve; Civitai/community-specific
+/// checkpoints usually won't, and are reported for manual download.
+fn download_missing_models(
+    graph: &str,
+    civitai: &[crate::sd_metadata::CivitaiRef],
+    tx: &mpsc::Sender<RunnerMsg>,
+    ctx: &egui::Context,
+) {
+    let send = |s: String| {
+        let _ = tx.send(RunnerMsg::Line(s));
+        ctx.request_repaint();
+    };
+    let label = |s: String| {
+        let _ = tx.send(RunnerMsg::Nodes(s));
+        ctx.request_repaint();
+    };
+
+    let comfy = comfy_base().join("ComfyUI");
+    let missing = imported_missing_models(graph, &comfy);
+    if missing.is_empty() {
+        return;
+    }
+    send(format!("== Workflow needs {} model file(s) not installed — resolving…", missing.len()));
+    label(format!("Downloading {} model(s)…", missing.len()));
+    let models_dir = comfy.join("models");
+    let mut got = 0usize;
+
+    // Track what's still missing as bare filenames; passes remove what they fetch.
+    let mut remaining: Vec<String> = missing
+        .iter()
+        .map(|n| n.replace('\\', "/").rsplit('/').next().unwrap_or(n).to_string())
+        .collect();
+
+    // Pass 1 — ComfyUI-Manager's index (well-known VAEs, SAM, upscalers, CLIP…).
+    let index = fetch_model_list(&send);
+    remaining.retain(|base| match index.get(&base.to_ascii_lowercase()) {
+        Some((url, folder)) => {
+            let dir = models_dir.join(folder);
+            let _ = std::fs::create_dir_all(&dir);
+            let dest = dir.join(base);
+            if dest.exists() {
+                got += 1;
+                return false;
+            }
+            send(format!("== Downloading {base} → models/{folder}/"));
+            if download(url, &dest, &send).is_ok() {
+                got += 1;
+                false
+            } else {
+                send(format!("   FAILED to download {base}"));
+                true
+            }
+        }
+        None => true,
+    });
+
+    // Pass 2 — Civitai resources by version id (the checkpoint + LoRAs the image
+    // was made with). Civitai's served filenames often differ from the workflow's
+    // local names (e.g. JANIMA_v10 vs JANIMA_V1), so match by resource CATEGORY
+    // against what's still missing and fetch each resource's primary file.
+    if !remaining.is_empty() && !civitai.is_empty() {
+        let cats = referenced_model_cats(graph);
+        // Count how many of each category are still missing.
+        let mut need: std::collections::HashMap<ModelCat, usize> = std::collections::HashMap::new();
+        for r in &remaining {
+            if let Some(c) = cats.get(&r.to_ascii_lowercase()) {
+                *need.entry(*c).or_default() += 1;
+            }
+        }
+        let key = crate::civitai::load_civitai_key();
+        for cref in civitai {
+            let cat = air_cat(&cref.kind);
+            if need.get(&cat).copied().unwrap_or(0) == 0 {
+                continue; // already have every model of this category
+            }
+            let files = fetch_civitai_version_files(cref.version_id, &send);
+            let chosen = files.iter().find(|(_, _, p)| *p).cloned().or_else(|| files.first().cloned());
+            let Some((fname, mut url, _)) = chosen else { continue };
+
+            let folder = civitai_folder(&cref.kind);
+            let dir = models_dir.join(folder);
+            let _ = std::fs::create_dir_all(&dir);
+            let dest = dir.join(&fname);
+            let downloaded = if dest.exists() {
+                true
+            } else {
+                // Token goes in the query string — Civitai 302-redirects to S3.
+                if !key.is_empty() {
+                    url.push(if url.contains('?') { '&' } else { '?' });
+                    url.push_str("token=");
+                    url.push_str(&key);
+                }
+                send(format!("== Downloading {fname} (Civitai {}) → models/{folder}/", cref.kind));
+                if download(&url, &dest, &send).is_ok() {
+                    true
+                } else {
+                    send(format!("   FAILED to download {fname} from Civitai (gated? add an API key in the Civitai panel)"));
+                    false
+                }
+            };
+            if !downloaded {
+                continue;
+            }
+            got += 1;
+            *need.entry(cat).or_insert(1) = need.get(&cat).copied().unwrap_or(1).saturating_sub(1);
+            // Resolve one missing slot of this category (names may differ).
+            if let Some(idx) = remaining.iter().position(|r| cats.get(&r.to_ascii_lowercase()) == Some(&cat)) {
+                let resolved = remaining.remove(idx);
+                if !resolved.eq_ignore_ascii_case(&fname) {
+                    send(format!("   note: workflow references '{resolved}' — downloaded as '{fname}'; rename it if the workflow can't find it."));
+                }
+            }
+        }
+    }
+
+    if remaining.is_empty() {
+        send("== All referenced models are present.".into());
+        label(format!("{got} model(s) downloaded"));
+    } else {
+        send(format!(
+            "== Couldn't auto-resolve {} model file(s): {}",
+            remaining.len(),
+            remaining.join(", ")
+        ));
+        send("   Download those manually into ComfyUI/models/<folder>/ to run this workflow.".into());
+        label(format!("{got} downloaded · {} need manual download", remaining.len()));
+    }
+}
+
+/// Fetch a Civitai model version's downloadable files as `(filename, url, primary)`.
+/// Listing needs no token; the download itself may.
+fn fetch_civitai_version_files(version_id: i64, send: &dyn Fn(String)) -> Vec<(String, String, bool)> {
+    let url = format!("https://civitai.com/api/v1/model-versions/{version_id}");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .max_redirects(5)
+        .build()
+        .into();
+    let resp = match agent.get(&url).header("User-Agent", "Clarity-TagFlow").call() {
+        Ok(r) => r,
+        Err(e) => {
+            send(format!("   Civitai lookup for version {version_id} failed: {e}"));
+            return Vec::new();
+        }
+    };
+    let Ok(json) = read_json(resp) else { return Vec::new() };
+    let Some(files) = json.get("files").and_then(|f| f.as_array()) else { return Vec::new() };
+    files
+        .iter()
+        .filter_map(|f| {
+            let name = f.get("name").and_then(|v| v.as_str())?.to_string();
+            let dl = f.get("downloadUrl").and_then(|v| v.as_str())?.to_string();
+            let primary = f.get("primary").and_then(|v| v.as_bool()).unwrap_or(false);
+            Some((name, dl, primary))
+        })
+        .collect()
+}
+
+/// Map a Civitai AIR resource kind to its ComfyUI `models/` subfolder.
+fn civitai_folder(kind: &str) -> &'static str {
+    match kind.to_ascii_lowercase().as_str() {
+        "checkpoint" => "checkpoints",
+        "lora" | "locon" | "lycoris" | "dora" => "loras",
+        "textualinversion" | "embedding" => "embeddings",
+        "vae" => "vae",
+        "controlnet" => "controlnet",
+        "upscaler" => "upscale_models",
+        _ => "checkpoints",
+    }
+}
+
+/// Coarse model category, used to match a Civitai resource (by its AIR kind)
+/// against a still-missing model in the workflow when their filenames differ.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ModelCat {
+    Checkpoint,
+    Lora,
+    Vae,
+    Clip,
+    Controlnet,
+    Upscale,
+    Sam,
+    Other,
+}
+
+/// Map a Civitai AIR resource kind to a category.
+fn air_cat(kind: &str) -> ModelCat {
+    match kind.to_ascii_lowercase().as_str() {
+        "checkpoint" => ModelCat::Checkpoint,
+        "lora" | "locon" | "lycoris" | "dora" => ModelCat::Lora,
+        "vae" => ModelCat::Vae,
+        "controlnet" => ModelCat::Controlnet,
+        "upscaler" => ModelCat::Upscale,
+        _ => ModelCat::Other,
+    }
+}
+
+/// Map a loader node's input field (disambiguated by class_type where needed) to
+/// the model category it loads.
+fn field_cat(class_type: &str, key: &str) -> Option<ModelCat> {
+    Some(match key {
+        "ckpt_name" | "unet_name" => ModelCat::Checkpoint,
+        "vae_name" => ModelCat::Vae,
+        k if k.starts_with("clip_name") => ModelCat::Clip,
+        "lora_name" | "lora" => ModelCat::Lora,
+        "control_net_name" => ModelCat::Controlnet,
+        "model_name" => match class_type {
+            "UpscaleModelLoader" => ModelCat::Upscale,
+            "SAMLoader" => ModelCat::Sam,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// Build `filename(lowercased) → category` for every model file an imported
+/// graph references through a recognised loader field — so a Civitai resource of
+/// a given kind can be matched to the right missing file even when names differ.
+fn referenced_model_cats(graph: &str) -> std::collections::HashMap<String, ModelCat> {
+    let mut out = std::collections::HashMap::new();
+    let Some(root) = crate::sd_metadata::parse_comfy_json(graph) else { return out };
+    let Some(map) = root.as_object() else { return out };
+    let base = |s: &str| s.replace('\\', "/").rsplit('/').next().unwrap_or(s).to_ascii_lowercase();
+    for node in map.values() {
+        let ct = node.get("class_type").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(inputs) = node.get("inputs").and_then(|v| v.as_object()) else { continue };
+        for (k, v) in inputs {
+            if let Some(s) = v.as_str() {
+                if let Some(c) = field_cat(ct, k) {
+                    out.insert(base(s), c);
+                }
+            } else if k.starts_with("lora_") && v.is_object() {
+                // rgthree Power Lora Loader: nested { lora: "name", on, strength }.
+                if let Some(name) = v.get("lora").and_then(|x| x.as_str()) {
+                    if !name.is_empty() {
+                        out.insert(base(name), ModelCat::Lora);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Fetch ComfyUI-Manager's model index into `filename(lowercased) → (url, folder)`.
+/// `folder` is the `save_path` when set (e.g. `sams`, `controlnet/sdxl`), else the
+/// `type` (which is the default models/ subfolder name). Empty map on failure.
+fn fetch_model_list(send: &dyn Fn(String)) -> std::collections::HashMap<String, (String, String)> {
+    let mut out = std::collections::HashMap::new();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .max_redirects(5)
+        .build()
+        .into();
+    let resp = match agent.get(MODEL_LIST_URL).header("User-Agent", "Clarity-TagFlow").call() {
+        Ok(r) => r,
+        Err(e) => {
+            send(format!("   model index fetch failed: {e}"));
+            return out;
+        }
+    };
+    let Ok(json) = read_json(resp) else { return out };
+    let Some(models) = json.get("models").and_then(|m| m.as_array()) else { return out };
+    for m in models {
+        let (Some(file), Some(url)) = (
+            m.get("filename").and_then(|v| v.as_str()),
+            m.get("url").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        if file.is_empty() || url.is_empty() {
+            continue;
+        }
+        let save_path = m.get("save_path").and_then(|v| v.as_str()).unwrap_or("default");
+        let ty = m.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let folder = if save_path != "default" && !save_path.is_empty() {
+            save_path.to_string()
+        } else {
+            ty.to_string()
+        };
+        if folder.is_empty() {
+            continue;
+        }
+        out.entry(file.to_ascii_lowercase()).or_insert((url.to_string(), folder));
+    }
+    out
+}
+
+/// Download + install the given custom nodes into ComfyUI's `custom_nodes/`
+/// (GitHub zip → unzip → pip-install its `requirements.txt`). Returns true when
+/// every node ended up installed. Progress + the corner label go through `tx`.
+fn install_custom_nodes(
+    nodes: Vec<crate::sd_metadata::CustomNodeRef>,
+    tx: &mpsc::Sender<RunnerMsg>,
+    ctx: &egui::Context,
+) -> bool {
+    let send = |s: String| {
+        let _ = tx.send(RunnerMsg::Line(s));
+        ctx.request_repaint();
+    };
+    let label = |s: String| {
+        let _ = tx.send(RunnerMsg::Nodes(s));
+        ctx.request_repaint();
+    };
+
+    let comfy = comfy_base().join("ComfyUI");
+    if !comfy.join("main.py").exists() {
+        send("ERROR: ComfyUI isn't installed yet — run Setup Requirements first.".into());
+        label("Install ComfyUI first".into());
+        return false;
+    }
+    let custom_dir = comfy.join("custom_nodes");
+    let _ = std::fs::create_dir_all(&custom_dir);
+
+    // The bundled standalone Python, for each node's requirements.
+    let py = if cfg!(windows) {
+        comfy_base().join("python").join("python.exe")
+    } else {
+        comfy_base().join("python").join("bin").join("python3")
+    };
+    let py = py.to_string_lossy().to_string();
+
+    let total = nodes.len();
+    let mut ok_count = 0usize;
+    for (i, node) in nodes.iter().enumerate() {
+        label(format!("Installing {}/{}: {}", i + 1, total, node.name));
+        send(format!("== [{}/{}] {}", i + 1, total, node.name));
+
+        // Resolve a GitHub repo: prefer the embedded aux_id, else the registry.
+        let repo = match &node.repo {
+            Some(r) => Some(r.clone()),
+            None => node.cnr_id.as_deref().and_then(|id| resolve_cnr_repo(id, &send)),
+        };
+        let Some(repo) = repo else {
+            send(format!("   skipped {} — couldn't resolve a download source", node.name));
+            continue;
+        };
+
+        match install_one_repo(&repo, &custom_dir, &send) {
+            // Only (re)install requirements for a *freshly downloaded* node —
+            // re-running pip for already-present nodes on every drop is slow and
+            // pointless (their deps are already satisfied).
+            Some((dir, newly_installed)) => {
+                if newly_installed {
+                    let reqs = dir.join("requirements.txt");
+                    if reqs.exists() {
+                        send(format!("   installing {} requirements…", node.name));
+                        let _ = run_streamed(&comfy, &py, &["-m", "pip", "install", "-r", &reqs.to_string_lossy()], &send);
+                    }
+                }
+                ok_count += 1;
+            }
+            None => send(format!("   FAILED to download {repo}")),
+        }
+    }
+
+    // New nodes only register when ComfyUI (re)starts — stop the server so the
+    // next generation relaunches it and picks them up.
+    stop_server();
+    if ok_count == total {
+        label(format!("{total} custom node{} added", if total == 1 { "" } else { "s" }));
+        send("== Done. ComfyUI will relaunch with the new nodes on the next generation.".into());
+        true
+    } else {
+        label(format!("{ok_count}/{total} custom nodes added — see Log"));
+        send(format!("== Finished with issues: {ok_count}/{total} installed."));
+        false
+    }
+}
+
+/// Download a GitHub repo (`owner/name`) as a zip and unpack it into
+/// `custom_dir/<name>`. Tries the `main` branch, then `master`, then the repo's
+/// actual default branch (looked up via the GitHub API — this handles repos on
+/// `Main`, `dev`, etc.). Returns the installed dir + whether it was *newly*
+/// downloaded (`false` = already present, so the caller can skip re-running its
+/// requirements). `None` on failure.
+fn install_one_repo(repo: &str, custom_dir: &Path, send: &dyn Fn(String)) -> Option<(PathBuf, bool)> {
+    let name = repo.rsplit('/').next().unwrap_or(repo);
+    let dest = custom_dir.join(name);
+    if dest.exists() {
+        send(format!("   {name} already installed"));
+        return Some((dest, false));
+    }
+
+    let mut tried = Vec::new();
+    let try_branch = |branch: &str, send: &dyn Fn(String)| -> bool {
+        let url = format!("https://github.com/{repo}/archive/refs/heads/{branch}.zip");
+        let zip = custom_dir.join(format!(".{name}-{branch}.zip"));
+        if download(&url, &zip, send).is_err() {
+            let _ = std::fs::remove_file(&zip);
+            return false;
+        }
+        let ok = extract_repo_zip(&zip, custom_dir, name);
+        let _ = std::fs::remove_file(&zip);
+        ok
+    };
+
+    for branch in ["main", "master"] {
+        tried.push(branch.to_string());
+        if try_branch(branch, send) {
+            return Some((dest, true));
+        }
+    }
+    // Neither default worked — ask GitHub for the repo's real default branch.
+    if let Some(branch) = github_default_branch(repo, send) {
+        if !tried.contains(&branch) && try_branch(&branch, send) {
+            return Some((dest, true));
+        }
+    }
+    None
+}
+
+/// Unzip a downloaded GitHub archive into `custom_dir`, renaming its single
+/// top-level folder (named like `<repo>-<branch>` or `<owner>-<repo>-<sha>`) to
+/// `custom_dir/<name>`. Robust to whatever the archive's root dir is called.
+fn extract_repo_zip(zip: &Path, custom_dir: &Path, name: &str) -> bool {
+    let tmp = custom_dir.join(format!(".import_{name}"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    if std::fs::create_dir_all(&tmp).is_err() || unzip(zip, &tmp).is_err() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return false;
+    }
+    // The archive contains exactly one top-level directory — move it to <name>.
+    let root = std::fs::read_dir(&tmp)
+        .ok()
+        .and_then(|mut it| it.find_map(|e| e.ok().map(|e| e.path()).filter(|p| p.is_dir())));
+    let ok = match root {
+        Some(src) => {
+            let dest = custom_dir.join(name);
+            let _ = std::fs::remove_dir_all(&dest);
+            std::fs::rename(&src, &dest).is_ok()
+        }
+        None => false,
+    };
+    let _ = std::fs::remove_dir_all(&tmp);
+    ok
+}
+
+/// Look up a GitHub repo's default branch (`owner/repo` → e.g. `Main`, `dev`)
+/// via the public API. Needs a `User-Agent` (GitHub rejects requests without
+/// one). Best-effort: `None` if the API can't be reached or parsed.
+fn github_default_branch(repo: &str, send: &dyn Fn(String)) -> Option<String> {
+    let url = format!("https://api.github.com/repos/{repo}");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .max_redirects(5)
+        .build()
+        .into();
+    let resp = agent.get(&url).header("User-Agent", "Clarity-TagFlow").call().ok()?;
+    let v = read_json(resp).ok()?;
+    let branch = v.get("default_branch").and_then(|x| x.as_str())?.to_string();
+    send(format!("   default branch for {repo} is {branch}"));
+    Some(branch)
+}
+
+/// Resolve a Comfy-registry node id to its GitHub `owner/repo` via the public
+/// registry API. Best-effort: `None` (logged) if it can't be resolved.
+fn resolve_cnr_repo(id: &str, send: &dyn Fn(String)) -> Option<String> {
+    let url = format!("https://api.comfy.org/nodes/{id}");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .max_redirects(5)
+        .build()
+        .into();
+    let resp = agent.get(&url).call().ok()?;
+    let v = read_json(resp).ok()?;
+    let repo_url = v
+        .get("repository")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("repository_url").and_then(|x| x.as_str()))?;
+    let repo = github_owner_repo(repo_url)?;
+    send(format!("   resolved {id} → {repo}"));
+    Some(repo)
+}
+
+/// Pull `owner/repo` out of a GitHub URL (`https://github.com/owner/repo[.git]`).
+fn github_owner_repo(url: &str) -> Option<String> {
+    let s = url.trim().trim_end_matches('/');
+    let s = s.strip_suffix(".git").unwrap_or(s);
+    let rest = s.split("github.com/").nth(1)?;
+    let mut it = rest.split('/');
+    let owner = it.next()?;
+    let name = it.next()?;
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{name}"))
+}
+
+/// Swap the current prompt / negative / seed into an imported ComfyUI API graph,
+/// leaving everything else (model, steps, cfg, size, custom nodes) exactly as the
+/// dropped image had it. Returns the edited graph, or `None` if it can't be
+/// parsed (the caller then runs it verbatim). Steps/CFG/size are intentionally
+/// left alone — they're part of the imported recipe and overriding every sampler
+/// would break multi-stage (e.g. upscale) workflows.
+fn override_imported(graph: &str, job: &GenJob) -> Option<serde_json::Value> {
+    use serde_json::json;
+    let mut root: serde_json::Value = crate::sd_metadata::parse_comfy_json(graph)?;
+
+    // Find which CLIPTextEncode nodes feed each sampler's positive/negative, by
+    // tracing links on a read-only snapshot before mutating.
+    let snap = root.clone();
+    let snap_map = snap.as_object()?;
+    let mut pos_ids = std::collections::BTreeSet::new();
+    let mut neg_ids = std::collections::BTreeSet::new();
+    for node in snap_map.values() {
+        let ct = node.get("class_type").and_then(|v| v.as_str()).unwrap_or("");
+        if ct.starts_with("KSampler") {
+            let inp = node.get("inputs");
+            if let Some(id) = inp.and_then(|i| trace_encode_id(snap_map, i.get("positive"), 0)) {
+                pos_ids.insert(id);
+            }
+            if let Some(id) = inp.and_then(|i| trace_encode_id(snap_map, i.get("negative"), 0)) {
+                neg_ids.insert(id);
+            }
+        }
+    }
+
+    let map = root.as_object_mut()?;
+    for (id, node) in map.iter_mut() {
+        let ct = node.get("class_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let Some(inputs) = node.get_mut("inputs").and_then(|v| v.as_object_mut()) else { continue };
+        if ct.starts_with("KSampler") {
+            if inputs.contains_key("seed") {
+                inputs.insert("seed".into(), json!(job.seed));
+            }
+            if inputs.contains_key("noise_seed") {
+                inputs.insert("noise_seed".into(), json!(job.seed));
+            }
+        }
+        if pos_ids.contains(id.as_str()) && inputs.get("text").is_some_and(|t| t.is_string()) {
+            inputs.insert("text".into(), json!(with_embeds(&job.prompt, &job.pos_embeds)));
+        }
+        if neg_ids.contains(id.as_str()) && inputs.get("text").is_some_and(|t| t.is_string()) {
+            inputs.insert("text".into(), json!(with_embeds(&job.negative, &job.neg_embeds)));
+        }
+    }
+    Some(root)
+}
+
+/// Scan an imported API graph for the model files it references (checkpoints,
+/// UNet/CLIP/VAE, LoRAs, upscale/SAM models, …) and return those **not present**
+/// under `comfy/models/`. The API `prompt` only contains nodes that actually
+/// execute (bypassed nodes are excluded), so anything here is genuinely required.
+/// Lets us tell the user exactly what's missing instead of surfacing an opaque
+/// ComfyUI error.
+fn imported_missing_models(graph: &str, comfy: &Path) -> Vec<String> {
+    let Some(root) = crate::sd_metadata::parse_comfy_json(graph) else { return Vec::new() };
+    let Some(map) = root.as_object() else { return Vec::new() };
+
+    const EXTS: &[&str] = &["safetensors", "ckpt", "pth", "pt", "gguf", "bin", "sft", "onnx"];
+    let is_model = |s: &str| {
+        let l = s.to_ascii_lowercase();
+        EXTS.iter().any(|e| l.ends_with(&format!(".{e}")))
+    };
+    let basename = |s: &str| s.replace('\\', "/").rsplit('/').next().unwrap_or(s).to_ascii_lowercase();
+
+    // Referenced model files (any string input whose value looks like a weight
+    // file — robust to the many custom loader nodes / field names out there).
+    let mut referenced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut display: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for node in map.values() {
+        if let Some(inputs) = node.get("inputs").and_then(|v| v.as_object()) {
+            for v in inputs.values() {
+                if let Some(s) = v.as_str() {
+                    if is_model(s) {
+                        let b = basename(s);
+                        display.entry(b.clone()).or_insert_with(|| s.to_string());
+                        referenced.insert(b);
+                    }
+                }
+            }
+        }
+    }
+    if referenced.is_empty() {
+        return Vec::new();
+    }
+
+    // Everything actually installed under models/ (recursively).
+    fn walk(dir: &Path, out: &mut std::collections::BTreeSet<String>, depth: u32) {
+        if depth > 6 {
+            return;
+        }
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out, depth + 1);
+                } else if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
+                    out.insert(n.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    let mut installed = std::collections::BTreeSet::new();
+    walk(&comfy.join("models"), &mut installed, 0);
+
+    referenced
+        .into_iter()
+        .filter(|r| !installed.contains(r))
+        .map(|r| display.get(&r).cloned().unwrap_or(r))
+        .collect()
+}
+
+/// Follow a ComfyUI API link (`[node_id, slot]`) to the `CLIPTextEncode` node id
+/// that ultimately feeds it (through pass-through conditioning nodes). Depth-
+/// guarded against malformed graphs.
+fn trace_encode_id(
+    map: &serde_json::Map<String, serde_json::Value>,
+    link: Option<&serde_json::Value>,
+    depth: u32,
+) -> Option<String> {
+    if depth > 64 {
+        return None;
+    }
+    let arr = link?.as_array()?;
+    let id = arr
+        .first()
+        .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string())))?;
+    let node = map.get(&id)?;
+    let ct = node.get("class_type").and_then(|v| v.as_str()).unwrap_or("");
+    if ct == "CLIPTextEncode" || ct == "CLIPTextEncodeSDXL" {
+        return Some(id);
+    }
+    if ct == "ConditioningZeroOut" {
+        return None;
+    }
+    let inputs = node.get("inputs")?;
+    for key in ["conditioning", "positive", "negative", "text"] {
+        if let Some(next) = inputs.get(key) {
+            if next.is_array() {
+                if let Some(r) = trace_encode_id(map, Some(next), depth + 1) {
+                    return Some(r);
+                }
+            }
+        }
+    }
+    None
 }
 
 struct GenJob {
@@ -3260,12 +4444,18 @@ struct GenJob {
     /// space-joined — appended to the positive / negative encoder text.
     pos_embeds: String,
     neg_embeds: String,
+    /// User's negative prompt — prepended to each family's built-in quality
+    /// negative in the negative encoder. Empty = just the built-in negative.
+    negative: String,
     /// Video (LTX): frame count + playback rate.
     frames: i32,
     fps: i32,
     /// Video (LTX): animate `src_image` (image-to-video) instead of text-to-video.
     i2v: bool,
     src_image: Option<PathBuf>,
+    /// An imported ComfyUI API graph to run verbatim (with prompt/negative/seed
+    /// swapped in) instead of the built-in pipeline. `None` = built-in.
+    imported_workflow: Option<String>,
 }
 
 fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, cancel: &AtomicBool) -> bool {
@@ -3289,14 +4479,30 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
     // 0 — pre-flight: make sure this variant's model files are actually on disk.
     // Without this, a missing file only surfaces as an opaque HTTP 400 from the
     // queue endpoint (e.g. picking the bf16 encoder before it was downloaded).
-    let missing = missing_files(job.model, job.checkpoint.as_deref());
-    if !missing.is_empty() {
-        send(format!(
-            "ERROR: this model isn't fully downloaded — select this variant and click \
-             Setup Requirements. Missing file(s): {}",
-            missing.join(", ")
-        ));
-        return false;
+    // An imported workflow references its own models (not this tab's built-in
+    // variant), so check those instead — and name exactly what's missing.
+    if let Some(graph) = &job.imported_workflow {
+        let missing = imported_missing_models(graph, &comfy);
+        if !missing.is_empty() {
+            send(format!(
+                "ERROR: the imported workflow needs {} model file(s) you don't have installed: {}. \
+                 Put them in ComfyUI/models/ (matching the loader's folder), or clear the imported \
+                 workflow from the + menu to use the built-in pipeline.",
+                missing.len(),
+                missing.join(", ")
+            ));
+            return false;
+        }
+    } else {
+        let missing = missing_files(job.model, job.checkpoint.as_deref());
+        if !missing.is_empty() {
+            send(format!(
+                "ERROR: this model isn't fully downloaded — select this variant and click \
+                 Setup Requirements. Missing file(s): {}",
+                missing.join(", ")
+            ));
+            return false;
+        }
     }
 
     // 1 — make sure the ComfyUI server is up. For checkpoint-picker families,
@@ -3358,7 +4564,18 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
     // 4xx returns a readable body instead of a bare status code — ComfyUI puts the
     // real reason (missing model, bad node input) in the body's `error`/`node_errors`.
     status("Queuing…");
-    let wf = build_workflow(&job, image_name.as_deref());
+    let wf = match &job.imported_workflow {
+        // Run the dropped image's own graph (custom nodes and all), swapping in
+        // the current prompt / negative / seed. Falls back to verbatim if the
+        // graph can't be parsed for substitution.
+        Some(graph) => {
+            send("== Using imported workflow (custom nodes)".into());
+            override_imported(graph, &job)
+                .or_else(|| crate::sd_metadata::parse_comfy_json(graph))
+                .unwrap_or(serde_json::Value::Null)
+        }
+        None => build_workflow(&job, image_name.as_deref()),
+    };
     let body = serde_json::json!({ "prompt": wf, "client_id": "clarity-tagflow" }).to_string();
     let resp = match agent
         .post(&format!("{SERVER_URL}/prompt"))
@@ -3678,7 +4895,7 @@ fn anima_workflow(job: &GenJob) -> serde_json::Value {
     // A light anime-oriented negative (cfg 4 uses the negative conditioning).
     const ANIMA_NEG: &str = "lowres, worst quality, low quality, bad anatomy, bad hands, text, watermark, jpeg artifacts, signature";
     obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
-    obj.insert("6".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(ANIMA_NEG, &job.neg_embeds), "clip": clip_ref}}));
+    obj.insert("6".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": neg_with(job, ANIMA_NEG), "clip": clip_ref}}));
     obj.insert("7".into(), json!({"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}));
     obj.insert("8".into(), json!({"class_type": "KSampler", "inputs": {
         "model": model_ref, "positive": ["4", 0], "negative": ["6", 0], "latent_image": ["7", 0],
@@ -3728,7 +4945,7 @@ fn sdxl_workflow(job: &GenJob) -> serde_json::Value {
     // A standard SDXL quality negative.
     const SDXL_NEG: &str = "ugly, low quality, worst quality, blurry, jpeg artifacts, watermark, text, deformed, bad anatomy";
     obj.insert("3".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
-    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(SDXL_NEG, &job.neg_embeds), "clip": clip_ref}}));
+    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": neg_with(job, SDXL_NEG), "clip": clip_ref}}));
     obj.insert("5".into(), json!({"class_type": "EmptyLatentImage", "inputs": {
         "width": width, "height": height, "batch_size": 1
     }}));
@@ -3764,6 +4981,21 @@ fn ltx2_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
         }
     };
     use serde_json::json;
+    // Resolution from the job (orientation + Size). The template baked landscape into
+    // two nodes — node 297 (EmptyLTXVLatentVideo, the half-res base latent) and node
+    // 292 (ResizeImageMaskNode, the i2v source-image working size) — so Portrait /
+    // Square tiles were ignored and every render came out landscape. Derive both from
+    // job.width/height instead: the base latent is half resolution and the ×2 spatial
+    // upscaler brings it to the full size, so full == 2×base keeps them aligned. All
+    // multiples of 32 (LTX's latent grid). 1280×704 maps back to the original 640×352
+    // / 1280×704, so landscape is unchanged.
+    let base_w = (job.width / 2 / 32).max(4) * 32;
+    let base_h = (job.height / 2 / 32).max(4) * 32;
+    let (full_w, full_h) = (base_w * 2, base_h * 2);
+    set(obj, "297", "width", json!(base_w)); // base latent (half res)
+    set(obj, "297", "height", json!(base_h));
+    set(obj, "292", "resize_type.width", json!(full_w)); // i2v image working size
+    set(obj, "292", "resize_type.height", json!(full_h));
     set(obj, "305", "text", json!(with_embeds(&job.prompt, &job.pos_embeds))); // positive prompt
     set(obj, "278", "noise_seed", json!(job.seed)); // stage-1 noise
     set(obj, "279", "noise_seed", json!(job.seed)); // stage-2 noise
@@ -3797,9 +5029,13 @@ fn ltx_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
     let width = (job.width / 32).max(8) * 32;
     let height = (job.height / 32).max(8) * 32;
     let fps = job.fps;
+    // An auto-detected installed checkpoint overrides the built-in 0.9.6 transformer;
+    // the shared t5xxl encoder and spatial upscaler are reused as-is (LTX-Video 0.9.x
+    // finetunes keep the same encoder/VAE/upscaler layout).
+    let ckpt = job.checkpoint.as_deref().unwrap_or("ltxv-2b-0.9.6-distilled-04-25.safetensors");
 
     let mut wf = json!({
-        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "ltxv-2b-0.9.6-distilled-04-25.safetensors"}},
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "t5xxl_fp8_e4m3fn.safetensors", "type": "ltxv"}},
     });
     let obj = wf.as_object_mut().unwrap();
@@ -3824,7 +5060,7 @@ fn ltx_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
     // A standard video negative (used because LTX runs with a little CFG here).
     const LTX_NEG: &str = "worst quality, inconsistent motion, blurry, jittery, distorted, washed out, overexposed";
     obj.insert("3".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
-    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(LTX_NEG, &job.neg_embeds), "clip": clip_ref}}));
+    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": neg_with(job, LTX_NEG), "clip": clip_ref}}));
 
     // Conditioning + latent: image-to-video seeds the latent from the uploaded
     // image (LTXVImgToVideo also rewrites the conditioning); text-to-video uses an
@@ -3903,6 +5139,14 @@ fn wan_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
     let height = (job.height / 32).max(8) * 32;
     let fps = job.fps;
 
+    // A custom installed model (from the picker) is treated as a Wan 2.2 14B I2V
+    // finetune — a different architecture from the built-in 5B TI2V: it uses the
+    // Wan 2.1 VAE and the WanImageToVideo latent node (which folds the start frame
+    // into the conditioning) instead of the 5B's wan2.2_vae + Wan22ImageToVideoLatent.
+    if let Some(ckpt) = job.checkpoint.as_deref() {
+        return wan14b_workflow(job, image_name, ckpt, width, height, length, fps);
+    }
+
     let mut wf = json!({
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.2_ti2v_5B_fp16.safetensors", "weight_dtype": job.model.wan_weight_dtype()}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan"}},
@@ -3927,11 +5171,8 @@ fn wan_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
 
     let clip_ref = json!(["2", 0]);
     let vae_ref = json!(["3", 0]);
-    // Wan's recommended (Chinese) negative — the one shipped in the official
-    // template; it markedly improves motion stability and reduces artifacts.
-    const WAN_NEG: &str = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走";
     obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
-    obj.insert("5".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(WAN_NEG, &job.neg_embeds), "clip": clip_ref}}));
+    obj.insert("5".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": neg_with(job, WAN_NEG), "clip": clip_ref}}));
 
     // ModelSamplingSD3 (shift 8) — Wan's sampling-shift node.
     obj.insert("6".into(), json!({"class_type": "ModelSamplingSD3", "inputs": {"model": model_ref, "shift": 8.0}}));
@@ -3956,6 +5197,81 @@ fn wan_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
     }}));
     obj.insert("10".into(), json!({"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": vae_ref}}));
     // Native ComfyUI SaveWEBM (vp9 .webm) — same as LTX; the app plays webm.
+    obj.insert("11".into(), json!({"class_type": "SaveWEBM", "inputs": {
+        "images": ["10", 0], "filename_prefix": "ClarityWan", "codec": "vp9", "fps": fps, "crf": 18.0
+    }}));
+    wf
+}
+
+/// Wan 2.2 *14B* I2V workflow for a custom installed model (picked from the model
+/// dropdown). Architecture differs from the built-in 5B TI2V: UNETLoader (the
+/// custom file; weight_dtype "default" since these single-file 14B builds ship as
+/// scaled-fp8) + CLIPLoader (umt5, type "wan") + VAELoader (the **Wan 2.1** VAE)
+/// → CLIPTextEncode ×2 → WanImageToVideo. That node folds the start frame into the
+/// conditioning AND emits the empty latent (so it does both t2v — no start_image —
+/// and i2v), returning [positive, negative, latent]; a single KSampler
+/// (uni_pc / simple) → VAEDecode → SaveWEBM. Model-side LoRAs chain in as for 5B.
+fn wan14b_workflow(
+    job: &GenJob,
+    image_name: Option<&str>,
+    ckpt: &str,
+    width: i32,
+    height: i32,
+    length: i32,
+    fps: i32,
+) -> serde_json::Value {
+    use serde_json::json;
+    let mut wf = json!({
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": ckpt, "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}},
+    });
+    let obj = wf.as_object_mut().unwrap();
+
+    // Model-only LoRA chain (Wan LoRAs are model-side), starting at the UNet.
+    let mut model_ref = json!(["1", 0]);
+    let mut id = 100;
+    for (file, strength) in &job.loras {
+        let node = id.to_string();
+        id += 1;
+        obj.insert(
+            node.clone(),
+            json!({"class_type": "LoraLoaderModelOnly", "inputs": {
+                "model": model_ref, "lora_name": file, "strength_model": strength
+            }}),
+        );
+        model_ref = json!([node, 0]);
+    }
+
+    let clip_ref = json!(["2", 0]);
+    let vae_ref = json!(["3", 0]);
+    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
+    obj.insert("5".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": neg_with(job, WAN_NEG), "clip": clip_ref}}));
+
+    // ModelSamplingSD3 (shift 8) — Wan's sampling-shift node.
+    obj.insert("6".into(), json!({"class_type": "ModelSamplingSD3", "inputs": {"model": model_ref, "shift": 8.0}}));
+
+    // WanImageToVideo: bakes the start frame into the conditioning (i2v) or builds a
+    // bare latent (t2v when start_image is omitted). Outputs [positive, negative,
+    // latent]. No clip_vision — Wan 2.2 14B I2V doesn't use it.
+    let mut wi2v = json!({
+        "positive": ["4", 0], "negative": ["5", 0], "vae": vae_ref.clone(),
+        "width": width, "height": height, "length": length, "batch_size": 1
+    });
+    if job.i2v {
+        if let Some(name) = image_name {
+            obj.insert("8".into(), json!({"class_type": "LoadImage", "inputs": {"image": name}}));
+            wi2v["start_image"] = json!(["8", 0]);
+        }
+    }
+    obj.insert("7".into(), json!({"class_type": "WanImageToVideo", "inputs": wi2v}));
+
+    obj.insert("9".into(), json!({"class_type": "KSampler", "inputs": {
+        "model": ["6", 0], "positive": ["7", 0], "negative": ["7", 1], "latent_image": ["7", 2],
+        "seed": job.seed, "steps": job.steps, "cfg": job.guidance,
+        "sampler_name": "uni_pc", "scheduler": "simple", "denoise": 1.0
+    }}));
+    obj.insert("10".into(), json!({"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": vae_ref}}));
     obj.insert("11".into(), json!({"class_type": "SaveWEBM", "inputs": {
         "images": ["10", 0], "filename_prefix": "ClarityWan", "codec": "vp9", "fps": fps, "crf": 18.0
     }}));
@@ -3992,7 +5308,7 @@ fn zimage_workflow(job: &GenJob) -> serde_json::Value {
     }
 
     obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
-    obj.insert("6".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds("", &job.neg_embeds), "clip": clip_ref}}));
+    obj.insert("6".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": neg_with(job, ""), "clip": clip_ref}}));
     obj.insert("7".into(), json!({"class_type": "EmptySD3LatentImage", "inputs": {"width": job.width, "height": job.height, "batch_size": 1}}));
     obj.insert("8".into(), json!({"class_type": "KSampler", "inputs": {
         "model": model_ref, "positive": ["4", 0], "negative": ["6", 0], "latent_image": ["7", 0],
@@ -4039,7 +5355,7 @@ fn flux_workflow(job: &GenJob) -> serde_json::Value {
 
     obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
     obj.insert("5".into(), json!({"class_type": "FluxGuidance", "inputs": {"conditioning": ["4", 0], "guidance": job.guidance}}));
-    obj.insert("6".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds("", &job.neg_embeds), "clip": clip_ref}}));
+    obj.insert("6".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": neg_with(job, ""), "clip": clip_ref}}));
     obj.insert("7".into(), json!({"class_type": "EmptySD3LatentImage", "inputs": {"width": job.width, "height": job.height, "batch_size": 1}}));
     obj.insert("8".into(), json!({"class_type": "KSampler", "inputs": {
         "model": model_ref, "positive": ["5", 0], "negative": ["6", 0], "latent_image": ["7", 0],
@@ -4292,4 +5608,91 @@ fn unzip(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod imported_workflow_tests {
+    use super::*;
+
+    /// The imported-graph prompt substitution must find the right CLIPTextEncode
+    /// nodes (the ones feeding the sampler), so Generate can swap the prompt/seed
+    /// into the dropped image's own workflow. Uses whatever sample image is
+    /// committed under tests/example/.
+    #[test]
+    fn traces_sampler_encode_nodes() {
+        let Some(p) = crate::sd_metadata::drop_import_tests::example_png() else { return };
+        let meta = crate::sd_metadata::read_generation(&p).expect("metadata");
+        let graph = meta.workflow_api.expect("runnable api graph");
+        let v: serde_json::Value = serde_json::from_str(&graph).unwrap();
+        let map = v.as_object().unwrap();
+
+        // Any sampler (KSampler / KSamplerAdvanced / …).
+        let ks = map
+            .values()
+            .find(|n| {
+                n.get("class_type").and_then(|c| c.as_str()).is_some_and(|c| c.starts_with("KSampler"))
+            })
+            .expect("a sampler node");
+        let inputs = ks.get("inputs").unwrap();
+
+        let pos = trace_encode_id(map, inputs.get("positive"), 0).expect("positive encode");
+        let neg = trace_encode_id(map, inputs.get("negative"), 0).expect("negative encode");
+        assert_ne!(pos, neg, "positive and negative trace to different nodes");
+    }
+}
+
+#[cfg(test)]
+mod ltx2_resolution_tests {
+    use super::*;
+
+    fn job(width: i32, height: i32, i2v: bool) -> GenJob {
+        GenJob {
+            model: GenModel::Ltx2Distilled,
+            prompt: "a cat".into(),
+            steps: 8,
+            guidance: 1.0,
+            width,
+            height,
+            seed: 1,
+            checkpoint: None,
+            loras: Vec::new(),
+            pos_embeds: String::new(),
+            neg_embeds: String::new(),
+            negative: String::new(),
+            frames: 49,
+            fps: 24,
+            i2v,
+            src_image: None,
+            imported_workflow: None,
+        }
+    }
+
+    fn dims(wf: &serde_json::Value, node: &str, wkey: &str, hkey: &str) -> (i64, i64) {
+        let inputs = wf[node]["inputs"].as_object().unwrap();
+        (inputs[wkey].as_i64().unwrap(), inputs[hkey].as_i64().unwrap())
+    }
+
+    /// The reported bug: selecting Portrait still rendered landscape because the
+    /// LTX-2.3 template baked landscape into the base latent (297) and image-resize
+    /// (292). A portrait job — like the 1024×1536 tests/example image — must now
+    /// produce a taller-than-wide latent and matching image-resize.
+    #[test]
+    fn portrait_job_yields_portrait_latent() {
+        let wf = ltx2_workflow(&job(704, 1280, true), Some("example.png"));
+        let (bw, bh) = dims(&wf, "297", "width", "height");
+        assert!(bh > bw, "base latent should be portrait, got {bw}x{bh}");
+        let (fw, fh) = dims(&wf, "292", "resize_type.width", "resize_type.height");
+        assert!(fh > fw, "image resize should be portrait, got {fw}x{fh}");
+        // full == 2×base keeps the ×2 upscaler target aligned with the base latent.
+        assert_eq!((fw, fh), (bw * 2, bh * 2));
+    }
+
+    /// Landscape must be byte-for-byte the template's original values, so the fix
+    /// doesn't regress the (default) landscape render.
+    #[test]
+    fn landscape_job_matches_native_template() {
+        let wf = ltx2_workflow(&job(1280, 704, false), None);
+        assert_eq!(dims(&wf, "297", "width", "height"), (640, 352));
+        assert_eq!(dims(&wf, "292", "resize_type.width", "resize_type.height"), (1280, 704));
+    }
 }

@@ -77,6 +77,9 @@ pub struct Settings {
     /// Loop videos: restart playback from the beginning when a video reaches its
     /// end. Read by the embedded video player when a clip starts.
     pub loop_video: bool,
+    /// Play a muted, looping live preview on each visible video thumbnail while
+    /// it's in view (stops when scrolled away). Off shows only the static poster.
+    pub video_thumbnail_play: bool,
     /// Show the live CPU / RAM graphs in the top bar. Off gives a cleaner bar (and
     /// skips the periodic system sampling).
     pub show_stats: bool,
@@ -115,6 +118,7 @@ impl Default for Settings {
             glass_bg: [20, 22, 34],
             glass_backdrop: Backdrop::default(),
             loop_video: false,
+            video_thumbnail_play: false,
             show_stats: true,
             movable_popups: true,
             media_filter: MediaFilter::default(),
@@ -180,11 +184,11 @@ pub fn show(ctx: &egui::Context, settings: &mut Settings, update: &mut crate::up
 
             // Tabs.
             ui.horizontal(|ui| {
-                tab_button(ui, settings, SettingsTab::General, "General");
-                tab_button(ui, settings, SettingsTab::Appearance, "Appearance");
-                // The Updates tab title carries a small dot when an update is waiting.
-                let updates_label = if update.badge(settings) { "Updates ●" } else { "Updates" };
-                tab_button(ui, settings, SettingsTab::Updates, updates_label);
+                tab_button(ui, settings, SettingsTab::General, "General", false);
+                tab_button(ui, settings, SettingsTab::Appearance, "Appearance", false);
+                // The Updates tab carries a small red dot when an update is waiting.
+                let update_waiting = update.badge(settings);
+                tab_button(ui, settings, SettingsTab::Updates, "Updates", update_waiting);
             });
             ui.add_space(8.0);
 
@@ -210,10 +214,7 @@ pub fn show(ctx: &egui::Context, settings: &mut Settings, update: &mut crate::up
 /// The General tab: the original viewer / browser / files / about sections.
 fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
     section(ui, "Interface", |ui| {
-        ui.checkbox(
-            &mut settings.show_stats,
-            egui::RichText::new("Show CPU / RAM stats").color(TEXT()),
-        );
+        dot_toggle(ui, &mut settings.show_stats, "Show CPU / RAM stats");
         hint(
             ui,
             "The live CPU and memory graphs in the top bar. Turn off for a cleaner \
@@ -221,10 +222,7 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
         );
 
         ui.add_space(6.0);
-        ui.checkbox(
-            &mut settings.movable_popups,
-            egui::RichText::new("Movable popups").color(TEXT()),
-        );
+        dot_toggle(ui, &mut settings.movable_popups, "Movable popups");
         hint(
             ui,
             "Let popups (Civitai settings, the LoRA picker, the image detail view, and \
@@ -254,10 +252,7 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
         hint(ui, "Largest height a thumbnail tile can take in the list.");
 
         ui.add_space(6.0);
-        ui.checkbox(
-            &mut settings.hd_thumbnails,
-            egui::RichText::new("HD thumbnails").color(TEXT()),
-        );
+        dot_toggle(ui, &mut settings.hd_thumbnails, "HD thumbnails");
         hint(
             ui,
             "Decode thumbnails at a higher resolution for crisper tiles. \
@@ -265,10 +260,7 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
         );
 
         ui.add_space(6.0);
-        ui.checkbox(
-            &mut settings.unload_offscreen_thumbs,
-            egui::RichText::new("Unload off-screen thumbnails").color(TEXT()),
-        );
+        dot_toggle(ui, &mut settings.unload_offscreen_thumbs, "Unload off-screen thumbnails");
         hint(
             ui,
             "Frees thumbnail memory as you scroll; tiles re-decode when \
@@ -277,10 +269,7 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
     });
 
     section(ui, "Files", |ui| {
-        ui.checkbox(
-            &mut settings.confirm_before_delete,
-            egui::RichText::new("Confirm before deleting").color(TEXT()),
-        );
+        dot_toggle(ui, &mut settings.confirm_before_delete, "Confirm before deleting");
         hint(
             ui,
             "Show a confirmation dialog before deleting an image and its \
@@ -293,10 +282,7 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
         #[cfg(feature = "avif")]
         {
             ui.add_space(6.0);
-            ui.checkbox(
-                &mut settings.enable_extended_formats,
-                egui::RichText::new("Enable extended formats (AVIF / HEIC / RAW)").color(TEXT()),
-            );
+            dot_toggle(ui, &mut settings.enable_extended_formats, "Enable extended formats (AVIF / HEIC / RAW)");
             hint(
                 ui,
                 "Recognise .avif, .heic, and camera raw (.dng, .arw, .cr2, .nef) files. These \
@@ -306,14 +292,20 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
     });
 
     section(ui, "Video", |ui| {
-        ui.checkbox(
-            &mut settings.loop_video,
-            egui::RichText::new("Loop videos").color(TEXT()),
-        );
+        dot_toggle(ui, &mut settings.loop_video, "Loop videos");
         hint(
             ui,
             "Restart a video from the beginning when it reaches the end. \
              Applies the next time a video starts playing.",
+        );
+
+        ui.add_space(6.0);
+        dot_toggle(ui, &mut settings.video_thumbnail_play, "Video thumbnail play");
+        hint(
+            ui,
+            "Play a live, muted, looping preview on each visible video thumbnail. \
+             Previews keep playing while in view and stop when scrolled away. Uses \
+             more CPU while playing; only a few play at once.",
         );
     });
 
@@ -459,15 +451,31 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
 }
 
 /// A tab selector button across the top of the window. Highlights the active
-/// tab and switches to it on click.
-fn tab_button(ui: &mut egui::Ui, settings: &mut Settings, tab: SettingsTab, label: &str) {
+/// tab and switches to it on click. When `badge` is set, a small red dot is
+/// painted just after the label (vertically centred) — the "update waiting" mark.
+fn tab_button(ui: &mut egui::Ui, settings: &mut Settings, tab: SettingsTab, label: &str, badge: bool) {
     let selected = settings.tab == tab;
-    let color = if selected { TEXT() } else { MUTED() };
-    if ui
-        .selectable_label(selected, egui::RichText::new(label).color(color).strong())
-        .clicked()
-    {
+    // Selected → a filled accent pill (large corner radius clamps to a full
+    // pill) with white text; unselected → plain, frameless muted text.
+    let text_color = if selected { egui::Color32::WHITE } else { MUTED() };
+    let mut btn = egui::Button::new(egui::RichText::new(label).color(text_color).strong())
+        .corner_radius(egui::CornerRadius::same(255));
+    btn = if selected {
+        btn.fill(crate::theme::ACCENT1())
+    } else {
+        btn.frame(false)
+    };
+    let resp = ui.add(btn);
+    if resp.clicked() {
         settings.tab = tab;
+    }
+    if badge {
+        // Reserve a small slot so the dot sits in the row (not overlapping the
+        // next tab), and paint it centred on the label's vertical midline. Matches
+        // the red of the top-bar gear's update badge.
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, resp.rect.height()), egui::Sense::hover());
+        ui.painter()
+            .circle_filled(rect.center(), 3.5, egui::Color32::from_rgb(230, 70, 70));
     }
 }
 
@@ -482,6 +490,17 @@ pub(crate) fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui
         add(ui);
     });
     ui.add_space(12.0);
+}
+
+/// A boolean toggle drawn as a radio-style dot (matching the Appearance tab's
+/// selectors) instead of a square checkbox tick. Clicking flips `value`.
+fn dot_toggle(ui: &mut egui::Ui, value: &mut bool, label: &str) -> egui::Response {
+    let mut resp = ui.radio(*value, egui::RichText::new(label).color(TEXT()));
+    if resp.clicked() {
+        *value = !*value;
+        resp.mark_changed();
+    }
+    resp
 }
 
 /// A small muted explanatory line, shown under a control.
