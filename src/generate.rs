@@ -2737,6 +2737,13 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
     // --- Settings. ---
     slider(ui, "Steps", &mut state.steps, 1..=50);
     slider(ui, "Guidance (CFG)", &mut state.cfg, 1.0..=8.0);
+    // Video families (LTX / Wan): length + frame rate, grouped with the sliders
+    // above the Size / aspect-ratio block. (The text/image-to-video mode toggle
+    // sits below the aspect tiles, just above the seed row.)
+    if state.family.is_video() {
+        slider(ui, "Frames", &mut state.frames, 25..=257);
+        slider(ui, "FPS", &mut state.fps, 8..=30);
+    }
     // Resolution: every family uses a single "Size" slider + quick aspect-ratio
     // tiles (square/landscape/portrait) instead of fine Width/Height sliders — the
     // slider scales every preset live, and one click on a tile picks the ratio.
@@ -2761,11 +2768,8 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
         }
         aspect_selector(ui, state);
     }
-    // Video families (LTX): length + frame rate, and the text/image-to-video
-    // mode toggle.
+    // Video families: the text/image-to-video mode toggle, above the seed row.
     if state.family.is_video() {
-        slider(ui, "Frames", &mut state.frames, 25..=257);
-        slider(ui, "FPS", &mut state.fps, 8..=30);
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().icon_width_inner = 11.0;
