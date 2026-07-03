@@ -727,6 +727,7 @@ impl ViewerApp {
                     right_details::RightView::Wan => (3u8, self.right_state.wan.gen_images().to_vec()),
                     right_details::RightView::Sdxl => (4u8, self.right_state.sdxl.gen_images().to_vec()),
                     right_details::RightView::Anima => (5u8, self.right_state.anima.gen_images().to_vec()),
+                    right_details::RightView::Krea2 => (6u8, self.right_state.krea2.gen_images().to_vec()),
                     _ => (0u8, self.right_state.generate.gen_images().to_vec()),
                 };
                 // The LTX and Wan Directors are image-to-video, so they keep the
@@ -1204,6 +1205,7 @@ impl eframe::App for ViewerApp {
                     | right_details::RightView::Wan
                     | right_details::RightView::Sdxl
                     | right_details::RightView::Anima
+                    | right_details::RightView::Krea2
             );
         #[cfg(target_os = "macos")]
         let in_flux = false;

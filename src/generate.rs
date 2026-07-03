@@ -118,6 +118,13 @@ const ANIMA_UNET: &str = "https://huggingface.co/circlestone-labs/Anima/resolve/
 const ANIMA_TE: &str = "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/text_encoders/qwen_3_06b_base.safetensors?download=true";
 const ANIMA_VAE: &str = "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/vae/qwen_image_vae.safetensors?download=true";
 
+/// Krea 2 Turbo (Krea / Comfy Org) — a 12B aesthetic-first dense DiT, 8-step
+/// distilled. ComfyUI-optimised fp8 split files (UNet + Qwen3-VL 4B encoder +
+/// the same Qwen-Image VAE Anima uses). Needs ComfyUI 0.26+ (CLIP type "krea2").
+const KREA2_UNET: &str = "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_fp8_scaled.safetensors?download=true";
+const KREA2_TE: &str = "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors?download=true";
+const KREA2_VAE: &str = "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/vae/qwen_image_vae.safetensors?download=true";
+
 /// Which model family a Generate tab drives.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GenFamily {
@@ -131,6 +138,9 @@ pub enum GenFamily {
     Sdxl,
     /// Anima: 2B anime text-to-image (Cosmos-2 DiT; UNet + Qwen3 encoder + VAE).
     Anima,
+    /// Krea 2: 12B aesthetic-first text-to-image (dense DiT; UNet + Qwen3-VL
+    /// encoder + Qwen-Image VAE). Turbo 8-step distilled checkpoint.
+    Krea2,
 }
 
 impl GenFamily {
@@ -142,6 +152,7 @@ impl GenFamily {
             GenFamily::Wan => "Wan Director",
             GenFamily::Sdxl => "SDXL",
             GenFamily::Anima => "Anima",
+            GenFamily::Krea2 => "Krea 2",
         }
     }
     /// Per-family outputs sub-folder, so each tab keeps its own history.
@@ -153,6 +164,7 @@ impl GenFamily {
             GenFamily::Wan => "wan",
             GenFamily::Sdxl => "sdxl",
             GenFamily::Anima => "anima",
+            GenFamily::Krea2 => "krea2",
         }
     }
     fn default_model(self) -> GenModel {
@@ -163,6 +175,7 @@ impl GenFamily {
             GenFamily::Wan => GenModel::WanTi2v5bFast,
             GenFamily::Sdxl => GenModel::SdxlBase,
             GenFamily::Anima => GenModel::AnimaBase,
+            GenFamily::Krea2 => GenModel::Krea2Turbo,
         }
     }
     /// This family produces video (an .mp4) rather than a still image — drives
@@ -178,13 +191,16 @@ impl GenFamily {
     /// and run through that pipeline. The other families use multi-file GGUF/UNet
     /// setups that can't be swapped wholesale.
     fn uses_checkpoint_picker(self) -> bool {
-        matches!(self, GenFamily::Sdxl | GenFamily::Anima | GenFamily::Ltx | GenFamily::Wan)
+        matches!(
+            self,
+            GenFamily::Sdxl | GenFamily::Anima | GenFamily::Krea2 | GenFamily::Ltx | GenFamily::Wan
+        )
     }
     /// The `models/` sub-dir holding this family's swappable model file — used to
     /// route the installed-model picker.
     fn model_subdir(self) -> &'static str {
         match self {
-            GenFamily::Anima | GenFamily::Wan => "diffusion_models",
+            GenFamily::Anima | GenFamily::Krea2 | GenFamily::Wan => "diffusion_models",
             _ => "checkpoints",
         }
     }
@@ -196,6 +212,7 @@ impl GenFamily {
         match self {
             GenFamily::Sdxl => &["sd_xl_base_1.0.safetensors"],
             GenFamily::Anima => &["anima-base-v1.0.safetensors"],
+            GenFamily::Krea2 => &["krea2_turbo_fp8_scaled.safetensors"],
             GenFamily::Ltx => {
                 &["ltxv-2b-0.9.6-distilled-04-25.safetensors", "ltx-2.3-22b-distilled-fp8.safetensors"]
             }
@@ -229,6 +246,8 @@ pub enum GenModel {
     SdxlBase,
     // Anima Base v1.0 (UNet + Qwen3 0.6B encoder + Qwen-Image VAE).
     AnimaBase,
+    // Krea 2 Turbo fp8 (UNet + Qwen3-VL 4B encoder + Qwen-Image VAE, 8-step).
+    Krea2Turbo,
 }
 
 impl GenModel {
@@ -239,6 +258,7 @@ impl GenModel {
             GenModel::WanTi2v5bFast | GenModel::WanTi2v5bQuality => GenFamily::Wan,
             GenModel::SdxlBase => GenFamily::Sdxl,
             GenModel::AnimaBase => GenFamily::Anima,
+            GenModel::Krea2Turbo => GenFamily::Krea2,
             _ => GenFamily::Flux,
         }
     }
@@ -251,6 +271,7 @@ impl GenModel {
             GenFamily::Wan => &[GenModel::WanTi2v5bFast, GenModel::WanTi2v5bQuality],
             GenFamily::Sdxl => &[GenModel::SdxlBase],
             GenFamily::Anima => &[GenModel::AnimaBase],
+            GenFamily::Krea2 => &[GenModel::Krea2Turbo],
         }
     }
 
@@ -268,6 +289,7 @@ impl GenModel {
             GenModel::WanTi2v5bQuality => "Wan 2.2 · 5B TI2V · fp16 (quality)",
             GenModel::SdxlBase => "SDXL Base 1.0 (~6.9 GB)",
             GenModel::AnimaBase => "Anima Base v1.0 (~5 GB)",
+            GenModel::Krea2Turbo => "Krea 2 Turbo · 12B fp8 (16GB+, ~17 GB)",
         }
     }
 
@@ -331,6 +353,8 @@ impl GenModel {
             GenModel::SdxlBase => 28,
             // Anima: the official template runs 30 steps (er_sde / simple).
             GenModel::AnimaBase => 30,
+            // Krea 2 Turbo is an 8-step distilled checkpoint (euler / simple).
+            GenModel::Krea2Turbo => 8,
         }
     }
 
@@ -344,6 +368,8 @@ impl GenModel {
             GenFamily::Wan => 5.0,
             GenFamily::Sdxl => 7.0,
             GenFamily::Anima => 4.0,
+            // Distilled — runs without classifier-free guidance.
+            GenFamily::Krea2 => 1.0,
         }
     }
 }
@@ -2367,7 +2393,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                     let options: &[GenFamily] = if state.family.is_video() {
                         &[GenFamily::Ltx, GenFamily::Wan]
                     } else {
-                        &[GenFamily::Sdxl, GenFamily::Anima, GenFamily::Flux, GenFamily::ZImage]
+                        &[GenFamily::Sdxl, GenFamily::Anima, GenFamily::Krea2, GenFamily::Flux, GenFamily::ZImage]
                     };
                     ui.spacing_mut().item_spacing.x = 2.0;
                     let menu_id = ui.id().with("family_menu");
@@ -3315,6 +3341,11 @@ fn required_files(model: GenModel) -> Vec<(&'static str, String)> {
             ("text_encoders", "qwen_3_06b_base.safetensors".into()),
             ("vae", "qwen_image_vae.safetensors".into()),
         ],
+        GenFamily::Krea2 => vec![
+            ("diffusion_models", "krea2_turbo_fp8_scaled.safetensors".into()),
+            ("text_encoders", "qwen3vl_4b_fp8_scaled.safetensors".into()),
+            ("vae", "qwen_image_vae.safetensors".into()),
+        ],
     }
 }
 
@@ -3586,6 +3617,17 @@ fn run_setup(
             ok &= fetch(ANIMA_UNET, m("diffusion_models").join("anima-base-v1.0.safetensors"), "Anima Base v1.0", "", &send);
             ok &= fetch(ANIMA_TE, m("text_encoders").join("qwen_3_06b_base.safetensors"), "Qwen3 0.6B encoder", "", &send);
             ok &= fetch(ANIMA_VAE, m("vae").join("qwen_image_vae.safetensors"), "Qwen-Image VAE", "", &send);
+        }
+        GenFamily::Krea2 => {
+            // Krea 2 Turbo — fp8 diffusion model + Qwen3-VL 4B encoder + Qwen-Image
+            // VAE (the same VAE file Anima uses, so it may already be present).
+            status("Downloading Krea 2 Turbo (~17 GB)…");
+            let _ = std::fs::create_dir_all(m("diffusion_models"));
+            let _ = std::fs::create_dir_all(m("text_encoders"));
+            let _ = std::fs::create_dir_all(m("vae"));
+            ok &= fetch(KREA2_UNET, m("diffusion_models").join("krea2_turbo_fp8_scaled.safetensors"), "Krea 2 Turbo fp8", "", &send);
+            ok &= fetch(KREA2_TE, m("text_encoders").join("qwen3vl_4b_fp8_scaled.safetensors"), "Qwen3-VL 4B encoder", "", &send);
+            ok &= fetch(KREA2_VAE, m("vae").join("qwen_image_vae.safetensors"), "Qwen-Image VAE", "", &send);
         }
     }
 
@@ -4793,6 +4835,7 @@ fn build_params(job: &GenJob) -> String {
         GenModel::WanTi2v5bFast | GenModel::WanTi2v5bQuality => "Wan 2.2 5B",
         GenModel::SdxlBase => "SDXL 1.0",
         GenModel::AnimaBase => "Anima v1.0",
+        GenModel::Krea2Turbo => "Krea 2 Turbo",
     };
     let mut prompt = job.prompt.clone();
     // Surface selected LoRAs as A1111 tags so they show up too.
@@ -4855,6 +4898,7 @@ fn build_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
             GenFamily::Wan => wan_workflow(job, image_name),
             GenFamily::Sdxl => sdxl_workflow(job),
             GenFamily::Anima => anima_workflow(job),
+            GenFamily::Krea2 => krea2_workflow(job),
         },
     }
 }
@@ -4908,6 +4952,60 @@ fn anima_workflow(job: &GenJob) -> serde_json::Value {
     }}));
     obj.insert("9".into(), json!({"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["3", 0]}}));
     obj.insert("10".into(), json!({"class_type": "SaveImage", "inputs": {"images": ["9", 0], "filename_prefix": "ClarityAnima"}}));
+    wf
+}
+
+/// Krea 2 Turbo text-to-image (Krea / Comfy Org, 12B dense DiT): UNETLoader +
+/// CLIPLoader(qwen3vl, type "krea2") + VAELoader(qwen image) + CLIPTextEncode
+/// with a ConditioningZeroOut negative (the distilled model runs at cfg 1) +
+/// EmptyLatentImage + KSampler (euler/simple, 8 steps) + VAEDecode + SaveImage,
+/// with any selected LoRAs chained in model+clip. Mirrors ComfyUI's official
+/// `image_krea2_turbo_t2i` template (needs ComfyUI 0.26+ for the krea2 CLIP type).
+fn krea2_workflow(job: &GenJob) -> serde_json::Value {
+    use serde_json::json;
+    let width = (job.width / 8).max(8) * 8;
+    let height = (job.height / 8).max(8) * 8;
+
+    // An auto-detected installed Krea 2 model overrides the built-in Turbo.
+    let unet = job.checkpoint.as_deref().unwrap_or("krea2_turbo_fp8_scaled.safetensors");
+    let mut wf = json!({
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": unet, "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors", "type": "krea2"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
+    });
+    let obj = wf.as_object_mut().unwrap();
+
+    // Chain LoraLoader nodes (model + clip thread through), starting at the loaders.
+    let mut model_ref = json!(["1", 0]);
+    let mut clip_ref = json!(["2", 0]);
+    let mut id = 100;
+    for (file, strength) in &job.loras {
+        let node = id.to_string();
+        id += 1;
+        obj.insert(
+            node.clone(),
+            json!({"class_type": "LoraLoader", "inputs": {
+                "model": model_ref, "clip": clip_ref, "lora_name": file,
+                "strength_model": strength, "strength_clip": strength
+            }}),
+        );
+        model_ref = json!([node, 0]);
+        clip_ref = json!([node, 1]);
+    }
+
+    // The official template zeroes the negative conditioning (cfg 1 ignores it
+    // anyway); a user negative would need cfg > 1 to have any effect, so the
+    // zeroed path matches the distilled model's intended use.
+    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref}}));
+    obj.insert("6".into(), json!({"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}}));
+    obj.insert("7".into(), json!({"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}));
+    obj.insert("8".into(), json!({"class_type": "KSampler", "inputs": {
+        "model": model_ref, "positive": ["4", 0], "negative": ["6", 0], "latent_image": ["7", 0],
+        "seed": job.seed, "steps": job.steps, "cfg": job.guidance,
+        "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0
+    }}));
+    obj.insert("9".into(), json!({"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["3", 0]}}));
+    obj.insert("10".into(), json!({"class_type": "SaveImage", "inputs": {"images": ["9", 0], "filename_prefix": "ClarityKrea2"}}));
     wf
 }
 

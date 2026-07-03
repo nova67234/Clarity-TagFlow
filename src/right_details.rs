@@ -50,6 +50,9 @@ pub enum RightView {
     /// The Anima Base v1.0 text-to-image generation view (same ComfyUI backend).
     #[cfg(not(target_os = "macos"))]
     Anima,
+    /// The Krea 2 Turbo text-to-image generation view (same ComfyUI backend).
+    #[cfg(not(target_os = "macos"))]
+    Krea2,
 }
 
 /// Map a generation family (chosen from a Generate header dropdown) to the
@@ -59,6 +62,7 @@ fn family_view(family: crate::generate::GenFamily) -> RightView {
     match family {
         crate::generate::GenFamily::Sdxl => RightView::Sdxl,
         crate::generate::GenFamily::Anima => RightView::Anima,
+        crate::generate::GenFamily::Krea2 => RightView::Krea2,
         crate::generate::GenFamily::Flux => RightView::Generate,
         crate::generate::GenFamily::ZImage => RightView::ZImage,
         crate::generate::GenFamily::Ltx => RightView::Ltx,
@@ -177,6 +181,9 @@ pub struct RightPanelState {
     /// State for the Anima Base v1.0 generation view (same backend, image output).
     #[cfg(not(target_os = "macos"))]
     pub anima: crate::generate::GenerateState,
+    /// State for the Krea 2 Turbo generation view.
+    #[cfg(not(target_os = "macos"))]
+    pub krea2: crate::generate::GenerateState,
     pub is_editing: bool,
 
     /// Which view the panel currently shows (Details vs Tag Manager).
@@ -232,6 +239,8 @@ impl Default for RightPanelState {
             sdxl: crate::generate::GenerateState::new(crate::generate::GenFamily::Sdxl),
             #[cfg(not(target_os = "macos"))]
             anima: crate::generate::GenerateState::new(crate::generate::GenFamily::Anima),
+            #[cfg(not(target_os = "macos"))]
+            krea2: crate::generate::GenerateState::new(crate::generate::GenFamily::Krea2),
             is_editing: false,
             view: RightView::default(),
             show_delete_confirm: false,
@@ -444,7 +453,11 @@ pub fn show(
                             {
                                 let t2i_active = matches!(
                                     state.view,
-                                    RightView::Sdxl | RightView::Anima | RightView::Generate | RightView::ZImage
+                                    RightView::Sdxl
+                                        | RightView::Anima
+                                        | RightView::Krea2
+                                        | RightView::Generate
+                                        | RightView::ZImage
                                 );
                                 if ui.selectable_label(t2i_active, "Text to Image").clicked() {
                                     if !t2i_active {
@@ -508,6 +521,11 @@ pub fn show(
                     #[cfg(target_os = "macos")]
                     let show_anima = false;
 
+                    #[cfg(not(target_os = "macos"))]
+                    let show_krea2 = state.view == RightView::Krea2;
+                    #[cfg(target_os = "macos")]
+                    let show_krea2 = false;
+
                     if show_pixal3d {
                         #[cfg(not(target_os = "macos"))]
                         crate::pixal3d::show(ui, &mut state.pixal3d, current_image);
@@ -556,6 +574,14 @@ pub fn show(
                         {
                             crate::generate::show(ui, &mut state.anima, None);
                             if let Some(f) = state.anima.family_switch.take() {
+                                state.view = family_view(f);
+                            }
+                        }
+                    } else if show_krea2 {
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            crate::generate::show(ui, &mut state.krea2, None);
+                            if let Some(f) = state.krea2.family_switch.take() {
                                 state.view = family_view(f);
                             }
                         }
