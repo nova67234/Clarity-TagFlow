@@ -33,6 +33,8 @@ pub struct SystemStats {
     gpu_pct: f32,
     gpu_mem_used_gb: f64,
     gpu_mem_total_gb: f64,
+    /// GPU core temperature (°C) — shown under the GPU name, colour-coded.
+    gpu_temp_c: f32,
     /// CPU brand string (from sysinfo, captured once) and the GPU's product name
     /// (from nvidia-smi) — shown beside the metric names in the stat labels.
     cpu_name: String,
@@ -63,6 +65,7 @@ impl Default for SystemStats {
             gpu_pct: 0.0,
             gpu_mem_used_gb: 0.0,
             gpu_mem_total_gb: 0.0,
+            gpu_temp_c: 0.0,
             cpu_name: String::new(),
             gpu_name: String::new(),
             gpu_available: false,
@@ -114,6 +117,7 @@ impl SystemStats {
             self.gpu_pct = g.util * 100.0;
             self.gpu_mem_used_gb = g.mem_used_gb;
             self.gpu_mem_total_gb = g.mem_total_gb;
+            self.gpu_temp_c = g.temp_c;
             if self.gpu_name != g.name {
                 self.gpu_name = g.name.clone();
             }
@@ -145,6 +149,8 @@ struct GpuInfo {
     util: f32, // 0.0..=1.0
     mem_used_gb: f64,
     mem_total_gb: f64,
+    /// Core temperature in °C.
+    temp_c: f32,
 }
 
 /// One `nvidia-smi` reading. `None` means the tool is missing / errored (no
@@ -152,7 +158,7 @@ struct GpuInfo {
 fn query_gpu() -> Option<GpuInfo> {
     let mut cmd = std::process::Command::new("nvidia-smi");
     cmd.args([
-        "--query-gpu=name,utilization.gpu,memory.used,memory.total",
+        "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
         "--format=csv,noheader,nounits",
     ]);
     // Suppress the console window (Windows). The helper lives in pixal3d, which
@@ -171,12 +177,16 @@ fn query_gpu() -> Option<GpuInfo> {
     let util = parts.next()?.parse::<f32>().ok()?;
     let used_mib = parts.next()?.parse::<f64>().ok()?;
     let total_mib = parts.next()?.parse::<f64>().ok()?;
+    // Temperature is best-effort: some GPUs report "N/A", which shouldn't drop
+    // the whole reading — show 0 (hidden) instead.
+    let temp_c = parts.next().and_then(|t| t.parse::<f32>().ok()).unwrap_or(0.0);
     Some(GpuInfo {
         available: true,
         name,
         util: (util / 100.0).clamp(0.0, 1.0),
         mem_used_gb: used_mib / 1024.0,
         mem_total_gb: total_mib / 1024.0,
+        temp_c,
     })
 }
 
@@ -260,8 +270,16 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool, update_bad
                             |ui| {
                                 ui.set_max_width(150.0);
                                 ui.spacing_mut().item_spacing.y = 2.0;
-                                // Optically centre one or two 10.5px lines in the row.
-                                ui.add_space(if stats.gpu_available { 6.0 } else { 13.0 });
+                                let show_gpu = stats.gpu_available && !stats.gpu_name.is_empty();
+                                let show_temp = show_gpu && stats.gpu_temp_c > 0.0;
+                                // Optically centre 1–3 10.5px lines in the row.
+                                ui.add_space(if show_temp {
+                                    0.0
+                                } else if show_gpu {
+                                    6.0
+                                } else {
+                                    13.0
+                                });
                                 let cpu = ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(short_cpu_name(&stats.cpu_name))
@@ -272,7 +290,7 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool, update_bad
                                     .truncate(),
                                 );
                                 cpu.on_hover_text(&stats.cpu_name);
-                                if stats.gpu_available && !stats.gpu_name.is_empty() {
+                                if show_gpu {
                                     let gpu = ui.add(
                                         egui::Label::new(
                                             egui::RichText::new(short_gpu_name(&stats.gpu_name))
@@ -286,6 +304,26 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool, update_bad
                                         "{} — {:.0} GB VRAM",
                                         stats.gpu_name, stats.gpu_mem_total_gb
                                     ));
+                                }
+                                // Core temperature under the GPU name — a muted
+                                // "Temp" label plus the value, colour-coded:
+                                // green cool, orange warm, red hot (80 °C+).
+                                if show_temp {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        ui.label(
+                                            egui::RichText::new("Temp")
+                                                .color(MUTED())
+                                                .size(10.5)
+                                                .strong(),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(format!("{:.0}°C", stats.gpu_temp_c))
+                                                .color(temp_color(stats.gpu_temp_c))
+                                                .size(10.5)
+                                                .strong(),
+                                        );
+                                    });
                                 }
                             },
                         );
@@ -493,6 +531,18 @@ fn vram_color(total_gb: f64) -> Color32 {
     if total_gb >= 15.5 {
         Color32::from_rgb(46, 160, 67) // green
     } else if total_gb >= 7.5 {
+        Color32::from_rgb(235, 150, 45) // orange
+    } else {
+        Color32::from_rgb(210, 70, 70) // red
+    }
+}
+
+/// Colour-code the GPU temperature: cool (under 65 °C) green, warm (65–79 °C)
+/// orange, hot (80 °C and up — where laptop GPUs start throttling) red.
+fn temp_color(temp_c: f32) -> Color32 {
+    if temp_c < 65.0 {
+        Color32::from_rgb(46, 160, 67) // green
+    } else if temp_c < 80.0 {
         Color32::from_rgb(235, 150, 45) // orange
     } else {
         Color32::from_rgb(210, 70, 70) // red
