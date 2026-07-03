@@ -155,6 +155,9 @@ fn query_gpu() -> Option<GpuInfo> {
         "--query-gpu=name,utilization.gpu,memory.used,memory.total",
         "--format=csv,noheader,nounits",
     ]);
+    // Suppress the console window (Windows). The helper lives in pixal3d, which
+    // is compiled out on macOS — where it's a no-op anyway (no NVIDIA support).
+    #[cfg(not(target_os = "macos"))]
     crate::pixal3d::hide_window(&mut cmd);
     let out = cmd.output().ok()?;
     if !out.status.success() {

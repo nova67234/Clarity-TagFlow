@@ -878,10 +878,14 @@ impl ViewerApp {
         }
         // A drop onto a generator's prompt box is consumed by that view (it
         // imports the file's metadata + installs the workflow's custom nodes),
-        // so don't also add the file to the gallery.
-        let drop_pos = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
-        if crate::generate::generator_claims_drop(ctx, drop_pos) {
-            return;
+        // so don't also add the file to the gallery. (The generate module is
+        // compiled out on macOS, so there's no prompt box to claim drops there.)
+        #[cfg(not(target_os = "macos"))]
+        {
+            let drop_pos = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
+            if crate::generate::generator_claims_drop(ctx, drop_pos) {
+                return;
+            }
         }
         // A dropped folder loads all media inside it; dropped files are added directly.
         let mut to_add = Vec::new();
