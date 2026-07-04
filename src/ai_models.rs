@@ -192,6 +192,31 @@ const CATALOG: &[ModelInfo] = &[
             ("model.onnx", "https://huggingface.co/onnx-community/BiRefNet_lite-ONNX/resolve/main/onnx/model.onnx"),
         ],
     },
+    ModelInfo {
+        name: "Region Detection (faces / hands / people / feet / age)",
+        tab: "Detect",
+        folder: "region-detect",
+        desc: "Detectors that draw labelled boxes over the image — faces, hands, \
+               people, and feet, trained on both anime and photos (DeepGHS) — plus \
+               age estimation on detected faces (InsightFace). Right-click an \
+               image → Detect Regions / Detect Age. Not a tagger.",
+        note: "Downloads five small ONNX models (~74 MB total).",
+        repo: "https://huggingface.co/deepghs",
+        kind: None,
+        // One folder holds all the detectors (see src/detect.rs).
+        files: &[
+            ("face.onnx", "https://huggingface.co/deepghs/yolo-face/resolve/main/yolov8n-face/model.onnx"),
+            ("hand.onnx", "https://huggingface.co/deepghs/anime_hand_detection/resolve/main/hand_detect_v0.8_s/model.onnx"),
+            // v1.3 of the anime person detector (the real-photo yolo-person misses
+            // anime/illustration people entirely; this one handles both).
+            ("person.onnx", "https://huggingface.co/deepghs/anime_person_detection/resolve/main/person_detect_v1.3_s/model.onnx"),
+            // NudeNet 320n — used ONLY for its two feet classes (src/detect.rs
+            // filters the rest out).
+            ("feet.onnx", "https://huggingface.co/deepghs/nudenet_onnx/resolve/main/320n.onnx"),
+            // InsightFace buffalo_l genderage — age estimation on face crops.
+            ("age.onnx", "https://huggingface.co/public-data/insightface/resolve/main/models/buffalo_l/genderage.onnx"),
+        ],
+    },
 ];
 
 /// True when every file for a model is present in any of the searched model
