@@ -17,6 +17,8 @@ pub enum SettingsTab {
     #[default]
     General,
     Appearance,
+    AiModel,
+    Ftp,
     Updates,
 }
 
@@ -83,6 +85,17 @@ pub struct Settings {
     /// Play a muted, looping live preview on each visible video thumbnail while
     /// it's in view (stops when scrolled away). Off shows only the static poster.
     pub video_thumbnail_play: bool,
+    /// FTP mode: the top bar's folder button becomes a remote FTP/FTPS browser
+    /// (see `src/ftp.rs`) instead of the local folder picker.
+    pub ftp_enabled: bool,
+    /// FTP server host (no scheme, e.g. "ftp.example.com" or "192.168.1.10").
+    pub ftp_host: String,
+    /// FTP control port (21 unless the server says otherwise).
+    pub ftp_port: u16,
+    /// FTP username; empty logs in as "anonymous".
+    pub ftp_user: String,
+    /// Upgrade the connection to FTPS (explicit TLS) before logging in.
+    pub ftp_secure: bool,
     /// Show the live CPU / RAM graphs in the top bar. Off gives a cleaner bar (and
     /// skips the periodic system sampling).
     pub show_stats: bool,
@@ -121,6 +134,11 @@ impl Default for Settings {
             glass_bg: [20, 22, 34],
             glass_backdrop: Backdrop::default(),
             glass_light: false,
+            ftp_enabled: false,
+            ftp_host: String::new(),
+            ftp_port: 21,
+            ftp_user: String::new(),
+            ftp_secure: false,
             loop_video: false,
             video_thumbnail_play: false,
             show_stats: true,
@@ -134,7 +152,15 @@ impl Default for Settings {
 
 /// Render the settings window when it's open. Mutates `settings` in place; the
 /// title-bar close button dismisses it (so does clicking the gear again).
-pub fn show(ctx: &egui::Context, settings: &mut Settings, update: &mut crate::update::UpdateState) {
+/// `ftp` carries the FTP/FTPS tab's live state (password + connection test);
+/// `llm` the AI Model tab's (setup download + inference worker).
+pub fn show(
+    ctx: &egui::Context,
+    settings: &mut Settings,
+    update: &mut crate::update::UpdateState,
+    ftp: &mut crate::ftp::FtpState,
+    llm: &mut crate::llm::LlmState,
+) {
     if !settings.open {
         return;
     }
@@ -190,6 +216,8 @@ pub fn show(ctx: &egui::Context, settings: &mut Settings, update: &mut crate::up
             ui.horizontal(|ui| {
                 tab_button(ui, settings, SettingsTab::General, "General", false);
                 tab_button(ui, settings, SettingsTab::Appearance, "Appearance", false);
+                tab_button(ui, settings, SettingsTab::AiModel, "AI Model", false);
+                tab_button(ui, settings, SettingsTab::Ftp, "FTP/FTPS", false);
                 // The Updates tab carries a small red dot when an update is waiting.
                 let update_waiting = update.badge(settings);
                 tab_button(ui, settings, SettingsTab::Updates, "Updates", update_waiting);
@@ -207,6 +235,8 @@ pub fn show(ctx: &egui::Context, settings: &mut Settings, update: &mut crate::up
                     match settings.tab {
                         SettingsTab::General => general_tab(ui, settings),
                         SettingsTab::Appearance => appearance_tab(ui, settings),
+                        SettingsTab::AiModel => ai_model_tab(ui, llm),
+                        SettingsTab::Ftp => ftp_tab(ui, settings, ftp),
                         SettingsTab::Updates => crate::update::updates_tab(ui, update, settings),
                     }
                 });
@@ -477,6 +507,275 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             hint(ui, "An optional animation painted over the background colour.");
         });
     }
+}
+
+/// The AI Model tab: one-click setup of the local Gemma 4 vision model
+/// (src/llm.rs) plus a small "try it" prompt box. Everything runs inside the
+/// app — the setup button just downloads the model weights.
+fn ai_model_tab(ui: &mut egui::Ui, llm: &mut crate::llm::LlmState) {
+    llm.poll();
+
+    section(ui, "Local model", |ui| {
+        if llm.installed {
+            ui.label(
+                egui::RichText::new("Gemma 4 E4B (vision) — installed")
+                    .color(egui::Color32::from_rgb(46, 160, 67))
+                    .strong()
+                    .size(12.5),
+            );
+        } else {
+            ui.label(egui::RichText::new("Gemma 4 E4B (vision) — not set up yet").color(TEXT()).size(12.5));
+        }
+        hint(
+            ui,
+            "Google's Gemma 4 vision model, running fully inside the app. It \
+             understands both text and images — no server, no account, and \
+             nothing ever leaves this device.",
+        );
+        ui.add_space(2.0);
+        // Which inference engine this exe was built with — makes it obvious
+        // when a CPU-only build is running instead of the Vulkan one.
+        if crate::llm::BUILT_WITH_GPU {
+            ui.label(
+                egui::RichText::new("Engine: GPU (Vulkan)")
+                    .color(egui::Color32::from_rgb(46, 160, 67))
+                    .size(11.5),
+            );
+        } else if crate::llm::BUILT_WITH_LLM {
+            ui.label(egui::RichText::new("Engine: CPU").color(MUTED()).size(11.5));
+            hint(ui, "For GPU acceleration, run the build made by scripts\\build-vulkan.cmd.");
+        }
+
+        if !crate::llm::BUILT_WITH_LLM {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("This build was compiled without the AI feature (`llm`).")
+                    .color(egui::Color32::from_rgb(210, 70, 70))
+                    .size(12.0),
+            );
+            return;
+        }
+
+        ui.add_space(6.0);
+        if let Some(dl) = &llm.download {
+            ui.add(
+                egui::ProgressBar::new(dl.pct() as f32 / 100.0)
+                    .desired_height(10.0)
+                    .corner_radius(egui::CornerRadius::same(5)),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!("Downloading the model… {}%", dl.pct()))
+                    .color(MUTED())
+                    .size(12.0),
+            );
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+        } else if !llm.installed {
+            let btn = egui::Button::new(
+                egui::RichText::new("Set up everything").color(egui::Color32::WHITE).strong(),
+            )
+            .fill(crate::theme::ACCENT1())
+            .corner_radius(egui::CornerRadius::same(255));
+            if ui.add_sized(egui::vec2(170.0, 32.0), btn).clicked() {
+                llm.start_setup();
+            }
+            hint(
+                ui,
+                "Downloads the model weights and the vision projector (about \
+                 6 GB) from HuggingFace into the models folder. You can keep \
+                 using the app while it downloads.",
+            );
+        }
+        if let Some(e) = &llm.download_err {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(12.0));
+        }
+    });
+
+    if llm.installed && crate::llm::BUILT_WITH_LLM {
+        section(ui, "Try it", |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut llm.prompt)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::Margin::symmetric(8, 6))
+                    .hint_text("Ask anything — attach an image to ask about it"),
+            );
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                if ui.button("Attach image…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"])
+                        .pick_file()
+                    {
+                        llm.image = Some(path);
+                    }
+                }
+                if let Some(img) = &llm.image {
+                    let name = img.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    ui.label(egui::RichText::new(name).color(MUTED()).size(11.5));
+                    if ui.small_button("✕").on_hover_text("Remove the image").clicked() {
+                        llm.image = None;
+                    }
+                }
+            });
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                let btn = egui::Button::new(
+                    egui::RichText::new(if llm.running { "Thinking…" } else { "Ask" })
+                        .color(egui::Color32::WHITE)
+                        .strong(),
+                )
+                .fill(crate::theme::ACCENT1())
+                .corner_radius(egui::CornerRadius::same(255));
+                if ui
+                    .add_enabled_ui(!llm.running, |ui| ui.add_sized(egui::vec2(110.0, 32.0), btn))
+                    .inner
+                    .clicked()
+                {
+                    llm.generate(ui.ctx());
+                }
+                if llm.running {
+                    ui.add(egui::Spinner::new().size(16.0).color(MUTED()));
+                    ui.label(egui::RichText::new(&llm.status).color(MUTED()).size(11.5));
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+                }
+            });
+
+            if let Some(e) = &llm.run_err {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(12.0));
+            }
+            if !llm.response.is_empty() {
+                ui.add_space(8.0);
+                egui::Frame::new()
+                    .fill(ui.visuals().extreme_bg_color)
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.add(egui::Label::new(egui::RichText::new(&llm.response).color(TEXT()).size(12.5)).wrap());
+                    });
+            }
+        });
+        hint(
+            ui,
+            "The first question loads the model into memory and can take a \
+             minute; after that it stays loaded. Runs on the CPU.",
+        );
+    }
+}
+
+/// The FTP/FTPS tab: connection details for the remote-folder browser. While
+/// FTP mode is on, the top bar's folder button opens the remote browser
+/// (`src/ftp.rs`) instead of the local folder picker.
+fn ftp_tab(ui: &mut egui::Ui, settings: &mut Settings, ftp: &mut crate::ftp::FtpState) {
+    // Round the input boxes (Host/Port/etc). The settings window pins widgets to
+    // a near-square radius for its checkboxes; this tab's fields look better
+    // pill-ish, and the scope keeps the override local to this tab.
+    let r = egui::CornerRadius::same(10);
+    let v = ui.visuals_mut();
+    v.widgets.inactive.corner_radius = r;
+    v.widgets.hovered.corner_radius = r;
+    v.widgets.active.corner_radius = r;
+
+    section(ui, "FTP mode", |ui| {
+        dot_toggle(ui, &mut settings.ftp_enabled, "Browse an FTP server");
+        hint(
+            ui,
+            "Replaces the top bar's folder button with a remote browser: pick a \
+             directory on the server and its images download into a local cache \
+             for viewing and tagging.",
+        );
+    });
+
+    section(ui, "Server", |ui| {
+        let field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint_text: &str, password: bool| {
+            ui.label(egui::RichText::new(label).color(TEXT()).size(12.5));
+            ui.add_space(2.0);
+            let resp = ui.add(
+                egui::TextEdit::singleline(value)
+                    .password(password)
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::Margin::symmetric(8, 6))
+                    .hint_text(hint_text),
+            );
+            ui.add_space(6.0);
+            resp
+        };
+
+        field(ui, "Host", &mut settings.ftp_host, "ftp.example.com", false);
+
+        ui.label(egui::RichText::new("Port").color(TEXT()).size(12.5));
+        ui.add_space(2.0);
+        let mut port = settings.ftp_port as u32;
+        ui.add(egui::DragValue::new(&mut port).range(1..=65535));
+        settings.ftp_port = port as u16;
+        ui.add_space(6.0);
+
+        field(ui, "Username", &mut settings.ftp_user, "anonymous", false);
+
+        // The password is stored encrypted (src/secret.rs), never in the plain
+        // settings file — save it whenever the field changes.
+        let pass = ftp.ensure_password();
+        let mut pass_edit = pass.clone();
+        let resp = field(ui, "Password", &mut pass_edit, "", true);
+        if resp.changed() {
+            *pass = pass_edit;
+            crate::ftp::save_password(pass);
+        }
+        hint(ui, "Stored encrypted on this device.");
+
+        ui.add_space(4.0);
+        dot_toggle(ui, &mut settings.ftp_secure, "Use FTPS (TLS)");
+        hint(
+            ui,
+            "Encrypts the connection before logging in (explicit TLS / AUTH TLS). \
+             Servers that require TLS session resumption on transfers aren't \
+             supported yet and will report it when listing.",
+        );
+    });
+
+    section(ui, "Connection", |ui| {
+        ftp.poll_test();
+        ui.horizontal(|ui| {
+            // A proper fixed-size accent button (like Civitai's Save), not a
+            // text-hugging sliver.
+            let btn = egui::Button::new(
+                egui::RichText::new(if ftp.testing() { "Testing…" } else { "Test connection" })
+                    .color(egui::Color32::WHITE)
+                    .strong(),
+            )
+            .fill(crate::theme::ACCENT1())
+            // A huge radius clamps to half the button height → a full pill.
+            .corner_radius(egui::CornerRadius::same(255));
+            if ui
+                .add_enabled_ui(!ftp.testing(), |ui| ui.add_sized(egui::vec2(150.0, 32.0), btn))
+                .inner
+                .clicked()
+            {
+                let params = ftp.params(settings);
+                ftp.start_test(params);
+            }
+            if ftp.testing() {
+                ui.add(egui::Spinner::new().size(16.0).color(MUTED()));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+            }
+        });
+        if let Some(status) = &ftp.test_status {
+            ui.add_space(4.0);
+            match status {
+                Ok(msg) => {
+                    ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(46, 160, 67)).size(12.0));
+                }
+                Err(e) => {
+                    ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(12.0));
+                }
+            }
+        }
+    });
 }
 
 /// A tab selector button across the top of the window. Highlights the active

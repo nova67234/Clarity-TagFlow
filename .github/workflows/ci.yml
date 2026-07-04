@@ -35,8 +35,11 @@ jobs:
             libssl-dev pkg-config
       # Compile everything (incl. the test targets) and run the unit tests. The
       # networked live-GitHub test is #[ignore]d, so this stays hermetic.
+      # `llm` compiles the local-AI worker (llama.cpp, CPU backend) so breaks in
+      # src/llm.rs's inference code surface here instead of at release-tag time;
+      # its smoke test needs model files on disk and is #[ignore]d too.
       - name: Check + test (no VLC)
-        run: cargo test --all-targets --no-default-features
+        run: cargo test --all-targets --no-default-features --features llm
 
   macos:
     runs-on: macos-14 # Apple Silicon, like the release build.

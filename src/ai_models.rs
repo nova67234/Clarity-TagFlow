@@ -193,6 +193,23 @@ const CATALOG: &[ModelInfo] = &[
         ],
     },
     ModelInfo {
+        name: "Gemma 4 E4B (local AI, vision)",
+        tab: "Gemma 4",
+        folder: crate::llm::FOLDER,
+        desc: "Google's Gemma 4 vision language model, run fully inside the app \
+               by the AI Model tab in Settings — describe images, answer \
+               questions, no server or account. Not a tagger.",
+        note: "Downloads the Q4_K_M weights (~5 GB) + vision projector (~1 GB).",
+        repo: "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF",
+        kind: None,
+        // Two GGUFs: the instruct weights and the mmproj vision projector that
+        // llama.cpp's multimodal pipeline uses to encode images (see src/llm.rs).
+        files: &[
+            (crate::llm::MODEL_FILE, "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf"),
+            (crate::llm::MMPROJ_FILE, "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/mmproj-F16.gguf"),
+        ],
+    },
+    ModelInfo {
         name: "Region Detection (faces / hands / people / feet / age)",
         tab: "Detect",
         folder: "region-detect",

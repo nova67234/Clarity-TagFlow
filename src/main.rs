@@ -75,6 +75,7 @@ mod depth;
 mod detect;
 mod emoji;
 mod favorites;
+mod ftp;
 mod image_cache;
 mod download;
 mod gallery;
@@ -85,6 +86,10 @@ mod generate;
 mod gif_info;
 mod left_browser;
 mod left_panel_settings;
+// Local AI model (Settings → AI Model): Gemma 4 vision via llama.cpp, fully
+// in-process. The module always compiles; the heavy bindings sit behind the
+// `llm` cargo feature.
+mod llm;
 mod mp4;
 // Pixal3D image->3D requirement setup — Linux/Windows only (compiled out on macOS).
 #[cfg(not(target_os = "macos"))]
@@ -265,6 +270,11 @@ struct ViewerApp {
     /// moves/renames. Shown as a heart badge on the browser thumbnails.
     favorites: favorites::Favorites,
     stats: top_bar::SystemStats,
+    /// FTP/FTPS remote-browser state (Settings → FTP/FTPS).
+    ftp: ftp::FtpState,
+    /// Local AI model state (Settings → AI Model): setup download + the
+    /// resident Gemma 4 inference worker.
+    llm: llm::LlmState,
 
     // Panel States
     right_state: right_details::RightPanelState,
@@ -340,6 +350,8 @@ impl Default for ViewerApp {
             tag_search_cache: std::collections::HashMap::new(),
             favorites: favorites::Favorites::load(),
             stats: top_bar::SystemStats::default(),
+            ftp: ftp::FtpState::default(),
+            llm: llm::LlmState::default(),
             right_state: right_details::RightPanelState::default(),
             settings: settings::Settings::default(),
             scan: scan::ScanState::default(),
@@ -1191,8 +1203,16 @@ impl eframe::App for ViewerApp {
         }
 
         let update_badge = self.update.badge(&self.settings);
-        match top_bar::show(ui, &self.stats, self.settings.show_stats, update_badge) {
-            top_bar::TopBarAction::OpenFolder => self.open_dialog(),
+        match top_bar::show(ui, &self.stats, self.settings.show_stats, update_badge, self.settings.ftp_enabled) {
+            // In FTP mode the folder button opens the remote browser instead of
+            // the local folder picker.
+            top_bar::TopBarAction::OpenFolder => {
+                if self.settings.ftp_enabled {
+                    self.ftp.browser_open = !self.ftp.browser_open;
+                } else {
+                    self.open_dialog();
+                }
+            }
             top_bar::TopBarAction::OpenSettings => self.settings.open = !self.settings.open,
             top_bar::TopBarAction::CreateBackup => self.start_backup(),
             top_bar::TopBarAction::FindIssues(pos) => {
@@ -1340,7 +1360,14 @@ impl eframe::App for ViewerApp {
             self.rescan_current_folder();
         }
 
-        settings::show(ui.ctx(), &mut self.settings, &mut self.update);
+        settings::show(ui.ctx(), &mut self.settings, &mut self.update, &mut self.ftp, &mut self.llm);
+
+        // FTP remote browser (opened by the top bar's globe button in FTP mode).
+        // A finished directory download loads its local cache like any folder.
+        ftp::show_browser(ui.ctx(), &mut self.ftp, &self.settings);
+        if let Some(dir) = self.ftp.take_loaded() {
+            self.load_folder(&dir);
+        }
 
         // Gallery detail popup (opened by clicking a gallery tile). Push the loop
         // preference first so a clip the popup starts picks it up (the centre
