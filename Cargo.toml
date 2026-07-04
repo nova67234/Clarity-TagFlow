@@ -69,14 +69,6 @@ unicode-segmentation = "1.13.3"
 # "Copy image" right-click action. Already in the tree via eframe, so pinning it
 # here as a direct dep adds no extra build cost.
 arboard = "3.6.1"
-
-# "Copy image" appends the legacy CF_DIB clipboard format after arboard's
-# PNG/DIBV5 — Chromium-based browsers only ever request CF_DIB when pasting an
-# image, so without it Chrome/Edge paste nothing. Already in the tree as
-# arboard's Windows backend, so this adds no build cost.
-[target.'cfg(windows)'.dependencies]
-clipboard-win = "5.4"
-
 # Local LLM for the AI Model tab (src/llm.rs): llama.cpp bindings running the
 # Gemma 4 vision model fully in-process (no server). The `mtmd` feature adds
 # llama.cpp's multimodal pipeline (image input via the mmproj projector).
@@ -86,6 +78,13 @@ llama-cpp-2 = { version = "0.1.150", features = ["mtmd"], optional = true }
 # Streaming UTF-8 decode for the LLM's token stream — a token can end mid-way
 # through a multi-byte character (CJK, emoji), so bytes carry over pieces.
 encoding_rs = { version = "0.8", optional = true }
+
+# "Copy image" appends the legacy CF_DIB clipboard format after arboard's
+# PNG/DIBV5 — Chromium-based browsers only ever request CF_DIB when pasting an
+# image, so without it Chrome/Edge paste nothing. Already in the tree as
+# arboard's Windows backend, so this adds no build cost.
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5.4"
 
 # Interactive 3D viewer for Pixal3D's generated GLB models (src/scene3d.rs),
 # shown in the centre panel. Renders into eframe's existing glow (OpenGL) context
