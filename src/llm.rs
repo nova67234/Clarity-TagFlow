@@ -52,9 +52,18 @@ pub fn installed() -> bool {
         && crate::tagger::resolve(FOLDER, MMPROJ_FILE).is_some()
 }
 
-/// A request to the inference worker.
+/// One message of the conversation snapshot handed to the worker.
+struct CmdMsg {
+    user: bool,
+    text: String,
+    image: Option<PathBuf>,
+}
+
+/// A request to the inference worker. The full (capped) history is sent every
+/// turn — the worker rebuilds the model context from scratch, so multi-turn
+/// chat works without keeping KV-cache state between requests.
 enum Cmd {
-    Generate { prompt: String, image: Option<PathBuf> },
+    Generate { msgs: Vec<CmdMsg> },
 }
 
 /// A message streamed back from the inference worker.
@@ -73,7 +82,45 @@ struct Worker {
     rx: Receiver<Msg>,
 }
 
-/// State for the AI Model tab, owned by `ViewerApp` (like `FtpState`).
+/// Who authored a chat message.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChatRole {
+    User,
+    Model,
+}
+
+/// One message in an AI Chat conversation.
+pub struct ChatMsg {
+    pub role: ChatRole,
+    pub text: String,
+    /// Image attached to a user message (the vision input).
+    pub image: Option<PathBuf>,
+}
+
+/// One conversation in the AI Chat view (the left strip switches between them).
+pub struct Chat {
+    pub id: u64,
+    pub msgs: Vec<ChatMsg>,
+}
+
+impl Chat {
+    /// Sidebar label: the first user message, trimmed — or "New chat".
+    pub fn title(&self) -> String {
+        let first = self.msgs.iter().find(|m| m.role == ChatRole::User);
+        match first {
+            Some(m) if !m.text.trim().is_empty() => {
+                let t = m.text.trim();
+                let cut: String = t.chars().take(22).collect();
+                if cut.len() < t.len() { format!("{cut}…") } else { cut }
+            }
+            Some(_) => "Image".to_string(),
+            None => "New chat".to_string(),
+        }
+    }
+}
+
+/// State for the AI Model tab and the AI Chat view, owned by `ViewerApp`
+/// (like `FtpState`).
 pub struct LlmState {
     /// Both model files present on disk (refreshed when a download finishes).
     pub installed: bool,
@@ -81,17 +128,25 @@ pub struct LlmState {
     pub download: Option<crate::ai_models::DownloadHandle>,
     pub download_err: Option<String>,
 
-    // --- Test area (Settings → AI Model → Try it) ---
-    pub prompt: String,
-    /// Optional image attached to the prompt (the "vision" in vision model).
-    pub image: Option<PathBuf>,
-    /// The streamed response so far.
-    pub response: String,
+    // --- AI Chat view (src/ai_chat.rs) ---
+    pub chats: Vec<Chat>,
+    pub active_chat: usize,
+    /// The chat receiving the streaming reply, by id (survives chat
+    /// switching/deletion while a reply streams in).
+    gen_chat: Option<u64>,
+    next_chat_id: u64,
+    /// The input pill's draft text and attached image.
+    pub draft: String,
+    pub draft_image: Option<PathBuf>,
+
     pub run_err: Option<String>,
     /// A generation is in flight.
     pub running: bool,
     /// Latest worker status line, shown next to the spinner.
     pub status: String,
+
+    /// Layout cache for the chat's markdown rendering (src/ai_chat.rs).
+    pub md_cache: egui_commonmark::CommonMarkCache,
 
     worker: Option<Worker>,
 }
@@ -102,12 +157,16 @@ impl Default for LlmState {
             installed: installed(),
             download: None,
             download_err: None,
-            prompt: String::new(),
-            image: None,
-            response: String::new(),
+            chats: vec![Chat { id: 0, msgs: Vec::new() }],
+            active_chat: 0,
+            gen_chat: None,
+            next_chat_id: 1,
+            draft: String::new(),
+            draft_image: None,
             run_err: None,
             running: false,
             status: String::new(),
+            md_cache: egui_commonmark::CommonMarkCache::default(),
             worker: None,
         }
     }
@@ -147,9 +206,23 @@ impl LlmState {
             loop {
                 match w.rx.try_recv() {
                     Ok(Msg::Status(s)) => self.status = s,
-                    Ok(Msg::Token(t)) => self.response.push_str(&t),
+                    Ok(Msg::Token(t)) => {
+                        // Stream into the reply bubble of the chat that asked,
+                        // even if the user switched to another chat meanwhile.
+                        if let Some(id) = self.gen_chat {
+                            if let Some(m) = self
+                                .chats
+                                .iter_mut()
+                                .find(|c| c.id == id)
+                                .and_then(|c| c.msgs.last_mut())
+                            {
+                                m.text.push_str(&t);
+                            }
+                        }
+                    }
                     Ok(Msg::Done(res)) => {
                         self.running = false;
+                        self.gen_chat = None;
                         if let Err(e) = res {
                             self.run_err = Some(e);
                         }
@@ -162,18 +235,49 @@ impl LlmState {
                 }
             }
             // A dead worker means the model failed to load (the error already
-            // arrived as a Done). Drop it so the next Ask can start fresh.
+            // arrived as a Done). Drop it so the next ask can start fresh.
             if worker_died {
                 self.worker = None;
                 self.running = false;
+                self.gen_chat = None;
             }
         }
     }
 
-    /// Send the current prompt (+ attached image) to the model, spawning the
-    /// worker thread on first use. Tokens stream into `self.response`.
-    pub fn generate(&mut self, ctx: &egui::Context) {
-        if self.running || self.prompt.trim().is_empty() {
+    /// Start a fresh conversation and switch to it.
+    pub fn new_chat(&mut self) {
+        // Reuse the current chat if it's still empty (no stacks of blanks).
+        if self.chats[self.active_chat].msgs.is_empty() {
+            return;
+        }
+        self.chats.push(Chat { id: self.next_chat_id, msgs: Vec::new() });
+        self.next_chat_id += 1;
+        self.active_chat = self.chats.len() - 1;
+    }
+
+    /// Delete a conversation (a streaming reply into it is silently dropped).
+    /// The list never goes empty — deleting the last chat leaves a fresh one.
+    pub fn delete_chat(&mut self, index: usize) {
+        if index >= self.chats.len() {
+            return;
+        }
+        let removed = self.chats.remove(index);
+        if self.gen_chat == Some(removed.id) {
+            self.gen_chat = None;
+        }
+        if self.chats.is_empty() {
+            self.chats.push(Chat { id: self.next_chat_id, msgs: Vec::new() });
+            self.next_chat_id += 1;
+        }
+        self.active_chat = self.active_chat.min(self.chats.len() - 1);
+    }
+
+    /// Send the input pill's draft (text + attached image) as the next user
+    /// message of the active chat, spawning the worker thread on first use.
+    /// The reply streams into a fresh model message.
+    pub fn send_draft(&mut self, ctx: &egui::Context) {
+        let text = self.draft.trim().to_string();
+        if self.running || (text.is_empty() && self.draft_image.is_none()) {
             return;
         }
         if !BUILT_WITH_LLM {
@@ -182,19 +286,45 @@ impl LlmState {
             return;
         }
         if !self.installed {
-            self.run_err = Some("Set up the model first.".to_string());
+            self.run_err = Some("Set up the model first (Settings → AI Model).".to_string());
             return;
         }
         self.run_err = None;
-        self.response.clear();
         self.status = "Starting…".to_string();
+
+        let image = self.draft_image.take();
+        self.draft.clear();
+        let chat = &mut self.chats[self.active_chat];
+        chat.msgs.push(ChatMsg { role: ChatRole::User, text, image });
+
+        // Snapshot the history for the worker, capped to the most recent
+        // messages so a very long chat doesn't overflow the model's context.
+        let msgs: Vec<CmdMsg> = chat
+            .msgs
+            .iter()
+            .rev()
+            .take(20)
+            .rev()
+            .map(|m| CmdMsg {
+                user: m.role == ChatRole::User,
+                text: m.text.clone(),
+                image: m.image.clone(),
+            })
+            .collect();
+        let id = chat.id;
 
         if self.worker.is_none() {
             self.worker = spawn_worker(ctx.clone());
         }
-        let cmd = Cmd::Generate { prompt: self.prompt.clone(), image: self.image.clone() };
         match &self.worker {
-            Some(w) if w.tx.send(cmd).is_ok() => self.running = true,
+            Some(w) if w.tx.send(Cmd::Generate { msgs }).is_ok() => {
+                // The empty reply bubble the tokens stream into.
+                self.chats[self.active_chat]
+                    .msgs
+                    .push(ChatMsg { role: ChatRole::Model, text: String::new(), image: None });
+                self.running = true;
+                self.gen_chat = Some(id);
+            }
             _ => {
                 self.worker = None;
                 self.run_err = Some("The AI worker stopped — try again.".to_string());
@@ -239,13 +369,15 @@ mod worker {
 
     use super::{Cmd, Msg, FOLDER, MMPROJ_FILE, MODEL_FILE};
 
-    /// Context window. Gemma 4 supports far more, but 4k keeps the KV cache
-    /// small enough for CPU inference on ordinary machines.
-    const N_CTX: u32 = 4096;
+    /// Context window. Gemma 4 supports far more, but 8k keeps the KV cache
+    /// reasonable on ordinary machines while leaving room for chat history
+    /// plus long replies.
+    const N_CTX: u32 = 8192;
     /// Prompt-eval batch size; must fit an image's token chunk (256 for Gemma).
     const N_BATCH: u32 = 512;
-    /// Cap on generated tokens per response.
-    const MAX_TOKENS: usize = 1024;
+    /// Cap on generated tokens per response. 1024 turned out to truncate real
+    /// answers mid-code-block; 3072 fits long code examples comfortably.
+    const MAX_TOKENS: usize = 3072;
 
     /// Worker body: load everything once, then serve Generate commands until
     /// the UI side drops its sender. On a load failure the error is reported
@@ -316,26 +448,25 @@ mod worker {
 
         send(Msg::Status("Ready".into()));
 
-        while let Ok(Cmd::Generate { prompt, image }) = rx.recv() {
-            let res = generate(&backend, &model, &mtmd, &template, threads, &prompt, image.as_deref(), send);
+        while let Ok(Cmd::Generate { msgs }) = rx.recv() {
+            let res = generate(&backend, &model, &mtmd, &template, threads, &msgs, send);
             send(Msg::Done(res));
         }
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn generate(
         backend: &LlamaBackend,
         model: &LlamaModel,
         mtmd: &MtmdContext,
         template: &llama_cpp_2::model::LlamaChatTemplate,
         threads: i32,
-        prompt: &str,
-        image: Option<&Path>,
+        msgs: &[super::CmdMsg],
         send: &dyn Fn(Msg),
     ) -> Result<(), String> {
-        // A fresh context per prompt: cheap next to the resident weights, and
-        // it guarantees no KV-cache state leaks between single-turn asks.
+        // A fresh context per turn: cheap next to the resident weights, and it
+        // guarantees no KV-cache state leaks — the whole (capped) history is
+        // re-evaluated, which is what makes multi-turn chat work.
         let context_params = LlamaContextParams::default()
             .with_n_threads(threads)
             .with_n_threads_batch(threads)
@@ -345,32 +476,49 @@ mod worker {
             .new_context(backend, context_params)
             .map_err(|e| format!("Create context: {e}"))?;
 
-        // The media marker tells the tokenizer where the image's tokens go.
-        // Without an explicit one, append it (matches llama.cpp's mtmd-cli).
+        // The media marker tells the tokenizer where an image's tokens go;
+        // bitmaps are matched to markers in order of appearance, so each
+        // message with an image gets a marker and its bitmap is pushed in the
+        // same sequence (matches llama.cpp's mtmd-cli).
         let marker = llama_cpp_2::mtmd::mtmd_default_marker();
-        let mut prompt = prompt.to_string();
         let mut bitmaps: Vec<MtmdBitmap> = Vec::new();
-        if let Some(path) = image {
-            send(Msg::Status("Reading the image…".into()));
-            bitmaps.push(load_bitmap(mtmd, path)?);
-            if !prompt.contains(marker) {
-                prompt.push('\n');
-                prompt.push_str(marker);
+        let mut turns: Vec<(bool, String)> = Vec::new();
+        for m in msgs {
+            let mut text = m.text.clone();
+            if let Some(path) = &m.image {
+                send(Msg::Status("Reading the image…".into()));
+                bitmaps.push(load_bitmap(mtmd, path)?);
+                if !text.contains(marker) {
+                    text = format!("{marker}\n{text}");
+                }
             }
+            turns.push((m.user, text));
         }
 
         send(Msg::Status("Thinking…".into()));
-        let chat = vec![
-            LlamaChatMessage::new("user".to_string(), prompt.clone()).map_err(|e| e.to_string())?,
-        ];
+        let chat: Vec<LlamaChatMessage> = turns
+            .iter()
+            .map(|(user, text)| {
+                let role = if *user { "user" } else { "assistant" };
+                LlamaChatMessage::new(role.to_string(), text.clone()).map_err(|e| e.to_string())
+            })
+            .collect::<Result<_, _>>()?;
         // Gemma 4 embeds a huge Jinja chat template (tool calls, thinking
         // channels) that llama.cpp's built-in non-Jinja formatter doesn't
-        // recognise (ffi error -1). Its actual single-turn wire format is
-        // simple, so fall back to formatting it by hand; the template path
-        // still serves models with conventional templates.
+        // recognise (ffi error -1). Its actual wire format is simple, so fall
+        // back to formatting the turns by hand; the template path still
+        // serves models with conventional templates.
         let formatted = match model.apply_chat_template(template, &chat, true) {
             Ok(s) => s,
-            Err(_) => format!("<|turn>user\n{prompt}<turn|>\n<|turn>model\n"),
+            Err(_) => {
+                let mut s = String::new();
+                for (user, text) in &turns {
+                    let role = if *user { "user" } else { "model" };
+                    s.push_str(&format!("<|turn>{role}\n{text}<turn|>\n"));
+                }
+                s.push_str("<|turn>model\n");
+                s
+            }
         };
         let input = MtmdInputText { text: formatted, add_special: true, parse_special: true };
         let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
@@ -439,6 +587,103 @@ mod worker {
 mod tests {
     use super::*;
 
+    /// TEMP QA battery: drives the real worker through the scenarios the AI
+    /// Chat exercises (multi-turn memory, long code, markdown+emoji, vision
+    /// follow-ups, CJK) and prints each reply between markers for review,
+    /// flagging template/marker leakage. Run like the smoke test.
+    #[test]
+    #[ignore]
+    fn llm_qa_battery() {
+        assert!(installed(), "place a GGUF pair in tools/gemma-4/ first");
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+
+        let img_path = std::env::temp_dir().join("llm_qa_red.png");
+        image::RgbImage::from_pixel(64, 64, image::Rgb([220, 30, 30]))
+            .save(&img_path)
+            .unwrap();
+
+        let u = |text: &str| CmdMsg { user: true, text: text.to_string(), image: None };
+        let m = |text: &str| CmdMsg { user: false, text: text.to_string(), image: None };
+
+        let scenarios: Vec<(&str, Vec<CmdMsg>)> = vec![
+            ("T1 sanity", vec![u("In one word, what is the capital of France?")]),
+            (
+                "T2 multi-turn memory",
+                vec![
+                    u("My name is Ferris and my favourite colour is teal."),
+                    m("Nice to meet you, Ferris! Teal is a lovely colour."),
+                    u("What is my name and favourite colour? Answer in one short sentence."),
+                ],
+            ),
+            (
+                "T3 long code (truncation check)",
+                vec![u("Write a complete Python tkinter script with a button that prints \
+                        'hello' when clicked. Include all imports, a class, docstrings, \
+                        and the mainloop call at the end.")],
+            ),
+            (
+                "T4 markdown + emoji",
+                vec![u("Give me a level-2 heading titled 'Cats', then exactly three \
+                        bullet points about cats, each starting with a different emoji.")],
+            ),
+            (
+                "T5 vision",
+                vec![CmdMsg {
+                    user: true,
+                    text: "What colour is this image? One word.".to_string(),
+                    image: Some(img_path.clone()),
+                }],
+            ),
+            (
+                "T6 vision follow-up from history",
+                vec![
+                    CmdMsg {
+                        user: true,
+                        text: "What colour is this image? One word.".to_string(),
+                        image: Some(img_path),
+                    },
+                    m("Red."),
+                    u("Is that colour warm or cool? One word."),
+                ],
+            ),
+            ("T7 CJK", vec![u("Write the Japanese word for 'hello' in Japanese characters only.")]),
+        ];
+
+        let names: Vec<&str> = scenarios.iter().map(|(n, _)| *n).collect();
+        for (_, msgs) in scenarios {
+            cmd_tx.send(Cmd::Generate { msgs }).unwrap();
+        }
+        drop(cmd_tx);
+
+        let ctx = egui::Context::default();
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx));
+
+        let mut idx = 0;
+        let mut current = String::new();
+        for msg in msg_rx {
+            match msg {
+                Msg::Status(_) => {}
+                Msg::Token(t) => current.push_str(&t),
+                Msg::Done(r) => {
+                    let name = names.get(idx).copied().unwrap_or("?");
+                    eprintln!("\n===== {name} — result: {r:?} =====");
+                    eprintln!("{current}");
+                    for leak in ["<|turn>", "<turn|>", "<|channel>", "<|think|>", "<|im_start|>"] {
+                        if current.contains(leak) {
+                            eprintln!("!!! LEAK DETECTED: {leak}");
+                        }
+                    }
+                    eprintln!("===== end {name} ({} chars) =====", current.len());
+                    current.clear();
+                    idx += 1;
+                }
+            }
+        }
+        handle.join().unwrap();
+        assert_eq!(idx, names.len(), "not all scenarios completed");
+    }
+
     #[test]
     #[ignore]
     fn llm_worker_smoke() {
@@ -452,15 +697,28 @@ mod tests {
             .save(&img_path)
             .unwrap();
 
-        // Two asks through one worker: plain text (the chat-template path)
-        // and an image question (the vision path).
+        // Two asks through one worker: plain text (the chat-template path),
+        // then a multi-turn history with an image (the vision path).
         cmd_tx
-            .send(Cmd::Generate { prompt: "Say hello in one short sentence.".to_string(), image: None })
+            .send(Cmd::Generate {
+                msgs: vec![CmdMsg {
+                    user: true,
+                    text: "Say hello in one short sentence.".to_string(),
+                    image: None,
+                }],
+            })
             .unwrap();
         cmd_tx
             .send(Cmd::Generate {
-                prompt: "What colour is this image? Answer briefly.".to_string(),
-                image: Some(img_path),
+                msgs: vec![
+                    CmdMsg { user: true, text: "Say hello in one short sentence.".to_string(), image: None },
+                    CmdMsg { user: false, text: "Hello!".to_string(), image: None },
+                    CmdMsg {
+                        user: true,
+                        text: "What colour is this image? Answer briefly.".to_string(),
+                        image: Some(img_path),
+                    },
+                ],
             })
             .unwrap();
         drop(cmd_tx); // worker exits after serving these

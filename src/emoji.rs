@@ -13,8 +13,22 @@ use eframe::egui::{self, Color32};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// The Twemoji SVG bytes for an emoji grapheme, if one exists.
+///
+/// U+FE0F (the emoji-presentation variation selector, e.g. in 🌧️ / ❤️) is
+/// inconsistent between real-world text and the asset table's keys — some
+/// entries include it, some don't — so an exact miss retries with the
+/// selector stripped and then re-appended.
 fn emoji_svg(grapheme: &str) -> Option<&'static [u8]> {
-    twemoji_assets::svg::SvgTwemojiAsset::from_emoji(grapheme).map(|a| a.as_bytes())
+    use twemoji_assets::svg::SvgTwemojiAsset;
+    if let Some(a) = SvgTwemojiAsset::from_emoji(grapheme) {
+        return Some(a.as_bytes());
+    }
+    let stripped: String = grapheme.chars().filter(|&c| c != '\u{fe0f}').collect();
+    if let Some(a) = SvgTwemojiAsset::from_emoji(&stripped) {
+        return Some(a.as_bytes());
+    }
+    let with_vs = format!("{stripped}\u{fe0f}");
+    SvgTwemojiAsset::from_emoji(&with_vs).map(|a| a.as_bytes())
 }
 
 /// A stable image-cache URI for an emoji grapheme (its codepoints in hex, so the
