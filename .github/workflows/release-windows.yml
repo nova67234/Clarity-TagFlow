@@ -15,6 +15,17 @@ permissions:
 jobs:
   windows:
     runs-on: windows-2022
+    env:
+      # llama.cpp's Vulkan build (the `llm-vulkan` feature) nests build dirs so
+      # deep that MSVC blows past MAX_PATH under the workspace target\ — build
+      # into a short target dir instead. Every later step that touches build
+      # output must use this path, not target/release.
+      CARGO_TARGET_DIR: C:\ctf
+      # The Visual Studio cmake generator runs llama.cpp's nested
+      # vulkan-shaders-gen steps out of order (MSBuild parallelism bug); Ninja
+      # has explicit dependency edges and builds it correctly. Needs the MSVC
+      # dev environment, set up by the msvc-dev-cmd step below.
+      CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@v4
 
@@ -23,6 +34,27 @@ jobs:
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
+
+      # Puts cl.exe (and friends) on PATH for the whole job — required for the
+      # Ninja cmake generator that llama.cpp's Vulkan backend needs.
+      - name: Set up MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # The Vulkan SDK provides the headers, loader import lib and glslc shader
+      # compiler needed to BUILD llama.cpp's Vulkan backend. End users need
+      # nothing extra: at runtime the exe delay-loads vulkan-1.dll (which ships
+      # with GPU drivers) and falls back to a readable in-app error without it.
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          $installer = "$env:RUNNER_TEMP\vulkan-sdk.exe"
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe" -OutFile $installer
+          $p = Start-Process -FilePath $installer -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Vulkan SDK installer failed with exit code $($p.ExitCode)" }
+          $sdk = Get-ChildItem "C:\VulkanSDK" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $sdk) { throw "Vulkan SDK install dir not found" }
+          "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$($sdk.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       # Generate an MSVC import library for libVLC from the checked-in export
       # list (ci/vlc.def). The official VLC SDK's libvlc.lib is a MinGW/dlltool-
@@ -50,33 +82,39 @@ jobs:
       # build.rs (so the exe still launches when VLC isn't installed) and need not
       # be repeated here — repeating them in RUSTFLAGS is what previously left
       # libvlc as a load-time import in some builds.
+      # llm-vulkan = the local AI (Settings → AI Model, Gemma 4 vision) with
+      # GPU acceleration via Vulkan; the same exe falls back to CPU inference
+      # on machines without a usable GPU.
       - name: Build
         shell: pwsh
         env:
           RUSTFLAGS: -L native=${{ env.VLC_LIB }}
-        run: cargo build --release --no-default-features --features vlc
+        run: cargo build --release --no-default-features --features vlc,llm-vulkan
 
-      # Guard: libvlc.dll must be DELAY-loaded, never a load-time import — a
-      # load-time import means the exe can't even start without VLC installed.
+      # Guard: libvlc.dll AND vulkan-1.dll must be DELAY-loaded, never
+      # load-time imports — a load-time import means the exe can't even start
+      # on machines missing that DLL (no VLC installed / no GPU driver).
       # Fails the build outright so a broken artifact can never ship again.
-      - name: Verify libVLC is delay-loaded
+      - name: Verify delay-loaded imports
         shell: pwsh
         run: |
           $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
           $dumpbin = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find "VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
           if (-not $dumpbin) { throw "dumpbin.exe not found on the runner" }
-          $out = & $dumpbin /dependents target/release/Clarity_TagFlow.exe | Out-String
+          $out = & $dumpbin /dependents C:\ctf\release\Clarity_TagFlow.exe | Out-String
           Write-Host $out
           $parts = $out -split 'delay load dependencies'
-          if ($parts[0] -match 'libvlc') { throw "libvlc.dll is a LOAD-TIME import - the delay-load was not applied" }
-          if ($parts.Count -lt 2 -or $parts[1] -notmatch 'libvlc\.dll') { throw "libvlc.dll missing from the delay-load imports" }
-          Write-Host "OK: libvlc.dll is delay-loaded."
+          foreach ($dll in 'libvlc', 'vulkan-1') {
+            if ($parts[0] -match $dll) { throw "$dll.dll is a LOAD-TIME import - the delay-load was not applied" }
+            if ($parts.Count -lt 2 -or $parts[1] -notmatch "$dll\.dll") { throw "$dll.dll missing from the delay-load imports" }
+            Write-Host "OK: $dll.dll is delay-loaded."
+          }
 
       - name: Package into a .zip
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force ClarityTagFlow-windows | Out-Null
-          Copy-Item target/release/Clarity_TagFlow.exe ClarityTagFlow-windows/
+          Copy-Item C:\ctf\release\Clarity_TagFlow.exe ClarityTagFlow-windows/
           # Bundle the runtime DLLs that `cargo build` stages next to the exe —
           # the ONNX Runtime DirectML provider (DirectML.dll) and any
           # onnxruntime*.dll — or the app fails to launch with a missing-DLL error.
@@ -84,7 +122,7 @@ jobs:
           # its license — the app uses the user's own VLC install at runtime and
           # offers an install link when it's missing (build.rs also skips staging
           # it when CI is set; this filter is defence in depth).
-          $staged = Get-ChildItem target/release -Filter *.dll -ErrorAction SilentlyContinue |
+          $staged = Get-ChildItem C:\ctf\release -Filter *.dll -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -notlike 'libvlc*' }
           if ($staged) { Copy-Item $staged.FullName ClarityTagFlow-windows/ -Force }
           Write-Host "Staged DLLs: $((Get-ChildItem ClarityTagFlow-windows -Filter *.dll).Name -join ', ')"

@@ -33,6 +33,9 @@ libwebp-sys = "0.14.4"
 # so no extra build toolchain (avoids rustls/ring needing nasm on MSVC).
 ureq = { version = "3.3.0", default-features = false, features = ["native-tls"] }
 native-tls = "0.2.18"
+# FTP/FTPS client for the remote-folder browser (Settings → FTP/FTPS). Sync API,
+# run on background threads; native-tls => Windows SChannel, same as ureq above.
+suppaftp = { version = "10", default-features = false, features = ["native-tls"] }
 # ONNX Runtime bindings for AI tagging inference. download-binaries (default)
 # fetches a prebuilt ORT at build time; copy-dylibs stages the DLL next to the exe.
 ort = "2.0.0-rc.12"
@@ -74,6 +77,16 @@ arboard = "3.6.1"
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4"
 
+# Local LLM for the AI Model tab (src/llm.rs): llama.cpp bindings running the
+# Gemma 4 vision model fully in-process (no server). The `mtmd` feature adds
+# llama.cpp's multimodal pipeline (image input via the mmproj projector).
+# Compiles llama.cpp from source at build time — needs cmake + a C++ toolchain
+# (VS 2022's bundled CMake works; GitHub runners ship cmake preinstalled).
+llama-cpp-2 = { version = "0.1.150", features = ["mtmd"], optional = true }
+# Streaming UTF-8 decode for the LLM's token stream — a token can end mid-way
+# through a multi-byte character (CJK, emoji), so bytes carry over pieces.
+encoding_rs = { version = "0.8", optional = true }
+
 # Interactive 3D viewer for Pixal3D's generated GLB models (src/scene3d.rs),
 # shown in the centre panel. Renders into eframe's existing glow (OpenGL) context
 # via an egui paint callback. three-d 0.19 pins glow 0.17 + egui_glow 0.34 — the
@@ -89,6 +102,21 @@ three-d-asset = { version = "0.10", default-features = false, features = ["gltf"
 egui_glow = "0.34"
 glow = "0.17"
 
+# Optimize llama.cpp's Rust shim even in dev (the C++ itself is always a
+# cmake Release build); mainly this keeps token streaming snappy in dev runs.
+[profile.dev.package.llama-cpp-sys-2]
+opt-level = 3
+debug = false
+
+# llama-cpp-sys-2's build.rs links the DEBUG CRT (msvcrtd) on top of the
+# release CRT whenever the build script itself has debug_assertions on — two
+# C runtimes in one process, which trips a heap-check break (0x80000003)
+# inside the multimodal init on dev builds. The link is gated on
+# cfg!(debug_assertions) in the build script, so turn that off for build
+# scripts in dev. (Release builds never linked it and are unaffected.)
+[profile.dev.build-override]
+debug-assertions = false
+
 [build-dependencies]
 # Embeds the Windows app icon (and version info) into the exe at build time.
 winresource = "0.1.31"
@@ -98,8 +126,24 @@ winresource = "0.1.31"
 # `cargo run` (and the IDE's Run button) play videos embedded. Build with
 # `--no-default-features` to drop the VLC SDK requirement; videos then show a
 # "couldn't start playback" notice instead.
-default = ["vlc", "avif"]
+default = ["vlc", "avif", "llm"]
 vlc = ["dep:vlc-rs"]
+# The local AI model (Settings → AI Model): Gemma 4 vision via llama.cpp.
+# On by default; build with --no-default-features (or without this feature) to
+# skip the C++ compile — the tab then shows a "built without AI" notice.
+llm = ["dep:llama-cpp-2", "dep:encoding_rs"]
+# GPU-accelerated local AI: compiles llama.cpp's Vulkan backend in addition to
+# CPU. Off by default because building needs the Vulkan SDK (VULKAN_SDK env +
+# glslc) and the exe then links vulkan-1.dll (ships with GPU drivers; absent
+# on some GPU-less VMs). The worker offloads all layers to the GPU
+# automatically when the backend is present.
+#
+# Windows: build with scripts\build-vulkan.cmd. Two gotchas make a plain
+# `cargo build --features llm-vulkan` fail there: (1) the Visual Studio cmake
+# generator runs llama.cpp's nested vulkan-shaders-gen steps out of order
+# (needs the Ninja generator in a VS dev env), and (2) the nested build paths
+# blow past MAX_PATH under target\ (needs a short CARGO_TARGET_DIR, C:\ctf).
+llm-vulkan = ["llm", "llama-cpp-2/vulkan"]
 # Pure-Rust AVIF decoding via avif-parse + rav1d (no C library / nasm needed).
 # Off by default to keep compile times down. Build with `--features avif`; the
 # in-app "extended formats" setting then turns .avif recognition on.

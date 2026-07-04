@@ -33,6 +33,18 @@ fn main() {
         }
     }
 
+    // Delay-load vulkan-1.dll for the GPU AI build (`llm-vulkan`): the DLL
+    // ships with GPU drivers, not with Windows, so a load-time import would
+    // stop the exe launching at all on GPU-less machines (VMs, servers).
+    // src/llm.rs probes for the DLL before initialising the AI backend and
+    // reports a readable error instead of crashing on the first Vulkan call.
+    if std::env::var_os("CARGO_FEATURE_LLM_VULKAN").is_some()
+        && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+    {
+        println!("cargo:rustc-link-arg=/DELAYLOAD:vulkan-1.dll");
+        println!("cargo:rustc-link-arg=delayimp.lib");
+    }
+
     // Only the `vlc` feature pulls in libVLC, and only the Windows target needs
     // the side-by-side runtime.
     if std::env::var_os("CARGO_FEATURE_VLC").is_none() {

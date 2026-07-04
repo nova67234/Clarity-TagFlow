@@ -238,8 +238,9 @@ pub enum TopBarAction {
 
 /// Render the top bar. Returns any action the app should perform. `show_stats`
 /// toggles the centre CPU/RAM graphs; `update_badge` paints a red dot on the
-/// settings gear when an app/ComfyUI update is available.
-pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool, update_badge: bool) -> TopBarAction {
+/// settings gear when an app/ComfyUI update is available; `ftp_mode` swaps the
+/// folder button for the FTP remote-browser button (Settings → FTP/FTPS).
+pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool, update_badge: bool, ftp_mode: bool) -> TopBarAction {
     let mut action = TopBarAction::None;
 
     egui::Panel::top("topbar")
@@ -251,10 +252,16 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool, update_bad
                 ui.horizontal(|ui| {
                     ui.set_min_height(56.0);
 
-                    // LEFT: folder icon -> open a folder of images.
-                    let folder_svg = egui::include_image!("../icons/folder.svg");
+                    // LEFT: folder icon -> open a folder of images. In FTP mode
+                    // the icon becomes a globe and opens the remote browser
+                    // instead (main.rs routes the action accordingly).
+                    let (folder_svg, tip) = if ftp_mode {
+                        (egui::include_image!("../icons/ftp_browser.svg"), "Browse FTP server")
+                    } else {
+                        (egui::include_image!("../icons/folder.svg"), "Open folder")
+                    };
 
-                    if svg_button(ui, folder_svg, "Open folder", 37.0, icon_tint(Color32::GRAY)).clicked() {
+                    if svg_button(ui, folder_svg, tip, 37.0, icon_tint(Color32::GRAY)).clicked() {
                         action = TopBarAction::OpenFolder;
                     }
 
