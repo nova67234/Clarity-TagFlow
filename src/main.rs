@@ -72,6 +72,7 @@ mod backup;
 mod bgremove;
 mod civitai;
 mod depth;
+mod detect;
 mod emoji;
 mod favorites;
 mod image_cache;

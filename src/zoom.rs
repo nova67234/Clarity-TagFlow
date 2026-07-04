@@ -345,6 +345,21 @@ impl ZoomState {
                 want_spatial = true;
                 ui.close();
             }
+            // Region detection overlay (faces / hands / people / feet boxes). The
+            // state is a process-wide singleton (src/detect.rs), so the toggle and
+            // the per-image result cache are shared with the gallery-detail popup.
+            let detect_label = if crate::detect::enabled() { "Hide Regions" } else { "Detect Regions" };
+            if menu_item(ui, egui::include_image!("../icons/frame_inspect.svg"), detect_label) {
+                crate::detect::toggle();
+                ui.close();
+            }
+            // Age overlay — estimates an age for each detected face (InsightFace
+            // genderage). Independent of the regions toggle.
+            let age_label = if crate::detect::age_enabled() { "Hide Age" } else { "Detect Age" };
+            if menu_item(ui, egui::include_image!("../icons/age.svg"), age_label) {
+                crate::detect::toggle_age();
+                ui.close();
+            }
         });
         let mut action = ViewerAction::None;
         if want_favorite {
@@ -364,6 +379,11 @@ impl ZoomState {
 
         // --- Paint ---
         self.paint_image(ui, viewport, img, tex);
+
+        // --- Region-detection / age overlays (labelled boxes) ---
+        if crate::detect::enabled() || crate::detect::age_enabled() {
+            self.paint_detections(ui, viewport, img, path);
+        }
 
         // --- Zoom-percent badge (fades after a moment) ---
         if now < self.overlay_until {
@@ -394,6 +414,86 @@ impl ZoomState {
         let shape = egui::epaint::RectShape::filled(rect, CornerRadius::same(22), Color32::WHITE)
             .with_texture(tex.id(), uv);
         ui.painter().with_clip_rect(viewport).add(shape);
+    }
+
+    /// Paint the detection overlays — regions (faces / hands / people / feet)
+    /// and/or per-face age labels (see `src/detect.rs`) — as labelled, coloured
+    /// boxes mapped through the current zoom/pan so they track the image
+    /// exactly. While models download or inference runs, small status chips
+    /// stack at the top instead.
+    fn paint_detections(&self, ui: &egui::Ui, viewport: Rect, img: Vec2, path: &Path) {
+        let mut chip_y = viewport.min.y + 14.0;
+        if crate::detect::enabled() {
+            let (dets, status) = crate::detect::overlay(path, ui.ctx());
+            self.paint_detection_layer(ui, viewport, img, dets, status, &mut chip_y);
+        }
+        if crate::detect::age_enabled() {
+            let (dets, status) = crate::detect::age_overlay(path, ui.ctx());
+            self.paint_detection_layer(ui, viewport, img, dets, status, &mut chip_y);
+        }
+    }
+
+    /// Draw one overlay's boxes, or its status chip at `chip_y` (advanced so a
+    /// second overlay's chip stacks below the first).
+    fn paint_detection_layer(
+        &self,
+        ui: &egui::Ui,
+        viewport: Rect,
+        img: Vec2,
+        dets: Option<std::sync::Arc<Vec<crate::detect::Detection>>>,
+        status: Option<String>,
+        chip_y: &mut f32,
+    ) {
+        let painter = ui.painter().with_clip_rect(viewport);
+
+        if let Some(dets) = dets {
+            let rect = self.image_rect(viewport, img);
+            for d in dets.iter() {
+                let r = Rect::from_min_max(
+                    Pos2::new(
+                        rect.min.x + d.rect[0] * rect.width(),
+                        rect.min.y + d.rect[1] * rect.height(),
+                    ),
+                    Pos2::new(
+                        rect.min.x + d.rect[2] * rect.width(),
+                        rect.min.y + d.rect[3] * rect.height(),
+                    ),
+                );
+                painter.rect_stroke(
+                    r,
+                    CornerRadius::same(3),
+                    Stroke::new(2.0, d.color),
+                    egui::StrokeKind::Outside,
+                );
+                // Label chip pinned to the box's top-left (falls inside the box
+                // when the box touches the top of the viewport).
+                let text = format!("{} {:.0}%", d.label, d.conf * 100.0);
+                let font = egui::FontId::proportional(11.0);
+                let galley = painter.layout_no_wrap(text, font, Color32::WHITE);
+                let pad = Vec2::new(5.0, 2.0);
+                let above = r.min.y - galley.size().y - pad.y * 2.0;
+                let label_y = if above < viewport.min.y { r.min.y } else { above };
+                let chip = Rect::from_min_size(
+                    Pos2::new(r.min.x, label_y),
+                    galley.size() + pad * 2.0,
+                );
+                painter.rect_filled(chip, CornerRadius::same(4), d.color.gamma_multiply(0.92));
+                painter.galley(chip.min + pad, galley, Color32::WHITE);
+            }
+        } else if let Some(status) = status {
+            // Status chip (downloading / detecting / error) at the top centre.
+            let font = egui::FontId::proportional(12.5);
+            let galley = painter.layout_no_wrap(status, font, Color32::from_gray(235));
+            let pad = Vec2::new(10.0, 6.0);
+            let size = galley.size() + pad * 2.0;
+            let chip = Rect::from_min_size(
+                Pos2::new(viewport.center().x - size.x * 0.5, *chip_y),
+                size,
+            );
+            painter.rect_filled(chip, CornerRadius::same(10), Color32::from_black_alpha(160));
+            painter.galley(chip.min + pad, galley, Color32::from_gray(235));
+            *chip_y += size.y + 6.0;
+        }
     }
 
     /// Crop-mode interaction: drag to select a region (clamped to the on-screen
