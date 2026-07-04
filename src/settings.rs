@@ -212,16 +212,49 @@ pub fn show(
             });
             ui.add_space(12.0);
 
-            // Tabs.
-            ui.horizontal(|ui| {
-                tab_button(ui, settings, SettingsTab::General, "General", false);
-                tab_button(ui, settings, SettingsTab::Appearance, "Appearance", false);
-                tab_button(ui, settings, SettingsTab::AiModel, "AI Model", false);
-                tab_button(ui, settings, SettingsTab::Ftp, "FTP/FTPS", false);
-                // The Updates tab carries a small red dot when an update is waiting.
-                let update_waiting = update.badge(settings);
-                tab_button(ui, settings, SettingsTab::Updates, "Updates", update_waiting);
-            });
+            // Tabs. More tabs exist than fit the window (about four show at
+            // once), so the row scrolls sideways — mouse wheel over it, or
+            // click a partially visible tab and it pulls itself into view.
+            // The scrollbar stays hidden; muted chevrons at the edges hint at
+            // the hidden tabs instead.
+            let tabs_out = egui::ScrollArea::horizontal()
+                .id_salt("settings_tabs")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        tab_button(ui, settings, SettingsTab::General, "General", false);
+                        tab_button(ui, settings, SettingsTab::Appearance, "Appearance", false);
+                        tab_button(ui, settings, SettingsTab::AiModel, "AI Model", false);
+                        tab_button(ui, settings, SettingsTab::Ftp, "FTP/FTPS", false);
+                        // The Updates tab carries a small red dot when an update is waiting.
+                        let update_waiting = update.badge(settings);
+                        tab_button(ui, settings, SettingsTab::Updates, "Updates", update_waiting);
+                    });
+                });
+            // Edge chevrons while content is hidden on that side.
+            {
+                let rect = tabs_out.inner_rect;
+                let max_off = (tabs_out.content_size.x - rect.width()).max(0.0);
+                let off = tabs_out.state.offset.x;
+                if off > 1.0 {
+                    ui.painter().text(
+                        rect.left_center(),
+                        egui::Align2::LEFT_CENTER,
+                        "‹",
+                        egui::FontId::proportional(14.0),
+                        MUTED(),
+                    );
+                }
+                if off < max_off - 1.0 {
+                    ui.painter().text(
+                        rect.right_center(),
+                        egui::Align2::RIGHT_CENTER,
+                        "›",
+                        egui::FontId::proportional(14.0),
+                        MUTED(),
+                    );
+                }
+            }
             ui.add_space(8.0);
 
             // Scroll the tab body so a long tab doesn't make the window tall; the
@@ -801,6 +834,8 @@ fn tab_button(ui: &mut egui::Ui, settings: &mut Settings, tab: SettingsTab, labe
         .inner;
     if resp.clicked() {
         settings.tab = tab;
+        // The tab row scrolls sideways — bring the clicked tab fully into view.
+        resp.scroll_to_me(None);
     }
     if badge {
         // Reserve a small slot so the dot sits in the row (not overlapping the
