@@ -65,6 +65,10 @@ pub struct Settings {
     /// The last AI tagger model selected in the Tag Manager, restored on launch
     /// so the user doesn't have to re-pick it each run.
     pub last_ai_model: String,
+    /// AI Chat mode: the main view swaps the three panels for a full-window
+    /// chat with the local model (src/ai_chat.rs). Toggled from the AI Model
+    /// tab; the top bar stays.
+    pub ai_chat: bool,
     /// The active app colour theme (Dark / Light). Applied on launch and live
     /// whenever changed from the Appearance tab.
     pub theme: Theme,
@@ -128,6 +132,7 @@ impl Default for Settings {
             confirm_before_delete: true,
             enable_extended_formats: false,
             last_ai_model: "Select AI...".to_string(),
+            ai_chat: false,
             theme: Theme::default(),
             layout: Layout::default(),
             // A deep navy reads well behind the glass panels by default.
@@ -166,6 +171,9 @@ pub fn show(
     }
 
     let mut want_close = false;
+    // One fixed window size for every tab (clamped only to the screen so it
+    // still fits small displays) — the size never follows a tab's content.
+    let win_h = (ctx.content_rect().height() - 160.0).clamp(320.0, 540.0);
     egui::Window::new("Settings")
         .id(egui::Id::new("settings_window"))
         .title_bar(false) // custom header inside (matches the other popups)
@@ -173,9 +181,8 @@ pub fn show(
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .frame(window_frame())
+        .fixed_size(egui::vec2(530.0, win_h))
         .show(ctx, |ui| {
-            ui.set_width(360.0);
-            ui.set_max_width(360.0);
 
             // Square-but-rounded checkboxes (the global theme rounds them into
             // pills otherwise).
@@ -187,92 +194,85 @@ pub fn show(
             visuals.widgets.active.corner_radius = square_radius;
             visuals.widgets.open.corner_radius = square_radius;
 
-            // Title row: settings icon + "Settings" + close.
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                ui.add(
-                    egui::Image::new(egui::include_image!("../icons/settings.svg"))
-                        .fit_to_exact_size(egui::vec2(20.0, 20.0))
-                        .tint(TEXT()),
-                );
-                ui.heading(egui::RichText::new("Settings").color(TEXT()).strong().size(17.0));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(egui::Button::image(
-                            egui::Image::new(egui::include_image!("../icons/close.svg"))
-                                .fit_to_exact_size(egui::vec2(24.0, 24.0))
+            // Two columns: a left sidebar (gear + "Settings" title over a
+            // vertical tab list) and the active tab's body on the right, with
+            // the close button in its top-right corner. A hairline divider
+            // between them spans the window's full height.
+            let row = ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+
+                // --- Sidebar ---
+                ui.vertical(|ui| {
+                    ui.set_width(136.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.add(
+                            egui::Image::new(egui::include_image!("../icons/settings.svg"))
+                                .fit_to_exact_size(egui::vec2(20.0, 20.0))
                                 .tint(TEXT()),
-                        ).frame(false))
-                        .on_hover_text("Close")
-                        .clicked()
-                    {
-                        want_close = true;
-                    }
+                        );
+                        ui.heading(egui::RichText::new("Settings").color(TEXT()).strong().size(17.0));
+                    });
+                    ui.add_space(8.0);
+                    // The underline beneath the title (as in the design sketch).
+                    let w = ui.available_width() - 10.0;
+                    let (line, _) = ui.allocate_exact_size(egui::vec2(w, 1.0), egui::Sense::hover());
+                    ui.painter().hline(line.x_range(), line.center().y, egui::Stroke::new(1.0, EDGE()));
+                    ui.add_space(10.0);
+
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    tab_button(ui, settings, SettingsTab::General, "General", false);
+                    tab_button(ui, settings, SettingsTab::Appearance, "Appearance", false);
+                    tab_button(ui, settings, SettingsTab::AiModel, "AI Model", false);
+                    tab_button(ui, settings, SettingsTab::Ftp, "FTP/FTPS", false);
+                    // The Updates tab carries a small red dot when an update is waiting.
+                    let update_waiting = update.badge(settings);
+                    tab_button(ui, settings, SettingsTab::Updates, "Updates", update_waiting);
+                });
+                ui.add_space(16.0);
+
+                // --- Content ---
+                ui.vertical(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if ui
+                            .add(egui::Button::image(
+                                egui::Image::new(egui::include_image!("../icons/close.svg"))
+                                    .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                                    .tint(TEXT()),
+                            ).frame(false))
+                            .on_hover_text("Close")
+                            .clicked()
+                        {
+                            want_close = true;
+                        }
+                    });
+                    ui.add_space(2.0);
+
+                    // The body fills the window's fixed height exactly (no
+                    // shrinking to content) and scrolls when a tab is taller;
+                    // the sidebar and close button stay pinned.
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            match settings.tab {
+                                SettingsTab::General => general_tab(ui, settings),
+                                SettingsTab::Appearance => appearance_tab(ui, settings),
+                                SettingsTab::AiModel => ai_model_tab(ui, settings, llm),
+                                SettingsTab::Ftp => ftp_tab(ui, settings, ftp),
+                                SettingsTab::Updates => crate::update::updates_tab(ui, update, settings),
+                            }
+                        });
                 });
             });
-            ui.add_space(12.0);
 
-            // Tabs. More tabs exist than fit the window (about four show at
-            // once), so the row scrolls sideways — mouse wheel over it, or
-            // click a partially visible tab and it pulls itself into view.
-            // The scrollbar stays hidden; muted chevrons at the edges hint at
-            // the hidden tabs instead.
-            let tabs_out = egui::ScrollArea::horizontal()
-                .id_salt("settings_tabs")
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        tab_button(ui, settings, SettingsTab::General, "General", false);
-                        tab_button(ui, settings, SettingsTab::Appearance, "Appearance", false);
-                        tab_button(ui, settings, SettingsTab::AiModel, "AI Model", false);
-                        tab_button(ui, settings, SettingsTab::Ftp, "FTP/FTPS", false);
-                        // The Updates tab carries a small red dot when an update is waiting.
-                        let update_waiting = update.badge(settings);
-                        tab_button(ui, settings, SettingsTab::Updates, "Updates", update_waiting);
-                    });
-                });
-            // Edge chevrons while content is hidden on that side.
-            {
-                let rect = tabs_out.inner_rect;
-                let max_off = (tabs_out.content_size.x - rect.width()).max(0.0);
-                let off = tabs_out.state.offset.x;
-                if off > 1.0 {
-                    ui.painter().text(
-                        rect.left_center(),
-                        egui::Align2::LEFT_CENTER,
-                        "‹",
-                        egui::FontId::proportional(14.0),
-                        MUTED(),
-                    );
-                }
-                if off < max_off - 1.0 {
-                    ui.painter().text(
-                        rect.right_center(),
-                        egui::Align2::RIGHT_CENTER,
-                        "›",
-                        egui::FontId::proportional(14.0),
-                        MUTED(),
-                    );
-                }
-            }
-            ui.add_space(8.0);
-
-            // Scroll the tab body so a long tab doesn't make the window tall; the
-            // header + tabs stay pinned.
-            let max_h = (ui.ctx().content_rect().height() - 140.0).clamp(240.0, 460.0);
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, true])
-                .max_height(max_h)
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    match settings.tab {
-                        SettingsTab::General => general_tab(ui, settings),
-                        SettingsTab::Appearance => appearance_tab(ui, settings),
-                        SettingsTab::AiModel => ai_model_tab(ui, llm),
-                        SettingsTab::Ftp => ftp_tab(ui, settings, ftp),
-                        SettingsTab::Updates => crate::update::updates_tab(ui, update, settings),
-                    }
-                });
+            // The sidebar/content divider, full height like the sketch.
+            let rect = row.response.rect;
+            ui.painter().vline(
+                rect.left() + 144.0,
+                rect.y_range(),
+                egui::Stroke::new(1.0, EDGE()),
+            );
         });
 
     settings.open = !want_close;
@@ -543,9 +543,10 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
 }
 
 /// The AI Model tab: one-click setup of the local Gemma 4 vision model
-/// (src/llm.rs) plus a small "try it" prompt box. Everything runs inside the
-/// app — the setup button just downloads the model weights.
-fn ai_model_tab(ui: &mut egui::Ui, llm: &mut crate::llm::LlmState) {
+/// (src/llm.rs) plus the toggle that swaps the main view for the AI Chat
+/// (src/ai_chat.rs). Everything runs inside the app — the setup button just
+/// downloads the model weights.
+fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm::LlmState) {
     llm.poll();
 
     section(ui, "Local model", |ui| {
@@ -626,78 +627,22 @@ fn ai_model_tab(ui: &mut egui::Ui, llm: &mut crate::llm::LlmState) {
     });
 
     if llm.installed && crate::llm::BUILT_WITH_LLM {
-        section(ui, "Try it", |ui| {
-            ui.add(
-                egui::TextEdit::multiline(&mut llm.prompt)
-                    .desired_rows(3)
-                    .desired_width(f32::INFINITY)
-                    .margin(egui::Margin::symmetric(8, 6))
-                    .hint_text("Ask anything — attach an image to ask about it"),
+        section(ui, "AI Chat", |ui| {
+            dot_toggle(ui, &mut settings.ai_chat, "Activate AI Chat");
+            hint(
+                ui,
+                "Swaps the main view for a full-window chat with the model — \
+                 ask anything, attach images with the +, and switch between \
+                 conversations with the tabs on the left. Turn it off to get \
+                 the panels back.",
             );
-            ui.add_space(6.0);
-
-            ui.horizontal(|ui| {
-                if ui.button("Attach image…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"])
-                        .pick_file()
-                    {
-                        llm.image = Some(path);
-                    }
-                }
-                if let Some(img) = &llm.image {
-                    let name = img.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                    ui.label(egui::RichText::new(name).color(MUTED()).size(11.5));
-                    if ui.small_button("✕").on_hover_text("Remove the image").clicked() {
-                        llm.image = None;
-                    }
-                }
-            });
-            ui.add_space(6.0);
-
-            ui.horizontal(|ui| {
-                let btn = egui::Button::new(
-                    egui::RichText::new(if llm.running { "Thinking…" } else { "Ask" })
-                        .color(egui::Color32::WHITE)
-                        .strong(),
-                )
-                .fill(crate::theme::ACCENT1())
-                .corner_radius(egui::CornerRadius::same(255));
-                if ui
-                    .add_enabled_ui(!llm.running, |ui| ui.add_sized(egui::vec2(110.0, 32.0), btn))
-                    .inner
-                    .clicked()
-                {
-                    llm.generate(ui.ctx());
-                }
-                if llm.running {
-                    ui.add(egui::Spinner::new().size(16.0).color(MUTED()));
-                    ui.label(egui::RichText::new(&llm.status).color(MUTED()).size(11.5));
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
-                }
-            });
-
-            if let Some(e) = &llm.run_err {
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(12.0));
-            }
-            if !llm.response.is_empty() {
-                ui.add_space(8.0);
-                egui::Frame::new()
-                    .fill(ui.visuals().extreme_bg_color)
-                    .corner_radius(egui::CornerRadius::same(10))
-                    .inner_margin(egui::Margin::same(10))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.add(egui::Label::new(egui::RichText::new(&llm.response).color(TEXT()).size(12.5)).wrap());
-                    });
-            }
+            ui.add_space(4.0);
+            hint(
+                ui,
+                "The first question loads the model into memory and can take \
+                 a minute; after that it stays loaded.",
+            );
         });
-        hint(
-            ui,
-            "The first question loads the model into memory and can take a \
-             minute; after that it stays loaded. Runs on the CPU.",
-        );
     }
 }
 
@@ -811,39 +756,39 @@ fn ftp_tab(ui: &mut egui::Ui, settings: &mut Settings, ftp: &mut crate::ftp::Ftp
     });
 }
 
-/// A tab selector button across the top of the window. Highlights the active
-/// tab and switches to it on click. When `badge` is set, a small red dot is
-/// painted just after the label (vertically centred) — the "update waiting" mark.
+/// One row of the settings sidebar. The active tab is a full-width
+/// accent-filled pill (white text); the others are quiet until hovered.
+/// When `badge` is set, a small red dot sits at the row's right edge —
+/// the "update waiting" mark.
 fn tab_button(ui: &mut egui::Ui, settings: &mut Settings, tab: SettingsTab, label: &str, badge: bool) {
     let selected = settings.tab == tab;
-    // Every tab is a real pill button: the active one filled with the accent
-    // (white text), the others with the theme's normal button fill + hover.
     let text_color = if selected { egui::Color32::WHITE } else { TEXT() };
     let resp = ui
         .scope(|ui| {
-            // Roomier padding than the default so the pills read as buttons.
-            ui.spacing_mut().button_padding = egui::vec2(14.0, 6.0);
+            ui.spacing_mut().button_padding = egui::vec2(12.0, 6.0);
             let mut btn = egui::Button::new(egui::RichText::new(label).color(text_color).strong())
-                .corner_radius(egui::CornerRadius::same(255))
-                .min_size(egui::vec2(0.0, 30.0));
+                .corner_radius(egui::CornerRadius::same(10))
+                .min_size(egui::vec2(ui.available_width() - 10.0, 32.0));
             if selected {
                 btn = btn.fill(crate::theme::ACCENT1());
+            } else {
+                // Quiet row: no fill until the theme's hover styling kicks in.
+                btn = btn.fill(egui::Color32::TRANSPARENT);
             }
             ui.add(btn)
         })
         .inner;
     if resp.clicked() {
         settings.tab = tab;
-        // The tab row scrolls sideways — bring the clicked tab fully into view.
-        resp.scroll_to_me(None);
     }
     if badge {
-        // Reserve a small slot so the dot sits in the row (not overlapping the
-        // next tab), and paint it centred on the label's vertical midline. Matches
-        // the red of the top-bar gear's update badge.
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, resp.rect.height()), egui::Sense::hover());
-        ui.painter()
-            .circle_filled(rect.center(), 3.5, egui::Color32::from_rgb(230, 70, 70));
+        // Paint the dot inside the row's right edge, on the label's vertical
+        // midline. Matches the red of the top-bar gear's update badge.
+        ui.painter().circle_filled(
+            egui::pos2(resp.rect.right() - 12.0, resp.rect.center().y),
+            3.5,
+            egui::Color32::from_rgb(230, 70, 70),
+        );
     }
 }
 

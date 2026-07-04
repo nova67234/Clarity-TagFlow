@@ -368,6 +368,12 @@ pub fn EDGE() -> Color32 {
 /// mirrors the original `apply_theme`; the light branch additionally recolours
 /// buttons to the accent blue.
 pub fn apply(ctx: &egui::Context) {
+    // No fade-out gradient at scroll-area edges anywhere in the app — the
+    // panel-coloured "shadow" egui paints at the top/bottom of scrollable
+    // content (white in light themes, dark in dark ones). Panels read cleaner
+    // without it.
+    ctx.all_styles_mut(|s| s.spacing.scroll.fade.strength = 0.0);
+
     let p = palette();
     let mut v = if p.is_dark {
         egui::Visuals::dark()
