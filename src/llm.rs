@@ -29,6 +29,16 @@ pub const MMPROJ_FILE: &str = "mmproj-F16.gguf";
 /// True when this binary was compiled with local-AI support.
 pub const BUILT_WITH_LLM: bool = cfg!(feature = "llm");
 
+/// How many of a chat's most recent messages are re-sent to the model each
+/// turn (the working memory — older messages are forgotten). Sized so ~25
+/// turns of conversation fit the 16k context with room for a long reply.
+const HISTORY_MSGS: usize = 50;
+/// How many of the newest attached images ride along with the history.
+/// Images are heavy (256 tokens each, re-encoded every turn), so older ones
+/// are dropped from the prompt — their text, and the model's own description
+/// of them, stay in the history.
+const HISTORY_IMAGES: usize = 4;
+
 /// True when this binary was compiled with the Vulkan GPU backend
 /// (`llm-vulkan`, built via scripts\build-vulkan.cmd). CPU-only otherwise.
 pub const BUILT_WITH_GPU: bool = cfg!(feature = "llm-vulkan");
@@ -298,12 +308,13 @@ impl LlmState {
         chat.msgs.push(ChatMsg { role: ChatRole::User, text, image });
 
         // Snapshot the history for the worker, capped to the most recent
-        // messages so a very long chat doesn't overflow the model's context.
-        let msgs: Vec<CmdMsg> = chat
+        // messages so a very long chat doesn't overflow the model's context,
+        // and with only the newest few images attached (see HISTORY_IMAGES).
+        let mut msgs: Vec<CmdMsg> = chat
             .msgs
             .iter()
             .rev()
-            .take(20)
+            .take(HISTORY_MSGS)
             .rev()
             .map(|m| CmdMsg {
                 user: m.role == ChatRole::User,
@@ -311,6 +322,15 @@ impl LlmState {
                 image: m.image.clone(),
             })
             .collect();
+        let mut kept_images = 0;
+        for m in msgs.iter_mut().rev() {
+            if m.image.is_some() {
+                kept_images += 1;
+                if kept_images > HISTORY_IMAGES {
+                    m.image = None;
+                }
+            }
+        }
         let id = chat.id;
 
         if self.worker.is_none() {
@@ -369,10 +389,10 @@ mod worker {
 
     use super::{Cmd, Msg, FOLDER, MMPROJ_FILE, MODEL_FILE};
 
-    /// Context window. Gemma 4 supports far more, but 8k keeps the KV cache
-    /// reasonable on ordinary machines while leaving room for chat history
-    /// plus long replies.
-    const N_CTX: u32 = 8192;
+    /// Context window. Gemma 4 supports far more, but 16k keeps the KV cache
+    /// reasonable on ordinary machines while fitting the 50-message history
+    /// cap plus a long reply.
+    const N_CTX: u32 = 16384;
     /// Prompt-eval batch size; must fit an image's token chunk (256 for Gemma).
     const N_BATCH: u32 = 512;
     /// Cap on generated tokens per response. 1024 turned out to truncate real
