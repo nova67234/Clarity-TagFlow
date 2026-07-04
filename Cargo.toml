@@ -78,6 +78,10 @@ llama-cpp-2 = { version = "0.1.150", features = ["mtmd"], optional = true }
 # Streaming UTF-8 decode for the LLM's token stream — a token can end mid-way
 # through a multi-byte character (CJK, emoji), so bytes carry over pieces.
 encoding_rs = { version = "0.8", optional = true }
+# Renders the AI chat's replies as real markdown — bold, bullet lists,
+# headings, code blocks — instead of raw **asterisks** (src/ai_chat.rs).
+# 0.23 pairs with egui 0.34 (0.24 needs egui 0.35, newer than eframe here).
+egui_commonmark = "0.23"
 
 # "Copy image" appends the legacy CF_DIB clipboard format after arboard's
 # PNG/DIBV5 — Chromium-based browsers only ever request CF_DIB when pasting an
@@ -115,6 +119,16 @@ debug = false
 # scripts in dev. (Release builds never linked it and are unaffected.)
 [profile.dev.build-override]
 debug-assertions = false
+
+# Vendored, lightly patched copies of egui_commonmark (+ its backend) for the
+# AI chat's markdown replies — the edits are tagged PATCH(Clarity TagFlow):
+#  * backend: the code-block copy button draws the app's copy/copied SVGs
+#    instead of the 🗐/✔ text glyphs.
+#  * viewer: text runs render color emoji as inline Twemoji SVG images
+#    (egui fonts are monochrome-only).
+[patch.crates-io]
+egui_commonmark = { path = "vendor/egui_commonmark" }
+egui_commonmark_backend = { path = "vendor/egui_commonmark_backend" }
 
 [build-dependencies]
 # Embeds the Windows app icon (and version info) into the exe at build time.

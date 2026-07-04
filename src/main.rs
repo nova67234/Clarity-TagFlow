@@ -67,6 +67,8 @@ use theme::*;
 mod ai_models;
 mod ai_orb;
 #[cfg(feature = "avif")]
+// The full-window AI Chat view (Settings → AI Model → Activate AI Chat).
+mod ai_chat;
 mod avif;
 mod backup;
 mod bgremove;
@@ -1246,6 +1248,15 @@ impl eframe::App for ViewerApp {
         self.video_previews.set_enabled(self.settings.video_thumbnail_play);
         self.video_previews.begin_frame();
 
+        // AI Chat mode replaces the panels with a full-window chat with the
+        // local model (the top bar stays). Takes precedence over the layouts.
+        if self.settings.ai_chat {
+            // Release the centre viewer's player — like the Gallery layout, a
+            // clip selected in Panels would keep playing behind the chat.
+            self.video_player = None;
+            self.last_video_path = None;
+            ai_chat::show(ui, &mut self.llm);
+        } else
         // When the Gallery layout is active, replace the three panels with a
         // full-window masonry grid of the open folder's images.
         if self.settings.layout == settings::Layout::Gallery {
@@ -1637,6 +1648,12 @@ fn install_fallback_fonts(ctx: &egui::Context) {
         &[(r"C:\Windows\Fonts\CAMBRIA.TTC", 1)],
         // Broader symbols / dingbats / arrows people drop in prompts.
         &[(r"C:\Windows\Fonts\seguisym.ttf", 0)],
+        // Emoji: Segoe UI Emoji's outline layer. egui rasterizes fonts
+        // monochrome-only, so this is what editable fields (the AI chat's
+        // send box, prompt boxes) show while typing — proper emoji shapes
+        // with no tofu (it also maps U+FE0F to a zero-width glyph). Sent
+        // messages render full-color Twemoji instead (src/emoji.rs).
+        &[(r"C:\Windows\Fonts\seguiemj.ttf", 0)],
     ];
     #[cfg(target_os = "macos")]
     let groups: &[&[(&str, u32)]] = &[
