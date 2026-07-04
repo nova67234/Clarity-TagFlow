@@ -66,9 +66,9 @@ use theme::*;
 
 mod ai_models;
 mod ai_orb;
-#[cfg(feature = "avif")]
 // The full-window AI Chat view (Settings → AI Model → Activate AI Chat).
 mod ai_chat;
+#[cfg(feature = "avif")]
 mod avif;
 mod backup;
 mod bgremove;
