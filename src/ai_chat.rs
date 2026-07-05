@@ -528,9 +528,9 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
 /// lists, headings, code blocks) straight on the background, like current
 /// assistant UIs. A streaming reply shows a ▌ cursor.
 fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool) {
-    let (role, text, image) = {
+    let (role, text, stored_thinking, image) = {
         let m = &llm.chats[llm.active_chat].msgs[index];
-        (m.role, m.text.clone(), m.image.clone())
+        (m.role, m.text.clone(), m.thinking.clone(), m.image.clone())
     };
 
     if role == ChatRole::User {
@@ -603,40 +603,57 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         }
     }
 
-    // Nothing streamed yet → a spinner with the worker status
-    // ("Loading the model…", "Thinking…") where the reply will appear.
-    if streaming && text.is_empty() {
+    // The thought channel (the 26B/31B variants reason before answering):
+    // split live while the reply streams; a finished message keeps its
+    // thoughts on the `thinking` field (llm.rs moves them there on Done).
+    let (thinking, body) = if streaming {
+        crate::llm::split_channels(&text)
+    } else {
+        (stored_thinking.unwrap_or_default(), text.clone())
+    };
+
+    // Nothing visible streamed yet (empty, or only channel tags so far) → a
+    // spinner with the worker status ("Loading the model…", "Thinking…")
+    // where the reply will appear.
+    if streaming && thinking.is_empty() && body.is_empty() {
         ui.horizontal(|ui| {
             ui.add(egui::Spinner::new().size(12.0).color(MUTED()));
             ui.label(egui::RichText::new(&llm.status).color(MUTED()).size(12.5));
         });
         return;
     }
+    if !thinking.is_empty() {
+        thinking_row(ui, llm, index, &thinking, streaming && body.is_empty());
+        ui.add_space(4.0);
+    }
+
     let mut shown = if streaming && llm.roleplay.enabled {
         // Diary lines are extracted for real when the reply finishes; hide
         // them while it streams so they never flash up.
-        crate::roleplay::strip_memory_lines(&text)
+        crate::roleplay::strip_memory_lines(&body)
     } else {
-        text.clone()
+        body.clone()
     };
-    if streaming {
+    if streaming && !body.is_empty() {
         shown.push('▌');
     }
-    ui.scope(|ui| {
-        // Slightly larger body text for replies than egui's default.
-        if let Some(body) = ui.style_mut().text_styles.get_mut(&egui::TextStyle::Body) {
-            body.size = 14.5;
-        }
-        // Code blocks: same frosted colour as the top bar's card (PANEL()),
-        // no outline, and rounded to 22 — the viewer takes its fill from
-        // `extreme_bg_color` and the radius/stroke from the noninteractive
-        // widget style.
-        let v = ui.visuals_mut();
-        v.extreme_bg_color = PANEL();
-        v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(22);
-        v.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-        egui_commonmark::CommonMarkViewer::new().show(ui, &mut llm.md_cache, &shown);
-    });
+    if !shown.trim().is_empty() {
+        ui.scope(|ui| {
+            // Slightly larger body text for replies than egui's default.
+            if let Some(body) = ui.style_mut().text_styles.get_mut(&egui::TextStyle::Body) {
+                body.size = 14.5;
+            }
+            // Code blocks: same frosted colour as the top bar's card (PANEL()),
+            // no outline, and rounded to 22 — the viewer takes its fill from
+            // `extreme_bg_color` and the radius/stroke from the noninteractive
+            // widget style.
+            let v = ui.visuals_mut();
+            v.extreme_bg_color = PANEL();
+            v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(22);
+            v.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+            egui_commonmark::CommonMarkViewer::new().show(ui, &mut llm.md_cache, &shown);
+        });
+    }
 
     // Action row under every finished reply: copy / regenerate / listen.
     if !streaming {
@@ -675,6 +692,77 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                 ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(11.0));
             }
         });
+    }
+}
+
+/// The collapsible "Thinking" row above a reply: the little AI orb, a muted
+/// label and a drop-down arrow. Clicking anywhere on it (orb included)
+/// reveals the model's thought channel underneath, muted in a soft card. The
+/// orb runs hot while the thought still streams (`live`), then settles to
+/// its idle breathing.
+fn thinking_row(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, thinking: &str, live: bool) {
+    let chat_id = llm.chats[llm.active_chat].id;
+    let open_id = egui::Id::new(("ai_thinking_open", chat_id, index));
+    let mut open = ui.data_mut(|d| d.get_temp::<bool>(open_id).unwrap_or(false));
+    let mut toggled = false;
+
+    ui.horizontal(|ui| {
+        let orb = llm.think_orbs.entry((chat_id, index)).or_default();
+        orb.set_state(if live {
+            crate::ai_orb::OrbState::Thinking
+        } else {
+            crate::ai_orb::OrbState::Idle
+        });
+        if orb.show(ui, 20.0, None).clicked() {
+            toggled = true;
+        }
+
+        let label = if live { "Thinking…" } else { "Thoughts" };
+        let galley = ui.painter().layout_no_wrap(
+            label.to_string(),
+            egui::FontId::proportional(12.5),
+            MUTED(),
+        );
+        let size = egui::vec2(galley.size().x + 4.0 + 16.0, 20.0);
+        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+        let resp = resp
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("See what the model thought before answering");
+        if resp.clicked() {
+            toggled = true;
+        }
+        if ui.is_rect_visible(rect) {
+            let text_pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
+            ui.painter().galley(text_pos, galley, MUTED());
+            let arrow = if open {
+                egui::include_image!("../icons/arrow_drop_down.svg")
+            } else {
+                egui::include_image!("../icons/arrow_right.svg")
+            };
+            egui::Image::new(arrow).tint(icon_tint(MUTED())).paint_at(
+                ui,
+                egui::Rect::from_center_size(
+                    egui::pos2(rect.right() - 8.0, rect.center().y),
+                    egui::vec2(14.0, 14.0),
+                ),
+            );
+        }
+    });
+    if toggled {
+        open = !open;
+        ui.data_mut(|d| d.insert_temp(open_id, open));
+    }
+
+    if open {
+        ui.add_space(2.0);
+        egui::Frame::new()
+            .fill(PANEL().gamma_multiply(0.55))
+            .corner_radius(egui::CornerRadius::same(14))
+            .inner_margin(egui::Margin::symmetric(12, 9))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new(thinking).color(MUTED()).size(12.5));
+            });
     }
 }
 
