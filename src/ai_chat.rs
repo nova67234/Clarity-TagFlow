@@ -19,8 +19,8 @@ use crate::card_frame;
 use crate::llm::{ChatRole, LlmState};
 use crate::theme::*;
 
-/// Width of the chats side panel (a slimmer sibling of the 290px browser).
-const PANEL_W: f32 = 250.0;
+/// Width of the chats side panel — same as the Details & Actions panel's.
+const PANEL_W: f32 = crate::right_details::PANEL_WIDTH;
 
 /// Drag-and-drop accent — the blue the input card turns while a file is
 /// dragged over it (matches the generator prompt box's import blue).
@@ -73,7 +73,21 @@ pub fn show(ui: &mut egui::Ui, llm: &mut LlmState) {
                 // Fill the panel's full height, like the browser card.
                 ui.set_min_height(ui.available_height());
                 ui.set_width(ui.available_width());
-                chat_list(ui, llm);
+                if llm.roleplay.enabled {
+                    // Role play: chats get the top, the character + shared
+                    // memory diary take the rest.
+                    let h = ui.available_height();
+                    egui::ScrollArea::vertical()
+                        .id_salt("ai_chat_list_outer")
+                        .max_height(h * 0.32)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| chat_list(ui, llm));
+                    ui.add_space(6.0);
+                    ui.separator();
+                    crate::roleplay::panel_ui(ui, &mut llm.roleplay);
+                } else {
+                    chat_list(ui, llm);
+                }
             });
         });
 
@@ -354,6 +368,40 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState) {
                             llm.draft_image = Some(path);
                         }
                     }
+                    // Tools menu: extra chat abilities with on/off toggles.
+                    let tools_resp = icon_button(ui, egui::include_image!("../icons/tools.svg"), 18.0, "Tools", true);
+                    if tools_resp.clicked() {
+                        llm.tools_open = !llm.tools_open;
+                    }
+                    if llm.tools_open {
+                        let mut open = llm.tools_open;
+                        egui::Popup::from_response(&tools_resp)
+                            .open_bool(&mut open)
+                            .align(egui::RectAlign::TOP_START) // opens upward (card sits at the bottom)
+                            .width(240.0)
+                            .gap(8.0)
+                            .frame(crate::card_frame(14))
+                            .show(|ui| {
+                                ui.label(egui::RichText::new("TOOLS").color(MUTED()).strong().size(10.5));
+                                ui.add_space(4.0);
+                                let mut on = llm.roleplay.enabled;
+                                let resp = ui.checkbox(&mut on, egui::RichText::new("Role playing").color(TEXT()));
+                                if resp.changed() {
+                                    llm.roleplay.enabled = on;
+                                    llm.roleplay.save();
+                                }
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Give the AI a persona and a shared memory \
+                                         diary (left panel). It remembers facts, \
+                                         permissions and the story as it unfolds.",
+                                    )
+                                    .color(MUTED())
+                                    .size(10.5),
+                                );
+                            });
+                        llm.tools_open = open;
+                    }
                     if llm.running {
                         ui.add_space(4.0);
                         ui.add(egui::Spinner::new().size(12.0).color(MUTED()));
@@ -457,7 +505,13 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         });
         return;
     }
-    let mut shown = text.clone();
+    let mut shown = if streaming && llm.roleplay.enabled {
+        // Diary lines are extracted for real when the reply finishes; hide
+        // them while it streams so they never flash up.
+        crate::roleplay::strip_memory_lines(&text)
+    } else {
+        text.clone()
+    };
     if streaming {
         shown.push('▌');
     }

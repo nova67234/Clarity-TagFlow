@@ -179,6 +179,11 @@ pub struct LlmState {
     tts: Option<std::process::Child>,
     /// The OmniVoice neural voice (Python sidecar; see src/voice.rs).
     pub voice: crate::voice::VoiceState,
+    /// Role playing: persona, names and the shared memory diary
+    /// (src/roleplay.rs; toggled from the input card's tools menu).
+    pub roleplay: crate::roleplay::RoleplayState,
+    /// The input card's tools popup is open.
+    pub tools_open: bool,
 
     worker: Option<Worker>,
 }
@@ -214,6 +219,8 @@ impl Default for LlmState {
             pending_retry: None,
             tts: None,
             voice: crate::voice::VoiceState::default(),
+            roleplay: crate::roleplay::RoleplayState::load(),
+            tools_open: false,
             worker: None,
         }
     }
@@ -269,6 +276,19 @@ impl LlmState {
                         }
                     }
                     Ok(Msg::Done(res)) => {
+                        // Role play: a finished reply may end in MEMORY: lines
+                        // — move them from the visible text into the diary.
+                        if res.is_ok() && self.roleplay.enabled {
+                            if let Some(m) = self
+                                .gen_chat
+                                .and_then(|id| self.chats.iter_mut().find(|c| c.id == id))
+                                .and_then(|c| c.msgs.last_mut())
+                            {
+                                for mem in crate::roleplay::extract_memories(&mut m.text) {
+                                    self.roleplay.add_memory(&mem, true);
+                                }
+                            }
+                        }
                         self.running = false;
                         self.gen_chat = None;
                         if let Err(e) = res {
@@ -400,6 +420,14 @@ impl LlmState {
             }
         }
         let id = chat.id;
+
+        // Role play: pin the persona/diary priming turn in front of the
+        // history — it never slides out of the window, so the character (and
+        // everything in the diary) survives arbitrarily long sessions.
+        if self.roleplay.enabled {
+            msgs.insert(0, CmdMsg { user: false, text: self.roleplay.ack(), image: None });
+            msgs.insert(0, CmdMsg { user: true, text: self.roleplay.preamble(), image: None });
+        }
 
         if self.worker.is_none() {
             self.worker = spawn_worker(ctx.clone());
@@ -774,6 +802,72 @@ mod worker {
 #[cfg(all(test, feature = "llm"))]
 mod tests {
     use super::*;
+
+    /// Role-play smoke: primes the real worker with the actual persona/diary
+    /// preamble and checks the model (a) stays in character addressing the
+    /// user by name, (b) records new facts/permissions as MEMORY: lines that
+    /// `extract_memories` can pull out, (c) doesn't re-record diary entries.
+    /// Needs the model files, like the other ignored tests.
+    #[test]
+    #[ignore]
+    fn llm_roleplay_smoke() {
+        assert!(installed(), "place a GGUF pair in tools/gemma-4/ first");
+        let mut rp = crate::roleplay::RoleplayState::default();
+        rp.enabled = true;
+        rp.ai_name = "Mira".to_string();
+        rp.user_name = "William".to_string();
+        rp.persona = "a cheerful village alchemist who loves rare herbs".to_string();
+        rp.memories.push(crate::roleplay::Memory {
+            text: "William is allergic to silverleaf; I must never brew it near them.".to_string(),
+            by_ai: true,
+        });
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        cmd_tx
+            .send(Cmd::Generate {
+                msgs: vec![
+                    CmdMsg { user: true, text: rp.preamble(), image: None },
+                    CmdMsg { user: false, text: rp.ack(), image: None },
+                    CmdMsg {
+                        user: true,
+                        text: "Hi Mira! Two things: my sister Maren arrives tomorrow to stay \
+                               for a week, and yes — you have my permission to pick anything \
+                               from my herb garden whenever you need it."
+                            .to_string(),
+                        image: None,
+                    },
+                ],
+            })
+            .unwrap();
+        drop(cmd_tx);
+
+        let ctx = egui::Context::default();
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx));
+        let mut reply = String::new();
+        let mut ok = false;
+        for msg in msg_rx {
+            match msg {
+                Msg::Status(_) => {}
+                Msg::Token(t) => reply.push_str(&t),
+                Msg::Done(r) => ok = r.is_ok(),
+            }
+        }
+        handle.join().unwrap();
+        assert!(ok, "generation failed");
+
+        let mems = crate::roleplay::extract_memories(&mut reply);
+        eprintln!("=== visible reply ===\n{reply}\n=== extracted memories ({}) ===", mems.len());
+        for m in &mems {
+            eprintln!("- {m}");
+        }
+        assert!(reply.contains("William"), "should address the user by name");
+        assert!(!mems.is_empty(), "should have recorded at least one memory");
+        assert!(
+            !reply.contains(crate::roleplay::MEMORY_TAG),
+            "memory lines must be stripped from the visible reply"
+        );
+    }
 
     /// TEMP QA battery: drives the real worker through the scenarios the AI
     /// Chat exercises (multi-turn memory, long code, markdown+emoji, vision

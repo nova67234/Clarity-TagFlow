@@ -70,6 +70,8 @@ mod ai_orb;
 mod ai_chat;
 // The OmniVoice neural voice for the chat's Listen buttons (Python sidecar).
 mod voice;
+// Role playing for the AI Chat: persona, names, shared memory diary.
+mod roleplay;
 #[cfg(feature = "avif")]
 mod avif;
 mod backup;
@@ -1387,7 +1389,24 @@ impl eframe::App for ViewerApp {
         if self.llm.voice.style != self.settings.ai_voice_style {
             self.llm.voice.style = self.settings.ai_voice_style.clone();
         }
+        if self.llm.voice.ref_audio != self.settings.ai_voice_ref_audio {
+            self.llm.voice.ref_audio = self.settings.ai_voice_ref_audio.clone();
+        }
+        if self.llm.voice.ref_text != self.settings.ai_voice_ref_text {
+            self.llm.voice.ref_text = self.settings.ai_voice_ref_text.clone();
+        }
         settings::show(ui.ctx(), &mut self.settings, &mut self.update, &mut self.ftp, &mut self.llm);
+
+        // The floating voice-sample recorder (its own always-on-top window,
+        // usable while other apps are focused). A finished recording becomes
+        // the cloning sample; the transcript still needs typing.
+        voice::recorder_window(ui.ctx(), &mut self.llm.voice);
+        if let Some(p) = self.llm.voice.rec.saved.take() {
+            self.settings.ai_voice_ref_audio = p.to_string_lossy().to_string();
+            self.settings.ai_voice_ref_text.clear();
+            self.llm.voice.ref_audio = self.settings.ai_voice_ref_audio.clone();
+            self.llm.voice.ref_text.clear();
+        }
 
         // FTP remote browser (opened by the top bar's globe button in FTP mode).
         // A finished directory download loads its local cache like any folder.
