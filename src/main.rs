@@ -1396,6 +1396,7 @@ impl eframe::App for ViewerApp {
             self.llm.voice.ref_text = self.settings.ai_voice_ref_text.clone();
         }
         self.llm.auto_speak = self.settings.ai_auto_speak;
+        self.llm.params = self.settings.ai_gen;
         self.llm.set_model(self.settings.ai_gemma_model);
         settings::show(ui.ctx(), &mut self.settings, &mut self.update, &mut self.ftp, &mut self.llm);
 

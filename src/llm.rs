@@ -93,6 +93,30 @@ impl GemmaModel {
 /// True when this binary was compiled with local-AI support.
 pub const BUILT_WITH_LLM: bool = cfg!(feature = "llm");
 
+/// Sampling knobs for the AI chat, edited from the gear in the chat-list
+/// panel and persisted in Settings (`ai_gen`). The defaults are Gemma's
+/// recommended sampling.
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct GenParams {
+    /// Randomness of the replies: 0 always picks the most likely token
+    /// (deterministic), 2 gets wild.
+    pub temperature: f32,
+    /// Sample only among the k most likely tokens.
+    pub top_k: i32,
+    /// Nucleus sampling: drop the tail once cumulative probability passes p.
+    pub top_p: f32,
+    /// Cap on generated tokens per reply. 1024 turned out to truncate real
+    /// answers mid-code-block; 3072 fits long code examples comfortably.
+    pub max_tokens: usize,
+}
+
+impl Default for GenParams {
+    fn default() -> Self {
+        Self { temperature: 1.0, top_k: 64, top_p: 0.95, max_tokens: 3072 }
+    }
+}
+
 /// How many of a chat's most recent messages are re-sent to the model each
 /// turn (the working memory — older messages are forgotten). Sized so ~25
 /// turns of conversation fit the 16k context with room for a long reply.
@@ -137,7 +161,7 @@ struct CmdMsg {
 /// turn — the worker rebuilds the model context from scratch, so multi-turn
 /// chat works without keeping KV-cache state between requests.
 enum Cmd {
-    Generate { msgs: Vec<CmdMsg> },
+    Generate { msgs: Vec<CmdMsg>, params: GenParams },
 }
 
 /// A message streamed back from the inference worker.
@@ -248,6 +272,11 @@ pub struct LlmState {
     pub roleplay: crate::roleplay::RoleplayState,
     /// The Gemma 4 variant to chat with (mirrors the persisted setting).
     pub model: GemmaModel,
+    /// Sampling knobs (mirrors the persisted setting; sent with every ask, so
+    /// edits apply from the next reply — no model reload).
+    pub params: GenParams,
+    /// The chat list's AI-settings popup (the gear) is open.
+    pub gen_settings_open: bool,
     /// The variant the resident worker actually loaded — a mismatch drops
     /// the worker so the next ask loads the newly selected model.
     worker_model: GemmaModel,
@@ -293,6 +322,8 @@ impl Default for LlmState {
             voice: crate::voice::VoiceState::default(),
             roleplay: crate::roleplay::RoleplayState::load(),
             model: GemmaModel::default(),
+            params: GenParams::default(),
+            gen_settings_open: false,
             worker_model: GemmaModel::default(),
             auto_speak: false,
             tools_open: false,
@@ -587,7 +618,7 @@ impl LlmState {
             self.worker_model = self.model;
         }
         match &self.worker {
-            Some(w) if w.tx.send(Cmd::Generate { msgs }).is_ok() => {
+            Some(w) if w.tx.send(Cmd::Generate { msgs, params: self.params }).is_ok() => {
                 // The empty reply bubble the tokens stream into.
                 self.chats[self.active_chat]
                     .msgs
@@ -778,9 +809,6 @@ mod worker {
     const N_CTX: u32 = 16384;
     /// Prompt-eval batch size; must fit an image's token chunk (256 for Gemma).
     const N_BATCH: u32 = 512;
-    /// Cap on generated tokens per response. 1024 turned out to truncate real
-    /// answers mid-code-block; 3072 fits long code examples comfortably.
-    const MAX_TOKENS: usize = 3072;
 
     /// The context configuration used for every generation — also created
     /// once as a probe during loading, so the GPU-offload ladder knows the
@@ -900,8 +928,8 @@ mod worker {
 
         send(Msg::Status("Ready".into()));
 
-        while let Ok(Cmd::Generate { msgs }) = rx.recv() {
-            let res = generate(&backend, &model, &mtmd, &template, threads, &msgs, send);
+        while let Ok(Cmd::Generate { msgs, params }) = rx.recv() {
+            let res = generate(&backend, &model, &mtmd, &template, threads, &msgs, &params, send);
             send(Msg::Done(res));
         }
         Ok(())
@@ -914,6 +942,7 @@ mod worker {
         template: &llama_cpp_2::model::LlamaChatTemplate,
         threads: i32,
         msgs: &[super::CmdMsg],
+        params: &super::GenParams,
         send: &dyn Fn(Msg),
     ) -> Result<(), String> {
         // A fresh context per turn: cheap next to the resident weights, and it
@@ -976,19 +1005,25 @@ mod worker {
             .eval_chunks(mtmd, &mut context, 0, 0, N_BATCH as i32, true)
             .map_err(|e| format!("Evaluate prompt: {e}"))?;
 
-        // Gemma's recommended sampling: top-k 64, top-p 0.95, temperature 1.0.
-        let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::top_k(64),
-            LlamaSampler::top_p(0.95, 1),
-            LlamaSampler::temp(1.0),
-            LlamaSampler::dist(1234),
-        ]);
+        // The user's sampling knobs (defaults are Gemma's recommendation:
+        // top-k 64, top-p 0.95, temperature 1.0). Temperature ~0 means "always
+        // the most likely token" — plain greedy, no need to sample.
+        let mut sampler = if params.temperature <= 0.01 {
+            LlamaSampler::greedy()
+        } else {
+            LlamaSampler::chain_simple([
+                LlamaSampler::top_k(params.top_k.max(1)),
+                LlamaSampler::top_p(params.top_p.clamp(0.05, 1.0), 1),
+                LlamaSampler::temp(params.temperature),
+                LlamaSampler::dist(1234),
+            ])
+        };
 
         let mut batch = LlamaBatch::new(N_BATCH as usize, 1);
         // Streaming decoder: a token can end mid-way through a multi-byte
         // UTF-8 character (CJK, emoji), so bytes carry over between pieces.
         let mut decoder = encoding_rs::UTF_8.new_decoder();
-        for _ in 0..MAX_TOKENS {
+        for _ in 0..params.max_tokens {
             let token = sampler.sample(&context, -1);
             sampler.accept(token);
             if model.is_eog_token(token) {
@@ -1058,6 +1093,7 @@ mod tests {
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         cmd_tx
             .send(Cmd::Generate {
+                params: Default::default(),
                 msgs: vec![
                     CmdMsg { user: true, text: rp.preamble(), image: None },
                     CmdMsg { user: false, text: rp.ack(), image: None },
@@ -1127,6 +1163,7 @@ mod tests {
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         cmd_tx
             .send(Cmd::Generate {
+                params: Default::default(),
                 msgs: vec![
                     CmdMsg { user: true, text: rp.preamble(), image: None },
                     CmdMsg { user: false, text: rp.ack(), image: None },
@@ -1232,7 +1269,7 @@ mod tests {
 
         let names: Vec<&str> = scenarios.iter().map(|(n, _)| *n).collect();
         for (_, msgs) in scenarios {
-            cmd_tx.send(Cmd::Generate { msgs }).unwrap();
+            cmd_tx.send(Cmd::Generate { msgs, params: Default::default() }).unwrap();
         }
         drop(cmd_tx);
 
@@ -1281,6 +1318,7 @@ mod tests {
         // then a multi-turn history with an image (the vision path).
         cmd_tx
             .send(Cmd::Generate {
+                params: Default::default(),
                 msgs: vec![CmdMsg {
                     user: true,
                     text: "Say hello in one short sentence.".to_string(),
@@ -1290,6 +1328,7 @@ mod tests {
             .unwrap();
         cmd_tx
             .send(Cmd::Generate {
+                params: Default::default(),
                 msgs: vec![
                     CmdMsg { user: true, text: "Say hello in one short sentence.".to_string(), image: None },
                     CmdMsg { user: false, text: "Hello!".to_string(), image: None },
