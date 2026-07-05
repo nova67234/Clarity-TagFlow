@@ -181,3 +181,29 @@ mod imp {
             .collect()
     }
 }
+
+/// Magic prefix for encrypted binary files (the role-play album's images and
+/// description sidecars).
+const BYTES_MAGIC: &[u8] = b"encb1:";
+
+/// Encrypt arbitrary bytes for storage. Mirrors [`protect`]: on any failure
+/// the plain bytes come back unchanged, so saving never loses data.
+pub fn protect_bytes(data: &[u8]) -> Vec<u8> {
+    match imp::encrypt(data) {
+        Some(ct) => {
+            let mut out = BYTES_MAGIC.to_vec();
+            out.extend_from_slice(&ct);
+            out
+        }
+        None => data.to_vec(),
+    }
+}
+
+/// Decrypt bytes stored by [`protect_bytes`]. Un-prefixed (legacy/fallback)
+/// data passes through unchanged; corrupt or foreign-user ciphertext is None.
+pub fn unprotect_bytes(stored: &[u8]) -> Option<Vec<u8>> {
+    match stored.strip_prefix(BYTES_MAGIC) {
+        Some(ct) => imp::decrypt(ct),
+        None => Some(stored.to_vec()),
+    }
+}

@@ -25,6 +25,11 @@ use crate::theme::*;
 
 /// The marker the model is told to prefix memory lines with.
 pub const MEMORY_TAG: &str = "MEMORY:";
+/// Saves the image from the user's latest message into the AI's album,
+/// with a diary-style reason why it liked it.
+pub const KEEP_IMAGE_TAG: &str = "KEEP_IMAGE:";
+/// Sends a previously saved album image back into the chat.
+pub const SHOW_IMAGE_TAG: &str = "SHOW_IMAGE:";
 
 /// How many diary entries ride along in the prompt (newest kept).
 const PROMPT_MEMORIES: usize = 60;
@@ -35,6 +40,10 @@ pub struct Memory {
     pub text: String,
     /// Written by the AI (diary) rather than typed by the user.
     pub by_ai: bool,
+    /// Album image this memory is about (file name inside the album dir,
+    /// e.g. "img_003.jpg" — stored on disk as "img_003.jpg.enc").
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 /// Persistent role-play state, owned by `LlmState` and saved to
@@ -54,6 +63,11 @@ pub struct RoleplayState {
 
 fn store_path() -> std::path::PathBuf {
     crate::tagger::models_root().join("ai_chat_roleplay.json")
+}
+
+/// Where the AI's kept images live (each as `<name>.enc` + `<stem>.txt.enc`).
+fn album_dir() -> std::path::PathBuf {
+    crate::tagger::models_root().join("ai_chat_album")
 }
 
 impl RoleplayState {
@@ -76,6 +90,10 @@ impl RoleplayState {
     /// not add the same memories" rule, enforced app-side on top of the
     /// prompt). True when added.
     pub fn add_memory(&mut self, text: &str, by_ai: bool) -> bool {
+        self.add_memory_with_image(text, by_ai, None)
+    }
+
+    pub fn add_memory_with_image(&mut self, text: &str, by_ai: bool, image: Option<String>) -> bool {
         let text = text.trim();
         if text.is_empty() {
             return false;
@@ -84,9 +102,46 @@ impl RoleplayState {
         if self.memories.iter().any(|m| normalize(&m.text) == key) {
             return false;
         }
-        self.memories.push(Memory { text: text.to_string(), by_ai });
+        self.memories.push(Memory { text: text.to_string(), by_ai, image });
         self.save();
         true
+    }
+
+    /// Copy `src` (the image the user just sent) into the AI's album,
+    /// encrypted, plus a same-named encrypted .txt describing why it was
+    /// kept. Returns the album file name (e.g. "img_003.jpg").
+    pub fn save_album_image(&self, src: &std::path::Path, why: &str) -> Result<String, String> {
+        let dir = album_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let ext = src
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("jpg")
+            .to_ascii_lowercase();
+        let n = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) / 2 + 1;
+        let name = format!("img_{n:03}.{ext}");
+
+        let bytes = std::fs::read(src).map_err(|e| format!("read image: {e}"))?;
+        std::fs::write(dir.join(format!("{name}.enc")), crate::secret::protect_bytes(&bytes))
+            .map_err(|e| format!("save image: {e}"))?;
+        std::fs::write(
+            dir.join(format!("img_{n:03}.txt.enc")),
+            crate::secret::protect_bytes(why.as_bytes()),
+        )
+        .map_err(|e| format!("save description: {e}"))?;
+        Ok(name)
+    }
+
+    /// Decrypt an album image to a temp file for display / re-sending in
+    /// chat. Returns the temp path.
+    pub fn load_album_image(&self, name: &str) -> Option<std::path::PathBuf> {
+        // The name comes from model output — never let it escape the album dir.
+        let name = std::path::Path::new(name).file_name()?.to_string_lossy().to_string();
+        let stored = std::fs::read(album_dir().join(format!("{name}.enc"))).ok()?;
+        let bytes = crate::secret::unprotect_bytes(&stored)?;
+        let tmp = std::env::temp_dir().join(format!("clarity_album_{name}"));
+        std::fs::write(&tmp, bytes).ok()?;
+        Some(tmp)
     }
 
     /// The display name used for the AI ("the AI" placeholder when unset).
@@ -108,6 +163,9 @@ impl RoleplayState {
         let skip = self.memories.len().saturating_sub(PROMPT_MEMORIES);
         for m in self.memories.iter().skip(skip) {
             diary.push_str("- ");
+            if let Some(img) = &m.image {
+                diary.push_str(&format!("[saved picture {img}] "));
+            }
             diary.push_str(&m.text);
             diary.push('\n');
         }
@@ -143,8 +201,24 @@ impl RoleplayState {
              - Write each entry like a diary in {ai}'s own voice: descriptive \
              and specific, with names, feelings and why it matters.\n\
              - The `{tag}` lines are stripped before {user} sees your reply; \
-             never talk about the diary mechanism in the visible text.",
+             never talk about the diary mechanism in the visible text.\n\
+             \n\
+             Your photo album:\n\
+             - When {user} shares a picture that genuinely means something to \
+             you — you love it, it touches you, it matters to your story — \
+             keep it: end your reply with one line `{keep} <why you love it, \
+             written like a diary entry>`. Only keep pictures that truly move \
+             you, not every picture.\n\
+             - Pictures marked [saved picture ...] in your diary are in your \
+             album. When the moment feels right — reminiscing, making plans, \
+             missing something — you may show one to {user} again by ending \
+             your reply with `{show} <its file name>` and mentioning it \
+             naturally in your visible text (e.g. \"oh, I want to go to this \
+             park you showed me!\").\n\
+             - These lines are also invisible to {user}.",
             tag = MEMORY_TAG,
+            keep = KEEP_IMAGE_TAG,
+            show = SHOW_IMAGE_TAG,
         )
     }
 
@@ -166,37 +240,69 @@ fn normalize(s: &str) -> String {
         .join(" ")
 }
 
-/// Pull `MEMORY:` lines out of a finished reply, returning them and removing
-/// them from the visible text.
-pub fn extract_memories(reply: &mut String) -> Vec<String> {
-    if !reply.contains(MEMORY_TAG) {
-        return Vec::new();
+/// Everything the model asked the app to do via control lines in a reply.
+#[derive(Default)]
+pub struct Directives {
+    pub memories: Vec<String>,
+    /// Why the AI liked the image the user just sent (→ save to the album).
+    pub keep_image: Option<String>,
+    /// Album file name the AI wants to show back in chat.
+    pub show_image: Option<String>,
+}
+
+/// Pull all control lines (`MEMORY:` / `KEEP_IMAGE:` / `SHOW_IMAGE:`) out of
+/// a finished reply, returning them and removing them from the visible text.
+pub fn extract_directives(reply: &mut String) -> Directives {
+    let mut d = Directives::default();
+    if !(reply.contains(MEMORY_TAG)
+        || reply.contains(KEEP_IMAGE_TAG)
+        || reply.contains(SHOW_IMAGE_TAG))
+    {
+        return d;
     }
-    let mut found = Vec::new();
     let mut kept = Vec::new();
     for line in reply.lines() {
         let t = line.trim_start();
         if let Some(rest) = t.strip_prefix(MEMORY_TAG) {
             let m = rest.trim();
             if !m.is_empty() {
-                found.push(m.to_string());
+                d.memories.push(m.to_string());
+            }
+        } else if let Some(rest) = t.strip_prefix(KEEP_IMAGE_TAG) {
+            let m = rest.trim();
+            if !m.is_empty() {
+                d.keep_image = Some(m.to_string());
+            }
+        } else if let Some(rest) = t.strip_prefix(SHOW_IMAGE_TAG) {
+            // The model sometimes wraps names in quotes/backticks — clean up.
+            let m = rest.trim().trim_matches(|c| c == '"' || c == '`' || c == '\'').to_string();
+            if !m.is_empty() {
+                d.show_image = Some(m);
             }
         } else {
             kept.push(line);
         }
     }
     *reply = kept.join("\n").trim_end().to_string();
-    found
+    d
 }
 
-/// Hide `MEMORY:` lines while a reply is still streaming (they're removed
-/// for real when the reply finishes).
+/// Hide control lines while a reply is still streaming (they're removed for
+/// real when the reply finishes).
 pub fn strip_memory_lines(text: &str) -> String {
-    if !text.contains(MEMORY_TAG) {
+    if !(text.contains(MEMORY_TAG)
+        || text.contains(KEEP_IMAGE_TAG)
+        || text.contains(SHOW_IMAGE_TAG))
+    {
         return text.to_string();
     }
     text.lines()
-        .filter(|l| !l.trim_start().starts_with(MEMORY_TAG))
+        .filter(|l| {
+            let t = l.trim_start();
+            !(t.starts_with(MEMORY_TAG)
+                || t.starts_with(KEEP_IMAGE_TAG)
+                || t.starts_with(SHOW_IMAGE_TAG))
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -285,7 +391,10 @@ pub fn panel_ui(ui: &mut egui::Ui, rp: &mut RoleplayState) {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        let who = if m.by_ai { rp.ai_display().to_string() } else { "you".to_string() };
+                        let mut who = if m.by_ai { rp.ai_display().to_string() } else { "you".to_string() };
+                        if m.image.is_some() {
+                            who.push_str("  🖼");
+                        }
                         ui.label(egui::RichText::new(who).color(ACCENT1()).size(10.0));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                             if ui
@@ -326,7 +435,7 @@ mod tests {
         let mut rp = RoleplayState::default();
         rp.enabled = true;
         rp.ai_name = "Mira".into();
-        rp.memories.push(Memory { text: "a very private diary entry 🗝".into(), by_ai: true });
+        rp.memories.push(Memory { text: "a very private diary entry 🗝".into(), by_ai: true, image: None });
 
         let json = serde_json::to_string(&rp).unwrap();
         let stored = crate::secret::protect(&json);
@@ -342,13 +451,46 @@ mod tests {
         assert_eq!(back.ai_name, "Mira");
     }
 
+    /// Control lines (diary/keep/show) parse out and vanish from the text.
+    #[test]
+    fn directives_extract_and_strip() {
+        let mut reply = "What a lovely place, William!
+                         MEMORY: William showed me the old harbour today.
+                         KEEP_IMAGE: The lighthouse photo — it feels like home.
+                         SHOW_IMAGE: `img_002.jpg`"
+            .to_string();
+        let d = extract_directives(&mut reply);
+        assert_eq!(d.memories, vec!["William showed me the old harbour today.".to_string()]);
+        assert_eq!(d.keep_image.as_deref(), Some("The lighthouse photo — it feels like home."));
+        assert_eq!(d.show_image.as_deref(), Some("img_002.jpg"));
+        assert_eq!(reply, "What a lovely place, William!");
+        // The streaming filter hides the same lines.
+        assert_eq!(strip_memory_lines("hi
+MEMORY: x
+SHOW_IMAGE: y"), "hi");
+    }
+
+    /// Album bytes survive the encrypt→decrypt round trip and are not stored
+    /// as plaintext (Windows).
+    #[test]
+    fn album_bytes_encrypt_round_trip() {
+        let data = b"fake image bytes   with binary".to_vec();
+        let stored = crate::secret::protect_bytes(&data);
+        #[cfg(windows)]
+        {
+            assert!(stored.starts_with(b"encb1:"));
+            assert_ne!(&stored, &data);
+        }
+        assert_eq!(crate::secret::unprotect_bytes(&stored).unwrap(), data);
+    }
+
     /// Duplicate detection is wording-insensitive.
     #[test]
     fn diary_rejects_duplicates() {
         let mut rp = RoleplayState::default();
         // Note: add_memory saves to disk; use texts that build a throwaway
         // state without touching the persisted file.
-        rp.memories.push(Memory { text: "William granted permission to use the garden.".into(), by_ai: true });
+        rp.memories.push(Memory { text: "William granted permission to use the garden.".into(), by_ai: true, image: None });
         let key_dup = "  alex GRANTED permission, to use the garden!! ";
         let normalized_matches = super::normalize(key_dup) == super::normalize(&rp.memories[0].text);
         assert!(normalized_matches, "normalization should treat these as the same memory");
