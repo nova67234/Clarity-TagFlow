@@ -190,7 +190,14 @@ pub enum ChatRole {
 /// One message in an AI Chat conversation.
 pub struct ChatMsg {
     pub role: ChatRole,
+    /// The visible text — for a finished model reply the thought channel has
+    /// already been split off into `thinking`.
     pub text: String,
+    /// The model's thought channel (the big Gemma variants reason before
+    /// answering, prefixing replies with `<|channel>thought …`). Shown behind
+    /// the chat's collapsible "Thinking" row; never re-sent in the history
+    /// and never spoken.
+    pub thinking: Option<String>,
     /// Image attached to a user message (the vision input).
     pub image: Option<PathBuf>,
 }
@@ -256,6 +263,10 @@ pub struct LlmState {
 
     /// Layout cache for the chat's markdown rendering (src/ai_chat.rs).
     pub md_cache: egui_commonmark::CommonMarkCache,
+    /// The little AI orb each "Thinking" disclosure row animates, keyed by
+    /// (chat id, message index) — the orb is stateful (its particles carry
+    /// physics between frames), so rows can't share one.
+    pub think_orbs: std::collections::HashMap<(u64, usize), crate::ai_orb::AiOrb>,
 
     /// Retry requested from inside the message list this frame — applied
     /// after the list finishes drawing (mutating mid-iteration would break
@@ -317,6 +328,7 @@ impl Default for LlmState {
             running: false,
             status: String::new(),
             md_cache: egui_commonmark::CommonMarkCache::default(),
+            think_orbs: std::collections::HashMap::new(),
             pending_retry: None,
             tts: None,
             voice: crate::voice::VoiceState::default(),
@@ -410,6 +422,23 @@ impl LlmState {
                         }
                     }
                     Msg::Done(res) => {
+                        // Split the thought channel off the finished reply:
+                        // it moves onto the message's `thinking` (for the
+                        // disclosure row) and out of the visible text — so it
+                        // is never re-sent in the history, spoken, or copied.
+                        if res.is_ok() {
+                            if let Some(m) = self
+                                .gen_chat
+                                .and_then(|id| self.chats.iter_mut().find(|c| c.id == id))
+                                .and_then(|c| c.msgs.last_mut())
+                            {
+                                let (thinking, visible) = split_channels(&m.text);
+                                if !thinking.is_empty() {
+                                    m.thinking = Some(thinking);
+                                }
+                                m.text = visible;
+                            }
+                        }
                         // Role play: a finished reply may end in control lines
                         // (diary entries, keep/show a picture) — pull them out
                         // of the visible text and act on them.
@@ -541,7 +570,7 @@ impl LlmState {
         self.draft.clear();
         self.chats[self.active_chat]
             .msgs
-            .push(ChatMsg { role: ChatRole::User, text, image });
+            .push(ChatMsg { role: ChatRole::User, text, thinking: None, image });
         self.begin_generation(ctx);
     }
 
@@ -622,7 +651,12 @@ impl LlmState {
                 // The empty reply bubble the tokens stream into.
                 self.chats[self.active_chat]
                     .msgs
-                    .push(ChatMsg { role: ChatRole::Model, text: String::new(), image: None });
+                    .push(ChatMsg {
+                        role: ChatRole::Model,
+                        text: String::new(),
+                        thinking: None,
+                        image: None,
+                    });
                 self.running = true;
                 self.gen_chat = Some(id);
             }
@@ -719,6 +753,65 @@ impl LlmState {
             self.run_err = Some("Listen isn't supported on this platform yet.".to_string());
         }
     }
+}
+
+/// Split a model reply into its thought channel and the visible answer.
+///
+/// The big Gemma 4 variants (26B/31B) reason before answering on the wire:
+/// `<|channel>thought\n{thinking}<channel|>{answer}` — `<|channel>NAME`
+/// switches into a named channel, a bare `<channel|>` switches back to the
+/// visible answer. Channels named thought/thinking/analysis collect into the
+/// returned thinking text; anything else (final, …) stays visible, as does
+/// text outside any channel (the E4B never emits channels at all). Safe on
+/// a mid-stream prefix: a trailing half-written marker is hidden so it never
+/// flashes up while tokens arrive.
+pub fn split_channels(raw: &str) -> (String, String) {
+    const START: &str = "<|channel>";
+    const END: &str = "<channel|>";
+
+    // Hide a trailing, still-streaming partial marker.
+    let mut raw = raw;
+    if let Some(i) = raw.rfind('<') {
+        let tail = &raw[i..];
+        if !tail.contains('>') && (START.starts_with(tail) || END.starts_with(tail)) {
+            raw = &raw[..i];
+        }
+    }
+
+    let mut thinking = String::new();
+    let mut visible = String::new();
+    let mut in_thought = false;
+    let mut rest = raw;
+    loop {
+        // The next marker of either kind decides where this segment ends.
+        let (i, is_start) = match (rest.find(START), rest.find(END)) {
+            (Some(a), Some(b)) if a <= b => (a, true),
+            (Some(a), None) => (a, true),
+            (_, Some(b)) => (b, false),
+            (None, None) => break,
+        };
+        let seg = &rest[..i];
+        if in_thought { thinking.push_str(seg) } else { visible.push_str(seg) }
+        if is_start {
+            rest = &rest[i + START.len()..];
+            // The channel name is the word right after the marker.
+            let name_len = rest
+                .find(|c: char| c.is_whitespace() || c == '<')
+                .unwrap_or(rest.len());
+            let name = rest[..name_len].to_ascii_lowercase();
+            in_thought = name.starts_with("thought")
+                || name.starts_with("think")
+                || name == "analysis";
+            rest = &rest[name_len..];
+        } else {
+            in_thought = false;
+            rest = &rest[i + END.len()..];
+        }
+        // Don't let a marker leave the next section starting on a blank line.
+        rest = rest.strip_prefix('\n').unwrap_or(rest);
+    }
+    if in_thought { thinking.push_str(rest) } else { visible.push_str(rest) }
+    (thinking.trim().to_string(), visible.trim().to_string())
 }
 
 /// True for codepoints a TTS shouldn't try to pronounce: emoji, pictographs,
@@ -929,7 +1022,8 @@ mod worker {
         send(Msg::Status("Ready".into()));
 
         while let Ok(Cmd::Generate { msgs, params }) = rx.recv() {
-            let res = generate(&backend, &model, &mtmd, &template, threads, &msgs, &params, send);
+            let res =
+                generate(&backend, &model, &mtmd, &template, threads, which, &msgs, &params, send);
             send(Msg::Done(res));
         }
         Ok(())
@@ -941,6 +1035,7 @@ mod worker {
         mtmd: &MtmdContext,
         template: &llama_cpp_2::model::LlamaChatTemplate,
         threads: i32,
+        which: super::GemmaModel,
         msgs: &[super::CmdMsg],
         params: &super::GenParams,
         send: &dyn Fn(Msg),
@@ -984,10 +1079,22 @@ mod worker {
         // recognise (ffi error -1). Its actual wire format is simple, so fall
         // back to formatting the turns by hand; the template path still
         // serves models with conventional templates.
+        //
+        // The big variants (26B/31B) reason in a thought channel — but only
+        // when the wire format's global thinking switch is on: a `<|think|>`
+        // token at the very top of a system turn (straight from the GGUF's
+        // own Jinja template; merely opening the reply with the channel
+        // header gets an empty thought — verified via llm_raw_probe_26b).
+        // With the switch on the model opens `<|channel>thought\n{reasoning}
+        // <channel|>` by itself, which the UI's split_channels understands.
+        let think = matches!(which, super::GemmaModel::A26B | super::GemmaModel::D31B);
         let formatted = match model.apply_chat_template(template, &chat, true) {
             Ok(s) => s,
             Err(_) => {
                 let mut s = String::new();
+                if think {
+                    s.push_str("<|turn>system\n<|think|>\n<turn|>\n");
+                }
                 for (user, text) in &turns {
                     let role = if *user { "user" } else { "model" };
                     s.push_str(&format!("<|turn>{role}\n{text}<turn|>\n"));
@@ -1057,6 +1164,58 @@ mod worker {
             .map_err(|e| format!("Convert image: {e}"))?;
         MtmdBitmap::from_file(mtmd, &tmp.to_string_lossy(), false)
             .map_err(|e| format!("Load image: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod split_channel_tests {
+    use super::split_channels;
+
+    #[test]
+    fn plain_text_untouched() {
+        // The E4B never emits channels — replies pass straight through.
+        let (t, v) = split_channels("Hello **there**.\n- a list");
+        assert_eq!(t, "");
+        assert_eq!(v, "Hello **there**.\n- a list");
+    }
+
+    #[test]
+    fn empty_thought_block() {
+        // Real 26B output: an empty thought header straight into the answer.
+        let (t, v) = split_channels(
+            "<|channel>thought\n<channel|>Hey Peter! I was wondering when I'd hear from you.",
+        );
+        assert_eq!(t, "");
+        assert_eq!(v, "Hey Peter! I was wondering when I'd hear from you.");
+    }
+
+    #[test]
+    fn thought_then_answer() {
+        let (t, v) = split_channels(
+            "<|channel>thought\nThe user greets me. Keep it warm.<channel|>Hello!",
+        );
+        assert_eq!(t, "The user greets me. Keep it warm.");
+        assert_eq!(v, "Hello!");
+    }
+
+    #[test]
+    fn final_channel_is_visible() {
+        let (t, v) = split_channels(
+            "<|channel>thought\nplan the reply<channel|><|channel>final\nAnswer.<channel|>",
+        );
+        assert_eq!(t, "plan the reply");
+        assert_eq!(v, "Answer.");
+    }
+
+    #[test]
+    fn partial_marker_hidden_mid_stream() {
+        // Streaming can cut a marker in half — the fragment must not show.
+        let (t, v) = split_channels("<|channel>thought\nHalf a thought<chan");
+        assert_eq!(t, "Half a thought");
+        assert_eq!(v, "");
+        let (t, v) = split_channels("An answer so far<|chann");
+        assert_eq!(t, "");
+        assert_eq!(v, "An answer so far");
     }
 }
 
@@ -1299,6 +1458,46 @@ mod tests {
         }
         handle.join().unwrap();
         assert_eq!(idx, names.len(), "not all scenarios completed");
+    }
+
+    /// Diagnostic: print the 26B's RAW wire output (channel markers included,
+    /// debug-escaped) for a question that invites reasoning, plus what
+    /// split_channels makes of it. Needs the 26B files installed.
+    #[test]
+    #[ignore]
+    fn llm_raw_probe_26b() {
+        assert!(GemmaModel::A26B.installed(), "26B model files not found");
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        cmd_tx
+            .send(Cmd::Generate {
+                params: Default::default(),
+                msgs: vec![CmdMsg {
+                    user: true,
+                    text: "I have 3 apples, eat one, then buy two more bags of 4 apples \
+                           each but give half of everything away. How many apples do I \
+                           have? Think it through carefully."
+                        .to_string(),
+                    image: None,
+                }],
+            })
+            .unwrap();
+        drop(cmd_tx);
+
+        let ctx = egui::Context::default();
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::A26B));
+        let mut raw = String::new();
+        for msg in msg_rx {
+            match msg {
+                Msg::Status(s) => eprintln!("[status] {s}"),
+                Msg::Token(t) => raw.push_str(&t),
+                Msg::Done(r) => eprintln!("[done] {r:?}"),
+            }
+        }
+        handle.join().unwrap();
+        eprintln!("=== RAW (escaped) ===\n{raw:?}\n=== END RAW ===");
+        let (think, vis) = split_channels(&raw);
+        eprintln!("=== THINKING ===\n{think}\n=== VISIBLE ===\n{vis}\n=== END ===");
     }
 
     #[test]
