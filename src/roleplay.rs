@@ -193,6 +193,9 @@ impl RoleplayState {
              to respond to — usually a few rich sentences up to a couple of \
              short paragraphs, more in big moments. One-line answers are almost \
              never enough.\n\
+             - Think briefly: when you reason privately before answering, a few \
+             short notes are enough — decide, then answer. Never write drafts \
+             or revisions of your reply in your head.\n\
              \n\
              Your diary — long-term memories from earlier in your story:\n\
              {diary}\

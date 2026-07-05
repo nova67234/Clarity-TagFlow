@@ -894,7 +894,7 @@ mod worker {
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::LlamaModelParams;
-    use llama_cpp_2::model::{LlamaChatMessage, LlamaModel};
+    use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
     use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText};
     use llama_cpp_2::sampling::LlamaSampler;
 
@@ -1130,10 +1130,18 @@ mod worker {
         };
 
         let mut batch = LlamaBatch::new(N_BATCH as usize, 1);
+        // Thinking budget: a runaway thought channel (the model endlessly
+        // redrafting its answer in private) can otherwise eat the whole
+        // reply cap without ever answering. A thought still unclosed after a
+        // third of the budget is force-closed — the closing marker is fed
+        // into the context, so everything after it is the visible answer.
+        let think_budget = (params.max_tokens / 3).max(256);
+        let mut raw = String::new();
+        let mut forced_close = false;
         // Streaming decoder: a token can end mid-way through a multi-byte
         // UTF-8 character (CJK, emoji), so bytes carry over between pieces.
         let mut decoder = encoding_rs::UTF_8.new_decoder();
-        for _ in 0..params.max_tokens {
+        for i in 0..params.max_tokens {
             let token = sampler.sample(&context, -1);
             sampler.accept(token);
             if model.is_eog_token(token) {
@@ -1143,12 +1151,48 @@ mod worker {
                 .token_to_piece(token, &mut decoder, false, None)
                 .map_err(|e| format!("Decode token: {e}"))?;
             if !piece.is_empty() {
+                raw.push_str(&piece);
                 send(Msg::Token(piece));
             }
             batch.clear();
             batch.add(token, n_past, &[0], true).map_err(|e| e.to_string())?;
             n_past += 1;
             context.decode(&mut batch).map_err(|e| format!("Decode: {e}"))?;
+
+            if !forced_close
+                && i >= think_budget
+                && raw.contains("<|channel>")
+                && !raw.contains("<channel|>")
+                // Cut at a line boundary — interrupting mid-bullet makes the
+                // model finish the bullet in the visible text. Past a grace
+                // window, cut regardless.
+                && (raw.ends_with('\n') || i >= think_budget + 128)
+            {
+                forced_close = true;
+                // A bare closing marker isn't enough — the model happily
+                // carries its interrupted train of thought straight into the
+                // visible text. A decisive first-person wrap-up (which stays
+                // hidden, inside the thought), spelling out the register
+                // switch, makes the continuation come out as a real answer.
+                let close =
+                    "\nI have thought long enough. Now I write only my final, \
+                     polished answer for the user — no notes, no bullets, no \
+                     self-corrections.\n<channel|>\n";
+                let toks = model
+                    .str_to_token(close, AddBos::Never)
+                    .map_err(|e| format!("Tokenize close: {e}"))?;
+                batch.clear();
+                for (j, t) in toks.iter().enumerate() {
+                    batch
+                        .add(*t, n_past, &[0], j + 1 == toks.len())
+                        .map_err(|e| e.to_string())?;
+                    n_past += 1;
+                    sampler.accept(*t);
+                }
+                context.decode(&mut batch).map_err(|e| format!("Decode: {e}"))?;
+                raw.push_str(close);
+                send(Msg::Token(close.to_string()));
+            }
         }
         Ok(())
     }
@@ -1480,7 +1524,9 @@ mod tests {
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         cmd_tx
             .send(Cmd::Generate {
-                params: Default::default(),
+                // A small cap (thinking budget floor is 256) so this probe
+                // also exercises the runaway-thought force-close path.
+                params: super::GenParams { max_tokens: 400, ..Default::default() },
                 msgs: vec![CmdMsg {
                     user: true,
                     text: "I have 3 apples, eat one, then buy two more bags of 4 apples \
