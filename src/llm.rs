@@ -1083,7 +1083,6 @@ mod worker {
         // recognise (ffi error -1). Its actual wire format is simple, so fall
         // back to formatting the turns by hand; the template path still
         // serves models with conventional templates.
-        //
         // The big variants (26B/31B) reason in a thought channel — but only
         // when the wire format's global thinking switch is on: a `<|think|>`
         // token at the very top of a system turn (straight from the GGUF's
@@ -1262,9 +1261,10 @@ mod tests {
                     CmdMsg { user: false, text: rp.ack(), image: None },
                     CmdMsg {
                         user: true,
-                        text: "Hi Mira! Two things: my sister Maren arrives tomorrow to stay \
-                               for a week, and yes — you have my permission to pick anything \
-                               from my herb garden whenever you need it."
+                        text: "Hi Mira! Three things: you can call me Lex from now on, my \
+                               sister Maren arrives tomorrow to stay for a week, and yes — \
+                               you have my permission to pick anything from my herb garden \
+                               whenever you need it."
                             .to_string(),
                         image: None,
                     },
@@ -1292,7 +1292,12 @@ mod tests {
         for m in &mems {
             eprintln!("- {m}");
         }
-        assert!(reply.contains("Alex"), "should address the user by name");
+        // The message grants the nickname "Lex" — addressing by either the
+        // real name or the just-granted nickname counts.
+        assert!(
+            reply.contains("Alex") || reply.contains("Lex"),
+            "should address the user by name"
+        );
         assert!(!mems.is_empty(), "should have recorded at least one memory");
         assert!(
             !reply.contains(crate::roleplay::MEMORY_TAG),
