@@ -81,12 +81,12 @@ pub fn show(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::setting
                         .id_salt("ai_chat_list_outer")
                         .max_height(h * 0.32)
                         .auto_shrink([false, true])
-                        .show(ui, |ui| chat_list(ui, llm));
+                        .show(ui, |ui| chat_list(ui, llm, settings));
                     ui.add_space(6.0);
                     ui.separator();
                     crate::roleplay::panel_ui(ui, &mut llm.roleplay);
                 } else {
-                    chat_list(ui, llm);
+                    chat_list(ui, llm, settings);
                 }
             });
         });
@@ -99,9 +99,10 @@ pub fn show(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::setting
         });
 }
 
-/// The chat list card: a "Chats" header with a new-chat button, then one row
-/// per conversation ("tabs like switch between chats").
-fn chat_list(ui: &mut egui::Ui, llm: &mut LlmState) {
+/// The chat list card: a "Chats" header with a new-chat button and the
+/// AI-settings gear (sampling knobs), then one row per conversation ("tabs
+/// like switch between chats").
+fn chat_list(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::settings::Settings) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(4.0);
@@ -112,6 +113,27 @@ fn chat_list(ui: &mut egui::Ui, llm: &mut LlmState) {
                 .clicked()
             {
                 llm.new_chat();
+            }
+            let gear = icon_button(
+                ui,
+                egui::include_image!("../icons/settings.svg"),
+                16.0,
+                "AI settings (temperature, reply length…)",
+                true,
+            );
+            if gear.clicked() {
+                llm.gen_settings_open = !llm.gen_settings_open;
+            }
+            if llm.gen_settings_open {
+                let mut open = llm.gen_settings_open;
+                egui::Popup::from_response(&gear)
+                    .open_bool(&mut open)
+                    .align(egui::RectAlign::BOTTOM_START)
+                    .width(250.0)
+                    .gap(8.0)
+                    .frame(crate::card_frame(14))
+                    .show(|ui| gen_settings_ui(ui, settings));
+                llm.gen_settings_open = open;
             }
         });
     });
@@ -151,6 +173,60 @@ fn chat_list(ui: &mut egui::Ui, llm: &mut LlmState) {
             llm.delete_chat(i);
         }
     });
+}
+
+/// The gear popup: sampling knobs for how the AI replies. Edits land in the
+/// persisted settings (main.rs mirrors them onto `LlmState` each frame) and
+/// apply from the next message — no model reload.
+fn gen_settings_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings) {
+    let p = &mut settings.ai_gen;
+    ui.label(egui::RichText::new("AI SETTINGS").color(MUTED()).strong().size(10.5));
+    ui.add_space(6.0);
+
+    let knob = |ui: &mut egui::Ui, name: &str, hint: &str, slider: egui::Slider<'_>| {
+        ui.label(egui::RichText::new(name).color(TEXT()).size(12.5));
+        ui.spacing_mut().slider_width = 170.0;
+        ui.add(slider);
+        ui.label(egui::RichText::new(hint).color(MUTED()).size(10.5));
+        ui.add_space(8.0);
+    };
+
+    knob(
+        ui,
+        "Temperature",
+        "Randomness of the replies: 0 is focused and repeatable, \
+         1 is Gemma's recommended default, 2 gets wild.",
+        egui::Slider::new(&mut p.temperature, 0.0..=2.0).step_by(0.05).fixed_decimals(2),
+    );
+    knob(
+        ui,
+        "Top-K",
+        "Pick each word from only the K most likely candidates. \
+         Lower is safer, higher is more varied. Default 64.",
+        egui::Slider::new(&mut p.top_k, 1..=128),
+    );
+    knob(
+        ui,
+        "Top-P",
+        "Or by probability: drop unlikely words past this cumulative \
+         share. Lower is safer. Default 0.95.",
+        egui::Slider::new(&mut p.top_p, 0.05..=1.0).step_by(0.01).fixed_decimals(2),
+    );
+    knob(
+        ui,
+        "Max reply length",
+        "The longest answer the AI may write, in tokens (≈ ¾ of a \
+         word each). Default 3072.",
+        egui::Slider::new(&mut p.max_tokens, 256..=8192).step_by(64.0),
+    );
+
+    if *p != crate::llm::GenParams::default()
+        && ui
+            .button(egui::RichText::new("Reset to defaults").size(11.5))
+            .clicked()
+    {
+        *p = crate::llm::GenParams::default();
+    }
 }
 
 /// The conversation column: scrollable bubbles + the bottom input pill, both

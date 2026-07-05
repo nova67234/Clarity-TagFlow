@@ -76,6 +76,9 @@ pub struct Settings {
     pub ai_auto_speak: bool,
     /// Which Gemma 4 variant the AI chat runs (E4B / 26B A4B / 31B).
     pub ai_gemma_model: crate::llm::GemmaModel,
+    /// AI chat sampling knobs (temperature, top-k/p, reply length) — edited
+    /// from the gear in the chat list panel.
+    pub ai_gen: crate::llm::GenParams,
     /// Voice cloning: path to a short reference recording (empty = none —
     /// the description above is used instead).
     pub ai_voice_ref_audio: String,
@@ -149,6 +152,7 @@ impl Default for Settings {
             ai_voice_style: crate::voice::DEFAULT_STYLE.to_string(),
             ai_auto_speak: false,
             ai_gemma_model: crate::llm::GemmaModel::default(),
+            ai_gen: crate::llm::GenParams::default(),
             ai_voice_ref_audio: String::new(),
             ai_voice_ref_text: String::new(),
             theme: Theme::default(),
