@@ -74,6 +74,8 @@ pub struct Settings {
     pub ai_voice_style: String,
     /// Auto-speak: read every finished AI reply aloud (tools menu toggle).
     pub ai_auto_speak: bool,
+    /// Which Gemma 4 variant the AI chat runs (E4B / 26B A4B / 31B).
+    pub ai_gemma_model: crate::llm::GemmaModel,
     /// Voice cloning: path to a short reference recording (empty = none —
     /// the description above is used instead).
     pub ai_voice_ref_audio: String,
@@ -146,6 +148,7 @@ impl Default for Settings {
             ai_chat: false,
             ai_voice_style: crate::voice::DEFAULT_STYLE.to_string(),
             ai_auto_speak: false,
+            ai_gemma_model: crate::llm::GemmaModel::default(),
             ai_voice_ref_audio: String::new(),
             ai_voice_ref_text: String::new(),
             theme: Theme::default(),
@@ -565,22 +568,36 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
     llm.poll(ui.ctx());
 
     section(ui, "Local model", |ui| {
-        if llm.installed {
-            ui.label(
-                egui::RichText::new("Gemma 4 E4B (vision) — installed")
-                    .color(egui::Color32::from_rgb(46, 160, 67))
-                    .strong()
-                    .size(12.5),
-            );
-        } else {
-            ui.label(egui::RichText::new("Gemma 4 E4B (vision) — not set up yet").color(TEXT()).size(12.5));
-        }
         hint(
             ui,
-            "Google's Gemma 4 vision model, running fully inside the app. It \
-             understands both text and images — no server, no account, and \
-             nothing ever leaves this device.",
+            "Google's Gemma 4 vision models, running fully inside the app. \
+             They understand both text and images — no server, no account, \
+             and nothing ever leaves this device.",
         );
+        ui.add_space(6.0);
+
+        // Variant picker: pick the size that fits the hardware; the chat
+        // switches models on its next question (the old one unloads).
+        for m in crate::llm::GemmaModel::ALL {
+            ui.horizontal(|ui| {
+                let selected = settings.ai_gemma_model == m;
+                if ui.radio(selected, egui::RichText::new(m.label()).color(TEXT())).clicked()
+                    && !selected
+                {
+                    settings.ai_gemma_model = m;
+                    llm.set_model(m);
+                }
+                if m.installed() {
+                    ui.label(
+                        egui::RichText::new("installed")
+                            .color(egui::Color32::from_rgb(46, 160, 67))
+                            .size(10.5),
+                    );
+                }
+            });
+            hint(ui, m.hint());
+            ui.add_space(2.0);
+        }
         ui.add_space(2.0);
         // Which inference engine this exe was built with — makes it obvious
         // when a CPU-only build is running instead of the Vulkan one.
@@ -621,18 +638,20 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
         } else if !llm.installed {
             let btn = egui::Button::new(
-                egui::RichText::new("Set up everything").color(egui::Color32::WHITE).strong(),
+                egui::RichText::new(format!("Download {}", settings.ai_gemma_model.label()))
+                    .color(egui::Color32::WHITE)
+                    .strong(),
             )
             .fill(crate::theme::ACCENT1())
             .corner_radius(egui::CornerRadius::same(255));
-            if ui.add_sized(egui::vec2(170.0, 32.0), btn).clicked() {
+            if ui.add_sized(egui::vec2(210.0, 32.0), btn).clicked() {
                 llm.start_setup();
             }
             hint(
                 ui,
-                "Downloads the model weights and the vision projector (about \
-                 6 GB) from HuggingFace into the models folder. You can keep \
-                 using the app while it downloads.",
+                "Downloads the selected model's weights and vision projector \
+                 from HuggingFace into the models folder. You can keep using \
+                 the app while it downloads.",
             );
         }
         if let Some(e) = &llm.download_err {

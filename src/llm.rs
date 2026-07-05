@@ -26,6 +26,70 @@ pub const MODEL_FILE: &str = "gemma-4-E4B-it-Q4_K_M.gguf";
 /// The multimodal (vision) projector llama.cpp uses to encode images (~1 GB).
 pub const MMPROJ_FILE: &str = "mmproj-F16.gguf";
 
+// The bigger Gemma 4 variants (also vision-capable; same mmproj file name).
+pub const FOLDER_26B: &str = "gemma-4-26b";
+pub const MODEL_FILE_26B: &str = "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf";
+pub const FOLDER_31B: &str = "gemma-4-31b";
+pub const MODEL_FILE_31B: &str = "gemma-4-31B-it-Q4_K_M.gguf";
+
+/// Which Gemma 4 variant the chat runs (Settings → AI Model). All are
+/// vision-capable; they trade download size + speed for quality.
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum GemmaModel {
+    /// E4B instruct — ~6 GB, fast, fits fully on 8 GB+ GPUs. The default.
+    #[default]
+    E4B,
+    /// 26B A4B (mixture-of-experts) — ~18 GB, much smarter.
+    A26B,
+    /// 31B dense — ~19.5 GB, the strongest Gemma 4.
+    D31B,
+}
+
+impl GemmaModel {
+    pub const ALL: [GemmaModel; 3] = [GemmaModel::E4B, GemmaModel::A26B, GemmaModel::D31B];
+
+    pub fn folder(self) -> &'static str {
+        match self {
+            GemmaModel::E4B => FOLDER,
+            GemmaModel::A26B => FOLDER_26B,
+            GemmaModel::D31B => FOLDER_31B,
+        }
+    }
+
+    pub fn model_file(self) -> &'static str {
+        match self {
+            GemmaModel::E4B => MODEL_FILE,
+            GemmaModel::A26B => MODEL_FILE_26B,
+            GemmaModel::D31B => MODEL_FILE_31B,
+        }
+    }
+
+    pub fn mmproj_file(self) -> &'static str {
+        MMPROJ_FILE
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GemmaModel::E4B => "Gemma 4 E4B",
+            GemmaModel::A26B => "Gemma 4 26B A4B",
+            GemmaModel::D31B => "Gemma 4 31B",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            GemmaModel::E4B => "~6 GB · fast, fits fully on 8 GB+ GPUs — recommended",
+            GemmaModel::A26B => "~18 GB · much smarter (MoE); wants ~20 GB VRAM, else spills to RAM (slower)",
+            GemmaModel::D31B => "~19.5 GB · strongest; on a 16 GB GPU it runs partly on the CPU (slower)",
+        }
+    }
+
+    pub fn installed(self) -> bool {
+        crate::tagger::resolve(self.folder(), self.model_file()).is_some()
+            && crate::tagger::resolve(self.folder(), self.mmproj_file()).is_some()
+    }
+}
+
 /// True when this binary was compiled with local-AI support.
 pub const BUILT_WITH_LLM: bool = cfg!(feature = "llm");
 
@@ -182,6 +246,11 @@ pub struct LlmState {
     /// Role playing: persona, names and the shared memory diary
     /// (src/roleplay.rs; toggled from the input card's tools menu).
     pub roleplay: crate::roleplay::RoleplayState,
+    /// The Gemma 4 variant to chat with (mirrors the persisted setting).
+    pub model: GemmaModel,
+    /// The variant the resident worker actually loaded — a mismatch drops
+    /// the worker so the next ask loads the newly selected model.
+    worker_model: GemmaModel,
     /// Auto-speak finished replies (mirrors the persisted setting; synced
     /// each frame by main.rs, toggled from the tools menu).
     pub auto_speak: bool,
@@ -223,6 +292,8 @@ impl Default for LlmState {
             tts: None,
             voice: crate::voice::VoiceState::default(),
             roleplay: crate::roleplay::RoleplayState::load(),
+            model: GemmaModel::default(),
+            worker_model: GemmaModel::default(),
             auto_speak: false,
             tools_open: false,
             worker: None,
@@ -238,9 +309,23 @@ impl LlmState {
             return;
         }
         self.download_err = None;
-        self.download = crate::ai_models::start_model_download(FOLDER);
+        self.download = crate::ai_models::start_model_download(self.model.folder());
         if self.download.is_none() {
             self.download_err = Some("Model missing from the catalog".to_string());
+        }
+    }
+
+    /// Switch the Gemma variant the chat uses. Refreshes the installed flag
+    /// and, when idle, drops the resident worker so the next ask loads the
+    /// new weights (and the old ones free their memory).
+    pub fn set_model(&mut self, model: GemmaModel) {
+        if self.model == model {
+            return;
+        }
+        self.model = model;
+        self.installed = model.installed();
+        if !self.running {
+            self.worker = None;
         }
     }
 
@@ -251,7 +336,7 @@ impl LlmState {
         if let Some(dl) = &self.download {
             if dl.done() {
                 if dl.ok() {
-                    self.installed = installed();
+                    self.installed = self.model.installed();
                 } else {
                     self.download_err =
                         Some(dl.error().unwrap_or_else(|| "Download failed".to_string()));
@@ -491,8 +576,15 @@ impl LlmState {
             msgs.insert(0, CmdMsg { user: true, text: self.roleplay.preamble(), image: None });
         }
 
+        // A different model was selected since the worker loaded — drop it so
+        // the fresh spawn below loads the new weights (the old ones free when
+        // the worker thread exits).
+        if self.worker.is_some() && self.worker_model != self.model {
+            self.worker = None;
+        }
         if self.worker.is_none() {
-            self.worker = spawn_worker(ctx.clone());
+            self.worker = spawn_worker(ctx.clone(), self.model);
+            self.worker_model = self.model;
         }
         match &self.worker {
             Some(w) if w.tx.send(Cmd::Generate { msgs }).is_ok() => {
@@ -598,8 +690,24 @@ impl LlmState {
     }
 }
 
+/// True for codepoints a TTS shouldn't try to pronounce: emoji, pictographs,
+/// dingbats (✨), symbols, and the invisible emoji plumbing (ZWJ, variation
+/// selectors). Letters of real scripts (Latin, CJK, Cyrillic, …) all pass.
+fn is_unspeakable(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x1F000..=0x1FAFF   // emoji, pictographs, flags, symbols-extended
+        | 0x2600..=0x27BF   // misc symbols + dingbats (✨ ❤ ☀ …)
+        | 0x2B00..=0x2BFF   // arrows / stars (⭐ …)
+        | 0xFE0E..=0xFE0F   // variation selectors
+        | 0x200D            // zero-width joiner
+    )
+}
+
 /// Strip markdown down to speakable text: code blocks are skipped ("code
-/// omitted"), inline markers (** * ` #) are dropped.
+/// omitted"), inline markers (** * ` #) are dropped, and emoji/symbols are
+/// removed — voices either mispronounce them or, in OmniVoice's frontend,
+/// can outright fail on them.
 fn speech_text(md: &str) -> String {
     let mut out = String::new();
     let mut in_code = false;
@@ -615,7 +723,11 @@ fn speech_text(md: &str) -> String {
             continue;
         }
         let line = line.trim_start_matches('#').trim();
-        let cleaned: String = line.chars().filter(|c| !matches!(c, '*' | '`')).collect();
+        let cleaned: String = line
+            .chars()
+            .filter(|c| !matches!(c, '*' | '`') && !is_unspeakable(*c))
+            .collect();
+        let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
         if !cleaned.is_empty() {
             out.push_str(&cleaned);
             out.push('\n');
@@ -630,15 +742,15 @@ fn speech_text(md: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(feature = "llm"))]
-fn spawn_worker(_ctx: egui::Context) -> Option<Worker> {
+fn spawn_worker(_ctx: egui::Context, _model: GemmaModel) -> Option<Worker> {
     None
 }
 
 #[cfg(feature = "llm")]
-fn spawn_worker(ctx: egui::Context) -> Option<Worker> {
+fn spawn_worker(ctx: egui::Context, model: GemmaModel) -> Option<Worker> {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
     let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
-    std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx));
+    std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, model));
     Some(Worker { tx: cmd_tx, rx: msg_rx })
 }
 
@@ -658,7 +770,7 @@ mod worker {
     use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText};
     use llama_cpp_2::sampling::LlamaSampler;
 
-    use super::{Cmd, Msg, FOLDER, MMPROJ_FILE, MODEL_FILE};
+    use super::{Cmd, Msg};
 
     /// Context window. Gemma 4 supports far more, but 16k keeps the KV cache
     /// reasonable on ordinary machines while fitting the 50-message history
@@ -673,18 +785,22 @@ mod worker {
     /// Worker body: load everything once, then serve Generate commands until
     /// the UI side drops its sender. On a load failure the error is reported
     /// as a `Done(Err)` and the thread exits (the UI respawns it on demand).
-    pub(super) fn run(rx: Receiver<Cmd>, tx: Sender<Msg>, ctx: egui::Context) {
+    pub(super) fn run(rx: Receiver<Cmd>, tx: Sender<Msg>, ctx: egui::Context, model: super::GemmaModel) {
         let send = |m: Msg| {
             let _ = tx.send(m);
             ctx.request_repaint();
         };
-        match load_and_serve(&rx, &send) {
+        match load_and_serve(&rx, &send, model) {
             Ok(()) => {}
             Err(e) => send(Msg::Done(Err(e))),
         }
     }
 
-    fn load_and_serve(rx: &Receiver<Cmd>, send: &dyn Fn(Msg)) -> Result<(), String> {
+    fn load_and_serve(
+        rx: &Receiver<Cmd>,
+        send: &dyn Fn(Msg),
+        which: super::GemmaModel,
+    ) -> Result<(), String> {
         // GPU build on a machine with no Vulkan runtime: fail readably before
         // llama.cpp's first (delay-loaded, would-crash) Vulkan call.
         #[cfg(all(feature = "llm-vulkan", target_os = "windows"))]
@@ -697,9 +813,9 @@ mod worker {
             );
         }
 
-        let model_path = crate::tagger::resolve(FOLDER, MODEL_FILE)
+        let model_path = crate::tagger::resolve(which.folder(), which.model_file())
             .ok_or_else(|| "Model file not found — run setup first".to_string())?;
-        let mmproj_path = crate::tagger::resolve(FOLDER, MMPROJ_FILE)
+        let mmproj_path = crate::tagger::resolve(which.folder(), which.mmproj_file())
             .ok_or_else(|| "Vision projector not found — run setup first".to_string())?;
 
         // Leave one core for the UI; llama.cpp saturates the rest.
@@ -709,11 +825,27 @@ mod worker {
 
         send(Msg::Status("Loading the model (first time takes a minute)…".into()));
         let backend = LlamaBackend::init().map_err(|e| format!("llama.cpp init: {e}"))?;
-        // Offload every layer to the GPU when a GPU backend is compiled in
-        // (the `llm-vulkan` feature); a CPU-only build ignores this.
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(1_000_000);
-        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
-            .map_err(|e| format!("Load model: {e}"))?;
+        // Offload to the GPU when a backend is compiled in (`llm-vulkan`) — a
+        // ladder of attempts, because the big variants (26B/31B) don't fit
+        // whole in common VRAM sizes: everything → about half → CPU only.
+        let mut model = None;
+        let mut last_err = String::new();
+        for (i, layers) in [1_000_000u32, 24, 0].into_iter().enumerate() {
+            if i > 0 {
+                send(Msg::Status(
+                    "Model doesn't fit in GPU memory — loading partly on the CPU…".into(),
+                ));
+            }
+            let params = LlamaModelParams::default().with_n_gpu_layers(layers);
+            match LlamaModel::load_from_file(&backend, &model_path, &params) {
+                Ok(m) => {
+                    model = Some(m);
+                    break;
+                }
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        let model = model.ok_or_else(|| format!("Load model: {last_err}"))?;
 
         send(Msg::Status("Loading the vision projector…".into()));
         let mtmd_params = MtmdContextParams {
@@ -919,7 +1051,7 @@ mod tests {
         drop(cmd_tx);
 
         let ctx = egui::Context::default();
-        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx));
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::E4B));
         let mut reply = String::new();
         let mut ok = false;
         for msg in msg_rx {
@@ -986,7 +1118,7 @@ mod tests {
         drop(cmd_tx);
 
         let ctx = egui::Context::default();
-        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx));
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::E4B));
         let mut reply = String::new();
         let mut ok = false;
         for msg in msg_rx {
@@ -1081,7 +1213,7 @@ mod tests {
         drop(cmd_tx);
 
         let ctx = egui::Context::default();
-        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx));
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::E4B));
 
         let mut idx = 0;
         let mut current = String::new();
@@ -1148,7 +1280,7 @@ mod tests {
         drop(cmd_tx); // worker exits after serving these
 
         let ctx = egui::Context::default();
-        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx));
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::E4B));
 
         let mut responses: Vec<(String, Result<(), String>)> = Vec::new();
         let mut current = String::new();

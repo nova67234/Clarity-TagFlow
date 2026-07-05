@@ -210,6 +210,36 @@ const CATALOG: &[ModelInfo] = &[
         ],
     },
     ModelInfo {
+        name: "Gemma 4 26B A4B (local AI, vision)",
+        tab: "Gemma 26B",
+        folder: crate::llm::FOLDER_26B,
+        desc: "The mixture-of-experts Gemma 4 — much smarter than E4B; wants \
+               ~20 GB of VRAM (spills to RAM otherwise). Selectable in \
+               Settings → AI Model. Not a tagger.",
+        note: "Downloads the UD-Q4_K_M weights (~17 GB) + vision projector (~1.2 GB).",
+        repo: "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF",
+        kind: None,
+        files: &[
+            (crate::llm::MODEL_FILE_26B, "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"),
+            (crate::llm::MMPROJ_FILE, "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/mmproj-F16.gguf"),
+        ],
+    },
+    ModelInfo {
+        name: "Gemma 4 31B (local AI, vision)",
+        tab: "Gemma 31B",
+        folder: crate::llm::FOLDER_31B,
+        desc: "The strongest Gemma 4 (dense). On a 16 GB GPU it loads partly \
+               on the CPU — slower, but the highest quality. Selectable in \
+               Settings → AI Model. Not a tagger.",
+        note: "Downloads the Q4_K_M weights (~18.5 GB) + vision projector (~1.2 GB).",
+        repo: "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF",
+        kind: None,
+        files: &[
+            (crate::llm::MODEL_FILE_31B, "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-Q4_K_M.gguf"),
+            (crate::llm::MMPROJ_FILE, "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/mmproj-F16.gguf"),
+        ],
+    },
+    ModelInfo {
         name: "Region Detection (faces / hands / people / feet / age)",
         tab: "Detect",
         folder: "region-detect",
