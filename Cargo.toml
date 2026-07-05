@@ -85,6 +85,9 @@ egui_commonmark = "0.23"
 # Audio playback for the OmniVoice neural voice (src/voice.rs) — plays the
 # Python sidecar's wav output. Pure Rust; wav-only keeps it lean.
 rodio = { version = "0.19", optional = true, default-features = false, features = ["wav"] }
+# Wav writing for the voice-sample recorder (src/voice.rs) — already in the
+# tree as rodio's wav decoder.
+hound = { version = "3.5", optional = true }
 
 # "Copy image" appends the legacy CF_DIB clipboard format after arboard's
 # PNG/DIBV5 — Chromium-based browsers only ever request CF_DIB when pasting an
@@ -147,7 +150,7 @@ vlc = ["dep:vlc-rs"]
 # The local AI model (Settings → AI Model): Gemma 4 vision via llama.cpp.
 # On by default; build with --no-default-features (or without this feature) to
 # skip the C++ compile — the tab then shows a "built without AI" notice.
-llm = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:rodio"]
+llm = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:rodio", "dep:hound"]
 # GPU-accelerated local AI: compiles llama.cpp's Vulkan backend in addition to
 # CPU. Off by default because building needs the Vulkan SDK (VULKAN_SDK env +
 # glslc) and the exe then links vulkan-1.dll (ships with GPU drivers; absent

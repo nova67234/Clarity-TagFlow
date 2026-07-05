@@ -20,6 +20,7 @@ dependencies = [
  "flate2",
  "glow",
  "heic",
+ "hound",
  "image",
  "jpeg-decoder",
  "libwebp-sys",

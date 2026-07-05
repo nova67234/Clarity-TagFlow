@@ -72,6 +72,12 @@ pub struct Settings {
     /// OmniVoice "voice design" description used by the chat's Listen buttons
     /// (gender, age, pitch, style, accent — free text).
     pub ai_voice_style: String,
+    /// Voice cloning: path to a short reference recording (empty = none —
+    /// the description above is used instead).
+    pub ai_voice_ref_audio: String,
+    /// Word-for-word transcript of the reference recording (cloning quality
+    /// hangs on this matching the audio).
+    pub ai_voice_ref_text: String,
     /// The active app colour theme (Dark / Light). Applied on launch and live
     /// whenever changed from the Appearance tab.
     pub theme: Theme,
@@ -137,6 +143,8 @@ impl Default for Settings {
             last_ai_model: "Select AI...".to_string(),
             ai_chat: false,
             ai_voice_style: crate::voice::DEFAULT_STYLE.to_string(),
+            ai_voice_ref_audio: String::new(),
+            ai_voice_ref_text: String::new(),
             theme: Theme::default(),
             layout: Layout::default(),
             // A deep navy reads well behind the glass panels by default.
@@ -677,6 +685,66 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                      indian/japanese/korean/portuguese/russian accent. E.g. \
                      \"male, low pitch, british accent\". Takes effect on the \
                      next Listen; invalid words fall back to the default voice.",
+                );
+
+                // Voice cloning: speak in the voice of a short recording.
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Voice sample (cloning)").color(TEXT()).size(12.5));
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Choose audio…").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("Audio", &["wav", "flac", "mp3", "ogg", "m4a"])
+                            .pick_file()
+                        {
+                            settings.ai_voice_ref_audio = p.to_string_lossy().to_string();
+                            llm.voice.ref_audio = settings.ai_voice_ref_audio.clone();
+                        }
+                    }
+                    // The floating always-on-top recorder: capture a voice off
+                    // whatever is playing (YouTube, a game) as the sample.
+                    let mic = egui::Button::image(
+                        egui::Image::new(egui::include_image!("../icons/mic.svg"))
+                            .fit_to_exact_size(egui::vec2(15.0, 15.0))
+                            .tint(crate::theme::icon_tint(TEXT())),
+                    );
+                    if ui
+                        .add(mic)
+                        .on_hover_text("Record what's playing (floating mic stays on top of other apps)")
+                        .clicked()
+                    {
+                        llm.voice.rec.open = true;
+                    }
+                    if !settings.ai_voice_ref_audio.is_empty() {
+                        let name = std::path::Path::new(&settings.ai_voice_ref_audio)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        ui.label(egui::RichText::new(name).color(MUTED()).size(11.5));
+                        if ui.small_button("✕").on_hover_text("Remove the sample").clicked() {
+                            settings.ai_voice_ref_audio.clear();
+                            llm.voice.ref_audio.clear();
+                        }
+                    }
+                });
+                if !settings.ai_voice_ref_audio.is_empty() {
+                    ui.add_space(4.0);
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut settings.ai_voice_ref_text)
+                            .desired_width(f32::INFINITY)
+                            .margin(egui::Margin::symmetric(8, 6))
+                            .hint_text("Type exactly what is said in the recording"),
+                    );
+                    if resp.changed() {
+                        llm.voice.ref_text = settings.ai_voice_ref_text.clone();
+                    }
+                }
+                hint(
+                    ui,
+                    "Clone any voice from a clean 3–10 second recording of one \
+                     speaker (plus its word-for-word transcript). The sample \
+                     wins over the description above; remove it to go back. \
+                     An unusable sample falls back automatically.",
                 );
             } else {
                 hint(

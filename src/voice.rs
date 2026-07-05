@@ -27,6 +27,8 @@ use std::sync::Arc;
 
 use eframe::egui;
 
+use crate::theme::*;
+
 /// Default voice-design description (Settings → AI Model lets the user tune
 /// it). OmniVoice accepts a FIXED attribute vocabulary — arbitrary words like
 /// "warm" are rejected: gender (male/female), age (child/teenager/young
@@ -65,15 +67,31 @@ def main():
         try:
             req = json.loads(line)
             kwargs = {"text": req["text"]}
-            if req.get("instruct"):
+            if req.get("ref_audio"):
+                # Voice cloning: a reference recording + its transcript.
+                kwargs["ref_audio"] = req["ref_audio"]
+                if req.get("ref_text"):
+                    kwargs["ref_text"] = req["ref_text"]
+            elif req.get("instruct"):
                 kwargs["instruct"] = req["instruct"]
+            # Layered fallbacks so a bad voice never silences the reply:
+            # sample -> description -> the model's default voice.
             try:
                 audio = model.generate(**kwargs)
-            except (ValueError, TypeError) as ve:
-                # A rejected voice description (fixed attribute vocabulary) or
-                # a bad instruct/text pairing (tokenizer TypeError) shouldn't
-                # silence the reply — retry with the model's default voice.
-                if "instruct" in kwargs:
+            except Exception as ve:
+                if "ref_audio" in kwargs:
+                    print("WARN voice sample not usable; using the voice description", flush=True)
+                    kwargs.pop("ref_audio", None)
+                    kwargs.pop("ref_text", None)
+                    if req.get("instruct"):
+                        kwargs["instruct"] = req["instruct"]
+                    try:
+                        audio = model.generate(**kwargs)
+                    except (ValueError, TypeError) :
+                        print("WARN voice description not accepted; using the default voice", flush=True)
+                        kwargs.pop("instruct", None)
+                        audio = model.generate(**kwargs)
+                elif "instruct" in kwargs:
                     print("WARN voice description not accepted; using the default voice", flush=True)
                     kwargs.pop("instruct")
                     audio = model.generate(**kwargs)
@@ -177,6 +195,10 @@ pub struct VoiceState {
     /// The voice-design description sent with every request (synced from the
     /// persisted setting by main.rs).
     pub style: String,
+    /// Voice cloning: reference recording + its transcript (synced from the
+    /// persisted settings by main.rs). When set, it wins over `style`.
+    pub ref_audio: String,
+    pub ref_text: String,
 
     // --- Runtime (the Python sidecar) ---
     engine: Option<Engine>,
@@ -191,6 +213,9 @@ pub struct VoiceState {
 
     player_tx: Option<Sender<PlayerCmd>>,
     speaking: Arc<AtomicBool>,
+
+    /// The floating always-on-top sample recorder popup.
+    pub rec: Recorder,
 }
 
 impl Default for VoiceState {
@@ -202,6 +227,8 @@ impl Default for VoiceState {
             setup_failed: false,
             setup_rx: None,
             style: DEFAULT_STYLE.to_string(),
+            ref_audio: String::new(),
+            ref_text: String::new(),
             engine: None,
             engine_rx: None,
             ready: false,
@@ -210,6 +237,7 @@ impl Default for VoiceState {
             last_err: None,
             player_tx: None,
             speaking: Arc::new(AtomicBool::new(false)),
+            rec: Recorder::default(),
         }
     }
 }
@@ -324,7 +352,21 @@ impl VoiceState {
                 }
             }
         }
-        let req = serde_json::json!({ "text": text, "instruct": self.style });
+        // A voice sample (cloning) wins over the description (voice design).
+        let use_ref = !self.ref_audio.trim().is_empty()
+            && std::path::Path::new(self.ref_audio.trim()).exists();
+        let req = if use_ref {
+            serde_json::json!({
+                "text": text,
+                "ref_audio": self.ref_audio.trim(),
+                "ref_text": self.ref_text.trim(),
+                // Still sent so the worker can fall back to it if the
+                // sample can't be used.
+                "instruct": self.style,
+            })
+        } else {
+            serde_json::json!({ "text": text, "instruct": self.style })
+        };
         if let Some(engine) = &mut self.engine {
             let line = format!("{req}\n");
             if engine.stdin.write_all(line.as_bytes()).is_err() {
@@ -356,6 +398,10 @@ impl VoiceState {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Setup downloaded the full model already — never let the model
+            // load ping the Hub (fully offline, and no stall on flaky
+            // connections).
+            .env("HF_HUB_OFFLINE", "1")
             .current_dir(base_dir());
         #[cfg(windows)]
         {
@@ -491,6 +537,276 @@ fn spawn_player_thread(rx: Receiver<PlayerCmd>, speaking: Arc<AtomicBool>) {
 fn spawn_player_thread(rx: Receiver<PlayerCmd>, _speaking: Arc<AtomicBool>) {
     // No audio backend in a build without the AI feature.
     drop(rx);
+}
+
+// ---------------------------------------------------------------------------
+// Voice-sample recorder — a small always-on-top popup (extra viewport) with a
+// mic button. It records WHAT'S PLAYING (WASAPI loopback of the default
+// output), so a voice heard on YouTube / in a game can be captured as a
+// cloning sample without leaving the other app. Saved wavs land in
+// models_root()/omnivoice/samples/ and auto-fill the Voice sample setting.
+// ---------------------------------------------------------------------------
+
+/// Recordings stop themselves at this length — cloning wants 3–10 s anyway.
+const MAX_RECORD_SECS: u64 = 30;
+
+/// State for the floating recorder popup, owned by `VoiceState`.
+#[derive(Default)]
+pub struct Recorder {
+    /// The popup window is shown (toggled from the AI Model tab).
+    pub open: bool,
+    pub recording: bool,
+    stop: Arc<AtomicBool>,
+    started: Option<std::time::Instant>,
+    rx: Option<Receiver<Result<PathBuf, String>>>,
+    /// A finished recording, waiting for main.rs to adopt it as the
+    /// cloning sample.
+    pub saved: Option<PathBuf>,
+    /// Keeps the "saved!" note visible after main.rs takes `saved`.
+    pub just_saved: bool,
+    pub err: Option<String>,
+}
+
+impl Recorder {
+    pub fn toggle_recording(&mut self, ctx: &egui::Context) {
+        if self.recording {
+            self.stop.store(true, Relaxed);
+        } else {
+            self.start(ctx);
+        }
+    }
+
+    fn start(&mut self, ctx: &egui::Context) {
+        self.err = None;
+        self.saved = None;
+        self.just_saved = false;
+        self.stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        let stop = self.stop.clone();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let res = record_loopback(&stop);
+            let _ = tx.send(res);
+            repaint.request_repaint();
+        });
+        self.recording = true;
+        self.started = Some(std::time::Instant::now());
+    }
+
+    pub fn seconds(&self) -> u64 {
+        self.started.map(|s| s.elapsed().as_secs()).unwrap_or(0)
+    }
+
+    pub fn poll(&mut self) {
+        if let Some(rx) = &self.rx {
+            match rx.try_recv() {
+                Ok(Ok(path)) => {
+                    self.recording = false;
+                    self.rx = None;
+                    self.saved = Some(path);
+                    self.just_saved = true;
+                }
+                Ok(Err(e)) => {
+                    self.recording = false;
+                    self.rx = None;
+                    self.err = Some(e);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.recording = false;
+                    self.rx = None;
+                }
+            }
+        }
+    }
+}
+
+/// Capture the default output device (loopback) until stopped or the length
+/// cap, then write a mono 16-bit wav into the samples dir.
+#[cfg(feature = "llm")]
+fn record_loopback(stop: &AtomicBool) -> Result<PathBuf, String> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use rodio::cpal::{self, SampleFormat};
+    use std::sync::Mutex;
+
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or("No output device to record from")?;
+    let config = device
+        .default_output_config()
+        .map_err(|e| format!("Audio config: {e}"))?;
+    if config.sample_format() != SampleFormat::F32 {
+        return Err(format!("Unsupported sample format {:?}", config.sample_format()));
+    }
+    let sample_rate = config.sample_rate().0;
+    let channels = config.channels() as usize;
+
+    let buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    let buf2 = buf.clone();
+    // Building an INPUT stream on an OUTPUT device = WASAPI loopback: we get
+    // exactly what the speakers are playing.
+    let stream = device
+        .build_input_stream(
+            &config.into(),
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                buf2.lock().unwrap().extend_from_slice(data);
+            },
+            |e| eprintln!("[recorder] stream error: {e}"),
+            None,
+        )
+        .map_err(|e| format!("Couldn't open loopback capture: {e}"))?;
+    stream.play().map_err(|e| format!("Couldn't start capture: {e}"))?;
+
+    let started = std::time::Instant::now();
+    while !stop.load(Relaxed) && started.elapsed().as_secs() < MAX_RECORD_SECS {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(stream);
+
+    let samples = std::mem::take(&mut *buf.lock().unwrap());
+    // Half a second of frames minimum, or there's nothing worth keeping.
+    if samples.len() < (sample_rate as usize * channels) / 2 {
+        return Err("Nothing captured — was anything playing?".to_string());
+    }
+
+    let dir = base_dir().join("samples");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let n = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) + 1;
+    let path = dir.join(format!("sample_{n:03}.wav"));
+
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&path, spec).map_err(|e| e.to_string())?;
+    // Downmix to mono (cloning wants one voice, and it halves the file).
+    for frame in samples.chunks_exact(channels) {
+        let avg = frame.iter().sum::<f32>() / channels as f32;
+        let v = (avg.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        writer.write_sample(v).map_err(|e| e.to_string())?;
+    }
+    writer.finalize().map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+#[cfg(not(feature = "llm"))]
+fn record_loopback(_stop: &AtomicBool) -> Result<PathBuf, String> {
+    Err("This build was compiled without the AI feature.".to_string())
+}
+
+/// The floating recorder popup: a tiny frameless always-on-top window (its
+/// own OS viewport, so it floats over other apps too). Drag anywhere to move;
+/// mic toggles recording; ✕ closes.
+pub fn recorder_window(ctx: &egui::Context, voice: &mut VoiceState) {
+    if !voice.rec.open {
+        return;
+    }
+    voice.rec.poll();
+
+    ctx.show_viewport_immediate(
+        egui::ViewportId::from_hash_of("voice_recorder"),
+        egui::ViewportBuilder::default()
+            .with_title("Record voice sample")
+            .with_inner_size([236.0, 76.0])
+            .with_always_on_top()
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_transparent(true),
+        |ctx, _class| {
+            // An Area pinned at the origin fills the (tiny) viewport — the
+            // ctx-level CentralPanel::show is deprecated in egui 0.34.
+            let size = ctx.content_rect().size();
+            egui::Area::new(egui::Id::new("voice_rec_root"))
+                .anchor(egui::Align2::LEFT_TOP, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(PANEL())
+                        .corner_radius(egui::CornerRadius::same(16))
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .stroke(egui::Stroke::new(1.0, EDGE()))
+                        .show(ui, |ui| {
+                            ui.set_width(size.x - 24.0);
+                            ui.set_height(size.y - 20.0);
+                    // Drag anywhere on the pill to move the window.
+                    let bg = ui.interact(
+                        ui.max_rect(),
+                        egui::Id::new("rec_drag"),
+                        egui::Sense::drag(),
+                    );
+                    if bg.drag_started() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+
+                    ui.horizontal(|ui| {
+                        // Mic button — red while recording.
+                        let tint = if voice.rec.recording {
+                            egui::Color32::from_rgb(230, 70, 70)
+                        } else {
+                            icon_tint(TEXT())
+                        };
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(34.0, 34.0),
+                            egui::Sense::click(),
+                        );
+                        let resp = resp
+                            .on_hover_text(if voice.rec.recording { "Stop" } else { "Record what's playing" })
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        egui::Image::new(egui::include_image!("../icons/mic.svg"))
+                            .tint(tint)
+                            .paint_at(ui, egui::Rect::from_center_size(rect.center(), egui::vec2(22.0, 22.0)));
+                        if resp.clicked() {
+                            voice.rec.toggle_recording(ui.ctx());
+                        }
+
+                        ui.vertical(|ui| {
+                            let status = if voice.rec.recording {
+                                format!("Recording… {}s (max {MAX_RECORD_SECS}s)", voice.rec.seconds())
+                            } else if let Some(e) = &voice.rec.err {
+                                e.clone()
+                            } else if voice.rec.just_saved {
+                                "Saved as the voice sample!".to_string()
+                            } else {
+                                "Play the voice, then hit the mic".to_string()
+                            };
+                            let color = if voice.rec.err.is_some() {
+                                egui::Color32::from_rgb(210, 70, 70)
+                            } else {
+                                MUTED()
+                            };
+                            ui.label(egui::RichText::new(status).color(color).size(11.5));
+                            ui.label(
+                                egui::RichText::new("3–10s of one clean voice works best")
+                                    .color(MUTED())
+                                    .size(10.0),
+                            );
+                        });
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                            if ui
+                                .add(egui::Button::new(egui::RichText::new("✕").color(MUTED())).frame(false))
+                                .on_hover_text("Close")
+                                .clicked()
+                            {
+                                voice.rec.open = false;
+                            }
+                        });
+                    });
+
+                    if voice.rec.recording {
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                    }
+                        });
+                });
+
+            if ctx.input(|i| i.viewport().close_requested()) {
+                voice.rec.open = false;
+            }
+        },
+    );
 }
 
 fn run_setup(tx: &Sender<SetupMsg>, ctx: &egui::Context) -> bool {
