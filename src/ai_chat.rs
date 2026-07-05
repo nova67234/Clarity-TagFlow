@@ -412,13 +412,17 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                     .auto_shrink([false, true])
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
-                        let edit = egui::TextEdit::multiline(&mut llm.draft)
+                        let out = egui::TextEdit::multiline(&mut llm.draft)
                             .desired_rows(1)
                             .frame(egui::Frame::NONE)
                             .font(egui::FontId::proportional(15.0))
                             .hint_text("Ask Gemma")
-                            .desired_width(f32::INFINITY);
-                        let resp = ui.add(edit);
+                            .desired_width(f32::INFINITY)
+                            .show(ui);
+                        // Live spell-check: red squiggles + right-click
+                        // suggestions, same as the generator prompt boxes.
+                        crate::spellcheck::attach(ui, &out, &mut llm.draft, &mut llm.spell);
+                        let resp = &out.response.response;
                         let enter = resp.has_focus()
                             && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                         if enter {

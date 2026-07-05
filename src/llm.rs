@@ -296,6 +296,9 @@ pub struct LlmState {
     pub auto_speak: bool,
     /// The input card's tools popup is open.
     pub tools_open: bool,
+    /// Spell-check state for the input card (right-click suggestion menu),
+    /// same checker as the generator prompt boxes.
+    pub spell: crate::spellcheck::SpellcheckState,
 
     worker: Option<Worker>,
 }
@@ -339,6 +342,7 @@ impl Default for LlmState {
             worker_model: GemmaModel::default(),
             auto_speak: false,
             tools_open: false,
+            spell: crate::spellcheck::SpellcheckState::default(),
             worker: None,
         }
     }
