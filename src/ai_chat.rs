@@ -22,6 +22,29 @@ use crate::theme::*;
 /// Width of the chats side panel (a slimmer sibling of the 290px browser).
 const PANEL_W: f32 = 250.0;
 
+/// Drag-and-drop accent — the blue the input card turns while a file is
+/// dragged over it (matches the generator prompt box's import blue).
+const DROP_BLUE: egui::Color32 = egui::Color32::from_rgb(56, 132, 255);
+
+/// Image types the input card accepts from a drop (matches the + picker).
+const DROP_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"];
+
+/// True when the AI Chat's input card (visible this or last frame) claims a
+/// file dropped at the pointer, so the gallery doesn't also add it — the same
+/// freshness-checked-rect scheme as `generate::generator_claims_drop`. A drop
+/// with no known pointer position (common on Windows mid-drag) is claimed
+/// whenever the card is live, since it was showing the highlight.
+pub fn claims_drop(llm: &crate::llm::LlmState, ctx: &egui::Context) -> bool {
+    let Some((rect, t)) = llm.input_rect else {
+        return false;
+    };
+    if (ctx.input(|i| i.time) - t).abs() >= 0.5 {
+        return false;
+    }
+    let pos = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
+    pos.map_or(true, |p| rect.contains(p))
+}
+
 pub fn show(ui: &mut egui::Ui, llm: &mut LlmState) {
     llm.poll();
 
@@ -124,10 +147,16 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState) {
     let col_w = (avail_w * 0.58).clamp(420.0, 880.0).min(avail_w - 16.0);
     let pad = ((avail_w - col_w) / 2.0).max(0.0);
 
-    // Room reserved under the messages for the pill (and its extra lines).
-    let mut input_h = 96.0;
+    // The conversation area under the input card. The reservation is
+    // CONSTANT while typing — the input card floats on its own layer and
+    // grows upward OVER the messages, so the chat never reflows as lines are
+    // added. Only discrete actions (attaching an image, an error line)
+    // change the reservation.
+    let panel = ui.max_rect();
+    let row_h = 20.0;
+    let mut input_h = 104.0;
     if llm.draft_image.is_some() {
-        input_h += 24.0;
+        input_h += 78.0;
     }
     if llm.run_err.is_some() {
         input_h += 22.0;
@@ -166,44 +195,155 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState) {
                         message(ui, llm, i, streaming);
                         ui.add_space(12.0);
                     }
+                    // A retry clicked inside the list is applied here, after
+                    // the loop, so it can safely truncate the message list.
+                    if let Some(i) = llm.pending_retry.take() {
+                        llm.retry(i, ui.ctx());
+                    }
                 });
             });
             ui.add_space(6.0);
         });
 
-    // --- Bottom input pill (centred on the same column) ---
-    ui.add_space(8.0);
-    if let Some(e) = llm.run_err.clone() {
-        ui.horizontal(|ui| {
-            ui.add_space(pad + 14.0);
-            ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(12.0));
-        });
-        ui.add_space(2.0);
+    // --- Bottom input card ---
+    // Gemini-style: attached-image thumbnail at the top-left inside the card,
+    // the text area beneath it (capped at 8 visible lines, scrolling
+    // internally beyond that), and a bottom row with + / send. The card lives
+    // on its OWN floating layer, anchored to the panel's bottom and centred
+    // on the conversation column — growing text extends it upward over the
+    // chat without reflowing the messages underneath.
+    ensure_draft_thumb(ui.ctx(), llm);
+
+    // Drag-and-drop onto the card: while an image is dragged over it the card
+    // expands to its full height and turns blue with a centred attach icon
+    // (like the text-to-image prompt box); dropping attaches the file. The
+    // hover/drop checks use last frame's card rect; an unknown pointer
+    // position mid-drag (common on Windows) counts as over the card.
+    let dragging_files = ui.input(|i| !i.raw.hovered_files.is_empty());
+    if dragging_files {
+        ui.ctx().request_repaint();
     }
-    // Attached-image chip, shown above the pill until sent or removed.
-    if let Some(img) = llm.draft_image.clone() {
-        ui.horizontal(|ui| {
-            ui.add_space(pad + 14.0);
-            let name = img.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            ui.label(egui::RichText::new(format!("🖼 {name}")).color(MUTED()).size(12.0));
-            if ui.small_button("✕").on_hover_text("Remove the image").clicked() {
-                llm.draft_image = None;
-            }
-        });
-        ui.add_space(2.0);
+    let hover_pos = ui.input(|i| i.pointer.hover_pos());
+    let drag_over_card = dragging_files
+        && llm
+            .input_rect
+            .map_or(true, |(r, _)| hover_pos.map_or(true, |p| r.contains(p)));
+    let dropped: Vec<std::path::PathBuf> = ui.input(|i| {
+        i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+    });
+    if !dropped.is_empty() && claims_drop(llm, ui.ctx()) {
+        if let Some(p) = dropped.into_iter().find(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| DROP_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        }) {
+            llm.draft_image = Some(p);
+            llm.run_err = None;
+        }
     }
 
-    ui.horizontal(|ui| {
-        ui.add_space(pad);
+    let screen = ui.ctx().content_rect();
+    let off_x = panel.center().x - screen.center().x;
+    let area = egui::Area::new(egui::Id::new("ai_chat_input_card"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(off_x, -14.0))
+        .show(ui.ctx(), |ui| {
+        // While a file is dragged over: the expanded blue drop zone replaces
+        // the whole card.
+        if drag_over_card {
+            let drop_h = 8.0 * row_h + 44.0;
+            egui::Frame::new()
+                .fill(DROP_BLUE.gamma_multiply(0.18))
+                .stroke(egui::Stroke::new(1.5, DROP_BLUE))
+                .corner_radius(egui::CornerRadius::same(24))
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.set_width(col_w - 24.0);
+                    ui.set_height(drop_h);
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(drop_h / 2.0 - 34.0);
+                        ui.add(
+                            egui::Image::new(egui::include_image!("../icons/attach_file.svg"))
+                                .fit_to_exact_size(egui::vec2(38.0, 38.0))
+                                .tint(DROP_BLUE),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("Add files here").color(DROP_BLUE).size(13.5));
+                    });
+                });
+            return;
+        }
+
+        if let Some(e) = llm.run_err.clone() {
+            ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(12.0));
+            ui.add_space(2.0);
+        }
         egui::Frame::new()
             .fill(ui.visuals().extreme_bg_color)
             .stroke(egui::Stroke::new(1.0, EDGE()))
-            .corner_radius(egui::CornerRadius::same(255))
-            .inner_margin(egui::Margin::symmetric(14, 12))
+            .corner_radius(egui::CornerRadius::same(24))
+            .inner_margin(egui::Margin::symmetric(12, 10))
             .show(ui, |ui| {
-                ui.set_width(col_w - 28.0);
+                ui.vertical(|ui| {
+                ui.set_width(col_w - 24.0);
+
+                // Attached-image thumbnail (rounded, with a remove ✕).
+                if llm.draft_image.is_some() {
+                    let tex = llm.draft_thumb.as_ref().map(|(_, t)| t.clone());
+                    if let Some(tex) = tex {
+                        ui.horizontal(|ui| {
+                            let size = tex.size_vec2();
+                            let scale = (64.0 / size.y).min(64.0 / size.x);
+                            ui.add(
+                                egui::Image::new(&tex)
+                                    .fit_to_exact_size(size * scale)
+                                    .corner_radius(egui::CornerRadius::same(10)),
+                            );
+                            if ui
+                                .add(egui::Button::new(egui::RichText::new("✕").color(MUTED()).size(11.0)).frame(false))
+                                .on_hover_text("Remove the image")
+                                .clicked()
+                            {
+                                llm.draft_image = None;
+                                llm.draft_thumb = None;
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
+                }
+
+                // Draft text: grows with its content (the card extends upward
+                // because it's bottom-anchored), scrolls inside past 8 lines.
+                // Enter sends; Shift+Enter makes a newline.
+                let mut send_now = false;
+                egui::ScrollArea::vertical()
+                    .id_salt("ai_chat_draft")
+                    .max_height(8.0 * row_h)
+                    .auto_shrink([false, true])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        let edit = egui::TextEdit::multiline(&mut llm.draft)
+                            .desired_rows(1)
+                            .frame(egui::Frame::NONE)
+                            .font(egui::FontId::proportional(15.0))
+                            .hint_text("Ask Gemma")
+                            .desired_width(f32::INFINITY);
+                        let resp = ui.add(edit);
+                        let enter = resp.has_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                        if enter {
+                            // Drop the newline the Enter keystroke inserted.
+                            while llm.draft.ends_with('\n') {
+                                llm.draft.pop();
+                            }
+                            send_now = true;
+                        }
+                    });
+
+                // Bottom row: attach on the left, streaming status in the
+                // middle, send on the right.
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    // "+" — attach an image (the vision input).
                     if icon_button(ui, egui::include_image!("../icons/add.svg"), 20.0, "Attach an image", !llm.running)
                         .clicked()
                     {
@@ -214,29 +354,12 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState) {
                             llm.draft_image = Some(path);
                         }
                     }
-                    ui.add_space(4.0);
-
-                    // Draft text. Enter sends; Shift+Enter makes a newline.
-                    let send_now = {
-                        let edit = egui::TextEdit::multiline(&mut llm.draft)
-                            .desired_rows(1)
-                            .frame(egui::Frame::NONE)
-                            .font(egui::FontId::proportional(15.0))
-                            .hint_text("Ask Gemma")
-                            .desired_width(ui.available_width() - 40.0);
-                        let resp = ui.add(edit);
-                        let enter = resp.has_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                        if enter {
-                            // Drop the newline the Enter keystroke inserted.
-                            while llm.draft.ends_with('\n') {
-                                llm.draft.pop();
-                            }
-                        }
-                        enter
-                    };
-
-                    // Send — the text-to-image view's send icon.
+                    if llm.running {
+                        ui.add_space(4.0);
+                        ui.add(egui::Spinner::new().size(12.0).color(MUTED()));
+                        ui.label(egui::RichText::new(&llm.status).color(MUTED()).size(11.5));
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+                    }
                     let can_send = !llm.running
                         && (!llm.draft.trim().is_empty() || llm.draft_image.is_some());
                     let send_clicked = ui
@@ -250,19 +373,13 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState) {
                         llm.send_draft(ui.ctx());
                     }
                 });
+                });
             });
     });
 
-    // While a reply streams in, keep painting and show the worker status.
-    if llm.running {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.add_space(pad + 14.0);
-            ui.add(egui::Spinner::new().size(12.0).color(MUTED()));
-            ui.label(egui::RichText::new(&llm.status).color(MUTED()).size(11.5));
-        });
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
-    }
+    // Publish the card's rect for next frame's drag-highlight and for the
+    // gallery's drop handler to check (claims_drop).
+    llm.input_rect = Some((area.response.rect, ui.ctx().input(|i| i.time)));
 }
 
 /// One conversation entry. User messages sit right in an accent-tinted
@@ -277,28 +394,56 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
     };
 
     if role == ChatRole::User {
+        let max_w = ui.available_width() * 0.82;
         ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
-            egui::Frame::new()
-                .fill(ACCENT1().gamma_multiply(0.28))
-                .corner_radius(egui::CornerRadius::same(22))
-                .inner_margin(egui::Margin::symmetric(14, 10))
-                .show(ui, |ui| {
-                    ui.set_max_width(ui.available_width() * 0.82);
-                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                        if let Some(img) = &image {
-                            let name = img
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            ui.label(egui::RichText::new(format!("🖼 {name}")).color(MUTED()).size(11.5));
-                        }
-                        if !text.is_empty() {
+            // The attached image shows as its own rounded thumbnail, separate
+            // from (and above) the text bubble.
+            if let Some(path) = &image {
+                match msg_thumb(ui.ctx(), llm, path) {
+                    Some(tex) => {
+                        let size = tex.size_vec2();
+                        let scale = (180.0 / size.y).min(280.0 / size.x).min(1.0);
+                        ui.add(
+                            egui::Image::new(&tex)
+                                .fit_to_exact_size(size * scale)
+                                .corner_radius(egui::CornerRadius::same(12)),
+                        );
+                    }
+                    None => {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        ui.label(egui::RichText::new(format!("🖼 {name}")).color(MUTED()).size(11.5));
+                    }
+                }
+                if !text.is_empty() {
+                    ui.add_space(4.0);
+                }
+            }
+            if !text.is_empty() {
+                egui::Frame::new()
+                    .fill(ACCENT1().gamma_multiply(0.28))
+                    .corner_radius(egui::CornerRadius::same(22))
+                    .inner_margin(egui::Margin::symmetric(14, 10))
+                    .show(ui, |ui| {
+                        // Hug short messages: cap the bubble at the text's own
+                        // measured width (the widest line for multi-line
+                        // drafts), up to 82% of the column.
+                        let est = ui
+                            .painter()
+                            .layout_no_wrap(text.clone(), egui::FontId::proportional(14.0), TEXT())
+                            .size()
+                            .x
+                            + 12.0;
+                        ui.set_max_width(est.min(max_w));
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                             // Emoji-aware label: color Twemoji instead of
                             // monochrome font glyphs.
                             crate::emoji::label(ui, &text, TEXT(), 14.0, false);
-                        }
+                        });
                     });
-                });
+            }
         });
         return;
     }
@@ -312,7 +457,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         });
         return;
     }
-    let mut shown = text;
+    let mut shown = text.clone();
     if streaming {
         shown.push('▌');
     }
@@ -331,6 +476,100 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         v.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
         egui_commonmark::CommonMarkViewer::new().show(ui, &mut llm.md_cache, &shown);
     });
+
+    // Action row under every finished reply: copy / regenerate / listen.
+    if !streaming {
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            if icon_button(ui, egui::include_image!("../icons/copy.svg"), 15.0, "Copy message", true)
+                .clicked()
+            {
+                ui.ctx().copy_text(text.clone());
+            }
+            let can_retry = !llm.running;
+            if icon_button(ui, egui::include_image!("../icons/retry.svg"), 15.0, "Regenerate this reply", can_retry)
+                .clicked()
+                && can_retry
+            {
+                // Applied after the message list finishes drawing (this
+                // mutates the list being iterated).
+                llm.pending_retry = Some(index);
+            }
+            let speaking = llm.any_speaking();
+            let tip = if speaking {
+                "Stop reading"
+            } else if llm.voice.installed {
+                "Read aloud (OmniVoice)"
+            } else {
+                "Read aloud"
+            };
+            if icon_button(ui, egui::include_image!("../icons/listen.svg"), 15.0, tip, true).clicked() {
+                llm.listen(&text, ui.ctx());
+            }
+            // First OmniVoice use loads the model — show that it's coming.
+            if llm.voice.loading || llm.voice.pending > 0 {
+                ui.add(egui::Spinner::new().size(11.0).color(MUTED()));
+            }
+            if let Some(e) = &llm.voice.last_err {
+                ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(11.0));
+            }
+        });
+    }
+}
+
+/// The cached chat-display texture for a message's attached image — decoded
+/// once (downscaled), `None` cached for unreadable files so they aren't
+/// retried every frame (those fall back to a filename chip).
+fn msg_thumb(
+    ctx: &egui::Context,
+    llm: &mut LlmState,
+    path: &std::path::Path,
+) -> Option<egui::TextureHandle> {
+    if let Some(t) = llm.msg_thumbs.get(path) {
+        return t.clone();
+    }
+    let tex = image::open(path).ok().map(|img| {
+        let t = img.thumbnail(512, 512).to_rgba8();
+        let size = [t.width() as usize, t.height() as usize];
+        ctx.load_texture(
+            format!("ai-chat-img-{}", path.display()),
+            egui::ColorImage::from_rgba_unmultiplied(size, t.as_raw()),
+            Default::default(),
+        )
+    });
+    llm.msg_thumbs.insert(path.to_path_buf(), tex.clone());
+    tex
+}
+
+/// Keep `draft_thumb` in sync with `draft_image`: decode the attached image
+/// once (downscaled) into a GPU texture for the in-card preview. An
+/// unreadable file clears the attachment with a readable error instead of
+/// failing later inside the model worker.
+fn ensure_draft_thumb(ctx: &egui::Context, llm: &mut LlmState) {
+    let Some(path) = llm.draft_image.clone() else {
+        llm.draft_thumb = None;
+        return;
+    };
+    if llm.draft_thumb.as_ref().is_some_and(|(p, _)| *p == path) {
+        return;
+    }
+    match image::open(&path) {
+        Ok(img) => {
+            let t = img.thumbnail(128, 128).to_rgba8();
+            let size = [t.width() as usize, t.height() as usize];
+            let tex = ctx.load_texture(
+                "ai-chat-draft-thumb",
+                egui::ColorImage::from_rgba_unmultiplied(size, t.as_raw()),
+                Default::default(),
+            );
+            llm.draft_thumb = Some((path, tex));
+        }
+        Err(e) => {
+            llm.draft_image = None;
+            llm.draft_thumb = None;
+            llm.run_err = Some(format!("Couldn't read that image: {e}"));
+        }
+    }
 }
 
 /// A bare icon button on a 28px click target (same look as the text-to-image
