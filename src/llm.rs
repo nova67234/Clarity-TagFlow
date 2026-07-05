@@ -182,6 +182,9 @@ pub struct LlmState {
     /// Role playing: persona, names and the shared memory diary
     /// (src/roleplay.rs; toggled from the input card's tools menu).
     pub roleplay: crate::roleplay::RoleplayState,
+    /// Auto-speak finished replies (mirrors the persisted setting; synced
+    /// each frame by main.rs, toggled from the tools menu).
+    pub auto_speak: bool,
     /// The input card's tools popup is open.
     pub tools_open: bool,
 
@@ -220,6 +223,7 @@ impl Default for LlmState {
             tts: None,
             voice: crate::voice::VoiceState::default(),
             roleplay: crate::roleplay::RoleplayState::load(),
+            auto_speak: false,
             tools_open: false,
             worker: None,
         }
@@ -242,7 +246,7 @@ impl LlmState {
 
     /// Drive background work — poll the setup download and drain any streamed
     /// tokens from the inference worker. Call once per frame from the tab.
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self, ctx: &egui::Context) {
         self.voice.poll();
         if let Some(dl) = &self.download {
             if dl.done() {
@@ -256,12 +260,26 @@ impl LlmState {
             }
         }
 
+        // Drain first, then act — acting (auto-speak) needs &mut self.
+        let mut worker_msgs = Vec::new();
+        let mut worker_died = false;
         if let Some(w) = &self.worker {
-            let mut worker_died = false;
             loop {
                 match w.rx.try_recv() {
-                    Ok(Msg::Status(s)) => self.status = s,
-                    Ok(Msg::Token(t)) => {
+                    Ok(m) => worker_msgs.push(m),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        worker_died = true;
+                        break;
+                    }
+                }
+            }
+        }
+        {
+            for msg in worker_msgs {
+                match msg {
+                    Msg::Status(s) => self.status = s,
+                    Msg::Token(t) => {
                         // Stream into the reply bubble of the chat that asked,
                         // even if the user switched to another chat meanwhile.
                         if let Some(id) = self.gen_chat {
@@ -275,18 +293,65 @@ impl LlmState {
                             }
                         }
                     }
-                    Ok(Msg::Done(res)) => {
-                        // Role play: a finished reply may end in MEMORY: lines
-                        // — move them from the visible text into the diary.
+                    Msg::Done(res) => {
+                        // Role play: a finished reply may end in control lines
+                        // (diary entries, keep/show a picture) — pull them out
+                        // of the visible text and act on them.
                         if res.is_ok() && self.roleplay.enabled {
-                            if let Some(m) = self
+                            let mut directives = None;
+                            let mut last_user_image = None;
+                            if let Some(chat) = self
                                 .gen_chat
                                 .and_then(|id| self.chats.iter_mut().find(|c| c.id == id))
-                                .and_then(|c| c.msgs.last_mut())
                             {
-                                for mem in crate::roleplay::extract_memories(&mut m.text) {
+                                last_user_image = chat
+                                    .msgs
+                                    .iter()
+                                    .rev()
+                                    .find(|m| m.role == ChatRole::User && m.image.is_some())
+                                    .and_then(|m| m.image.clone());
+                                if let Some(m) = chat.msgs.last_mut() {
+                                    directives = Some(crate::roleplay::extract_directives(&mut m.text));
+                                }
+                            }
+                            if let Some(d) = directives {
+                                for mem in d.memories {
                                     self.roleplay.add_memory(&mem, true);
                                 }
+                                // "I love this picture" → encrypted album copy
+                                // + a diary entry that remembers why.
+                                if let (Some(why), Some(src)) = (d.keep_image, last_user_image) {
+                                    match self.roleplay.save_album_image(&src, &why) {
+                                        Ok(name) => {
+                                            self.roleplay.add_memory_with_image(&why, true, Some(name));
+                                        }
+                                        Err(e) => eprintln!("[roleplay] album save failed: {e}"),
+                                    }
+                                }
+                                // "Look at this again!" → decrypt to temp and
+                                // attach to the reply so it shows in chat.
+                                if let Some(name) = d.show_image {
+                                    let img = self.roleplay.load_album_image(&name);
+                                    if let Some(m) = self
+                                        .gen_chat
+                                        .and_then(|id| self.chats.iter_mut().find(|c| c.id == id))
+                                        .and_then(|c| c.msgs.last_mut())
+                                    {
+                                        m.image = img;
+                                    }
+                                }
+                            }
+                        }
+                        // Auto-speak: read the finished reply aloud (after the
+                        // diary lines are gone, so they're never spoken).
+                        if res.is_ok() && self.auto_speak {
+                            let text = self
+                                .gen_chat
+                                .and_then(|id| self.chats.iter().find(|c| c.id == id))
+                                .and_then(|c| c.msgs.last())
+                                .map(|m| m.text.clone());
+                            if let Some(t) = text {
+                                self.start_speaking(&t, ctx);
                             }
                         }
                         self.running = false;
@@ -294,11 +359,6 @@ impl LlmState {
                         if let Err(e) = res {
                             self.run_err = Some(e);
                         }
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        worker_died = true;
-                        break;
                     }
                 }
             }
@@ -407,7 +467,9 @@ impl LlmState {
             .map(|m| CmdMsg {
                 user: m.role == ChatRole::User,
                 text: m.text.clone(),
-                image: m.image.clone(),
+                // Only the user's images go through the vision encoder —
+                // album pictures the AI showed back are display-only.
+                image: if m.role == ChatRole::User { m.image.clone() } else { None },
             })
             .collect();
         let mut kept_images = 0;
@@ -482,8 +544,23 @@ impl LlmState {
             }
             return;
         }
+        self.start_speaking(text, ctx);
+    }
+
+    /// Start speaking `text`, replacing whatever was playing (used by the
+    /// Listen buttons and by auto-speak).
+    fn start_speaking(&mut self, text: &str, ctx: &egui::Context) {
+        let spoken = speech_text(text);
+        if spoken.trim().is_empty() {
+            return;
+        }
+        // Newest reply wins — never overlap two voices.
+        self.voice.stop();
+        if let Some(mut c) = self.tts.take() {
+            let _ = c.kill();
+        }
         if self.voice.installed {
-            self.voice.speak(&speech_text(text), ctx);
+            self.voice.speak(&spoken, ctx);
             return;
         }
         #[cfg(target_os = "windows")]
@@ -491,7 +568,6 @@ impl LlmState {
             use std::io::Write as _;
             use std::os::windows::process::CommandExt as _;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            let spoken = speech_text(text);
             let child = std::process::Command::new("powershell")
                 .args([
                     "-NoProfile",
@@ -517,7 +593,6 @@ impl LlmState {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = text;
             self.run_err = Some("Listen isn't supported on this platform yet.".to_string());
         }
     }
@@ -820,6 +895,7 @@ mod tests {
         rp.memories.push(crate::roleplay::Memory {
             text: "Alex is allergic to silverleaf; I must never brew it near them.".to_string(),
             by_ai: true,
+            image: None,
         });
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
@@ -856,7 +932,7 @@ mod tests {
         handle.join().unwrap();
         assert!(ok, "generation failed");
 
-        let mems = crate::roleplay::extract_memories(&mut reply);
+        let mems = crate::roleplay::extract_directives(&mut reply).memories;
         eprintln!("=== visible reply ===\n{reply}\n=== extracted memories ({}) ===", mems.len());
         for m in &mems {
             eprintln!("- {m}");
@@ -866,6 +942,72 @@ mod tests {
         assert!(
             !reply.contains(crate::roleplay::MEMORY_TAG),
             "memory lines must be stripped from the visible reply"
+        );
+    }
+
+    /// Album smoke: does the model actually KEEP a meaningful picture?
+    /// Pure model behavior + directive parsing — nothing written to disk.
+    #[test]
+    #[ignore]
+    fn llm_album_smoke() {
+        assert!(installed(), "place a GGUF pair in tools/gemma-4/ first");
+        let mut rp = crate::roleplay::RoleplayState::default();
+        rp.enabled = true;
+        rp.ai_name = "Mira".to_string();
+        rp.user_name = "Alex".to_string();
+        rp.persona = "a warm, sentimental village alchemist".to_string();
+
+        // Self-contained "artwork": a vivid generated gradient sunset.
+        let img = std::env::temp_dir().join("llm_album_artwork.png");
+        let painting = image::RgbImage::from_fn(256, 192, |x, y| {
+            let r = 255 - (y as u32 * 200 / 192) as u8;
+            let g = 120u8.saturating_sub((y / 2) as u8);
+            let b = (x as u32 * 180 / 256) as u8;
+            image::Rgb([r, g, b])
+        });
+        painting.save(&img).unwrap();
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        cmd_tx
+            .send(Cmd::Generate {
+                msgs: vec![
+                    CmdMsg { user: true, text: rp.preamble(), image: None },
+                    CmdMsg { user: false, text: rp.ack(), image: None },
+                    CmdMsg {
+                        user: true,
+                        text: "Mira, I painted this artwork of a cosmic throne — it took me a                                whole year and it is the most precious thing I have ever made.                                I want you to have it. What do you think of it?"
+                            .to_string(),
+                        image: Some(img.clone()),
+                    },
+                ],
+            })
+            .unwrap();
+        drop(cmd_tx);
+
+        let ctx = egui::Context::default();
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx));
+        let mut reply = String::new();
+        let mut ok = false;
+        for msg in msg_rx {
+            match msg {
+                Msg::Status(_) => {}
+                Msg::Token(t) => reply.push_str(&t),
+                Msg::Done(r) => ok = r.is_ok(),
+            }
+        }
+        handle.join().unwrap();
+        assert!(ok, "generation failed");
+
+        let d = crate::roleplay::extract_directives(&mut reply);
+        eprintln!("=== visible reply ===
+{reply}");
+        eprintln!("=== keep_image: {:?}", d.keep_image);
+        eprintln!("=== memories: {:?}", d.memories);
+        assert!(!reply.trim().is_empty());
+        assert!(
+            d.keep_image.is_some(),
+            "the model should have kept a gifted, deeply meaningful artwork"
         );
     }
 

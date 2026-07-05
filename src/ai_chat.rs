@@ -45,8 +45,8 @@ pub fn claims_drop(llm: &crate::llm::LlmState, ctx: &egui::Context) -> bool {
     pos.map_or(true, |p| rect.contains(p))
 }
 
-pub fn show(ui: &mut egui::Ui, llm: &mut LlmState) {
-    llm.poll();
+pub fn show(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::settings::Settings) {
+    llm.poll(ui.ctx());
 
     // Not usable yet — say why, centred, instead of an empty chat.
     if !crate::llm::BUILT_WITH_LLM || !llm.installed {
@@ -95,7 +95,7 @@ pub fn show(ui: &mut egui::Ui, llm: &mut LlmState) {
     egui::CentralPanel::default()
         .frame(egui::Frame::new().fill(BG()).inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 10 }))
         .show_inside(ui, |ui| {
-            conversation(ui, llm);
+            conversation(ui, llm, settings);
         });
 }
 
@@ -155,7 +155,7 @@ fn chat_list(ui: &mut egui::Ui, llm: &mut LlmState) {
 
 /// The conversation column: scrollable bubbles + the bottom input pill, both
 /// centred on the same column (like the sketch's two guide lines).
-fn conversation(ui: &mut egui::Ui, llm: &mut LlmState) {
+fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::settings::Settings) {
     let avail_w = ui.available_width();
     // The centred content column both the messages and the pill live in.
     let col_w = (avail_w * 0.58).clamp(420.0, 880.0).min(avail_w - 16.0);
@@ -399,6 +399,22 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState) {
                                     .color(MUTED())
                                     .size(10.5),
                                 );
+                                ui.add_space(6.0);
+                                let mut speak = settings.ai_auto_speak;
+                                let resp = ui.checkbox(&mut speak, egui::RichText::new("Auto-speak replies").color(TEXT()));
+                                if resp.changed() {
+                                    settings.ai_auto_speak = speak;
+                                    llm.auto_speak = speak;
+                                }
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Read every reply aloud the moment it \
+                                         finishes — click any reply's listen \
+                                         icon to stop.",
+                                    )
+                                    .color(MUTED())
+                                    .size(10.5),
+                                );
                             });
                         llm.tools_open = open;
                     }
@@ -496,7 +512,22 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         return;
     }
 
-    // Model reply. Nothing streamed yet → a spinner with the worker status
+    // Model reply. An album picture the AI chose to share shows above the
+    // text, on its side of the column.
+    if let Some(path) = &image {
+        if let Some(tex) = msg_thumb(ui.ctx(), llm, path) {
+            let size = tex.size_vec2();
+            let scale = (180.0 / size.y).min(280.0 / size.x).min(1.0);
+            ui.add(
+                egui::Image::new(&tex)
+                    .fit_to_exact_size(size * scale)
+                    .corner_radius(egui::CornerRadius::same(12)),
+            );
+            ui.add_space(4.0);
+        }
+    }
+
+    // Nothing streamed yet → a spinner with the worker status
     // ("Loading the model…", "Thinking…") where the reply will appear.
     if streaming && text.is_empty() {
         ui.horizontal(|ui| {

@@ -72,6 +72,8 @@ pub struct Settings {
     /// OmniVoice "voice design" description used by the chat's Listen buttons
     /// (gender, age, pitch, style, accent — free text).
     pub ai_voice_style: String,
+    /// Auto-speak: read every finished AI reply aloud (tools menu toggle).
+    pub ai_auto_speak: bool,
     /// Voice cloning: path to a short reference recording (empty = none —
     /// the description above is used instead).
     pub ai_voice_ref_audio: String,
@@ -143,6 +145,7 @@ impl Default for Settings {
             last_ai_model: "Select AI...".to_string(),
             ai_chat: false,
             ai_voice_style: crate::voice::DEFAULT_STYLE.to_string(),
+            ai_auto_speak: false,
             ai_voice_ref_audio: String::new(),
             ai_voice_ref_text: String::new(),
             theme: Theme::default(),
@@ -559,7 +562,7 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
 /// (src/ai_chat.rs). Everything runs inside the app — the setup button just
 /// downloads the model weights.
 fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm::LlmState) {
-    llm.poll();
+    llm.poll(ui.ctx());
 
     section(ui, "Local model", |ui| {
         if llm.installed {

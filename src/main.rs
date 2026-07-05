@@ -1264,7 +1264,7 @@ impl eframe::App for ViewerApp {
             // clip selected in Panels would keep playing behind the chat.
             self.video_player = None;
             self.last_video_path = None;
-            ai_chat::show(ui, &mut self.llm);
+            ai_chat::show(ui, &mut self.llm, &mut self.settings);
         } else
         // When the Gallery layout is active, replace the three panels with a
         // full-window masonry grid of the open folder's images.
@@ -1395,6 +1395,7 @@ impl eframe::App for ViewerApp {
         if self.llm.voice.ref_text != self.settings.ai_voice_ref_text {
             self.llm.voice.ref_text = self.settings.ai_voice_ref_text.clone();
         }
+        self.llm.auto_speak = self.settings.ai_auto_speak;
         settings::show(ui.ctx(), &mut self.settings, &mut self.update, &mut self.ftp, &mut self.llm);
 
         // The floating voice-sample recorder (its own always-on-top window,
