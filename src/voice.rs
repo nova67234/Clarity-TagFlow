@@ -49,7 +49,14 @@ const MODEL_REPO: &str = "k2-fsa/OmniVoice";
 /// The synth worker. Loads the model once (GPU when available), then serves
 /// one JSON request per stdin line: {"text": "...", "instruct": "..."} →
 /// "WAV <path>" (or "ERR <msg>") per stdout line. "READY" once loaded.
-const WORKER_PY: &str = r#"import json, os, sys, tempfile, traceback
+const WORKER_PY: &str = r#"import json, os, re, sys, tempfile, traceback
+
+# Emoji / pictographs / dingbats and their invisible plumbing — some break
+# OmniVoice's text frontend outright. The app strips them too; this is the
+# belt-and-braces layer.
+UNSPEAKABLE = re.compile(
+    "[\U0001F000-\U0001FAFF☀-➿⬀-⯿︎️‍]"
+)
 
 def main():
     import torch
@@ -66,7 +73,11 @@ def main():
             continue
         try:
             req = json.loads(line)
-            kwargs = {"text": req["text"]}
+            text = req["text"]
+            stripped = UNSPEAKABLE.sub("", text)
+            if stripped.strip():
+                text = stripped
+            kwargs = {"text": text}
             if req.get("ref_audio"):
                 # Voice cloning: a reference recording + its transcript.
                 kwargs["ref_audio"] = req["ref_audio"]
