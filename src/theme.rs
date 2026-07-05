@@ -291,6 +291,17 @@ pub fn icon_tint(fallback: Color32) -> Color32 {
     }
 }
 
+/// The AI orb's accent. The orb is a glowing object, not an icon, so it keeps
+/// its "true" dark-theme light blue on every surface — the grey/deep icon
+/// tints of the light themes would wash it out. Aurora keeps its pink.
+pub fn orb_color() -> Color32 {
+    if palette().aurora {
+        Color32::from_rgb(235, 130, 175)
+    } else {
+        DARK.accent1
+    }
+}
+
 /// Colour for the selected-tile outline in the browser: the theme's accent blue
 /// everywhere (light modes use their deeper accent so it reads on white panels),
 /// except Aurora's pink so it matches that theme's warm glow.

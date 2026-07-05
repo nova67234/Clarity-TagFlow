@@ -234,8 +234,9 @@ impl AiOrb {
             return;
         }
 
-        // Accent normally; blends to red as the error grows.
-        let accent = color.unwrap_or_else(|| crate::theme::icon_tint(crate::theme::ACCENT1()));
+        // The orb's own accent (dark-theme light blue everywhere, Aurora
+        // pink); blends to red as the error grows.
+        let accent = color.unwrap_or_else(crate::theme::orb_color);
         let base = lerp_color(accent, Color32::from_rgb(235, 55, 48), self.error);
 
         let light = crate::theme::is_light();
