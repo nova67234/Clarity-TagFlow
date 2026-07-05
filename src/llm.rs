@@ -782,6 +782,17 @@ mod worker {
     /// answers mid-code-block; 3072 fits long code examples comfortably.
     const MAX_TOKENS: usize = 3072;
 
+    /// The context configuration used for every generation — also created
+    /// once as a probe during loading, so the GPU-offload ladder knows the
+    /// KV cache actually fits alongside the weights.
+    fn context_params(threads: i32) -> LlamaContextParams {
+        LlamaContextParams::default()
+            .with_n_threads(threads)
+            .with_n_threads_batch(threads)
+            .with_n_batch(N_BATCH)
+            .with_n_ctx(NonZeroU32::new(N_CTX))
+    }
+
     /// Worker body: load everything once, then serve Generate commands until
     /// the UI side drops its sender. On a load failure the error is reported
     /// as a `Done(Err)` and the thread exits (the UI respawns it on demand).
@@ -828,7 +839,11 @@ mod worker {
         // Offload to the GPU when a backend is compiled in (`llm-vulkan`) — a
         // ladder of attempts, because the big variants (26B/31B) don't fit
         // whole in common VRAM sizes: everything → about half → CPU only.
-        let mut model = None;
+        // Each rung must survive the WHOLE pipeline — weights, vision
+        // projector, and a probe context — because weights fitting is not
+        // enough: the 26B loads into ~20 GB of VRAM and llama.cpp then
+        // returns a null context when the KV cache no longer fits.
+        let mut loaded = None;
         let mut last_err = String::new();
         for (i, layers) in [1_000_000u32, 24, 0].into_iter().enumerate() {
             if i > 0 {
@@ -837,33 +852,47 @@ mod worker {
                 ));
             }
             let params = LlamaModelParams::default().with_n_gpu_layers(layers);
-            match LlamaModel::load_from_file(&backend, &model_path, &params) {
-                Ok(m) => {
-                    model = Some(m);
-                    break;
+            let model = match LlamaModel::load_from_file(&backend, &model_path, &params) {
+                Ok(m) => m,
+                Err(e) => {
+                    last_err = format!("Load model: {e}");
+                    continue;
                 }
-                Err(e) => last_err = e.to_string(),
+            };
+            send(Msg::Status("Loading the vision projector…".into()));
+            let mtmd_params = MtmdContextParams {
+                // Like n_gpu_layers: uses the GPU when a backend exists, CPU otherwise.
+                use_gpu: true,
+                print_timings: false,
+                n_threads: threads,
+                media_marker: CString::new(llama_cpp_2::mtmd::mtmd_default_marker().to_string())
+                    .map_err(|e| e.to_string())?,
+                image_min_tokens: -1,
+                image_max_tokens: -1,
+            };
+            let mtmd = match MtmdContext::init_from_file(
+                &mmproj_path.to_string_lossy(),
+                &model,
+                &mtmd_params,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    last_err = format!("Load vision projector: {e}");
+                    continue;
+                }
+            };
+            // Probe context, created and dropped: proves generation will have
+            // room for the KV cache with this many layers on the GPU.
+            if let Err(e) = model.new_context(&backend, context_params(threads)) {
+                last_err = format!("Create context: {e}");
+                continue;
             }
+            loaded = Some((model, mtmd));
+            break;
         }
-        let model = model.ok_or_else(|| format!("Load model: {last_err}"))?;
-
-        send(Msg::Status("Loading the vision projector…".into()));
-        let mtmd_params = MtmdContextParams {
-            // Like n_gpu_layers: uses the GPU when a backend exists, CPU otherwise.
-            use_gpu: true,
-            print_timings: false,
-            n_threads: threads,
-            media_marker: CString::new(llama_cpp_2::mtmd::mtmd_default_marker().to_string())
-                .map_err(|e| e.to_string())?,
-            image_min_tokens: -1,
-            image_max_tokens: -1,
+        let Some((model, mtmd)) = loaded else {
+            return Err(last_err);
         };
-        let mtmd = MtmdContext::init_from_file(
-            &mmproj_path.to_string_lossy(),
-            &model,
-            &mtmd_params,
-        )
-        .map_err(|e| format!("Load vision projector: {e}"))?;
 
         let template = model
             .chat_template(None)
@@ -890,13 +919,8 @@ mod worker {
         // A fresh context per turn: cheap next to the resident weights, and it
         // guarantees no KV-cache state leaks — the whole (capped) history is
         // re-evaluated, which is what makes multi-turn chat work.
-        let context_params = LlamaContextParams::default()
-            .with_n_threads(threads)
-            .with_n_threads_batch(threads)
-            .with_n_batch(N_BATCH)
-            .with_n_ctx(NonZeroU32::new(N_CTX));
         let mut context = model
-            .new_context(backend, context_params)
+            .new_context(backend, context_params(threads))
             .map_err(|e| format!("Create context: {e}"))?;
 
         // The media marker tells the tokenizer where an image's tokens go;
