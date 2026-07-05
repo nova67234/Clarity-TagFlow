@@ -68,6 +68,8 @@ mod ai_models;
 mod ai_orb;
 // The full-window AI Chat view (Settings → AI Model → Activate AI Chat).
 mod ai_chat;
+// The OmniVoice neural voice for the chat's Listen buttons (Python sidecar).
+mod voice;
 #[cfg(feature = "avif")]
 mod avif;
 mod backup;
@@ -910,6 +912,11 @@ impl ViewerApp {
                 return;
             }
         }
+        // Likewise, a drop onto the AI Chat's input card attaches the image
+        // to the draft there (ai_chat.rs consumes it), not to the gallery.
+        if self.settings.ai_chat && ai_chat::claims_drop(&self.llm, ctx) {
+            return;
+        }
         // A dropped folder loads all media inside it; dropped files are added directly.
         let mut to_add = Vec::new();
         for p in dropped {
@@ -1371,6 +1378,15 @@ impl eframe::App for ViewerApp {
             self.rescan_current_folder();
         }
 
+        // Keep the voice's design prompt in sync with the persisted setting
+        // (edited in the AI Model tab; read at Listen time). Migrate the old
+        // default, which used attributes OmniVoice rejects.
+        if self.settings.ai_voice_style == "female, warm, natural, conversational" {
+            self.settings.ai_voice_style = voice::DEFAULT_STYLE.to_string();
+        }
+        if self.llm.voice.style != self.settings.ai_voice_style {
+            self.llm.voice.style = self.settings.ai_voice_style.clone();
+        }
         settings::show(ui.ctx(), &mut self.settings, &mut self.update, &mut self.ftp, &mut self.llm);
 
         // FTP remote browser (opened by the top bar's globe button in FTP mode).

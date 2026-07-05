@@ -32,7 +32,8 @@ jobs:
             libgtk-3-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev \
-            libssl-dev pkg-config
+            libssl-dev pkg-config \
+            libasound2-dev
       # Compile everything (incl. the test targets) and run the unit tests. The
       # networked live-GitHub test is #[ignore]d, so this stays hermetic.
       # `llm` compiles the local-AI worker (llama.cpp, CPU backend) so breaks in

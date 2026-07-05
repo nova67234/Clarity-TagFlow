@@ -148,6 +148,17 @@ pub struct LlmState {
     /// The input pill's draft text and attached image.
     pub draft: String,
     pub draft_image: Option<PathBuf>,
+    /// Cached thumbnail texture for `draft_image` (path it was made from +
+    /// the GPU texture), shown inside the input card.
+    pub draft_thumb: Option<(PathBuf, egui::TextureHandle)>,
+    /// Cached display textures for images attached to sent messages, keyed by
+    /// path (`None` = unreadable file, cached so it isn't retried per frame).
+    pub msg_thumbs: std::collections::HashMap<PathBuf, Option<egui::TextureHandle>>,
+    /// The input card's on-screen rect + the `ctx.input(time)` it was last
+    /// drawn, published every frame the chat is visible. Drag-and-drop uses it
+    /// both for the hover highlight and to claim drops away from the gallery
+    /// (same freshness scheme as the generator's prompt box).
+    pub input_rect: Option<(egui::Rect, f64)>,
 
     pub run_err: Option<String>,
     /// A generation is in flight.
@@ -158,7 +169,27 @@ pub struct LlmState {
     /// Layout cache for the chat's markdown rendering (src/ai_chat.rs).
     pub md_cache: egui_commonmark::CommonMarkCache,
 
+    /// Retry requested from inside the message list this frame — applied
+    /// after the list finishes drawing (mutating mid-iteration would break
+    /// the loop's indices).
+    pub pending_retry: Option<usize>,
+    /// The running text-to-speech process for "Listen" (Windows speech
+    /// synthesis in a spawned PowerShell; killed to stop playback). The
+    /// fallback voice — OmniVoice below is used when installed.
+    tts: Option<std::process::Child>,
+    /// The OmniVoice neural voice (Python sidecar; see src/voice.rs).
+    pub voice: crate::voice::VoiceState,
+
     worker: Option<Worker>,
+}
+
+impl Drop for LlmState {
+    fn drop(&mut self) {
+        // Don't leave a voice speaking after the app closes.
+        if let Some(mut c) = self.tts.take() {
+            let _ = c.kill();
+        }
+    }
 }
 
 impl Default for LlmState {
@@ -173,10 +204,16 @@ impl Default for LlmState {
             next_chat_id: 1,
             draft: String::new(),
             draft_image: None,
+            draft_thumb: None,
+            msg_thumbs: std::collections::HashMap::new(),
+            input_rect: None,
             run_err: None,
             running: false,
             status: String::new(),
             md_cache: egui_commonmark::CommonMarkCache::default(),
+            pending_retry: None,
+            tts: None,
+            voice: crate::voice::VoiceState::default(),
             worker: None,
         }
     }
@@ -199,6 +236,7 @@ impl LlmState {
     /// Drive background work — poll the setup download and drain any streamed
     /// tokens from the inference worker. Call once per frame from the tab.
     pub fn poll(&mut self) {
+        self.voice.poll();
         if let Some(dl) = &self.download {
             if dl.done() {
                 if dl.ok() {
@@ -303,9 +341,39 @@ impl LlmState {
         self.status = "Starting…".to_string();
 
         let image = self.draft_image.take();
+        self.draft_thumb = None;
         self.draft.clear();
+        self.chats[self.active_chat]
+            .msgs
+            .push(ChatMsg { role: ChatRole::User, text, image });
+        self.begin_generation(ctx);
+    }
+
+    /// Regenerate the model reply at `msg_index` of the active chat: that
+    /// reply — and everything after it — is discarded, and the conversation
+    /// up to its user message is resent.
+    pub fn retry(&mut self, msg_index: usize, ctx: &egui::Context) {
+        if self.running {
+            return;
+        }
         let chat = &mut self.chats[self.active_chat];
-        chat.msgs.push(ChatMsg { role: ChatRole::User, text, image });
+        if chat.msgs.get(msg_index).map(|m| m.role) != Some(ChatRole::Model) {
+            return;
+        }
+        chat.msgs.truncate(msg_index);
+        if chat.msgs.last().map(|m| m.role) != Some(ChatRole::User) {
+            return;
+        }
+        self.run_err = None;
+        self.status = "Starting…".to_string();
+        self.begin_generation(ctx);
+    }
+
+    /// Generate a reply to the active chat's history (which must end with a
+    /// user message): snapshot the capped history, send it to the worker, and
+    /// push the empty reply bubble the tokens stream into.
+    fn begin_generation(&mut self, ctx: &egui::Context) {
+        let chat = &mut self.chats[self.active_chat];
 
         // Snapshot the history for the worker, capped to the most recent
         // messages so a very long chat doesn't overflow the model's context,
@@ -351,6 +419,106 @@ impl LlmState {
             }
         }
     }
+
+    /// True while a "Listen" playback is speaking.
+    pub fn speaking(&mut self) -> bool {
+        match &mut self.tts {
+            Some(c) => match c.try_wait() {
+                Ok(None) => true,
+                _ => {
+                    self.tts = None;
+                    false
+                }
+            },
+            None => false,
+        }
+    }
+
+    /// True while either voice backend is playing.
+    pub fn any_speaking(&mut self) -> bool {
+        self.voice.speaking() || self.speaking()
+    }
+
+    /// Read a reply aloud — or stop the current playback if one is speaking.
+    /// Uses OmniVoice (the natural neural voice, Python sidecar) once its
+    /// one-click setup has run; otherwise falls back to the OS speech
+    /// synthesizer (Windows).
+    pub fn listen(&mut self, text: &str, ctx: &egui::Context) {
+        if self.voice.speaking() {
+            self.voice.stop();
+            return;
+        }
+        if self.speaking() {
+            if let Some(mut c) = self.tts.take() {
+                let _ = c.kill();
+            }
+            return;
+        }
+        if self.voice.installed {
+            self.voice.speak(&speech_text(text), ctx);
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::io::Write as _;
+            use std::os::windows::process::CommandExt as _;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let spoken = speech_text(text);
+            let child = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    "Add-Type -AssemblyName System.Speech; \
+                     $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
+                     $s.Speak([Console]::In.ReadToEnd())",
+                ])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+            match child {
+                Ok(mut c) => {
+                    if let Some(mut stdin) = c.stdin.take() {
+                        let _ = stdin.write_all(spoken.as_bytes());
+                    }
+                    self.tts = Some(c);
+                }
+                Err(e) => self.run_err = Some(format!("Couldn't start speech: {e}")),
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = text;
+            self.run_err = Some("Listen isn't supported on this platform yet.".to_string());
+        }
+    }
+}
+
+/// Strip markdown down to speakable text: code blocks are skipped ("code
+/// omitted"), inline markers (** * ` #) are dropped.
+fn speech_text(md: &str) -> String {
+    let mut out = String::new();
+    let mut in_code = false;
+    for line in md.lines() {
+        if line.trim_start().starts_with("```") {
+            if !in_code {
+                out.push_str("Code omitted. ");
+            }
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            continue;
+        }
+        let line = line.trim_start_matches('#').trim();
+        let cleaned: String = line.chars().filter(|c| !matches!(c, '*' | '`')).collect();
+        if !cleaned.is_empty() {
+            out.push_str(&cleaned);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

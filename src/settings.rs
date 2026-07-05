@@ -69,6 +69,9 @@ pub struct Settings {
     /// chat with the local model (src/ai_chat.rs). Toggled from the AI Model
     /// tab; the top bar stays.
     pub ai_chat: bool,
+    /// OmniVoice "voice design" description used by the chat's Listen buttons
+    /// (gender, age, pitch, style, accent — free text).
+    pub ai_voice_style: String,
     /// The active app colour theme (Dark / Light). Applied on launch and live
     /// whenever changed from the Appearance tab.
     pub theme: Theme,
@@ -133,6 +136,7 @@ impl Default for Settings {
             enable_extended_formats: false,
             last_ai_model: "Select AI...".to_string(),
             ai_chat: false,
+            ai_voice_style: crate::voice::DEFAULT_STYLE.to_string(),
             theme: Theme::default(),
             layout: Layout::default(),
             // A deep navy reads well behind the glass panels by default.
@@ -642,6 +646,79 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                 "The first question loads the model into memory and can take \
                  a minute; after that it stays loaded.",
             );
+        });
+
+        section(ui, "Natural voice (OmniVoice)", |ui| {
+            if llm.voice.installed {
+                ui.label(
+                    egui::RichText::new("Installed — the chat's Listen buttons use OmniVoice")
+                        .color(egui::Color32::from_rgb(46, 160, 67))
+                        .strong()
+                        .size(12.5),
+                );
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Voice").color(TEXT()).size(12.5));
+                ui.add_space(2.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut settings.ai_voice_style)
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::Margin::symmetric(8, 6))
+                        .hint_text(crate::voice::DEFAULT_STYLE),
+                );
+                if resp.changed() {
+                    llm.voice.style = settings.ai_voice_style.clone();
+                }
+                hint(
+                    ui,
+                    "Comma-separated voice attributes (OmniVoice accepts a fixed \
+                     set): male/female · child/teenager/young adult/middle-aged/\
+                     elderly · very low/low/moderate/high/very high pitch · \
+                     whisper · american/british/australian/canadian/chinese/\
+                     indian/japanese/korean/portuguese/russian accent. E.g. \
+                     \"male, low pitch, british accent\". Takes effect on the \
+                     next Listen; invalid words fall back to the default voice.",
+                );
+            } else {
+                hint(
+                    ui,
+                    "A natural neural voice for the chat's Listen buttons \
+                     (OmniVoice, runs fully on this PC) — great for role play \
+                     or long sessions, instead of the robotic system voice.",
+                );
+                ui.add_space(6.0);
+                if llm.voice.setting_up {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(14.0).color(MUTED()));
+                        ui.label(
+                            egui::RichText::new(&llm.voice.setup_status).color(MUTED()).size(11.5),
+                        );
+                    });
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                } else {
+                    let btn = egui::Button::new(
+                        egui::RichText::new("Set up voice").color(egui::Color32::WHITE).strong(),
+                    )
+                    .fill(crate::theme::ACCENT1())
+                    .corner_radius(egui::CornerRadius::same(255));
+                    if ui.add_sized(egui::vec2(150.0, 32.0), btn).clicked() {
+                        llm.voice.start_setup(ui.ctx());
+                    }
+                    hint(
+                        ui,
+                        "Downloads its own Python, GPU PyTorch and the \
+                         OmniVoice model (several GB — one time). Listen \
+                         falls back to the system voice until this is done.",
+                    );
+                    if llm.voice.setup_failed {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(format!("Setup failed: {}", llm.voice.setup_status))
+                                .color(egui::Color32::from_rgb(210, 70, 70))
+                                .size(12.0),
+                        );
+                    }
+                }
+            }
         });
     }
 }
