@@ -285,10 +285,16 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                         message(ui, llm, i, streaming);
                         ui.add_space(12.0);
                     }
-                    // A retry clicked inside the list is applied here, after
-                    // the loop, so it can safely truncate the message list.
+                    // A retry or edit clicked inside the list is applied
+                    // here, after the loop, so it can safely truncate the
+                    // message list.
                     if let Some(i) = llm.pending_retry.take() {
                         llm.retry(i, ui.ctx());
+                    }
+                    if let Some(i) = llm.pending_edit.take() {
+                        let text = std::mem::take(&mut llm.edit_draft);
+                        llm.editing = None;
+                        llm.apply_edit(i, text, ui.ctx());
                     }
                 });
             });
@@ -539,6 +545,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
 
     if role == ChatRole::User {
         let max_w = ui.available_width() * 0.82;
+        let chat_id = llm.chats[llm.active_chat].id;
         ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
             // The attached image shows as its own rounded thumbnail, separate
             // from (and above) the text bubble.
@@ -565,6 +572,65 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                     ui.add_space(4.0);
                 }
             }
+
+            // Editing: the bubble becomes an in-place editor. Enter (or the
+            // send icon) resends from here — everything after this message
+            // is discarded and the reply regenerates. Esc cancels.
+            if llm.editing == Some((chat_id, index)) {
+                egui::Frame::new()
+                    .fill(ui.visuals().extreme_bg_color)
+                    .stroke(egui::Stroke::new(1.0, EDGE()))
+                    .corner_radius(egui::CornerRadius::same(16))
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.set_width(max_w);
+                        let resp = ui.add(
+                            egui::TextEdit::multiline(&mut llm.edit_draft)
+                                .desired_rows(2)
+                                .frame(egui::Frame::NONE)
+                                .font(egui::FontId::proportional(14.0))
+                                .desired_width(f32::INFINITY),
+                        );
+                        let enter = resp.has_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let can_send = !llm.running
+                                    && (!llm.edit_draft.trim().is_empty() || image.is_some());
+                                let send = icon_button(
+                                    ui,
+                                    egui::include_image!("../icons/send.svg"),
+                                    16.0,
+                                    "Send — the conversation continues from here",
+                                    can_send,
+                                )
+                                .clicked();
+                                let cancel = icon_button(
+                                    ui,
+                                    egui::include_image!("../icons/x.svg"),
+                                    14.0,
+                                    "Cancel editing",
+                                    true,
+                                )
+                                .clicked();
+                                if (send || enter) && can_send {
+                                    // Drop the newline the Enter keystroke inserted.
+                                    while llm.edit_draft.ends_with('\n') {
+                                        llm.edit_draft.pop();
+                                    }
+                                    llm.pending_edit = Some(index);
+                                }
+                                if cancel || escape {
+                                    llm.editing = None;
+                                    llm.edit_draft.clear();
+                                }
+                            });
+                        });
+                    });
+                return;
+            }
+
             if !text.is_empty() {
                 egui::Frame::new()
                     .fill(ACCENT1().gamma_multiply(0.28))
@@ -587,6 +653,17 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                             crate::emoji::label(ui, &text, TEXT(), 14.0, false);
                         });
                     });
+            }
+
+            // Edit action under the bubble (mirrors the reply action row).
+            ui.add_space(2.0);
+            let can_edit = !llm.running;
+            if icon_button(ui, egui::include_image!("../icons/edit.svg"), 14.0, "Edit this message", can_edit)
+                .clicked()
+                && can_edit
+            {
+                llm.editing = Some((chat_id, index));
+                llm.edit_draft = text.clone();
             }
         });
         return;
