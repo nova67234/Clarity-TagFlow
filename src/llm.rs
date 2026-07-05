@@ -874,9 +874,11 @@ fn is_unspeakable(c: char) -> bool {
 }
 
 /// Strip markdown down to speakable text: code blocks are skipped ("code
-/// omitted"), inline markers (** * ` #) are dropped, and emoji/symbols are
+/// omitted"), inline markers (** * ` #) are dropped, emoji/symbols are
 /// removed — voices either mispronounce them or, in OmniVoice's frontend,
-/// can outright fail on them.
+/// can outright fail on them — and dashes (— – --) become commas, since
+/// voices read them aloud as "dash" instead of pausing. In-word hyphens
+/// ("well-known") are left alone.
 fn speech_text(md: &str) -> String {
     let mut out = String::new();
     let mut in_code = false;
@@ -892,11 +894,15 @@ fn speech_text(md: &str) -> String {
             continue;
         }
         let line = line.trim_start_matches('#').trim();
+        // A bullet's leading dash would be read as "dash" — drop the marker.
+        let line = line.strip_prefix("- ").unwrap_or(line);
         let cleaned: String = line
             .chars()
             .filter(|c| !matches!(c, '*' | '`') && !is_unspeakable(*c))
             .collect();
+        let cleaned = cleaned.replace("--", "—").replace(['—', '–'], ", ");
         let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+        let cleaned = cleaned.replace(" ,", ",").replace(",,", ",");
         if !cleaned.is_empty() {
             out.push_str(&cleaned);
             out.push('\n');
@@ -1302,6 +1308,25 @@ mod worker {
             .map_err(|e| format!("Convert image: {e}"))?;
         MtmdBitmap::from_file(mtmd, &tmp.to_string_lossy(), false)
             .map_err(|e| format!("Load image: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod speech_text_tests {
+    use super::speech_text;
+
+    #[test]
+    fn dashes_become_pauses() {
+        assert_eq!(speech_text("I paused — then spoke."), "I paused, then spoke.\n");
+        assert_eq!(speech_text("wait -- what"), "wait, what\n");
+        assert_eq!(speech_text("an en–dash too"), "an en, dash too\n");
+    }
+
+    #[test]
+    fn bullets_and_in_word_hyphens() {
+        assert_eq!(speech_text("- a bullet point"), "a bullet point\n");
+        // In-word hyphens must stay: "well-known" is one spoken word.
+        assert_eq!(speech_text("a well-known fact"), "a well-known fact\n");
     }
 }
 
