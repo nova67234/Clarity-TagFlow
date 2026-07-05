@@ -272,6 +272,14 @@ pub struct LlmState {
     /// after the list finishes drawing (mutating mid-iteration would break
     /// the loop's indices).
     pub pending_retry: Option<usize>,
+    /// A user message being edited in place, as (chat id, message index).
+    /// The text being typed lives in `edit_draft`; sending rewinds the
+    /// conversation to that message and regenerates the reply.
+    pub editing: Option<(u64, usize)>,
+    pub edit_draft: String,
+    /// Edit submitted from inside the message list this frame — applied
+    /// after the list finishes drawing (same deferral as `pending_retry`).
+    pub pending_edit: Option<usize>,
     /// The running text-to-speech process for "Listen" (Windows speech
     /// synthesis in a spawned PowerShell; killed to stop playback). The
     /// fallback voice — OmniVoice below is used when installed.
@@ -333,6 +341,9 @@ impl Default for LlmState {
             md_cache: egui_commonmark::CommonMarkCache::default(),
             think_orbs: std::collections::HashMap::new(),
             pending_retry: None,
+            editing: None,
+            edit_draft: String::new(),
+            pending_edit: None,
             tts: None,
             voice: crate::voice::VoiceState::default(),
             roleplay: crate::roleplay::RoleplayState::load(),
@@ -593,6 +604,28 @@ impl LlmState {
         if chat.msgs.last().map(|m| m.role) != Some(ChatRole::User) {
             return;
         }
+        self.run_err = None;
+        self.status = "Starting…".to_string();
+        self.begin_generation(ctx);
+    }
+
+    /// Apply an edited user message: it keeps its attached image, gets the
+    /// new text, everything after it is discarded, and a fresh reply is
+    /// generated — like `retry`, but with rewritten words.
+    pub fn apply_edit(&mut self, msg_index: usize, text: String, ctx: &egui::Context) {
+        if self.running {
+            return;
+        }
+        let chat = &mut self.chats[self.active_chat];
+        if chat.msgs.get(msg_index).map(|m| m.role) != Some(ChatRole::User) {
+            return;
+        }
+        let text = text.trim().to_string();
+        if text.is_empty() && chat.msgs[msg_index].image.is_none() {
+            return;
+        }
+        chat.msgs.truncate(msg_index + 1);
+        chat.msgs[msg_index].text = text;
         self.run_err = None;
         self.status = "Starting…".to_string();
         self.begin_generation(ctx);
