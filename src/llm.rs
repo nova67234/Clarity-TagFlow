@@ -448,10 +448,18 @@ impl LlmState {
                                 .and_then(|c| c.msgs.last_mut())
                             {
                                 let (thinking, visible) = split_channels(&m.text);
-                                if !thinking.is_empty() {
-                                    m.thinking = Some(thinking);
+                                if visible.is_empty() && !thinking.is_empty() {
+                                    // Last resort: the model wrote everything
+                                    // inside its head and ignored every nudge
+                                    // to say it out loud — better to show the
+                                    // thought than an empty bubble.
+                                    m.text = thinking;
+                                } else {
+                                    if !thinking.is_empty() {
+                                        m.thinking = Some(thinking);
+                                    }
+                                    m.text = visible;
                                 }
-                                m.text = visible;
                             }
                         }
                         // Role play: a finished reply may end in control lines
@@ -1171,6 +1179,14 @@ mod worker {
         let think_budget = (params.max_tokens / 3).max(256);
         let mut raw = String::new();
         let mut forced_close = false;
+        // Where the visible answer starts after a forced close, plus how many
+        // end-of-turn attempts were rejected while that answer was still
+        // empty (the model likes to end the turn right after a forced close,
+        // treating its hidden draft as "already said").
+        let mut closed_at: Option<usize> = None;
+        let mut eog_rejects = 0;
+        let thought_open =
+            |raw: &String| raw.contains("<|channel>") && !raw.contains("<channel|>");
         // Streaming decoder: a token can end mid-way through a multi-byte
         // UTF-8 character (CJK, emoji), so bytes carry over between pieces.
         let mut decoder = encoding_rs::UTF_8.new_decoder();
@@ -1178,6 +1194,28 @@ mod worker {
             let token = sampler.sample(&context, -1);
             sampler.accept(token);
             if model.is_eog_token(token) {
+                // Ending the turn with the thought channel still open would
+                // leave the whole reply hidden — the model "said" it in its
+                // head. Close the channel instead (the EOG token is dropped,
+                // never fed to the context) and let it answer out loud.
+                if !forced_close && thought_open(&raw) {
+                    forced_close = true;
+                    close_thought(
+                        model, &mut context, &mut batch, &mut sampler, &mut n_past, &mut raw,
+                        send,
+                    )?;
+                    closed_at = Some(raw.len());
+                    continue;
+                }
+                // Turn ending straight after a forced close, with nothing
+                // visible yet: reject and resample (the EOG never enters the
+                // context; the sampler's RNG moves on) until it speaks.
+                if let Some(p) = closed_at {
+                    if raw[p..].trim().is_empty() && eog_rejects < 24 {
+                        eog_rejects += 1;
+                        continue;
+                    }
+                }
                 break;
             }
             let piece = model
@@ -1194,39 +1232,59 @@ mod worker {
 
             if !forced_close
                 && i >= think_budget
-                && raw.contains("<|channel>")
-                && !raw.contains("<channel|>")
+                && thought_open(&raw)
                 // Cut at a line boundary — interrupting mid-bullet makes the
                 // model finish the bullet in the visible text. Past a grace
                 // window, cut regardless.
                 && (raw.ends_with('\n') || i >= think_budget + 128)
             {
                 forced_close = true;
-                // A bare closing marker isn't enough — the model happily
-                // carries its interrupted train of thought straight into the
-                // visible text. A decisive first-person wrap-up (which stays
-                // hidden, inside the thought), spelling out the register
-                // switch, makes the continuation come out as a real answer.
-                let close =
-                    "\nI have thought long enough. Now I write only my final, \
-                     polished answer for the user — no notes, no bullets, no \
-                     self-corrections.\n<channel|>\n";
-                let toks = model
-                    .str_to_token(close, AddBos::Never)
-                    .map_err(|e| format!("Tokenize close: {e}"))?;
-                batch.clear();
-                for (j, t) in toks.iter().enumerate() {
-                    batch
-                        .add(*t, n_past, &[0], j + 1 == toks.len())
-                        .map_err(|e| e.to_string())?;
-                    n_past += 1;
-                    sampler.accept(*t);
-                }
-                context.decode(&mut batch).map_err(|e| format!("Decode: {e}"))?;
-                raw.push_str(close);
-                send(Msg::Token(close.to_string()));
+                close_thought(
+                    model, &mut context, &mut batch, &mut sampler, &mut n_past, &mut raw, send,
+                )?;
+                closed_at = Some(raw.len());
             }
         }
+        Ok(())
+    }
+
+    /// Force-close a thought channel: feed a hidden first-person wrap-up plus
+    /// the real `<channel|>` control token into the context, so everything
+    /// the model generates next is the visible answer. A bare closing marker
+    /// is not enough — the model carries its interrupted train of thought
+    /// straight into the visible text unless the wrap-up spells out the
+    /// register switch.
+    #[allow(clippy::too_many_arguments)]
+    fn close_thought(
+        model: &LlamaModel,
+        context: &mut llama_cpp_2::context::LlamaContext<'_>,
+        batch: &mut LlamaBatch,
+        sampler: &mut LlamaSampler,
+        n_past: &mut i32,
+        raw: &mut String,
+        send: &dyn Fn(Msg),
+    ) -> Result<(), String> {
+        // "Nothing above has been shown" matters: the model often drafts its
+        // full reply inside the thought and then ends the turn without
+        // repeating it, believing it already answered.
+        let close = "\nEnough thinking. Nothing above has been shown to the \
+                     user — it is my private notes, and they are still waiting \
+                     for my reply. I now write it for them, in full: polished \
+                     prose, no notes, no bullets, no self-corrections.\n<channel|>\n";
+        let toks = model
+            .str_to_token(close, AddBos::Never)
+            .map_err(|e| format!("Tokenize close: {e}"))?;
+        batch.clear();
+        for (j, t) in toks.iter().enumerate() {
+            batch
+                .add(*t, *n_past, &[0], j + 1 == toks.len())
+                .map_err(|e| e.to_string())?;
+            *n_past += 1;
+            sampler.accept(*t);
+        }
+        context.decode(batch).map_err(|e| format!("Decode: {e}"))?;
+        raw.push_str(close);
+        send(Msg::Token(close.to_string()));
         Ok(())
     }
 
@@ -1547,8 +1605,11 @@ mod tests {
     }
 
     /// Diagnostic: print the 26B's RAW wire output (channel markers included,
-    /// debug-escaped) for a question that invites reasoning, plus what
-    /// split_channels makes of it. Needs the 26B files installed.
+    /// debug-escaped) plus what split_channels makes of it, for two asks —
+    /// a reasoning question, and the role-play scene that once came back as
+    /// an empty bubble (the model drafted its whole reply inside the thought
+    /// and ended the turn). Small caps so the runaway-thought force-close
+    /// path is exercised. Needs the 26B files installed.
     #[test]
     #[ignore]
     fn llm_raw_probe_26b() {
@@ -1570,22 +1631,55 @@ mod tests {
                 }],
             })
             .unwrap();
+
+        // The real-world empty-bubble scenario: role play, a narrative user
+        // message, the model prone to redrafting privately.
+        let mut rp = crate::roleplay::RoleplayState::default();
+        rp.enabled = true;
+        rp.ai_name = "Sabrina".to_string();
+        rp.user_name = "Peter".to_string();
+        rp.persona = "a warm, romantic 25-year-old woman".to_string();
+        let u = |t: &str| CmdMsg { user: true, text: t.to_string(), image: None };
+        let m = |t: &str| CmdMsg { user: false, text: t.to_string(), image: None };
+        cmd_tx
+            .send(Cmd::Generate {
+                params: super::GenParams { max_tokens: 900, ..Default::default() },
+                msgs: vec![
+                    u(&rp.preamble()),
+                    m(&rp.ack()),
+                    u("hey sabrina are you ready to go eat or should i wait for you till your ready?"),
+                    m("I'm almost ready, Peter! Just grabbing my purse. Give me two minutes \
+                       and I'll be right out the door."),
+                    u("okay as i wait for her at the door wondering how she would look today"),
+                ],
+            })
+            .unwrap();
         drop(cmd_tx);
 
         let ctx = egui::Context::default();
         let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::A26B));
         let mut raw = String::new();
+        let mut n = 0;
         for msg in msg_rx {
             match msg {
                 Msg::Status(s) => eprintln!("[status] {s}"),
                 Msg::Token(t) => raw.push_str(&t),
-                Msg::Done(r) => eprintln!("[done] {r:?}"),
+                Msg::Done(r) => {
+                    n += 1;
+                    eprintln!("[done {n}] {r:?}");
+                    eprintln!("=== RAW {n} (escaped) ===\n{raw:?}\n=== END RAW {n} ===");
+                    let (think, vis) = split_channels(&raw);
+                    eprintln!("=== THINKING {n} ===\n{think}\n=== VISIBLE {n} ===\n{vis}\n=== END {n} ===");
+                    assert!(
+                        !vis.trim().is_empty(),
+                        "generation {n} produced no visible answer"
+                    );
+                    raw.clear();
+                }
             }
         }
         handle.join().unwrap();
-        eprintln!("=== RAW (escaped) ===\n{raw:?}\n=== END RAW ===");
-        let (think, vis) = split_channels(&raw);
-        eprintln!("=== THINKING ===\n{think}\n=== VISIBLE ===\n{vis}\n=== END ===");
+        assert_eq!(n, 2, "expected two completed generations");
     }
 
     #[test]
