@@ -260,6 +260,8 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
         .stick_to_bottom(true)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            // Keep scrolling while a text selection is dragged past the edge.
+            crate::drag_select_autoscroll(ui);
             ui.add_space(12.0);
             let chat = &llm.chats[llm.active_chat];
             if chat.msgs.is_empty() {

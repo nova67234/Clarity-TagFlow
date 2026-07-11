@@ -661,17 +661,22 @@ fn tags_box_fill(ui: &mut egui::Ui, popup: &mut DetailPopup) {
                 .auto_shrink([false, false])
                 .max_height(inner_h)
                 .show(ui, |ui| {
+                    // Keep scrolling while a text selection is dragged past the box edge.
+                    crate::drag_select_autoscroll(ui);
                     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
                         right_details::highlight_tags(ui, buf.as_str(), &artist, &character, role_color, wrap)
                     };
                     if editable {
+                        // Fill the whole box so clicking anywhere inside it (not just
+                        // on the first lines) focuses the editor. egui 0.34 ignores
+                        // TextEdit::min_size's height — desired_rows is the only lever.
+                        let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+                        let fill_rows = (inner_h / row_h).floor().max(4.0) as usize;
                         let mut text_edit = egui::TextEdit::multiline(&mut display_text)
                             .desired_width(f32::INFINITY)
                             .font(egui::TextStyle::Monospace)
                             .frame(egui::Frame::NONE)
-                            // Fill the whole box so clicking anywhere inside it (not
-                            // just on the first lines) focuses the editor.
-                            .min_size(egui::vec2(0.0, inner_h));
+                            .desired_rows(fill_rows);
                         if highlight_roles {
                             text_edit = text_edit.layouter(&mut layouter);
                         }

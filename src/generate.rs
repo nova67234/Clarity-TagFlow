@@ -2583,6 +2583,8 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                 .max_height(prompt_max_h - btn_strip)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    // Keep scrolling while a text selection is dragged past the edge.
+                    crate::drag_select_autoscroll(ui);
                     // Video models are very prompt-length-sensitive — nudge toward
                     // long, motion-describing prompts.
                     let hint = if state.family.is_video() {
@@ -2947,6 +2949,8 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 egui::ScrollArea::vertical().max_height(180.0).stick_to_bottom(true).show(ui, |ui| {
+                    // Keep scrolling while a text selection is dragged past the edge.
+                    crate::drag_select_autoscroll(ui);
                     for l in &state.log {
                         ui.label(RichText::new(l).color(TEXT()).monospace().size(11.0));
                     }

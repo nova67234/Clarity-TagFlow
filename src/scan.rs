@@ -385,6 +385,8 @@ fn console_box(ui: &mut egui::Ui, title: &str, lines: &[String], height: f32, sa
                 .stick_to_bottom(salt == "scan_console")
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
+                    // Keep scrolling while a text selection is dragged past the edge.
+                    crate::drag_select_autoscroll(ui);
                     if lines.is_empty() {
                         ui.label(egui::RichText::new("—").color(MUTED()).monospace().size(10.0));
                     } else {

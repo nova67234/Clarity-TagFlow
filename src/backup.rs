@@ -247,12 +247,9 @@ impl BackupState {
             }
             // TextEdit fill comes from extreme_bg_color — set it to the section
             // card colour so the name/password boxes blend with the card behind
-            // them, then give the input widgets a thin visible outline so the box
-            // still reads as an input.
+            // them. The input outline lives in `text_field` (scoped), NOT here:
+            // a dialog-wide bg_stroke would outline every button too.
             style.visuals.extreme_bg_color = FIELD();
-            let outline = egui::Stroke::new(1.0, Color32::from_gray(80));
-            style.visuals.widgets.inactive.bg_stroke = outline;
-            style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, Color32::from_gray(110));
             ui.set_style(style);
 
             // Custom title row (Civitai-style): backup icon + phase title + close.
@@ -579,12 +576,15 @@ fn kv(ui: &mut egui::Ui, key: &str, value: &str) {
 fn text_field(ui: &mut egui::Ui, value: &mut String, hint: &str, password: bool) {
     ui.scope(|ui| {
         // The dialog rounds all widgets to 4px for the square checkboxes; round the
-        // text fields back up to match Civitai.
+        // text fields back up to match Civitai. No outline in any state — the
+        // fields read as flat wells, like the buttons.
         let r = egui::CornerRadius::same(10);
         let v = ui.visuals_mut();
         v.widgets.inactive.corner_radius = r;
         v.widgets.hovered.corner_radius = r;
         v.widgets.active.corner_radius = r;
+        v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+        v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
         ui.add(
             egui::TextEdit::singleline(value)
                 .password(password)

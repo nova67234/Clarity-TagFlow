@@ -1808,6 +1808,32 @@ pub(crate) fn card_frame(radius: u8) -> egui::Frame {
         })
 }
 
+/// Auto-scroll a vertical ScrollArea while the user drag-selects text past its
+/// top or bottom edge — egui doesn't do this on its own, so a selection could
+/// never grow beyond the visible part. Call inside the ScrollArea's closure.
+/// Scrolls only while the left button is held AND the press started inside this
+/// scroll viewport, with speed scaling by how far past the edge the pointer is.
+pub(crate) fn drag_select_autoscroll(ui: &mut egui::Ui) {
+    let clip = ui.clip_rect();
+    let (down, origin, pos) = ui.input(|i| {
+        (i.pointer.primary_down(), i.pointer.press_origin(), i.pointer.latest_pos())
+    });
+    let (Some(origin), Some(pos)) = (origin, pos) else { return };
+    if !down || !clip.contains(origin) {
+        return;
+    }
+    let speed = |overshoot: f32| (overshoot * 0.35).clamp(1.0, 25.0);
+    let dy = if pos.y < clip.top() {
+        speed(clip.top() - pos.y) // positive delta scrolls up (content moves down)
+    } else if pos.y > clip.bottom() {
+        -speed(pos.y - clip.bottom())
+    } else {
+        return;
+    };
+    ui.scroll_with_delta(egui::vec2(0.0, dy));
+    ui.ctx().request_repaint(); // keep scrolling while the pointer holds still
+}
+
 /// A borderless button using an SVG or raster image source, tinted with `tint`.
 pub(crate) fn svg_button(ui: &mut egui::Ui, source: egui::ImageSource<'_>, tooltip: &str, icon_size: f32, tint: Color32) -> egui::Response {
     let img = egui::Image::new(source)
