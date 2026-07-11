@@ -74,7 +74,7 @@ pub struct Settings {
     pub ai_voice_style: String,
     /// Auto-speak: read every finished AI reply aloud (tools menu toggle).
     pub ai_auto_speak: bool,
-    /// Which Gemma 4 variant the AI chat runs (E4B / 26B A4B / 31B).
+    /// Which local model the AI chat runs (Gemma E4B / 27B / 31B, Qwen3-VL).
     pub ai_gemma_model: crate::llm::GemmaModel,
     /// AI chat sampling knobs (temperature, top-k/p, reply length) — edited
     /// from the gear in the chat list panel.
@@ -273,10 +273,14 @@ pub fn show(
                     // The body fills the window's fixed height exactly (no
                     // shrinking to content) and scrolls when a tab is taller;
                     // the sidebar and close button stay pinned.
+                    // Push the scrollbar into the window's margin so it rides
+                    // the edge instead of sitting on the controls.
+                    const SCROLL_GUTTER: f32 = 12.0;
+                    let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
+                        .show(&mut scroll_ui, |ui| {
+                            ui.set_width(ui.available_width() - SCROLL_GUTTER);
                             match settings.tab {
                                 SettingsTab::General => general_tab(ui, settings),
                                 SettingsTab::Appearance => appearance_tab(ui, settings),
@@ -285,6 +289,7 @@ pub fn show(
                                 SettingsTab::Updates => crate::update::updates_tab(ui, update, settings),
                             }
                         });
+                    crate::edge_scroll_done(ui, &scroll_ui, SCROLL_GUTTER);
                 });
             });
 

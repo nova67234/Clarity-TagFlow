@@ -84,8 +84,15 @@ pub fn show(
             if list_changed {
                 scroll = scroll.vertical_scroll_offset(0.0);
             }
-            scroll.show(ui, |ui| {
+            // Widen into the panel's right margin so the scrollbar sits on the
+            // panel edge instead of over the last column, then narrow the
+            // content back so tiles stay clear of the bar (same treatment as
+            // the left browser).
+            const SCROLL_GUTTER: f32 = 12.0;
+            let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
+            scroll.show(&mut scroll_ui, |ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
+                    ui.set_max_width(ui.available_width() - SCROLL_GUTTER);
                     let avail = ui.available_width();
                     let target = target_col_w.clamp(120.0, 400.0);
                     let ncols = (((avail + GAP) / (target + GAP)).floor() as usize).max(1);
