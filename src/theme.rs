@@ -379,13 +379,18 @@ pub fn EDGE() -> Color32 {
 /// mirrors the original `apply_theme`; the light branch additionally recolours
 /// buttons to the accent blue.
 pub fn apply(ctx: &egui::Context) {
+    let p = palette();
     // No fade-out gradient at scroll-area edges anywhere in the app — the
     // panel-coloured "shadow" egui paints at the top/bottom of scrollable
     // content (white in light themes, dark in dark ones). Panels read cleaner
     // without it.
-    ctx.all_styles_mut(|s| s.spacing.scroll.fade.strength = 0.0);
-
-    let p = palette();
+    ctx.all_styles_mut(|s| {
+        s.spacing.scroll.fade.strength = 0.0;
+        // Light glass: the default (foreground-colour) scrollbar takes the
+        // widgets' fg_stroke — the dark ink — so the handle read near-black.
+        // Switch it to the widgets' bg fill, the theme's light-grey pills.
+        s.spacing.scroll.foreground_color = !(p.glass && !p.is_dark);
+    });
     let mut v = if p.is_dark {
         egui::Visuals::dark()
     } else {
@@ -413,18 +418,18 @@ pub fn apply(ctx: &egui::Context) {
     }
 
     // Light glass gets its own QUIET widget styling instead of the Light theme's
-    // accent-blue: panel-toned grey fills with a grey outline and dark-ink text.
+    // accent-blue: panel-toned grey fills with dark-ink text and NO outlines —
+    // widgets read as flat pills against the frosted panel.
     // - toggles (radio/checkbox) render grey, not blue
     // - widget/menu text is dark ink, not white (white-on-light was unreadable)
-    // - the slider rail/knob match the panel tone, ringed grey ("outer layer")
+    // - the slider rail/knob match the panel tone
     if p.glass && !p.is_dark {
         let ink = p.text;
-        let outline = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 40));
         let tune = |w: &mut egui::style::WidgetVisuals, fill: Color32, weak: Color32| {
             w.bg_fill = fill;
             w.weak_bg_fill = weak;
             w.fg_stroke.color = ink;
-            w.bg_stroke = outline;
+            w.bg_stroke = egui::Stroke::NONE;
         };
         tune(&mut v.widgets.inactive, Color32::from_rgb(226, 229, 234), Color32::from_rgb(214, 218, 224));
         tune(&mut v.widgets.hovered, Color32::from_rgb(214, 218, 224), Color32::from_rgb(202, 206, 213));

@@ -396,6 +396,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
+                        // Keep scrolling while a text selection is dragged past the edge.
+                        crate::drag_select_autoscroll(ui);
                         if state.log.is_empty() {
                             ui.label(RichText::new("Output will appear here.").color(MUTED()).monospace().size(12.0));
                         } else {

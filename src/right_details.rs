@@ -822,6 +822,9 @@ pub fn show(
                                             .auto_shrink([false, false])
                                             .max_height(inner_h)
                                             .show(ui, |ui| {
+                                                // Keep scrolling while a text selection
+                                                // is dragged past the box edge.
+                                                crate::drag_select_autoscroll(ui);
                                                 // Colour artist (orange) / character
                                                 // (green) tags via a custom layouter.
                                                 let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
@@ -829,15 +832,20 @@ pub fn show(
                                                 };
 
                                                 if editable {
+                                                    // Fill the whole box so clicking anywhere
+                                                    // inside it (not just on the first lines)
+                                                    // focuses the editor and places the caret.
+                                                    // NB: `TextEdit::min_size` only honours
+                                                    // width in egui 0.34 — the minimum height
+                                                    // comes from `desired_rows`, so convert
+                                                    // the box height into a row count.
+                                                    let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+                                                    let fill_rows = (inner_h / row_h).floor().max(4.0) as usize;
                                                     let mut text_edit = egui::TextEdit::multiline(&mut display_text)
                                                         .desired_width(f32::INFINITY)
                                                         .font(egui::TextStyle::Monospace)
                                                         .frame(egui::Frame::NONE) // the Frame above is the box
-                                                        // Fill the whole box so clicking
-                                                        // anywhere inside it (not just on
-                                                        // the first lines) focuses the
-                                                        // editor and places the caret.
-                                                        .min_size(egui::vec2(0.0, inner_h));
+                                                        .desired_rows(fill_rows);
                                                     if highlight_roles {
                                                         text_edit = text_edit.layouter(&mut layouter);
                                                     }

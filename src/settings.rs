@@ -939,6 +939,10 @@ fn tab_button(ui: &mut egui::Ui, settings: &mut Settings, tab: SettingsTab, labe
             ui.spacing_mut().button_padding = egui::vec2(12.0, 6.0);
             let mut btn = egui::Button::new(egui::RichText::new(label).color(text_color).strong())
                 .corner_radius(egui::CornerRadius::same(10))
+                // Flat rows in every state: light Glass strokes all buttons by
+                // default, which outlined the quiet tabs. Only the selected row
+                // should stand out (accent fill below).
+                .stroke(egui::Stroke::NONE)
                 .min_size(egui::vec2(ui.available_width() - 10.0, 32.0));
             if selected {
                 btn = btn.fill(crate::theme::ACCENT1());

@@ -291,6 +291,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
+                            // Keep scrolling while a text selection is dragged past the edge.
+                            crate::drag_select_autoscroll(ui);
                             if state.log.is_empty() {
                                 ui.label(
                                     egui::RichText::new("Log output will appear here.")

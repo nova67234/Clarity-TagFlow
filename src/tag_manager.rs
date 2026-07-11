@@ -269,6 +269,10 @@ pub fn show(
                         get_models_icon,
                         egui::RichText::new("Get Models").color(Color32::WHITE),
                     )
+                    // Same dark grey as the Text to Image "Setup Requirements"
+                    // button, so the white label reads in every theme (the light
+                    // Glass default fill is too pale for white text).
+                    .fill(Color32::from_rgb(96, 99, 105))
                     .corner_radius(CornerRadius::same(12)),
                 );
                 if get_models.clicked() {
@@ -390,8 +394,12 @@ pub fn show(
                 ui.visuals_mut().widgets.hovered.corner_radius = r;
                 ui.visuals_mut().widgets.active.corner_radius = r;
 
+                // Same dark grey as the Text to Image "Setup Requirements" button,
+                // so the white labels read in every theme.
+                let action_bg = Color32::from_rgb(96, 99, 105);
+
                 if ui
-                    .add_sized(size, egui::Button::new(egui::RichText::new("Add").color(Color32::WHITE)))
+                    .add_sized(size, egui::Button::new(egui::RichText::new("Add").color(Color32::WHITE)).fill(action_bg))
                     .clicked()
                 {
                     if let Some(path) = current_image {
@@ -406,7 +414,7 @@ pub fn show(
                 }
 
                 if ui
-                    .add_sized(size, egui::Button::new(egui::RichText::new("Add All").color(Color32::WHITE)))
+                    .add_sized(size, egui::Button::new(egui::RichText::new("Add All").color(Color32::WHITE)).fill(action_bg))
                     .on_hover_text("Add these tags to every loaded file")
                     .clicked()
                 {
