@@ -32,7 +32,7 @@ pub const KEEP_IMAGE_TAG: &str = "KEEP_IMAGE:";
 pub const SHOW_IMAGE_TAG: &str = "SHOW_IMAGE:";
 
 /// How many diary entries ride along in the prompt (newest kept).
-const PROMPT_MEMORIES: usize = 60;
+const PROMPT_MEMORIES: usize = 300;
 
 /// One diary entry.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -232,7 +232,7 @@ impl RoleplayState {
              you — you love it, it touches you, it matters to your story — \
              keep it: end your reply with one line `{keep} <why you love it, \
              written like a diary entry>`. Only keep pictures that truly move \
-             you, not every picture.\n\
+             you.\n\
              - Pictures marked [saved picture ...] in your diary are in your \
              album. When the moment feels right — reminiscing, making plans, \
              missing something — you may show one to {user} again by ending \
@@ -478,16 +478,16 @@ mod tests {
     /// Control lines (diary/keep/show) parse out and vanish from the text.
     #[test]
     fn directives_extract_and_strip() {
-        let mut reply = "What a lovely place, Alex!
-                         MEMORY: Alex showed me the old harbour today.
+        let mut reply = "What a lovely place, Andrew!
+                         MEMORY: Andrew showed me the old harbour today.
                          KEEP_IMAGE: The lighthouse photo — it feels like home.
                          SHOW_IMAGE: `img_002.jpg`"
             .to_string();
         let d = extract_directives(&mut reply);
-        assert_eq!(d.memories, vec!["Alex showed me the old harbour today.".to_string()]);
+        assert_eq!(d.memories, vec!["Andrew showed me the old harbour today.".to_string()]);
         assert_eq!(d.keep_image.as_deref(), Some("The lighthouse photo — it feels like home."));
         assert_eq!(d.show_image.as_deref(), Some("img_002.jpg"));
-        assert_eq!(reply, "What a lovely place, Alex!");
+        assert_eq!(reply, "What a lovely place, Andrew!");
         // The streaming filter hides the same lines.
         assert_eq!(strip_memory_lines("hi
 MEMORY: x
@@ -514,8 +514,8 @@ SHOW_IMAGE: y"), "hi");
         let mut rp = RoleplayState::default();
         // Note: add_memory saves to disk; use texts that build a throwaway
         // state without touching the persisted file.
-        rp.memories.push(Memory { text: "Alex granted permission to use the garden.".into(), by_ai: true, image: None });
-        let key_dup = "  alex GRANTED permission, to use the garden!! ";
+        rp.memories.push(Memory { text: "Andrew granted permission to use the garden.".into(), by_ai: true, image: None });
+        let key_dup = "  Andrew GRANTED permission, to use the garden!! ";
         let normalized_matches = super::normalize(key_dup) == super::normalize(&rp.memories[0].text);
         assert!(normalized_matches, "normalization should treat these as the same memory");
     }

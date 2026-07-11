@@ -15,9 +15,16 @@
 //! just reports that this build has no AI support.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 
 use eframe::egui;
+
+/// Set by the chat's Stop button; the worker's token loop checks it between
+/// tokens and ends the reply early (the partial text stays in the bubble).
+/// A single static works because only one generation runs at a time — same
+/// scheme as the text-to-image view's cancel flag.
+static GEN_CANCEL: AtomicBool = AtomicBool::new(false);
 
 /// Model folder under the shared models root (`tagger::models_root()`).
 pub const FOLDER: &str = "gemma-4";
@@ -26,41 +33,51 @@ pub const MODEL_FILE: &str = "gemma-4-E4B-it-Q4_K_M.gguf";
 /// The multimodal (vision) projector llama.cpp uses to encode images (~1 GB).
 pub const MMPROJ_FILE: &str = "mmproj-F16.gguf";
 
-// The bigger Gemma 4 variants (also vision-capable; same mmproj file name).
-pub const FOLDER_26B: &str = "gemma-4-26b";
-pub const MODEL_FILE_26B: &str = "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf";
+// The other options (all vision-capable; every repo names its projector
+// mmproj-F16.gguf, so MMPROJ_FILE is shared).
+pub const FOLDER_27B: &str = "gemma-3-27b";
+pub const MODEL_FILE_27B: &str = "gemma-3-27b-it-Q4_K_M.gguf";
 pub const FOLDER_31B: &str = "gemma-4-31b";
 pub const MODEL_FILE_31B: &str = "gemma-4-31B-it-Q4_K_M.gguf";
+pub const FOLDER_QWEN: &str = "qwen3-vl-8b";
+pub const MODEL_FILE_QWEN: &str = "Qwen3-VL-8B-Instruct-Q4_K_M.gguf";
 
-/// Which Gemma 4 variant the chat runs (Settings → AI Model). All are
+/// Which local model the chat runs (Settings → AI Model). All are
 /// vision-capable; they trade download size + speed for quality.
 #[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum GemmaModel {
-    /// E4B instruct — ~6 GB, fast, fits fully on 8 GB+ GPUs. The default.
+    /// Gemma 4 E4B instruct — ~6 GB, fast, fits fully on 8 GB+ GPUs. The default.
     #[default]
     E4B,
-    /// 26B A4B (mixture-of-experts) — ~18 GB, much smarter.
-    A26B,
-    /// 31B dense — ~19.5 GB, the strongest Gemma 4.
+    /// Gemma 3 27B — ~16 GB, the previous-gen flagship, very strong.
+    /// (Replaced the Gemma 4 26B A4B; settings saved as "A26B" land here.)
+    #[serde(alias = "A26B")]
+    G27B,
+    /// Gemma 4 31B dense — ~19.5 GB, the strongest option.
     D31B,
+    /// Qwen3-VL 8B instruct — ~6 GB, a different flavour to Gemma.
+    Qwen8B,
 }
 
 impl GemmaModel {
-    pub const ALL: [GemmaModel; 3] = [GemmaModel::E4B, GemmaModel::A26B, GemmaModel::D31B];
+    pub const ALL: [GemmaModel; 4] =
+        [GemmaModel::E4B, GemmaModel::G27B, GemmaModel::D31B, GemmaModel::Qwen8B];
 
     pub fn folder(self) -> &'static str {
         match self {
             GemmaModel::E4B => FOLDER,
-            GemmaModel::A26B => FOLDER_26B,
+            GemmaModel::G27B => FOLDER_27B,
             GemmaModel::D31B => FOLDER_31B,
+            GemmaModel::Qwen8B => FOLDER_QWEN,
         }
     }
 
     pub fn model_file(self) -> &'static str {
         match self {
             GemmaModel::E4B => MODEL_FILE,
-            GemmaModel::A26B => MODEL_FILE_26B,
+            GemmaModel::G27B => MODEL_FILE_27B,
             GemmaModel::D31B => MODEL_FILE_31B,
+            GemmaModel::Qwen8B => MODEL_FILE_QWEN,
         }
     }
 
@@ -71,16 +88,18 @@ impl GemmaModel {
     pub fn label(self) -> &'static str {
         match self {
             GemmaModel::E4B => "Gemma 4 E4B",
-            GemmaModel::A26B => "Gemma 4 26B A4B",
+            GemmaModel::G27B => "Gemma 3 27B",
             GemmaModel::D31B => "Gemma 4 31B",
+            GemmaModel::Qwen8B => "Qwen3-VL 8B",
         }
     }
 
     pub fn hint(self) -> &'static str {
         match self {
             GemmaModel::E4B => "~6 GB · fast, fits fully on 8 GB+ GPUs — recommended",
-            GemmaModel::A26B => "~18 GB · much smarter (MoE); wants ~20 GB VRAM, else spills to RAM (slower)",
+            GemmaModel::G27B => "~16 GB · very strong; wants ~20 GB VRAM, else spills to RAM (slower)",
             GemmaModel::D31B => "~19.5 GB · strongest; on a 16 GB GPU it runs partly on the CPU (slower)",
+            GemmaModel::Qwen8B => "~6 GB · fast, a different flavour to Gemma — worth comparing",
         }
     }
 
@@ -691,6 +710,7 @@ impl LlmState {
             self.worker = spawn_worker(ctx.clone(), self.model);
             self.worker_model = self.model;
         }
+        GEN_CANCEL.store(false, Ordering::SeqCst);
         match &self.worker {
             Some(w) if w.tx.send(Cmd::Generate { msgs, params: self.params }).is_ok() => {
                 // The empty reply bubble the tokens stream into.
@@ -709,6 +729,16 @@ impl LlmState {
                 self.worker = None;
                 self.run_err = Some("The AI worker stopped — try again.".to_string());
             }
+        }
+    }
+
+    /// The chat's Stop button: ask the worker to end the streaming reply.
+    /// It finishes the token in flight and reports Done, so whatever streamed
+    /// so far stays in the bubble as the (partial) reply.
+    pub fn stop_generation(&mut self) {
+        if self.running {
+            GEN_CANCEL.store(true, Ordering::SeqCst);
+            self.status = "Stopping…".into();
         }
     }
 
@@ -802,7 +832,7 @@ impl LlmState {
 
 /// Split a model reply into its thought channel and the visible answer.
 ///
-/// The big Gemma 4 variants (26B/31B) reason before answering on the wire:
+/// The big Gemma 4 (the 31B) reasons before answering on the wire:
 /// `<|channel>thought\n{thinking}<channel|>{answer}` — `<|channel>NAME`
 /// switches into a named channel, a bare `<channel|>` switches back to the
 /// visible answer. Channels named thought/thinking/analysis collect into the
@@ -1009,11 +1039,11 @@ mod worker {
         send(Msg::Status("Loading the model (first time takes a minute)…".into()));
         let backend = LlamaBackend::init().map_err(|e| format!("llama.cpp init: {e}"))?;
         // Offload to the GPU when a backend is compiled in (`llm-vulkan`) — a
-        // ladder of attempts, because the big variants (26B/31B) don't fit
+        // ladder of attempts, because the big variants (27B/31B) don't fit
         // whole in common VRAM sizes: everything → about half → CPU only.
         // Each rung must survive the WHOLE pipeline — weights, vision
         // projector, and a probe context — because weights fitting is not
-        // enough: the 26B loads into ~20 GB of VRAM and llama.cpp then
+        // enough: a big model can load into ~20 GB of VRAM and llama.cpp then
         // returns a null context when the KV cache no longer fits.
         let mut loaded = None;
         let mut last_err = String::new();
@@ -1129,29 +1159,54 @@ mod worker {
         // channels) that llama.cpp's built-in non-Jinja formatter doesn't
         // recognise (ffi error -1). Its actual wire format is simple, so fall
         // back to formatting the turns by hand; the template path still
-        // serves models with conventional templates.
-        // The big variants (26B/31B) reason in a thought channel — but only
-        // when the wire format's global thinking switch is on: a `<|think|>`
-        // token at the very top of a system turn (straight from the GGUF's
-        // own Jinja template; merely opening the reply with the channel
-        // header gets an empty thought — verified via llm_raw_probe_26b).
-        // With the switch on the model opens `<|channel>thought\n{reasoning}
-        // <channel|>` by itself, which the UI's split_channels understands.
-        let think = matches!(which, super::GemmaModel::A26B | super::GemmaModel::D31B);
+        // serves models with conventional templates (Gemma 3's and Qwen's
+        // are both known to the built-in formatter, so their fallbacks below
+        // are belt-and-braces).
+        // The 31B reasons in a thought channel — but only when the wire
+        // format's global thinking switch is on: a `<|think|>` token at the
+        // very top of a system turn (straight from the GGUF's own Jinja
+        // template; merely opening the reply with the channel header gets an
+        // empty thought — verified via llm_raw_probe_31b). With the switch on
+        // the model opens `<|channel>thought\n{reasoning}<channel|>` by
+        // itself, which the UI's split_channels understands.
+        let think = matches!(which, super::GemmaModel::D31B);
         let formatted = match model.apply_chat_template(template, &chat, true) {
             Ok(s) => s,
-            Err(_) => {
-                let mut s = String::new();
-                if think {
-                    s.push_str("<|turn>system\n<|think|>\n<turn|>\n");
+            Err(_) => match which {
+                // Gemma 4's wire format.
+                super::GemmaModel::E4B | super::GemmaModel::D31B => {
+                    let mut s = String::new();
+                    if think {
+                        s.push_str("<|turn>system\n<|think|>\n<turn|>\n");
+                    }
+                    for (user, text) in &turns {
+                        let role = if *user { "user" } else { "model" };
+                        s.push_str(&format!("<|turn>{role}\n{text}<turn|>\n"));
+                    }
+                    s.push_str("<|turn>model\n");
+                    s
                 }
-                for (user, text) in &turns {
-                    let role = if *user { "user" } else { "model" };
-                    s.push_str(&format!("<|turn>{role}\n{text}<turn|>\n"));
+                // Gemma 3's wire format.
+                super::GemmaModel::G27B => {
+                    let mut s = String::new();
+                    for (user, text) in &turns {
+                        let role = if *user { "user" } else { "model" };
+                        s.push_str(&format!("<start_of_turn>{role}\n{text}<end_of_turn>\n"));
+                    }
+                    s.push_str("<start_of_turn>model\n");
+                    s
                 }
-                s.push_str("<|turn>model\n");
-                s
-            }
+                // ChatML, Qwen's wire format.
+                super::GemmaModel::Qwen8B => {
+                    let mut s = String::new();
+                    for (user, text) in &turns {
+                        let role = if *user { "user" } else { "assistant" };
+                        s.push_str(&format!("<|im_start|>{role}\n{text}<|im_end|>\n"));
+                    }
+                    s.push_str("<|im_start|>assistant\n");
+                    s
+                }
+            },
         };
         let input = MtmdInputText { text: formatted, add_special: true, parse_special: true };
         let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
@@ -1197,6 +1252,10 @@ mod worker {
         // UTF-8 character (CJK, emoji), so bytes carry over between pieces.
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         for i in 0..params.max_tokens {
+            // The UI's Stop button: end the reply here, keeping what streamed.
+            if super::GEN_CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
             let token = sampler.sample(&context, -1);
             sampler.accept(token);
             if model.is_eog_token(token) {
@@ -1344,7 +1403,7 @@ mod split_channel_tests {
 
     #[test]
     fn empty_thought_block() {
-        // Real 26B output: an empty thought header straight into the answer.
+        // Real Gemma 4 output: an empty thought header straight into the answer.
         let (t, v) = split_channels(
             "<|channel>thought\n<channel|>Hey Peter! I was wondering when I'd hear from you.",
         );
@@ -1629,16 +1688,16 @@ mod tests {
         assert_eq!(idx, names.len(), "not all scenarios completed");
     }
 
-    /// Diagnostic: print the 26B's RAW wire output (channel markers included,
+    /// Diagnostic: print the 31B's RAW wire output (channel markers included,
     /// debug-escaped) plus what split_channels makes of it, for two asks —
     /// a reasoning question, and the role-play scene that once came back as
     /// an empty bubble (the model drafted its whole reply inside the thought
     /// and ended the turn). Small caps so the runaway-thought force-close
-    /// path is exercised. Needs the 26B files installed.
+    /// path is exercised. Needs the 31B files installed.
     #[test]
     #[ignore]
-    fn llm_raw_probe_26b() {
-        assert!(GemmaModel::A26B.installed(), "26B model files not found");
+    fn llm_raw_probe_31b() {
+        assert!(GemmaModel::D31B.installed(), "31B model files not found");
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         cmd_tx
@@ -1682,7 +1741,7 @@ mod tests {
         drop(cmd_tx);
 
         let ctx = egui::Context::default();
-        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::A26B));
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::D31B));
         let mut raw = String::new();
         let mut n = 0;
         for msg in msg_rx {
