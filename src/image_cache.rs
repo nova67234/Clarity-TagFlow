@@ -65,11 +65,25 @@ impl Drop for SemaphoreGuard<'_> {
     }
 }
 
+/// `image::ImageReader::open`, but reading through [`crate::archive`] so
+/// entries of a mounted zip decode from memory like plain files.
+fn image_reader(
+    path: &Path,
+) -> std::io::Result<image::ImageReader<std::io::BufReader<crate::archive::Reader>>> {
+    Ok(image::ImageReader::new(std::io::BufReader::new(crate::archive::open(path)?)))
+}
+
+/// `image::image_dimensions`, routed through [`crate::archive`] (header-only
+/// read either way).
+fn probe_dimensions(path: &Path) -> Option<(u32, u32)> {
+    image_reader(path).ok()?.with_guessed_format().ok()?.into_dimensions().ok()
+}
+
 /// Take a permit from this cache's `gate` if `path` is a large (≥ [`LARGE_PIXELS`])
-/// image; otherwise `None` (no throttling). `image_dimensions` only reads the
+/// image; otherwise `None` (no throttling). `probe_dimensions` only reads the
 /// header, so the size check is cheap. Hold the guard for the whole decode.
 fn large_decode_permit<'a>(path: &Path, gate: &'a Semaphore) -> Option<SemaphoreGuard<'a>> {
-    let pixels = image::image_dimensions(path)
+    let pixels = probe_dimensions(path)
         .map(|(w, h)| w as u64 * h as u64)
         .unwrap_or(0);
     (pixels >= LARGE_PIXELS).then(|| gate.acquire())
@@ -450,7 +464,7 @@ fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::Co
     // once and apply it to whatever the decode paths below produce.
     let orientation = exif_orientation(path);
 
-    if let Ok((w, h)) = image::image_dimensions(path) {
+    if let Some((w, h)) = probe_dimensions(path) {
         if w > max_edge || h > max_edge {
             if let Some(mut img) = decode_downscaled(path, w, h, max_edge) {
                 img.apply_orientation(orientation);
@@ -465,7 +479,7 @@ fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::Co
     // spike RAM and freeze the UI (small images skip the gate inside the helper).
     let _gate = large_decode_permit(path, gate);
 
-    match image::ImageReader::open(path)
+    match image_reader(path)
         .ok()?
         .with_guessed_format()
         .ok()?
@@ -482,7 +496,7 @@ fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::Co
         // photometric interpretation"). Recover the embedded camera JPEG instead.
         Err(_) if matches!(path.extension().and_then(|e| e.to_str()), Some(e) if e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff")) =>
         {
-            let bytes = std::fs::read(path).ok()?;
+            let bytes = crate::archive::read(path).ok()?;
             let rgba = crate::raw_preview::largest_embedded_jpeg(&bytes)?;
             let img = image::DynamicImage::ImageRgba8(rgba).thumbnail(max_edge, max_edge);
             Some(color_image(&img.to_rgba8()))
@@ -497,7 +511,7 @@ fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::Co
 /// header/metadata, not the pixels.
 fn exif_orientation(path: &Path) -> image::metadata::Orientation {
     use image::ImageDecoder;
-    image::ImageReader::open(path)
+    image_reader(path)
         .ok()
         .and_then(|r| r.with_guessed_format().ok())
         .and_then(|r| r.into_decoder().ok())
@@ -525,7 +539,7 @@ pub fn decode_hdr(path: &Path) -> Option<image::RgbaImage> {
     // format equally permits `#?RGBE` (and other program-name tokens). Read the
     // bytes, normalise the signature line, and decode from memory so those files
     // aren't rejected as "signature invalid".
-    let bytes = normalize_hdr_signature(std::fs::read(path).ok()?);
+    let bytes = normalize_hdr_signature(crate::archive::read(path).ok()?);
     let decoder = image::codecs::hdr::HdrDecoder::new(std::io::Cursor::new(&bytes)).ok()?;
     let src = image::DynamicImage::from_decoder(decoder).ok()?.to_rgb32f();
     let (w, h) = src.dimensions();
@@ -590,7 +604,7 @@ fn decode_downscaled(path: &Path, src_w: u32, src_h: u32, max_edge: u32) -> Opti
 fn decode_jpeg_scaled(path: &Path, max_edge: u32) -> Option<image::DynamicImage> {
     use jpeg_decoder::PixelFormat;
 
-    let file = std::fs::File::open(path).ok()?;
+    let file = crate::archive::open(path).ok()?;
     let mut decoder = jpeg_decoder::Decoder::new(std::io::BufReader::new(file));
     // Ask for ~max_edge; the decoder snaps to the nearest power-of-two DCT scale.
     decoder.scale(max_edge as u16, max_edge as u16).ok()?;
@@ -610,7 +624,7 @@ fn decode_jpeg_scaled(path: &Path, max_edge: u32) -> Option<image::DynamicImage>
 /// and every `ss`-th pixel, so only the small output (plus one source row) is
 /// ever held. Interlaced PNGs don't arrive top-to-bottom, so they return `None`.
 fn decode_png_subsampled(path: &Path, src_w: u32, src_h: u32, max_edge: u32) -> Option<image::DynamicImage> {
-    let file = std::fs::File::open(path).ok()?;
+    let file = crate::archive::open(path).ok()?;
     let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
     // Normalize rows to 8-bit and expand palette / low-bit-depth, so a row is a
     // simple array of 1–4 bytes-per-pixel that we can sample directly.
@@ -669,7 +683,7 @@ fn decode_png_subsampled(path: &Path, src_w: u32, src_h: u32, max_edge: u32) -> 
 /// 8-bit, stripped RGB/RGBA/Gray case is handled — anything else (tiled, planar,
 /// 16-bit, CMYK, …) returns `None` and lets the full-decode fallback take over.
 fn decode_tiff_subsampled(path: &Path, src_w: u32, src_h: u32, max_edge: u32) -> Option<image::DynamicImage> {
-    let file = std::fs::File::open(path).ok()?;
+    let file = crate::archive::open(path).ok()?;
     let mut decoder = tiff::decoder::Decoder::new(std::io::BufReader::new(file)).ok()?;
 
     let channels = match decoder.colortype().ok()? {
@@ -736,7 +750,7 @@ fn decode_tiff_subsampled(path: &Path, src_w: u32, src_h: u32, max_edge: u32) ->
 fn decode_webp_scaled(path: &Path, src_w: u32, src_h: u32, max_edge: u32) -> Option<image::DynamicImage> {
     use libwebp_sys as webp;
 
-    let data = std::fs::read(path).ok()?;
+    let data = crate::archive::read(path).ok()?;
 
     // Fit the long edge to max_edge, preserving aspect (only ever downscaling).
     let scale = (max_edge as f64 / src_w.max(src_h).max(1) as f64).min(1.0);
@@ -803,7 +817,7 @@ fn color_image(rgba: &image::RgbaImage) -> egui::ColorImage {
 /// the Image Info panel matches the displayed image.
 pub fn oriented_dimensions(path: &Path) -> Option<(u32, u32)> {
     use image::metadata::Orientation;
-    let (w, h) = image::image_dimensions(path).ok()?;
+    let (w, h) = probe_dimensions(path)?;
     let rotated = matches!(
         exif_orientation(path),
         Orientation::Rotate90

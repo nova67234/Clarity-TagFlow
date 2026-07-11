@@ -295,7 +295,8 @@ pub fn show(
 
         if let Some(path) = current_image {
             let txt_path = sidecar_txt(path);
-            state.current_tags = std::fs::read_to_string(&txt_path).unwrap_or_default();
+            // Through `archive` so sidecars inside a mounted zip backup load too.
+            state.current_tags = crate::archive::read_to_string(&txt_path).unwrap_or_default();
             // Look up this image's artist/character roles (by md5) from the shared
             // tag_roles.json, so the tag box can colour those tags.
             state.tag_roles = lookup_tag_roles(&mut state.roles_cache, path);
@@ -643,15 +644,21 @@ pub fn show(
                                         state.copy_flash = Some((Instant::now(), ok));
                                     }
 
+                                    // Images inside a mounted zip are view-only: no tag
+                                    // edits, moves or deletes (nothing is ever written
+                                    // into — or extracted from — the archive).
+                                    let read_only = crate::archive::is_entry(img_path);
+
                                     // Edit/Save slot: flashes green when a save succeeds,
                                     // red when the write fails (stays in edit mode to retry).
                                     let mut edit_btn =
-                                        egui::Button::new(label(if state.is_editing { "Save" } else { "Edit Text" }));
+                                        egui::Button::new(label(if state.is_editing { "Save" } else { "Edit Text" }))
+                                            .min_size(size);
                                     if let Some(fill) = flash_fill(ui, state.save_flash, FLASH_GREEN, FLASH_RED) {
                                         edit_btn = edit_btn.fill(fill);
                                     }
 
-                                    if ui.add_sized(size, edit_btn).clicked() {
+                                    if ui.add_enabled(!read_only, edit_btn).clicked() {
                                         if state.showing_meta {
                                             // The metadata view is read-only. Clicking
                                             // Edit Text here drops to the .txt tags view,
@@ -680,16 +687,20 @@ pub fn show(
                                         }
                                     }
 
-                                    if ui.add_sized(size, egui::Button::new(label("Move"))).clicked() {
+                                    if ui
+                                        .add_enabled(!read_only, egui::Button::new(label("Move")).min_size(size))
+                                        .clicked()
+                                    {
                                         action = RightPanelAction::MoveCurrent;
                                     }
 
                                     let danger_bg = egui::Color32::from_rgb(180, 40, 40);
                                     let delete_btn =
                                         egui::Button::new(label("Delete").color(egui::Color32::WHITE))
-                                            .fill(danger_bg);
+                                            .fill(danger_bg)
+                                            .min_size(size);
 
-                                    if ui.add_sized(size, delete_btn).clicked() {
+                                    if ui.add_enabled(!read_only, delete_btn).clicked() {
                                         // Confirm first, unless confirmations are disabled.
                                         if *confirm_before_delete {
                                             state.show_delete_confirm = true;

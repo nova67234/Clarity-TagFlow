@@ -73,6 +73,7 @@ mod voice;
 // Role playing for the AI Chat: persona, names, shared memory diary.
 mod roleplay;
 #[cfg(feature = "avif")]
+mod archive;
 mod avif;
 mod backup;
 mod bgremove;
@@ -178,16 +179,43 @@ fn main() -> eframe::Result {
             app.last_theme = app.settings.theme;
             app.last_glass_light = app.settings.glass_light;
             apply_theme(&cc.egui_ctx);
-            // Optional: open a folder passed on the command line (e.g. "Open with").
-            if let Some(arg) = std::env::args().nth(1) {
-                let dir = PathBuf::from(arg);
-                if dir.is_dir() {
-                    app.load_folder(&dir);
+            // Optional: open a folder passed on the command line (e.g. "Open
+            // with"), falling back to the Input folder from the last session.
+            // A `.zip` input never opens silently — it always goes through the
+            // password prompt first.
+            let is_zip = |p: &PathBuf| {
+                p.is_file()
+                    && p.extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+            };
+            let cli = std::env::args().nth(1).map(PathBuf::from);
+            let saved = (!app.settings.input_folder.trim().is_empty())
+                .then(|| PathBuf::from(app.settings.input_folder.trim()));
+            let restore = cli
+                .filter(|p| p.is_dir() || is_zip(p))
+                .or_else(|| saved.filter(|p| p.is_dir() || is_zip(p)));
+            if let Some(target) = restore {
+                if is_zip(&target) {
+                    app.prompt_for_zip(target);
+                } else {
+                    app.load_folder(&target);
                 }
             }
             Ok(Box::new(app))
         }),
     )
+}
+
+/// State of the zip password prompt (see `ViewerApp::show_zip_prompt`).
+struct ZipPrompt {
+    /// The `.zip` waiting to be opened.
+    path: PathBuf,
+    password: String,
+    /// Shown under the password box after a failed attempt.
+    error: Option<String>,
+    /// The password box grabs focus once per prompt (and again after a wrong
+    /// password clears it).
+    focused: bool,
 }
 
 /// Decode the bundled PNG into an egui window icon (taskbar / title bar).
@@ -249,6 +277,11 @@ fn spawn_bg_inference(src: PathBuf, ctx: egui::Context) -> std::sync::mpsc::Rece
 // ---------------------------------------------------------------------------
 struct ViewerApp {
     images: Vec<PathBuf>,
+    /// The folder button's popup (input/output folder pickers).
+    folder_popup: top_bar::FolderPopup,
+    /// Password prompt for opening a zip archive as the input (see
+    /// `src/archive.rs`). `Some` while the prompt is on screen.
+    zip_prompt: Option<ZipPrompt>,
     /// The folder last opened via the folder button (the backup root). `None`
     /// when the list was built only from individually dropped files.
     current_folder: Option<PathBuf>,
@@ -345,6 +378,8 @@ impl Default for ViewerApp {
     fn default() -> Self {
         Self {
             images: Vec::new(),
+            folder_popup: top_bar::FolderPopup::default(),
+            zip_prompt: None,
             current_folder: None,
             last_extended_formats: settings::Settings::default().enable_extended_formats,
             last_theme: Theme::default(),
@@ -439,17 +474,40 @@ impl ViewerApp {
         entry.1.contains(query)
     }
 
-    /// Pick a folder and show every image in it (replacing the current list).
-    fn open_dialog(&mut self) {
-        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-            self.load_folder(&dir);
-        }
+    /// Unload the current folder (the folder popup's "Clear Input"), emptying
+    /// the browser and viewer. Also forgets the remembered Input folder so the
+    /// next launch starts empty, and unmounts any open zip archive.
+    fn clear_folder(&mut self) {
+        archive::close();
+        self.images.clear();
+        self.current_folder = None;
+        self.selected = None;
+        self.settings.input_folder.clear();
+        self.tag_search_cache.clear();
+        self.update_filtered();
+    }
+
+    /// Replace the browser contents with the (already opened) zip archive's
+    /// media entries — virtual paths served from memory by `src/archive.rs`.
+    fn load_zip_entries(&mut self, zip_path: &std::path::Path, mut entries: Vec<PathBuf>) {
+        entries.retain(|p| is_media(p));
+        entries.sort();
+        self.images = entries;
+        self.current_folder = None; // not a real directory
+        // Remember the zip as the Input so the next launch re-prompts for it.
+        self.settings.input_folder = zip_path.display().to_string();
+        self.selected = if self.images.is_empty() { None } else { Some(0) };
+        self.tag_search_cache.clear();
+        self.update_filtered();
     }
 
     /// Replace the browser contents with all images found directly in `dir`.
     fn load_folder(&mut self, dir: &std::path::Path) {
+        archive::close(); // a real folder replaces any mounted zip
         self.images = images_in_dir(dir);
         self.current_folder = Some(dir.to_path_buf());
+        // Remember the Input folder so the next launch reopens it.
+        self.settings.input_folder = dir.display().to_string();
         self.selected = if self.images.is_empty() { None } else { Some(0) };
         self.tag_search_cache.clear(); // tags belong to the previous folder
         self.update_filtered();
@@ -459,6 +517,10 @@ impl ViewerApp {
     /// backup root is the last-opened folder, falling back to the first image's
     /// parent (e.g. when files were dropped in individually).
     fn start_backup(&mut self) {
+        // A mounted zip can't be backed up (its entries aren't files on disk).
+        if archive::active().is_some() {
+            return;
+        }
         let source = self
             .current_folder
             .clone()
@@ -489,6 +551,10 @@ impl ViewerApp {
     /// full-resolution original from disk so the crop isn't limited to the
     /// (possibly downscaled) on-screen texture. A port of ViewerPanel.cropTo().
     fn crop_current(&mut self, src: &std::path::Path, frac: zoom::CropFraction) {
+        // Zip entries are view-only (cropping writes a new file next to the source).
+        if archive::is_entry(src) {
+            return;
+        }
         // `decode_full_rgba` covers common formats via `image::open` plus the
         // extended formats (AVIF/HEIC/RAW) through our own decoder, so cropping
         // works on everything the viewer can display.
@@ -596,7 +662,8 @@ impl ViewerApp {
     /// Start removing the background of `src` (right-click action). Downloads the
     /// BiRefNet model first if it isn't installed. One job at a time.
     fn start_bgremove(&mut self, src: &std::path::Path, ctx: &egui::Context) {
-        if self.bg_job.is_some() {
+        // Zip entries are view-only (the result is written next to the source).
+        if self.bg_job.is_some() || archive::is_entry(src) {
             return;
         }
         let src = src.to_path_buf();
@@ -815,12 +882,30 @@ impl ViewerApp {
         }
     }
 
-    /// Move the selected image (and its `.txt` sidecar) to a folder the user picks,
+    /// Move the selected image (and its `.txt` sidecar) to the Output folder
+    /// (folder button's popup) — or a folder the user picks when none is set —
     /// then drop it from the list. Shared by the right panel and the gallery popup.
     fn move_selected(&mut self) {
         let Some(idx) = self.selected else { return };
-        let Some(target_dir) = rfd::FileDialog::new().pick_folder() else { return };
         let img_path = self.images[idx].clone();
+        // Zip entries are view-only — never move out of an archive (checked
+        // before the picker so no dialog pops up either).
+        if archive::is_entry(&img_path) {
+            return;
+        }
+        let out = self.settings.output_folder.trim();
+        let target_dir = if out.is_empty() {
+            let Some(dir) = rfd::FileDialog::new().pick_folder() else { return };
+            dir
+        } else {
+            std::path::PathBuf::from(out)
+        };
+        // Moving into the folder the image already lives in would only drop it
+        // from the list — treat it as a no-op instead.
+        if img_path.parent() == Some(target_dir.as_path()) {
+            return;
+        }
+        let _ = std::fs::create_dir_all(&target_dir);
         let txt_path = right_details::sidecar_txt(&img_path);
 
         if let Some(file_name) = img_path.file_name() {
@@ -833,6 +918,145 @@ impl ViewerApp {
         }
 
         self.remove_image_at(idx);
+    }
+
+    /// Show the password prompt for `path` (a `.zip`). The archive is opened
+    /// only after the prompt — even at startup for the remembered Input zip —
+    /// and the password never leaves the process.
+    fn prompt_for_zip(&mut self, path: PathBuf) {
+        self.zip_prompt = Some(ZipPrompt {
+            path,
+            password: String::new(),
+            error: None,
+            focused: false,
+        });
+    }
+
+    /// Draw the zip password prompt while one is pending and handle its
+    /// Open/Cancel actions.
+    fn show_zip_prompt(&mut self, ctx: &egui::Context) {
+        let mut submit = false;
+        let mut cancel;
+        {
+            let Some(prompt) = &mut self.zip_prompt else { return };
+            cancel = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+            let name = prompt
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            // A fixed, centred modal — deliberately not movable, like the other
+            // modal dialogs (Settings / Backup / Confirm Delete).
+            egui::Window::new("Open Zip")
+                .id(egui::Id::new("zip_password_prompt"))
+                .title_bar(false)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .frame(
+                    egui::Frame::new()
+                        .fill(PANEL())
+                        .corner_radius(CornerRadius::same(16))
+                        .inner_margin(Margin::same(18))
+                        .stroke(Stroke::new(1.0, EDGE()))
+                        .shadow(egui::epaint::Shadow {
+                            offset: [0, 6],
+                            blur: 20,
+                            spread: 0,
+                            color: Color32::from_black_alpha(150),
+                        }),
+                )
+                .show(ctx, |ui| {
+                    ui.set_width(320.0);
+                    ui.heading(egui::RichText::new("Open Zip").color(TEXT()).strong().size(17.0));
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new(&name).color(MUTED()).size(12.0));
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Enter the archive password (leave it empty if the zip isn't \
+                             encrypted). Contents are viewed straight from the zip — nothing \
+                             is ever extracted.",
+                        )
+                        .color(MUTED())
+                        .size(11.0),
+                    );
+                    ui.add_space(8.0);
+                    let resp = ui.add_sized(
+                        egui::vec2(ui.available_width(), 30.0),
+                        egui::TextEdit::singleline(&mut prompt.password)
+                            .password(true)
+                            .hint_text("Password")
+                            // Centre the text in the 30px box (a sized TextEdit
+                            // top-aligns its one line by default).
+                            .vertical_align(egui::Align::Center),
+                    );
+                    if !prompt.focused {
+                        resp.request_focus();
+                        prompt.focused = true;
+                    }
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        submit = true;
+                    }
+                    if let Some(err) = &prompt.error {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(err)
+                                .color(Color32::from_rgb(230, 90, 90))
+                                .size(12.0),
+                        );
+                    }
+                    ui.add_space(12.0);
+                    // Wrapped in horizontal() so the right-to-left layout only
+                    // claims one row, not all remaining window height.
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let open_btn = egui::Button::new(
+                                egui::RichText::new("Open").color(Color32::WHITE).strong(),
+                            )
+                            .fill(ACCENT1())
+                            .min_size(egui::vec2(84.0, 30.0));
+                            if ui.add(open_btn).clicked() {
+                                submit = true;
+                            }
+                            if ui
+                                .add(egui::Button::new("Cancel").min_size(egui::vec2(84.0, 30.0)))
+                                .clicked()
+                            {
+                                cancel = true;
+                            }
+                        });
+                    });
+                });
+        }
+
+        if submit {
+            let (path, password) = {
+                let p = self.zip_prompt.as_ref().unwrap();
+                (p.path.clone(), p.password.clone())
+            };
+            match archive::open_archive(&path, &password) {
+                Ok(entries) => {
+                    self.zip_prompt = None;
+                    self.load_zip_entries(&path, entries);
+                }
+                Err(archive::OpenError::WrongPassword) => {
+                    if let Some(p) = &mut self.zip_prompt {
+                        p.error = Some("Wrong password — try again.".to_string());
+                        p.password.clear();
+                        p.focused = false; // re-focus the emptied box
+                    }
+                }
+                Err(archive::OpenError::Other(e)) => {
+                    if let Some(p) = &mut self.zip_prompt {
+                        p.error = Some(format!("Couldn't open the zip: {e}"));
+                    }
+                }
+            }
+        } else if cancel {
+            self.zip_prompt = None;
+        }
     }
 
     /// Remove image `idx`, re-filter the browser, and clamp the selection to a
@@ -878,6 +1102,10 @@ impl ViewerApp {
     fn delete_selected(&mut self) {
         let Some(idx) = self.selected else { return };
         let img_path = self.images[idx].clone();
+        // Zip entries are view-only — never delete out of an archive.
+        if archive::is_entry(&img_path) {
+            return;
+        }
         let txt_path = right_details::sidecar_txt(&img_path);
 
         // Stop any embedded player so VLC releases the file before we delete it.
@@ -919,11 +1147,16 @@ impl ViewerApp {
         if self.settings.ai_chat && ai_chat::claims_drop(&self.llm, ctx) {
             return;
         }
-        // A dropped folder loads all media inside it; dropped files are added directly.
+        // A dropped folder loads all media inside it; dropped files are added
+        // directly; a dropped zip goes through the password prompt and opens
+        // as the (view-only, in-memory) input.
         let mut to_add = Vec::new();
         for p in dropped {
             if p.is_dir() {
                 to_add.extend(images_in_dir(&p));
+            } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) {
+                self.prompt_for_zip(p);
+                return;
             } else if is_media(&p) {
                 to_add.push(p);
             }
@@ -1216,12 +1449,13 @@ impl eframe::App for ViewerApp {
         let update_badge = self.update.badge(&self.settings);
         match top_bar::show(ui, &self.stats, self.settings.show_stats, update_badge, self.settings.ftp_enabled) {
             // In FTP mode the folder button opens the remote browser instead of
-            // the local folder picker.
-            top_bar::TopBarAction::OpenFolder => {
+            // the input/output folder popup.
+            top_bar::TopBarAction::OpenFolder(pos) => {
                 if self.settings.ftp_enabled {
                     self.ftp.browser_open = !self.ftp.browser_open;
                 } else {
-                    self.open_dialog();
+                    self.folder_popup.open = !self.folder_popup.open;
+                    self.folder_popup.anchor = Some(pos + egui::vec2(0.0, 8.0));
                 }
             }
             top_bar::TopBarAction::OpenSettings => self.settings.open = !self.settings.open,
@@ -1232,6 +1466,24 @@ impl eframe::App for ViewerApp {
             }
             top_bar::TopBarAction::None => {}
         }
+
+        // The folder button's popup: select/clear the Input (a folder or a zip
+        // archive) and the Output folder used by the Move button.
+        let shown_input = self.current_folder.clone().or_else(archive::active);
+        match top_bar::folder_popup(
+            ui.ctx(),
+            &mut self.folder_popup,
+            shown_input.as_deref(),
+            &mut self.settings.output_folder,
+        ) {
+            top_bar::FolderMenuAction::LoadInput(dir) => self.load_folder(&dir),
+            top_bar::FolderMenuAction::OpenZip(path) => self.prompt_for_zip(path),
+            top_bar::FolderMenuAction::ClearInput => self.clear_folder(),
+            top_bar::FolderMenuAction::None => {}
+        }
+
+        // Zip password prompt (opens the archive on success).
+        self.show_zip_prompt(ui.ctx());
 
         // While the Generate (Flux) view is open, swap the browser/viewer over to
         // the session's generated images (restored on exit).
