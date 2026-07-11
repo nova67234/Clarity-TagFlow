@@ -818,10 +818,17 @@ pub fn show(
                                         ui.set_height(inner_h); // fixed — never grows with text
                                         ui.set_width(ui.available_width());
 
+                                        // Push the scrollbar into the box's right
+                                        // margin so it rides the edge instead of
+                                        // sitting on the text (same treatment as
+                                        // the left browser / gallery).
+                                        const SCROLL_GUTTER: f32 = 12.0;
+                                        let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
                                         egui::ScrollArea::vertical()
                                             .auto_shrink([false, false])
                                             .max_height(inner_h)
-                                            .show(ui, |ui| {
+                                            .show(&mut scroll_ui, |ui| {
+                                                ui.set_max_width(ui.available_width() - SCROLL_GUTTER);
                                                 // Keep scrolling while a text selection
                                                 // is dragged past the box edge.
                                                 crate::drag_select_autoscroll(ui);

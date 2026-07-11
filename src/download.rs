@@ -343,9 +343,15 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.inner_margin(egui::Margin::ZERO))
         .show_inside(ui, |ui| {
+            // Push the scrollbar into the card's right margin so it rides the
+            // panel edge instead of sitting on the form (same treatment as the
+            // gallery).
+            const SCROLL_GUTTER: f32 = 12.0;
+            let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .show(ui, |ui| {
+                .show(&mut scroll_ui, |ui| {
+                    ui.set_max_width(ui.available_width() - SCROLL_GUTTER);
                     let api = state.api_status.load(Ordering::Relaxed);
                     section_with_pill(ui, "Destination", api, |ui| {
                         field_label(ui, "Output folder");

@@ -193,9 +193,17 @@ fn thumbnail_list(
         scroll_area = scroll_area.vertical_scroll_offset(0.0);
     }
 
+    // The card's inner margin sits between the tiles and the panel edge. Widen
+    // the scroll area into that margin so the floating scrollbar rides the
+    // card's edge instead of overlapping the images; the tiles are still laid
+    // out against the original (narrower) width below.
+    const SCROLL_GUTTER: f32 = 12.0;
+    let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
+    let ui = &mut scroll_ui;
+
     scroll_area
         .show_viewport(ui, |ui, viewport| {
-            let avail_w = ui.available_width();
+            let avail_w = ui.available_width() - SCROLL_GUTTER;
 
             // Size every tile up front (cheap arithmetic) so we know the total
             // content height and each tile's vertical offset.

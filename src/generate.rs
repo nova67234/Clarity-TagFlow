@@ -1835,7 +1835,12 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
                 let shown = state.loras.iter().filter(|l| l.base.matches(family)).count();
                 let hidden = state.loras.len() - shown;
                 let show_other = state.show_other_loras;
-                egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, false]).show(ui, |ui| {
+                // Push the scrollbar into the popup's margin so it rides the
+                // window edge instead of sitting on the LoRA cards.
+                const SCROLL_GUTTER: f32 = 12.0;
+                let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
+                egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, false]).show(&mut scroll_ui, |ui| {
+                    ui.set_max_width(ui.available_width() - SCROLL_GUTTER);
                     let tdir = lora_thumbs_dir();
                     if shown == 0 {
                         ui.label(
@@ -1862,6 +1867,7 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
                         }
                     }
                 });
+                crate::edge_scroll_done(ui, &scroll_ui, SCROLL_GUTTER);
                 // Reveal/hide the other-model LoRAs (where the "… hidden" note used
                 // to be).
                 if hidden > 0 {
@@ -2025,7 +2031,12 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
                 let shown = state.embeddings.iter().filter(|e| e.base.matches(family)).count();
                 let hidden = state.embeddings.len() - shown;
                 let show_other = state.show_other_embeddings;
-                egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, false]).show(ui, |ui| {
+                // Push the scrollbar into the popup's margin so it rides the
+                // window edge instead of sitting on the embedding cards.
+                const SCROLL_GUTTER: f32 = 12.0;
+                let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
+                egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, false]).show(&mut scroll_ui, |ui| {
+                    ui.set_max_width(ui.available_width() - SCROLL_GUTTER);
                     if shown == 0 {
                         ui.label(
                             RichText::new(format!("No {} embeddings found.", family.title()))
@@ -2051,6 +2062,7 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
                         }
                     }
                 });
+                crate::edge_scroll_done(ui, &scroll_ui, SCROLL_GUTTER);
                 if hidden > 0 {
                     ui.add_space(6.0);
                     ui.checkbox(
@@ -2340,10 +2352,17 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState, current_image: Option<
     // edge); expanding the log console overflows the panel and this scroll area
     // lets you scroll down to read it.
     let panel_h = ui.available_height();
+    // Push the scrollbar into the card's right margin so it rides the panel
+    // edge instead of sitting on the controls (same treatment as the gallery).
+    const SCROLL_GUTTER: f32 = 12.0;
+    let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
     egui::ScrollArea::vertical()
         .id_salt(state.family.title()) // per-tab scroll position
         .auto_shrink([false, false])
-        .show(ui, |ui| show_inner(ui, state, panel_h, current_image));
+        .show(&mut scroll_ui, |ui| {
+            ui.set_max_width(ui.available_width() - SCROLL_GUTTER);
+            show_inner(ui, state, panel_h, current_image)
+        });
 }
 
 /// The view body. `fill_h` is the panel height to fill: the prompt box

@@ -362,10 +362,38 @@ fn console_box(ui: &mut egui::Ui, title: &str, lines: &[String], height: f32, sa
         ui.set_min_height(HEADER_H);
         ui.label(egui::RichText::new(title).color(MUTED()).strong().size(11.0));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let copy = egui::Button::new(egui::RichText::new("Copy").size(10.0))
-                .corner_radius(egui::CornerRadius::same(8));
-            if ui.add_enabled(!lines.is_empty(), copy).on_hover_text("Copy the log").clicked() {
-                ui.ctx().copy_text(lines.join("\n"));
+            // Copy icon; flips to the green "copied" check for a moment after
+            // a click, as feedback that the log is on the clipboard. Sized to
+            // stay within HEADER_H so the sibling column header lines up.
+            const FLASH_SECS: f64 = 1.2;
+            let flash_id = egui::Id::new("console_copy_flash").with(salt);
+            let now = ui.input(|i| i.time);
+            let flashing = ui
+                .data(|d| d.get_temp::<f64>(flash_id))
+                .is_some_and(|t| now - t < FLASH_SECS);
+            let icon = |src: egui::ImageSource<'static>, tint: egui::Color32| {
+                egui::Button::image(
+                    egui::Image::new(src)
+                        .fit_to_exact_size(egui::vec2(15.0, 15.0))
+                        .tint(tint),
+                )
+                .frame(false)
+            };
+            if flashing {
+                // WHITE tint = keep the icon's own green.
+                ui.add(icon(egui::include_image!("../icons/copied.svg"), egui::Color32::WHITE))
+                    .on_hover_text("Copied");
+                // Wake up to flip back to the copy icon when the flash ends.
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            } else {
+                let copy = icon(
+                    egui::include_image!("../icons/copy.svg"),
+                    crate::theme::icon_tint(MUTED()),
+                );
+                if ui.add_enabled(!lines.is_empty(), copy).on_hover_text("Copy the log").clicked() {
+                    ui.ctx().copy_text(lines.join("\n"));
+                    ui.data_mut(|d| d.insert_temp(flash_id, now));
+                }
             }
         });
     });

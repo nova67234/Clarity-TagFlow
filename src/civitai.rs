@@ -435,10 +435,14 @@ pub fn show(
 
     // Body. The Download buttons set `download_req`, acted on after rendering.
     let mut download_req: Option<DownloadRequest> = None;
+    // Push the scrollbar into the card's right margin so it rides the panel
+    // edge instead of sitting on the cards (same treatment as the gallery).
+    const SCROLL_GUTTER: f32 = 12.0;
+    let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
+        .show(&mut scroll_ui, |ui| {
+            ui.set_width(ui.available_width() - SCROLL_GUTTER);
             match &state.result {
                 Some(res) => render_result(ui, res, &state.downloads, &state.download_dirs, state.thumb_size, &mut download_req),
                 None => {

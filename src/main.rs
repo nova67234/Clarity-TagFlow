@@ -1808,6 +1808,32 @@ pub(crate) fn card_frame(radius: u8) -> egui::Frame {
         })
 }
 
+/// Child ui widened `gutter` px to the right, so a ScrollArea shown inside it
+/// draws its floating scrollbar in the surrounding panel margin instead of on
+/// top of the content — lay the content out `gutter` px narrower to keep it
+/// clear of the bar. The handle is inked (the light-glass grey is invisible
+/// against the panel margin), hidden while idle, and fades in on hover/scroll.
+pub(crate) fn edge_scroll_ui(ui: &mut egui::Ui, gutter: f32) -> egui::Ui {
+    let mut wide = ui.available_rect_before_wrap();
+    wide.max.x += gutter;
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(wide));
+    let scroll = &mut child.style_mut().spacing.scroll;
+    scroll.foreground_color = true;
+    scroll.dormant_handle_opacity = 0.0;
+    scroll.active_handle_opacity = 0.9;
+    child
+}
+
+/// Companion to [`edge_scroll_ui`]: the widened child never advances the
+/// parent's cursor, so when more widgets follow below the scroll area (e.g.
+/// in an auto-sized popup) call this after showing it — otherwise the
+/// trailing widgets land on top of the list and the popup sizes without it.
+pub(crate) fn edge_scroll_done(ui: &mut egui::Ui, child: &egui::Ui, gutter: f32) {
+    let mut used = child.min_rect();
+    used.max.x -= gutter; // the gutter overhang isn't the parent's to claim
+    ui.allocate_rect(used, egui::Sense::hover());
+}
+
 /// Auto-scroll a vertical ScrollArea while the user drag-selects text past its
 /// top or bottom edge — egui doesn't do this on its own, so a selection could
 /// never grow beyond the visible part. Call inside the ScrollArea's closure.
