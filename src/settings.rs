@@ -105,6 +105,14 @@ pub struct Settings {
     /// Play a muted, looping live preview on each visible video thumbnail while
     /// it's in view (stops when scrolled away). Off shows only the static poster.
     pub video_thumbnail_play: bool,
+    /// The last Input folder loaded into the browser, reopened automatically
+    /// on launch. Kept up to date by `load_folder` and emptied by the folder
+    /// popup's "Clear Input".
+    pub input_folder: String,
+    /// Where the Move button (Details & Actions) sends images. Picked in the
+    /// folder button's popup; empty falls back to asking with a folder dialog
+    /// on every move.
+    pub output_folder: String,
     /// FTP mode: the top bar's folder button becomes a remote FTP/FTPS browser
     /// (see `src/ftp.rs`) instead of the local folder picker.
     pub ftp_enabled: bool,
@@ -161,6 +169,8 @@ impl Default for Settings {
             glass_bg: [20, 22, 34],
             glass_backdrop: Backdrop::default(),
             glass_light: false,
+            input_folder: String::new(),
+            output_folder: String::new(),
             ftp_enabled: false,
             ftp_host: String::new(),
             ftp_port: 21,

@@ -6,7 +6,6 @@
 //! large animation. Dimensions come from the regular image path; this only adds
 //! the animation facts.
 
-use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
@@ -25,8 +24,8 @@ const MAX_GIF: usize = 256 * 1024 * 1024; // 256 MiB
 /// Probe a GIF for its frame count and duration. Returns `None` if the file
 /// isn't a GIF or is malformed.
 pub fn probe(path: &Path) -> Option<GifInfo> {
-    let f = File::open(path).ok()?;
-    let len = f.metadata().ok()?.len() as usize;
+    let mut f = crate::archive::open(path).ok()?;
+    let len = f.len().ok()? as usize;
     if len > MAX_GIF {
         return None;
     }

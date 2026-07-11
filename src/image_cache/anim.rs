@@ -99,7 +99,7 @@ pub(super) fn stream_gif(path: &Path, results: &Sender<Decoded>, gate: &Semaphor
 
     let fail = || results.send((path.to_owned(), None)).is_ok();
 
-    let Ok(file) = std::fs::File::open(path) else { return fail() };
+    let Ok(file) = crate::archive::open(path) else { return fail() };
 
     // PERFORMANCE: Use a 64KB BufReader instead of the 8KB default.
     // GIF parsing executes thousands of micro-reads, so a larger buffer massively reduces syscalls.
