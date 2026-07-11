@@ -32,7 +32,7 @@ pub const KEEP_IMAGE_TAG: &str = "KEEP_IMAGE:";
 pub const SHOW_IMAGE_TAG: &str = "SHOW_IMAGE:";
 
 /// How many diary entries ride along in the prompt (newest kept).
-const PROMPT_MEMORIES: usize = 300;
+const PROMPT_MEMORIES: usize = 75;
 
 /// One diary entry.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
