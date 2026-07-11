@@ -210,18 +210,18 @@ const CATALOG: &[ModelInfo] = &[
         ],
     },
     ModelInfo {
-        name: "Gemma 4 26B A4B (local AI, vision)",
-        tab: "Gemma 26B",
-        folder: crate::llm::FOLDER_26B,
-        desc: "The mixture-of-experts Gemma 4 — much smarter than E4B; wants \
-               ~20 GB of VRAM (spills to RAM otherwise). Selectable in \
+        name: "Gemma 3 27B (local AI, vision)",
+        tab: "Gemma 27B",
+        folder: crate::llm::FOLDER_27B,
+        desc: "The previous-generation flagship Gemma — much smarter than E4B; \
+               wants ~20 GB of VRAM (spills to RAM otherwise). Selectable in \
                Settings → AI Model. Not a tagger.",
-        note: "Downloads the UD-Q4_K_M weights (~17 GB) + vision projector (~1.2 GB).",
-        repo: "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF",
+        note: "Downloads the Q4_K_M weights (~15.5 GB) + vision projector (~0.8 GB).",
+        repo: "https://huggingface.co/unsloth/gemma-3-27b-it-GGUF",
         kind: None,
         files: &[
-            (crate::llm::MODEL_FILE_26B, "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"),
-            (crate::llm::MMPROJ_FILE, "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/mmproj-F16.gguf"),
+            (crate::llm::MODEL_FILE_27B, "https://huggingface.co/unsloth/gemma-3-27b-it-GGUF/resolve/main/gemma-3-27b-it-Q4_K_M.gguf"),
+            (crate::llm::MMPROJ_FILE, "https://huggingface.co/unsloth/gemma-3-27b-it-GGUF/resolve/main/mmproj-F16.gguf"),
         ],
     },
     ModelInfo {
@@ -237,6 +237,21 @@ const CATALOG: &[ModelInfo] = &[
         files: &[
             (crate::llm::MODEL_FILE_31B, "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-Q4_K_M.gguf"),
             (crate::llm::MMPROJ_FILE, "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/mmproj-F16.gguf"),
+        ],
+    },
+    ModelInfo {
+        name: "Qwen3-VL 8B (local AI, vision)",
+        tab: "Qwen3-VL",
+        folder: crate::llm::FOLDER_QWEN,
+        desc: "Alibaba's Qwen3-VL vision language model — about E4B's size and \
+               speed, with a different flavour to Gemma. Selectable in \
+               Settings → AI Model. Not a tagger.",
+        note: "Downloads the Q4_K_M weights (~4.7 GB) + vision projector (~1.1 GB).",
+        repo: "https://huggingface.co/unsloth/Qwen3-VL-8B-Instruct-GGUF",
+        kind: None,
+        files: &[
+            (crate::llm::MODEL_FILE_QWEN, "https://huggingface.co/unsloth/Qwen3-VL-8B-Instruct-GGUF/resolve/main/Qwen3-VL-8B-Instruct-Q4_K_M.gguf"),
+            (crate::llm::MMPROJ_FILE, "https://huggingface.co/unsloth/Qwen3-VL-8B-Instruct-GGUF/resolve/main/mmproj-F16.gguf"),
         ],
     },
     ModelInfo {

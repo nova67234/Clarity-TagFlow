@@ -506,20 +506,25 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                             });
                         llm.tools_open = open;
                     }
-                    if llm.running {
-                        ui.add_space(4.0);
-                        ui.add(egui::Spinner::new().size(12.0).color(MUTED()));
-                        ui.label(egui::RichText::new(&llm.status).color(MUTED()).size(11.5));
-                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
-                    }
                     let can_send = !llm.running
                         && (!llm.draft.trim().is_empty() || llm.draft_image.is_some());
+                    // While a reply streams the send icon becomes a stop
+                    // button, same as the text-to-image view.
                     let send_clicked = ui
                         .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            icon_button(ui, egui::include_image!("../icons/send.svg"), 19.0, "Send", can_send)
+                            if llm.running {
+                                if icon_button(ui, egui::include_image!("../icons/stop.svg"), 16.0, "Stop generating", true)
+                                    .clicked()
+                                {
+                                    llm.stop_generation();
+                                }
+                                false
+                            } else {
+                                icon_button(ui, egui::include_image!("../icons/send.svg"), 19.0, "Send", can_send)
+                                    .clicked()
+                            }
                         })
-                        .inner
-                        .clicked();
+                        .inner;
 
                     if (send_now || send_clicked) && can_send {
                         llm.send_draft(ui.ctx());
@@ -686,7 +691,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         }
     }
 
-    // The thought channel (the 26B/31B variants reason before answering):
+    // The thought channel (the 31B reasons before answering):
     // split live while the reply streams; a finished message keeps its
     // thoughts on the `thinking` field (llm.rs moves them there on Done).
     let (thinking, body) = if streaming {
