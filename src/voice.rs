@@ -709,6 +709,50 @@ fn record_loopback(_stop: &AtomicBool) -> Result<PathBuf, String> {
     Err("This build was compiled without the AI feature.".to_string())
 }
 
+/// Windows: ask DWM to clip the recorder window to Windows 11's rounded-corner
+/// shape. The glow backend can't create transparent child viewports on Windows
+/// (WGL pixel formats don't support transparency), so drawing a rounded frame
+/// inside a transparent window — the approach used on other platforms — leaves
+/// opaque black corners. Clipping the window itself at the OS level needs no
+/// alpha channel. On Windows 10 the attribute doesn't exist and the call is a
+/// harmless no-op (square corners, but no black artifacts).
+#[cfg(windows)]
+fn round_corners_win11() {
+    use std::os::windows::ffi::OsStrExt as _;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn FindWindowW(class: *const u16, title: *const u16) -> isize;
+    }
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: isize,
+            attr: u32,
+            value: *const std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWCP_ROUND: i32 = 2;
+    let title: Vec<u16> = std::ffi::OsStr::new(RECORDER_TITLE)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd != 0 {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                (&DWMWCP_ROUND as *const i32).cast(),
+                std::mem::size_of::<i32>() as u32,
+            );
+        }
+    }
+}
+
+const RECORDER_TITLE: &str = "Record voice sample";
+
 /// The floating recorder popup: a tiny frameless always-on-top window (its
 /// own OS viewport, so it floats over other apps too). Drag anywhere to move;
 /// mic toggles recording; ✕ closes.
@@ -721,12 +765,13 @@ pub fn recorder_window(ctx: &egui::Context, voice: &mut VoiceState) {
     ctx.show_viewport_immediate(
         egui::ViewportId::from_hash_of("voice_recorder"),
         egui::ViewportBuilder::default()
-            .with_title("Record voice sample")
+            .with_title(RECORDER_TITLE)
             .with_inner_size([236.0, 76.0])
             .with_always_on_top()
             .with_decorations(false)
             .with_resizable(false)
-            .with_transparent(true),
+            // Transparency only works off-Windows (see round_corners_win11).
+            .with_transparent(cfg!(not(windows))),
         |ctx, _class| {
             // An Area pinned at the origin fills the (tiny) viewport — the
             // ctx-level CentralPanel::show is deprecated in egui 0.34.
@@ -734,11 +779,24 @@ pub fn recorder_window(ctx: &egui::Context, voice: &mut VoiceState) {
             egui::Area::new(egui::Id::new("voice_rec_root"))
                 .anchor(egui::Align2::LEFT_TOP, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
+                    // Windows: paint edge-to-edge and let DWM round the
+                    // window itself (round_corners_win11) — a rounded frame
+                    // here would expose black corners, since the viewport
+                    // can't be transparent. Elsewhere the window IS
+                    // transparent, so draw the pill shape ourselves.
+                    let (radius, stroke) = if cfg!(windows) {
+                        (egui::CornerRadius::ZERO, egui::Stroke::NONE)
+                    } else {
+                        (
+                            egui::CornerRadius::same(16),
+                            egui::Stroke::new(1.0, EDGE()),
+                        )
+                    };
                     egui::Frame::new()
                         .fill(PANEL())
-                        .corner_radius(egui::CornerRadius::same(16))
+                        .corner_radius(radius)
                         .inner_margin(egui::Margin::symmetric(12, 10))
-                        .stroke(egui::Stroke::new(1.0, EDGE()))
+                        .stroke(stroke)
                         .show(ui, |ui| {
                             ui.set_width(size.x - 24.0);
                             ui.set_height(size.y - 20.0);
@@ -818,6 +876,12 @@ pub fn recorder_window(ctx: &egui::Context, voice: &mut VoiceState) {
             }
         },
     );
+
+    // Idempotent and cheap, so applied every frame — this also covers the OS
+    // window being recreated (the viewport is destroyed whenever the popup
+    // closes and rebuilt on reopen).
+    #[cfg(windows)]
+    round_corners_win11();
 }
 
 fn run_setup(tx: &Sender<SetupMsg>, ctx: &egui::Context) -> bool {
