@@ -57,13 +57,13 @@ fn metadata_map(path: &Path) -> Option<BTreeMap<String, String>> {
 
     // Guard against pathologically large files (or anything mis-detected): only
     // read files small enough to scan safely.
-    match std::fs::metadata(path) {
-        Ok(m) if m.len() > MAX_SCAN_BYTES => return None,
-        Ok(_) => {}
-        Err(_) => return None,
+    let mut file = crate::archive::open(path).ok()?;
+    if file.len().ok()? > MAX_SCAN_BYTES {
+        return None;
     }
 
-    let bytes = std::fs::read(path).ok()?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).ok()?;
 
     let is_png = bytes.len() >= 8 && bytes[0..8] == [137, 80, 78, 71, 13, 10, 26, 10];
 

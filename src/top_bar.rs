@@ -225,8 +225,9 @@ fn spawn_gpu_sampler(shared: Arc<Mutex<GpuInfo>>) {
 /// What the top bar is asking the app to do this frame.
 pub enum TopBarAction {
     None,
-    /// The user clicked the open-folder button.
-    OpenFolder,
+    /// The user clicked the open-folder button. Carries the button's
+    /// bottom-left so the folder popup can drop down under it.
+    OpenFolder(egui::Pos2),
     /// The user clicked the settings gear.
     OpenSettings,
     /// The user clicked "Create Backup".
@@ -261,8 +262,9 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool, update_bad
                         (egui::include_image!("../icons/folder.svg"), "Open folder")
                     };
 
-                    if svg_button(ui, folder_svg, tip, 37.0, icon_tint(Color32::GRAY)).clicked() {
-                        action = TopBarAction::OpenFolder;
+                    let fb = svg_button(ui, folder_svg, tip, 37.0, icon_tint(Color32::GRAY));
+                    if fb.clicked() {
+                        action = TopBarAction::OpenFolder(fb.rect.left_bottom());
                     }
 
                     // Hardware names stacked in the left corner next to the folder
@@ -674,4 +676,248 @@ fn modern_chart(ui: &mut egui::Ui, data: &VecDeque<f32>, accent: Color32, width:
     }
 
     resp
+}
+// ---------------------------------------------------------------------------
+// Folder popup — dropped down from the folder button.
+// ---------------------------------------------------------------------------
+
+/// State for the folder button's popup (owned by `ViewerApp`).
+#[derive(Default)]
+pub struct FolderPopup {
+    pub open: bool,
+    /// The folder button's bottom-left, captured on click — the popup drops
+    /// down from there.
+    pub anchor: Option<egui::Pos2>,
+}
+
+/// What the folder popup asked the app to do this frame.
+pub enum FolderMenuAction {
+    None,
+    /// Load this folder as the new input (browser contents).
+    LoadInput(std::path::PathBuf),
+    /// Open this zip archive as the input (via the password prompt; viewed
+    /// in memory, never extracted — see `src/archive.rs`).
+    OpenZip(std::path::PathBuf),
+    /// Unload the current folder, emptying the browser.
+    ClearInput,
+}
+
+/// The folder button's popup — a compact menu: a status line with the current
+/// input folder, then Select Input / Select Output / Clear Input / Clear
+/// Output rows. The Output folder is where the Move button (Details &
+/// Actions) sends images; empty asks with a dialog on every move.
+pub fn folder_popup(
+    ctx: &egui::Context,
+    state: &mut FolderPopup,
+    current_folder: Option<&std::path::Path>,
+    output_folder: &mut String,
+) -> FolderMenuAction {
+    if !state.open {
+        return FolderMenuAction::None;
+    }
+
+    let mut action = FolderMenuAction::None;
+    let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+    // Drop down from the folder button, left-aligned under it (mirrors the
+    // Find Issues placement on the bar's other side). Clamped on-screen.
+    let screen = ctx.content_rect();
+    let win_w = 340.0_f32.min(screen.width() - 40.0);
+    let anchor = state
+        .anchor
+        .unwrap_or_else(|| egui::pos2(screen.left() + 10.0, screen.top() + 80.0));
+    let x = anchor.x.min(screen.right() - win_w - 10.0).max(screen.left() + 10.0);
+    let y = anchor.y.min(screen.bottom() - 280.0).max(screen.top() + 10.0);
+
+    use crate::PopupPlacement;
+    egui::Window::new("Open Folder")
+        .id(egui::Id::new("folder_popup"))
+        .title_bar(false) // custom header inside (matches Find Issues)
+        .collapsible(false)
+        .resizable(false)
+        .placed_at([x, y])
+        .frame(popup_frame())
+        .show(ctx, |ui| {
+            // Only the top strip drags the popup — not stray drags on the body.
+            crate::popup_drag_strip(ui, 30.0);
+            // Width pinned; the height hugs the content.
+            ui.set_width(win_w - 36.0);
+
+            // Title row: folder icon + "Open Folder" + close.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add(
+                    egui::Image::new(egui::include_image!("../icons/folder.svg"))
+                        .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                        .tint(icon_tint(TEXT())),
+                );
+                ui.heading(egui::RichText::new("Open Folder").color(TEXT()).strong().size(17.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // click_and_drag so a click that slips a pixel is swallowed
+                    // by the button instead of dragging the popup.
+                    if ui
+                        .add(
+                            egui::Button::image(
+                                egui::Image::new(egui::include_image!("../icons/close.svg"))
+                                    .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                                    .tint(icon_tint(TEXT())),
+                            )
+                            .frame(false)
+                            .sense(egui::Sense::click_and_drag()),
+                        )
+                        .on_hover_text("Close")
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                });
+            });
+            ui.add_space(10.0);
+
+            // Menu rows — plain text like a context menu, with the selected
+            // folder shown right-aligned on its row (full path on hover).
+            let input_path = current_folder.map(|p| p.display().to_string());
+            let mut sel_in = menu_row_value(
+                ui,
+                "Select Input...",
+                input_path.as_deref().unwrap_or("No folder selected"),
+                true,
+            );
+            if let Some(p) = &input_path {
+                sel_in = sel_in.on_hover_text(p);
+            }
+            if sel_in.clicked() {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    action = FolderMenuAction::LoadInput(dir);
+                }
+                close = true;
+            }
+            let mut sel_out_tip = String::from("Where the Move button (Details & Actions) sends images");
+            if !output_folder.trim().is_empty() {
+                sel_out_tip = format!("{output_folder}\n{sel_out_tip}");
+            }
+            let sel_out = menu_row_value(
+                ui,
+                "Select Output...",
+                if output_folder.trim().is_empty() { "No folder selected" } else { output_folder },
+                true,
+            );
+            if sel_out.on_hover_text(sel_out_tip).clicked() {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    *output_folder = dir.display().to_string();
+                }
+                close = true;
+            }
+            if menu_row(ui, "Open Zip (.zip)...", true)
+                .on_hover_text(
+                    "Browse a zip archive — password-protected too — straight from \
+                     the file, without extracting anything",
+                )
+                .clicked()
+            {
+                if let Some(f) = rfd::FileDialog::new()
+                    .add_filter("Zip archive", &["zip"])
+                    .pick_file()
+                {
+                    action = FolderMenuAction::OpenZip(f);
+                }
+                close = true;
+            }
+
+            ui.separator();
+
+            if menu_row(ui, "Clear Input", current_folder.is_some()).clicked() {
+                action = FolderMenuAction::ClearInput;
+                close = true;
+            }
+            if menu_row(ui, "Clear Output", !output_folder.trim().is_empty()).clicked() {
+                output_folder.clear();
+                close = true;
+            }
+        });
+
+    if close {
+        state.open = false;
+    }
+    action
+}
+
+/// A folder-menu row with a right-aligned readout of its current selection.
+/// The value is muted and elided from the left, keeping the tail (the folder
+/// name) visible.
+fn menu_row_value(ui: &mut egui::Ui, label: &str, value: &str, enabled: bool) -> egui::Response {
+    let resp = menu_row(ui, label, enabled);
+    let rect = resp.rect;
+    if ui.is_rect_visible(rect) {
+        let font = egui::FontId::proportional(12.0);
+        let label_w = ui
+            .painter()
+            .layout_no_wrap(label.to_string(), egui::FontId::proportional(14.0), TEXT())
+            .size()
+            .x;
+        let max_w = rect.width() - label_w - 30.0;
+        let chars: Vec<char> = value.chars().collect();
+        let mut galley = ui.painter().layout_no_wrap(value.to_string(), font.clone(), MUTED());
+        let mut skip = 0;
+        while galley.size().x > max_w && skip < chars.len() {
+            // Drop characters from the front until the tail fits.
+            skip += (chars.len() - skip).div_ceil(8).max(1);
+            let shown: String = std::iter::once('…').chain(chars[skip..].iter().copied()).collect();
+            galley = ui.painter().layout_no_wrap(shown, font.clone(), MUTED());
+        }
+        if max_w > 20.0 {
+            ui.painter().galley(
+                egui::pos2(rect.right() - 10.0 - galley.size().x, rect.center().y - galley.size().y / 2.0),
+                galley,
+                MUTED(),
+            );
+        }
+    }
+    resp
+}
+
+/// One left-aligned text row of the folder menu; highlights on hover, muted
+/// when `enabled` is false.
+fn menu_row(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 34.0),
+        if enabled { egui::Sense::click() } else { egui::Sense::hover() },
+    );
+    if ui.is_rect_visible(rect) {
+        if enabled && resp.hovered() {
+            ui.painter().rect_filled(
+                rect,
+                CornerRadius::same(10),
+                ui.visuals().widgets.hovered.weak_bg_fill,
+            );
+        }
+        ui.painter().text(
+            egui::pos2(rect.left() + 10.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(14.0),
+            if enabled { TEXT() } else { MUTED() },
+        );
+    }
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// A themed frame for the folder popup — same card styling as the other
+/// popups, but with the softer rounded-22 corners of the gallery detail view.
+fn popup_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(PANEL())
+        .corner_radius(CornerRadius::same(22))
+        .inner_margin(egui::Margin::same(18))
+        .stroke(Stroke::new(1.0, EDGE()))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 6],
+            blur: 20,
+            spread: 0,
+            color: Color32::from_black_alpha(150),
+        })
 }

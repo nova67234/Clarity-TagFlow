@@ -6,7 +6,6 @@
 //! payload), so probing a multi-gigabyte clip touches just a few KB. Containers
 //! that aren't ISO-BMFF (MKV / WebM / AVI) simply return `None`.
 
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -24,8 +23,8 @@ const MAX_MOOV: u64 = 64 * 1024 * 1024;
 /// Probe an MP4/MOV/M4V file. Returns `None` if it isn't ISO-BMFF or has no
 /// readable `moov`.
 pub fn probe(path: &Path) -> Option<VideoInfo> {
-    let mut f = File::open(path).ok()?;
-    let file_len = f.metadata().ok()?.len();
+    let mut f = crate::archive::open(path).ok()?;
+    let file_len = f.len().ok()?;
 
     let (moov_off, moov_total) = find_top_level_box(&mut f, file_len, b"moov")?;
     if moov_total < 8 || moov_total > MAX_MOOV {
@@ -101,7 +100,11 @@ pub fn probe(path: &Path) -> Option<VideoInfo> {
 
 /// Seek through the top-level boxes (reading only their headers) and return the
 /// `(absolute offset, total size)` of the first box of `target` type.
-fn find_top_level_box(f: &mut File, file_len: u64, target: &[u8; 4]) -> Option<(u64, u64)> {
+fn find_top_level_box(
+    f: &mut crate::archive::Reader,
+    file_len: u64,
+    target: &[u8; 4],
+) -> Option<(u64, u64)> {
     let mut pos = 0u64;
     while pos + 8 <= file_len {
         f.seek(SeekFrom::Start(pos)).ok()?;
