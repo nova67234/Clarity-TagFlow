@@ -250,9 +250,10 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
     let panel = ui.max_rect();
     let row_h = 20.0;
     let mut input_h = 104.0;
-    if let Some(p) = &llm.draft_image {
-        // A video attachment shows as a one-line chip, an image as a 64px thumb.
-        input_h += if crate::is_video(p) { 30.0 } else { 78.0 };
+    if llm.draft_image.is_some() {
+        // A 64px preview once the thumb/poster exists, a one-line chip until
+        // a video's poster capture lands.
+        input_h += if llm.draft_thumb.is_some() { 78.0 } else { 30.0 };
     }
     if llm.run_err.is_some() {
         input_h += 22.0;
@@ -392,47 +393,36 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                 ui.vertical(|ui| {
                 ui.set_width(col_w - 24.0);
 
-                // Attached-image thumbnail (rounded, with a remove ✕). Videos
-                // have no cheap still, so they show a filename chip instead.
+                // Attached-media preview (rounded, with a remove ✕): image
+                // thumbnail, or a video's poster still with a play badge —
+                // a filename chip while the poster is still being captured.
                 if let Some(path) = llm.draft_image.clone() {
                     let tex = llm.draft_thumb.as_ref().map(|(_, t)| t.clone());
-                    if let Some(tex) = tex {
-                        ui.horizontal(|ui| {
+                    ui.horizontal(|ui| {
+                        if let Some(tex) = tex {
                             let size = tex.size_vec2();
                             let scale = (64.0 / size.y).min(64.0 / size.x);
-                            ui.add(
+                            let resp = ui.add(
                                 egui::Image::new(&tex)
                                     .fit_to_exact_size(size * scale)
                                     .corner_radius(egui::CornerRadius::same(10)),
                             );
-                            if ui
-                                .add(egui::Button::new(egui::RichText::new("✕").color(MUTED()).size(11.0)).frame(false))
-                                .on_hover_text("Remove the image")
-                                .clicked()
-                            {
-                                llm.draft_image = None;
-                                llm.draft_thumb = None;
+                            if crate::is_video(&path) {
+                                paint_play_badge(ui, resp.rect);
                             }
-                        });
-                        ui.add_space(6.0);
-                    } else if crate::is_video(&path) {
-                        ui.horizontal(|ui| {
-                            let name = path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            ui.label(egui::RichText::new(format!("🎬 {name}")).color(MUTED()).size(12.0));
-                            if ui
-                                .add(egui::Button::new(egui::RichText::new("✕").color(MUTED()).size(11.0)).frame(false))
-                                .on_hover_text("Remove the video")
-                                .clicked()
-                            {
-                                llm.draft_image = None;
-                                llm.draft_thumb = None;
-                            }
-                        });
-                        ui.add_space(6.0);
-                    }
+                        } else {
+                            media_chip(ui, &path);
+                        }
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("✕").color(MUTED()).size(11.0)).frame(false))
+                            .on_hover_text("Remove the attachment")
+                            .clicked()
+                        {
+                            llm.draft_image = None;
+                            llm.draft_thumb = None;
+                        }
+                    });
+                    ui.add_space(6.0);
                 }
 
                 // Draft text: grows with its content (the card extends upward
@@ -587,19 +577,19 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                     Some(tex) => {
                         let size = tex.size_vec2();
                         let scale = (180.0 / size.y).min(280.0 / size.x).min(1.0);
-                        ui.add(
+                        let resp = ui.add(
                             egui::Image::new(&tex)
                                 .fit_to_exact_size(size * scale)
                                 .corner_radius(egui::CornerRadius::same(12)),
                         );
+                        // A clip's poster gets a play badge — it's a still,
+                        // not a player, but shouldn't pass for a photo.
+                        if crate::is_video(path) {
+                            paint_play_badge(ui, resp.rect);
+                        }
                     }
                     None => {
-                        let name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        let icon = if crate::is_video(path) { "🎬" } else { "🖼" };
-                        ui.label(egui::RichText::new(format!("{icon} {name}")).color(MUTED()).size(11.5));
+                        media_chip(ui, path);
                     }
                 }
                 if !text.is_empty() {
@@ -889,6 +879,10 @@ fn msg_thumb(
     llm: &mut LlmState,
     path: &std::path::Path,
 ) -> Option<egui::TextureHandle> {
+    if crate::is_video(path) {
+        // Poster still, captured off-thread; the chip shows while it loads.
+        return llm.video_poster(ctx, path);
+    }
     if let Some(t) = llm.msg_thumbs.get(path) {
         return t.clone();
     }
@@ -917,11 +911,11 @@ fn ensure_draft_thumb(ctx: &egui::Context, llm: &mut LlmState) {
     if llm.draft_thumb.as_ref().is_some_and(|(p, _)| *p == path) {
         return;
     }
-    // Videos can't be decoded here (and grabbing a poster frame would stall
-    // the UI thread) — the input card shows a filename chip instead, and the
+    // Videos: the poster still is captured on a background thread (decoding
+    // here would stall the UI); a filename chip shows until it lands. The
     // worker samples the actual frames at send time.
     if crate::is_video(&path) {
-        llm.draft_thumb = None;
+        llm.draft_thumb = llm.video_poster(ctx, &path).map(|t| (path, t));
         return;
     }
     match image::open(&path) {
@@ -941,6 +935,36 @@ fn ensure_draft_thumb(ctx: &egui::Context, llm: &mut LlmState) {
             llm.run_err = Some(format!("Couldn't read that image: {e}"));
         }
     }
+}
+
+/// A play badge painted over a video attachment's poster still, so a clip
+/// doesn't pass for a photo — the thumbnail never plays, the frames go to
+/// the model instead.
+fn paint_play_badge(ui: &mut egui::Ui, rect: egui::Rect) {
+    let c = rect.center();
+    ui.painter().circle_filled(c, 15.0, egui::Color32::from_black_alpha(150));
+    egui::Image::new(egui::include_image!("../icons/playbutton.svg"))
+        .tint(egui::Color32::WHITE)
+        .paint_at(ui, egui::Rect::from_center_size(c + egui::vec2(1.0, 0.0), egui::vec2(16.0, 16.0)));
+}
+
+/// Filename chip for an attachment with no thumbnail (an unreadable image, or
+/// a video whose poster is still being captured): a small type icon + name.
+fn media_chip(ui: &mut egui::Ui, path: &std::path::Path) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    ui.horizontal(|ui| {
+        let icon = if crate::is_video(path) {
+            egui::Image::new(egui::include_image!("../icons/video.svg"))
+        } else {
+            egui::Image::new(egui::include_image!("../icons/image.svg"))
+        };
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+        icon.tint(icon_tint(MUTED())).paint_at(ui, rect);
+        ui.label(egui::RichText::new(name).color(MUTED()).size(11.5));
+    });
 }
 
 /// A bare icon button on a 28px click target (same look as the text-to-image

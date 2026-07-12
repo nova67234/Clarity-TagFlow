@@ -285,6 +285,13 @@ pub struct LlmState {
     /// Cached display textures for images attached to sent messages, keyed by
     /// path (`None` = unreadable file, cached so it isn't retried per frame).
     pub msg_thumbs: std::collections::HashMap<PathBuf, Option<egui::TextureHandle>>,
+    /// Poster stills for video attachments land here from background capture
+    /// threads (a VLC decode takes seconds, so it can't run on the UI thread);
+    /// `poll` turns them into `msg_thumbs` textures. The set tracks paths
+    /// whose capture is already in flight.
+    video_poster_tx: Sender<(PathBuf, Option<egui::ColorImage>)>,
+    video_poster_rx: Receiver<(PathBuf, Option<egui::ColorImage>)>,
+    video_posters_pending: std::collections::HashSet<PathBuf>,
     /// The input card's on-screen rect + the `ctx.input(time)` it was last
     /// drawn, published every frame the chat is visible. Drag-and-drop uses it
     /// both for the hover highlight and to claim drops away from the gallery
@@ -358,6 +365,7 @@ impl Drop for LlmState {
 
 impl Default for LlmState {
     fn default() -> Self {
+        let (video_poster_tx, video_poster_rx) = std::sync::mpsc::channel();
         Self {
             installed: installed(),
             download: None,
@@ -370,6 +378,9 @@ impl Default for LlmState {
             draft_image: None,
             draft_thumb: None,
             msg_thumbs: std::collections::HashMap::new(),
+            video_poster_tx,
+            video_poster_rx,
+            video_posters_pending: std::collections::HashSet::new(),
             input_rect: None,
             run_err: None,
             running: false,
@@ -425,8 +436,45 @@ impl LlmState {
 
     /// Drive background work — poll the setup download and drain any streamed
     /// tokens from the inference worker. Call once per frame from the tab.
+    /// The cached poster still for a video attachment, kicking off a capture
+    /// on a background thread on first sight. `None` while the capture runs
+    /// (the chat shows a filename chip meanwhile) and for clips VLC can't
+    /// decode (cached, like unreadable images).
+    pub fn video_poster(
+        &mut self,
+        ctx: &egui::Context,
+        path: &std::path::Path,
+    ) -> Option<egui::TextureHandle> {
+        if let Some(t) = self.msg_thumbs.get(path) {
+            return t.clone();
+        }
+        if self.video_posters_pending.insert(path.to_path_buf()) {
+            let tx = self.video_poster_tx.clone();
+            let ctx = ctx.clone();
+            let path = path.to_path_buf();
+            std::thread::spawn(move || {
+                let img = crate::video::capture_poster(&path, 512);
+                let _ = tx.send((path, img));
+                ctx.request_repaint();
+            });
+        }
+        None
+    }
+
     pub fn poll(&mut self, ctx: &egui::Context) {
         self.voice.poll();
+        // Poster stills captured for video attachments become textures.
+        while let Ok((path, img)) = self.video_poster_rx.try_recv() {
+            let tex = img.map(|img| {
+                ctx.load_texture(
+                    format!("ai-chat-video-{}", path.display()),
+                    img,
+                    Default::default(),
+                )
+            });
+            self.video_posters_pending.remove(&path);
+            self.msg_thumbs.insert(path, tex);
+        }
         if let Some(dl) = &self.download {
             if dl.done() {
                 if dl.ok() {

@@ -293,11 +293,18 @@ pub fn capture_frames(
     Vec::new()
 }
 
+/// Stub poster grab when the `vlc` feature is off — video attachments in the
+/// AI chat keep their filename chip.
+#[cfg(not(feature = "vlc"))]
+pub fn capture_poster(_path: &Path, _max_edge: u32) -> Option<egui::ColorImage> {
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Real libVLC-backed player (feature = "vlc").
 // ---------------------------------------------------------------------------
 #[cfg(feature = "vlc")]
-pub use backend::{capture_frames, VideoPlayer, VideoPreviews, VideoThumbs};
+pub use backend::{capture_frames, capture_poster, VideoPlayer, VideoPreviews, VideoThumbs};
 
 #[cfg(feature = "vlc")]
 mod backend {
@@ -862,7 +869,8 @@ mod backend {
 
     /// Decode one representative frame of `path`, scaled so its long edge is about
     /// `max_edge`, as an RGBA image. `None` if no frame arrives within the timeout.
-    fn capture_poster(path: &Path, max_edge: u32) -> Option<egui::ColorImage> {
+    /// Also used by the AI chat for its video-attachment thumbnails (pub).
+    pub fn capture_poster(path: &Path, max_edge: u32) -> Option<egui::ColorImage> {
         let instance = vlc::Instance::new()?;
         let media = open_media(&instance, path)?;
         // Poster capture only needs a video frame. Disable the audio output for
