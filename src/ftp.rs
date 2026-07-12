@@ -73,6 +73,12 @@ pub struct FtpState {
     dl_rx: Option<Receiver<DlMsg>>,
     dl_progress: (usize, usize),
     dl_current: String,
+    /// What to do when the download finishes: `true` loads the fetched folder
+    /// into the browser (the Load button); `false` was a plain "Download All"
+    /// save — the browser stays open and shows a note instead.
+    dl_load_after: bool,
+    /// "Saved N file(s) to …" note after a Download All finishes.
+    saved_note: Option<String>,
     /// Set when a download finishes — `main.rs` takes it and loads the folder.
     loaded_dir: Option<PathBuf>,
 
@@ -161,15 +167,26 @@ impl FtpState {
         });
     }
 
-    fn start_download(&mut self, params: FtpParams, path: String, files: Vec<String>) {
+    /// Fetch `files` from remote `path` into `dest`. `load_after` makes the
+    /// finished folder load into the browser (the Load button); without it the
+    /// download is a plain save (Download All → the Output folder).
+    fn start_download(
+        &mut self,
+        params: FtpParams,
+        path: String,
+        files: Vec<String>,
+        dest: PathBuf,
+        load_after: bool,
+    ) {
         let (tx, rx) = mpsc::channel();
         self.dl_rx = Some(rx);
         self.dl_progress = (0, files.len());
         self.dl_current.clear();
+        self.dl_load_after = load_after;
+        self.saved_note = None;
         std::thread::spawn(move || {
-            let dest = cache_dir(&params.host, &path);
             if let Err(e) = std::fs::create_dir_all(&dest) {
-                let _ = tx.send(DlMsg::Err(format!("Create cache dir: {e}")));
+                let _ = tx.send(DlMsg::Err(format!("Create destination dir: {e}")));
                 return;
             }
             let result = (|| -> Result<(), String> {
@@ -348,8 +365,14 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
             }
             DlMsg::Done(dir) => {
                 state.dl_rx = None;
-                state.loaded_dir = Some(dir);
-                state.browser_open = false;
+                if state.dl_load_after {
+                    state.loaded_dir = Some(dir);
+                    state.browser_open = false;
+                } else {
+                    let (_, total) = state.dl_progress;
+                    state.saved_note =
+                        Some(format!("Saved {total} file(s) to {}", dir.display()));
+                }
             }
             DlMsg::Err(e) => {
                 state.dl_rx = None;
@@ -378,6 +401,7 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
     let mut open = state.browser_open;
     let mut navigate: Option<String> = None;
     let mut load_files: Option<Vec<String>> = None;
+    let mut save_files: Option<Vec<String>> = None;
 
     egui::Window::new("")
         .id(egui::Id::new("ftp_browser"))
@@ -539,6 +563,14 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
                 let frac = if total == 0 { 0.0 } else { done as f32 / total as f32 };
                 ui.add(egui::ProgressBar::new(frac).desired_height(6.0));
             } else {
+                if let Some(note) = &state.saved_note {
+                    ui.label(
+                        egui::RichText::new(note)
+                            .color(egui::Color32::from_rgb(80, 190, 120))
+                            .size(12.0),
+                    );
+                    ui.add_space(4.0);
+                }
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(format!("{} media file(s) here", media.len()))
@@ -554,7 +586,26 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
                         .fill(ACCENT1())
                         .corner_radius(egui::CornerRadius::same(10));
                         if ui.add_enabled(!media.is_empty(), btn).clicked() {
-                            load_files = Some(media);
+                            load_files = Some(media.clone());
+                        }
+
+                        // Download All: save everything in this directory to
+                        // the Output folder (set in the folder popup) without
+                        // loading it into the browser.
+                        let out = settings.output_folder.trim();
+                        let tip = if out.is_empty() {
+                            "Save all media in this folder to a destination you pick \
+                             (set an Output in the folder button's popup to skip asking)"
+                                .to_string()
+                        } else {
+                            format!("Save all media in this folder to {out}")
+                        };
+                        let dl_btn = egui::Button::new(
+                            egui::RichText::new("Download All").color(TEXT()),
+                        )
+                        .corner_radius(egui::CornerRadius::same(10));
+                        if ui.add_enabled(!media.is_empty(), dl_btn).on_hover_text(tip).clicked() {
+                            save_files = Some(media);
                         }
                     });
                 });
@@ -564,19 +615,36 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
     // Apply the deferred actions (borrowck: outside the closure).
     if let Some(dir) = navigate {
         state.cwd = dir.clone();
+        state.saved_note = None;
         let params = state.params(settings);
         state.start_list(params, dir);
     }
     if let Some(files) = load_files {
         let params = state.params(settings);
         let cwd = state.cwd.clone();
-        state.start_download(params, cwd, files);
+        let dest = cache_dir(&params.host, &cwd);
+        state.start_download(params, cwd, files, dest, true);
+    }
+    if let Some(files) = save_files {
+        // Download All: into the Output folder, or ask when none is set.
+        let out = settings.output_folder.trim();
+        let dest = if out.is_empty() {
+            rfd::FileDialog::new().pick_folder()
+        } else {
+            Some(PathBuf::from(out))
+        };
+        if let Some(dest) = dest {
+            let params = state.params(settings);
+            let cwd = state.cwd.clone();
+            state.start_download(params, cwd, files, dest, false);
+        }
     }
     state.browser_open = open;
     // Re-list on next open so a fresh session starts from a live listing.
     if !state.browser_open && state.dl_rx.is_none() {
         state.entries = None;
         state.error = None;
+        state.saved_note = None;
     }
 }
 
