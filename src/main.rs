@@ -28,6 +28,7 @@ const EXTENDED_IMAGE_EXTENSIONS: &[&str] = &["avif", "heic", "heif", "dng", "arw
 /// the pure-Rust decoders in `crate::avif` rather than `image::open`. Centralises
 /// the list that was otherwise repeated across every decode path. Always `false`
 /// in builds without the `avif` feature (those files aren't recognised anyway).
+#[cfg_attr(not(feature = "avif"), allow(dead_code))] // callers sit behind avif gates
 pub(crate) fn is_extended_extension(ext: &str) -> bool {
     #[cfg(feature = "avif")]
     {
@@ -82,6 +83,9 @@ mod archive;
 mod avif;
 #[cfg(not(feature = "avif"))]
 mod avif {
+    // Today's callers all sit behind their own `avif` gates; the stub stays so
+    // an ungated call keeps compiling (and simply fails to decode).
+    #[allow(dead_code)]
     pub fn decode_avif(_path: &std::path::Path) -> Option<image::RgbaImage> {
         None
     }
@@ -175,13 +179,12 @@ fn main() -> eframe::Result {
 
             let mut app = ViewerApp::default();
             // Restore saved settings (if any) from eframe's persistent storage.
-            if let Some(storage) = cc.storage {
-                if let Some(saved) = eframe::get_value::<settings::Settings>(storage, settings::STORAGE_KEY) {
+            if let Some(storage) = cc.storage
+                && let Some(saved) = eframe::get_value::<settings::Settings>(storage, settings::STORAGE_KEY) {
                     app.settings = saved;
                     // Restore the last-used AI tagger model into the Tag Manager.
                     app.tag_manager.ai_model = app.settings.last_ai_model.clone();
                 }
-            }
             // Apply the saved colour theme before the first paint so a Light-mode
             // user doesn't see a dark flash on launch. The Glass config (incl.
             // dark/light panels) must be pushed first — the palette reads it.
@@ -699,11 +702,10 @@ impl ViewerApp {
     /// transient toast.
     fn drive_bg_job(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
-        if let Some((_, until)) = &self.bg_toast {
-            if now >= *until {
+        if let Some((_, until)) = &self.bg_toast
+            && now >= *until {
                 self.bg_toast = None;
             }
-        }
 
         // Result of this frame's polling, applied after the &mut borrow ends.
         let mut done: Option<Result<PathBuf, String>> = None;
@@ -922,11 +924,10 @@ impl ViewerApp {
         if let Some(file_name) = img_path.file_name() {
             let _ = std::fs::rename(&img_path, target_dir.join(file_name));
         }
-        if txt_path.exists() {
-            if let Some(txt_name) = txt_path.file_name() {
+        if txt_path.exists()
+            && let Some(txt_name) = txt_path.file_name() {
                 let _ = std::fs::rename(&txt_path, target_dir.join(txt_name));
             }
-        }
 
         self.remove_image_at(idx);
     }
@@ -1450,11 +1451,10 @@ impl eframe::App for ViewerApp {
             // In the Gallery layout the arrow keys also page the open detail
             // popup to the newly selected image (it loads its content once on
             // open, so it must be re-pointed explicitly).
-            if self.settings.layout == settings::Layout::Gallery && self.detail_popup.open {
-                if let Some(i) = self.selected {
+            if self.settings.layout == settings::Layout::Gallery && self.detail_popup.open
+                && let Some(i) = self.selected {
                     self.detail_popup.open_for(i, &self.images[i], ui.ctx());
                 }
-            }
         }
 
         let update_badge = self.update.badge(&self.settings);

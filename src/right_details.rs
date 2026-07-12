@@ -276,12 +276,11 @@ pub fn show(
     all_images: &[PathBuf],
 ) -> RightPanelAction {
     // 0. Non-blocking check to see if our background thread finished calculating
-    if let Some(rx) = &state.meta_rx {
-        if let Ok(meta) = rx.try_recv() {
+    if let Some(rx) = &state.meta_rx
+        && let Ok(meta) = rx.try_recv() {
             state.meta = meta;
             state.meta_rx = None; // Finished!
         }
-    }
 
     // 1. Sync the text box state when the selected image changes.
     if state.last_path.as_deref() != current_image {
@@ -798,7 +797,7 @@ pub fn show(
                                 let artist_set = state.tag_roles.artist.clone();
                                 let character_set = state.tag_roles.character.clone();
                                 let highlight_roles = !showing_meta
-                                    && !(artist_set.is_empty() && character_set.is_empty());
+                                    && (!artist_set.is_empty() || !character_set.is_empty());
                                 let role_color = if editable { TEXT() } else { TEXT().gamma_multiply(0.8) };
 
                                 // The box is a FIXED-size rounded frame that always

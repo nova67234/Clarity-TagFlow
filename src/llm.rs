@@ -187,6 +187,8 @@ pub fn installed() -> bool {
 }
 
 /// One message of the conversation snapshot handed to the worker.
+// The worker that reads these (and constructs Msg) only exists in `llm` builds.
+#[cfg_attr(not(feature = "llm"), allow(dead_code))]
 struct CmdMsg {
     user: bool,
     text: String,
@@ -196,11 +198,13 @@ struct CmdMsg {
 /// A request to the inference worker. The full (capped) history is sent every
 /// turn — the worker rebuilds the model context from scratch, so multi-turn
 /// chat works without keeping KV-cache state between requests.
+#[cfg_attr(not(feature = "llm"), allow(dead_code))]
 enum Cmd {
     Generate { msgs: Vec<CmdMsg>, params: GenParams },
 }
 
 /// A message streamed back from the inference worker.
+#[cfg_attr(not(feature = "llm"), allow(dead_code))]
 enum Msg {
     /// Progress line ("Loading model…", "Reading the image…", "Thinking…").
     Status(String),
@@ -475,8 +479,8 @@ impl LlmState {
             self.video_posters_pending.remove(&path);
             self.msg_thumbs.insert(path, tex);
         }
-        if let Some(dl) = &self.download {
-            if dl.done() {
+        if let Some(dl) = &self.download
+            && dl.done() {
                 if dl.ok() {
                     self.installed = self.model.installed();
                 } else {
@@ -485,7 +489,6 @@ impl LlmState {
                 }
                 self.download = None;
             }
-        }
 
         // Drain first, then act — acting (auto-speak) needs &mut self.
         let mut worker_msgs = Vec::new();
@@ -509,8 +512,8 @@ impl LlmState {
                     Msg::Token(t) => {
                         // Stream into the reply bubble of the chat that asked,
                         // even if the user switched to another chat meanwhile.
-                        if let Some(id) = self.gen_chat {
-                            if let Some(m) = self
+                        if let Some(id) = self.gen_chat
+                            && let Some(m) = self
                                 .chats
                                 .iter_mut()
                                 .find(|c| c.id == id)
@@ -518,15 +521,14 @@ impl LlmState {
                             {
                                 m.text.push_str(&t);
                             }
-                        }
                     }
                     Msg::Done(res) => {
                         // Split the thought channel off the finished reply:
                         // it moves onto the message's `thinking` (for the
                         // disclosure row) and out of the visible text — so it
                         // is never re-sent in the history, spoken, or copied.
-                        if res.is_ok() {
-                            if let Some(m) = self
+                        if res.is_ok()
+                            && let Some(m) = self
                                 .gen_chat
                                 .and_then(|id| self.chats.iter_mut().find(|c| c.id == id))
                                 .and_then(|c| c.msgs.last_mut())
@@ -545,7 +547,6 @@ impl LlmState {
                                     m.text = visible;
                                 }
                             }
-                        }
                         // Role play: a finished reply may end in control lines
                         // (diary entries, keep/show a picture) — pull them out
                         // of the visible text and act on them.
@@ -1194,6 +1195,7 @@ mod worker {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // threads the worker's resident state
     fn generate(
         backend: &LlamaBackend,
         model: &LlamaModel,
@@ -1322,7 +1324,7 @@ mod worker {
             .tokenize(input, &bitmap_refs)
             .map_err(|e| format!("Tokenize: {e}"))?;
         let mut n_past = chunks
-            .eval_chunks(mtmd, &mut context, 0, 0, N_BATCH as i32, true)
+            .eval_chunks(mtmd, &context, 0, 0, N_BATCH as i32, true)
             .map_err(|e| format!("Evaluate prompt: {e}"))?;
 
         // The user's sampling knobs (defaults are Gemma's recommendation:
@@ -1397,12 +1399,11 @@ mod worker {
                 // Turn ending straight after a forced close, with nothing
                 // visible yet: reject and resample (the EOG never enters the
                 // context; the sampler's RNG moves on) until it speaks.
-                if let Some(p) = closed_at {
-                    if raw[p..].trim().is_empty() && eog_rejects < 24 {
+                if let Some(p) = closed_at
+                    && raw[p..].trim().is_empty() && eog_rejects < 24 {
                         eog_rejects += 1;
                         continue;
                     }
-                }
                 break;
             }
             let piece = model
@@ -1509,11 +1510,10 @@ mod worker {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         path.hash(&mut h);
         meta.len().hash(&mut h);
-        if let Ok(t) = meta.modified() {
-            if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+        if let Ok(t) = meta.modified()
+            && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
                 d.as_secs().hash(&mut h);
             }
-        }
         let dir = std::env::temp_dir().join(format!("clarity_tagflow_ai_frames_{:016x}", h.finish()));
 
         // Frames are named {index:02}_{timestamp ms}.png, so a name sort is
@@ -1679,11 +1679,13 @@ mod tests {
     #[ignore]
     fn llm_roleplay_smoke() {
         assert!(installed(), "place a GGUF pair in tools/gemma-4/ first");
-        let mut rp = crate::roleplay::RoleplayState::default();
-        rp.enabled = true;
-        rp.ai_name = "Mira".to_string();
-        rp.user_name = "William".to_string();
-        rp.persona = "a cheerful village alchemist who loves rare herbs".to_string();
+        let mut rp = crate::roleplay::RoleplayState {
+            enabled: true,
+            ai_name: "Mira".to_string(),
+            user_name: "William".to_string(),
+            persona: "a cheerful village alchemist who loves rare herbs".to_string(),
+            ..Default::default()
+        };
         rp.memories.push(crate::roleplay::Memory {
             text: "William is allergic to silverleaf; I must never brew it near them.".to_string(),
             by_ai: true,
@@ -1750,18 +1752,20 @@ mod tests {
     #[ignore]
     fn llm_album_smoke() {
         assert!(installed(), "place a GGUF pair in tools/gemma-4/ first");
-        let mut rp = crate::roleplay::RoleplayState::default();
-        rp.enabled = true;
-        rp.ai_name = "Mira".to_string();
-        rp.user_name = "William".to_string();
-        rp.persona = "a warm, sentimental village alchemist".to_string();
+        let rp = crate::roleplay::RoleplayState {
+            enabled: true,
+            ai_name: "Mira".to_string(),
+            user_name: "William".to_string(),
+            persona: "a warm, sentimental village alchemist".to_string(),
+            ..Default::default()
+        };
 
         // Self-contained "artwork": a vivid generated gradient sunset.
         let img = std::env::temp_dir().join("llm_album_artwork.png");
         let painting = image::RgbImage::from_fn(256, 192, |x, y| {
-            let r = 255 - (y as u32 * 200 / 192) as u8;
+            let r = 255 - (y * 200 / 192) as u8;
             let g = 120u8.saturating_sub((y / 2) as u8);
-            let b = (x as u32 * 180 / 256) as u8;
+            let b = (x * 180 / 256) as u8;
             image::Rgb([r, g, b])
         });
         painting.save(&img).unwrap();
@@ -1938,11 +1942,13 @@ mod tests {
 
         // The real-world empty-bubble scenario: role play, a narrative user
         // message, the model prone to redrafting privately.
-        let mut rp = crate::roleplay::RoleplayState::default();
-        rp.enabled = true;
-        rp.ai_name = "Sabrina".to_string();
-        rp.user_name = "Peter".to_string();
-        rp.persona = "a warm, romantic 25-year-old woman".to_string();
+        let rp = crate::roleplay::RoleplayState {
+            enabled: true,
+            ai_name: "Sabrina".to_string(),
+            user_name: "Peter".to_string(),
+            persona: "a warm, romantic 25-year-old woman".to_string(),
+            ..Default::default()
+        };
         let u = |t: &str| CmdMsg { user: true, text: t.to_string(), image: None };
         let m = |t: &str| CmdMsg { user: false, text: t.to_string(), image: None };
         cmd_tx

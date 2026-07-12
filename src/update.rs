@@ -98,14 +98,13 @@ impl UpdateState {
             self.started = true;
             self.start_check(ctx);
         }
-        if let Some(rx) = &self.check_rx {
-            if let Ok(res) = rx.try_recv() {
+        if let Some(rx) = &self.check_rx
+            && let Ok(res) = rx.try_recv() {
                 self.result = Some(res);
                 self.checking = false;
                 self.check_rx = None;
                 ctx.request_repaint();
             }
-        }
         if let Some(rx) = &self.comfy_rx {
             let msgs: Vec<ComfyMsg> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
             let mut finished = false;
@@ -248,18 +247,16 @@ fn run_check() -> CheckResult {
 /// fall back to the newest of all releases (includes pre-releases like betas).
 fn fetch_release(agent: &ureq::Agent, repo: &str) -> Result<ReleaseInfo, String> {
     let (code, v) = get_json(agent, &format!("https://api.github.com/repos/{repo}/releases/latest"))?;
-    if code == 200 {
-        if let Some(r) = ReleaseInfo::from_json(&v) {
+    if code == 200
+        && let Some(r) = ReleaseInfo::from_json(&v) {
             return Ok(r);
         }
-    }
     // 404 here means "no non-prerelease release" — fall back to the full list.
     let (code, v) = get_json(agent, &format!("https://api.github.com/repos/{repo}/releases?per_page=1"))?;
-    if code == 200 {
-        if let Some(r) = v.as_array().and_then(|a| a.first()).and_then(ReleaseInfo::from_json) {
+    if code == 200
+        && let Some(r) = v.as_array().and_then(|a| a.first()).and_then(ReleaseInfo::from_json) {
             return Ok(r);
         }
-    }
     Err(format!("no releases found (HTTP {code})"))
 }
 
@@ -383,8 +380,8 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
             Some(v) => ui.label(RichText::new(format!("Installed: {v}")).color(MUTED()).size(12.0)),
             None => ui.label(RichText::new("Not installed.").color(MUTED()).size(12.0)),
         };
-        if let Some(r) = &state.result {
-            if let (Some(inst), Some(latest)) = (&r.comfy_installed, &r.comfy_latest) {
+        if let Some(r) = &state.result
+            && let (Some(inst), Some(latest)) = (&r.comfy_installed, &r.comfy_latest) {
                 if is_newer(&latest.tag, inst) {
                     ui.add_space(2.0);
                     ui.label(RichText::new(format!("Update available — {}", latest.tag)).color(GREEN).strong());
@@ -409,7 +406,6 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
                     ui.label(RichText::new("ComfyUI is up to date.").color(MUTED()).size(12.0));
                 }
             }
-        }
         // Live progress / result of the in-place update.
         if comfy_updating || state.comfy_done.is_some() {
             ui.add_space(6.0);
@@ -453,8 +449,8 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
     if do_comfy_update {
         state.start_comfy_update(ui.ctx());
     }
-    if do_dismiss {
-        if let Some(r) = &state.result {
+    if do_dismiss
+        && let Some(r) = &state.result {
             if let Some(ri) = &r.app_latest {
                 settings.dismissed_app_version = ri.tag.clone();
             }
@@ -462,7 +458,6 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
                 settings.dismissed_comfy_version = ri.tag.clone();
             }
         }
-    }
 }
 
 /// A bordered, scrollable box for release notes.

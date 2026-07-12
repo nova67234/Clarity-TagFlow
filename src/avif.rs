@@ -59,15 +59,13 @@ pub fn decode_avif(path: &std::path::Path) -> Option<RgbaImage> {
     };
 
     let (mut rgba, w, h) = decode_obu_to_rgba(&parsed.primary_item)?;
-    if let Some(alpha_obu) = &parsed.alpha_item {
-        if let Some((alpha, aw, ah)) = decode_gray(alpha_obu) {
-            if aw == w && ah == h {
+    if let Some(alpha_obu) = &parsed.alpha_item
+        && let Some((alpha, aw, ah)) = decode_gray(alpha_obu)
+            && aw == w && ah == h {
                 for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
                     px[3] = alpha[i];
                 }
             }
-        }
-    }
     RgbaImage::from_raw(w, h, rgba)
 }
 
@@ -212,11 +210,10 @@ fn read_f32(row: &[u8], o: usize) -> f64 {
 fn decode_raw(path: &std::path::Path) -> Option<RgbaImage> {
     let bytes = crate::archive::read(path).ok()?;
     if let Some(dev) = decode_raw_develop(&bytes) {
-        if let Some(prev) = crate::raw_preview::largest_embedded_jpeg(&bytes) {
-            if let Some(matched) = color_match_to_preview(&dev, &prev) {
+        if let Some(prev) = crate::raw_preview::largest_embedded_jpeg(&bytes)
+            && let Some(matched) = color_match_to_preview(&dev, &prev) {
                 return Some(matched);
             }
-        }
         return Some(dev);
     }
     crate::raw_preview::largest_embedded_jpeg(&bytes)
@@ -281,6 +278,8 @@ fn color_match_to_preview(dev: &RgbaImage, prev: &RgbaImage) -> Option<RgbaImage
 
 /// Solve the 4×4 system `a · x = b` (b and x have 3 columns) by Gauss-Jordan
 /// elimination with partial pivoting. Returns `None` if `a` is singular.
+// Index loops mirror the row/column notation of the algorithm.
+#[allow(clippy::needless_range_loop)]
 fn solve4x3(mut a: [[f64; 4]; 4], mut b: [[f64; 3]; 4]) -> Option<[[f64; 3]; 4]> {
     for col in 0..4 {
         // Partial pivot: move the row with the largest |value| in this column up.
@@ -684,13 +683,12 @@ mod tests {
             }
             // The colour-matched result is what the app actually displays (see
             // `decode_raw`): develop recoloured to the preview.
-            if let (Some(dev), Some(prev)) = (&dev, &prev) {
-                if let Some(matched) = color_match_to_preview(dev, prev) {
+            if let (Some(dev), Some(prev)) = (&dev, &prev)
+                && let Some(matched) = color_match_to_preview(dev, prev) {
                     let (r, g, b) = mean_rgb(&matched);
                     println!("  matched  {}x{}  mean RGB = ({r:.1}, {g:.1}, {b:.1})", matched.width(), matched.height());
                     matched.save(format!("{stem}.matched.png")).unwrap();
                 }
-            }
         }
     }
 

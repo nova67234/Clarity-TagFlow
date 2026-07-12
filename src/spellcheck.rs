@@ -274,6 +274,21 @@ fn custom_words_path() -> PathBuf {
         .join("spellcheck_custom_words.txt")
 }
 
+fn add_to_dictionary(word: &str) {
+    let Ok(mut set) = custom_words().write() else {
+        return;
+    };
+    if set.insert(word.to_lowercase()) {
+        let path = custom_words_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut lines: Vec<&str> = set.iter().map(String::as_str).collect();
+        lines.sort_unstable();
+        let _ = std::fs::write(path, lines.join("\n"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,20 +332,5 @@ mod tests {
         assert_eq!(match_case("Cinematc", "cinematic"), "Cinematic");
         assert_eq!(match_case("CINEMATC", "cinematic"), "CINEMATIC");
         assert_eq!(match_case("cinematc", "cinematic"), "cinematic");
-    }
-}
-
-fn add_to_dictionary(word: &str) {
-    let Ok(mut set) = custom_words().write() else {
-        return;
-    };
-    if set.insert(word.to_lowercase()) {
-        let path = custom_words_path();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let mut lines: Vec<&str> = set.iter().map(String::as_str).collect();
-        lines.sort_unstable();
-        let _ = std::fs::write(path, lines.join("\n"));
     }
 }

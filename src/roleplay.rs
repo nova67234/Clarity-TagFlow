@@ -456,9 +456,11 @@ mod tests {
     /// stored form must not contain the plaintext (real DPAPI on Windows).
     #[test]
     fn diary_encrypts_and_round_trips() {
-        let mut rp = RoleplayState::default();
-        rp.enabled = true;
-        rp.ai_name = "Mira".into();
+        let mut rp = RoleplayState {
+            enabled: true,
+            ai_name: "Mira".into(),
+            ..Default::default()
+        };
         rp.memories.push(Memory { text: "a very private diary entry 🗝".into(), by_ai: true, image: None });
 
         let json = serde_json::to_string(&rp).unwrap();

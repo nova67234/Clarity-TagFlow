@@ -75,11 +75,10 @@ fn metadata_map(path: &Path) -> Option<BTreeMap<String, String>> {
 
     // If the PNG had no useful key (or it isn't a PNG), fall back to the raw
     // byte scan — that's how JPEG/WebP/AVIF EXIF-UserComment metadata is found.
-    if first_non_blank(&text, &["parameters", "prompt", "workflow", "Comment", "Description"]).is_none() {
-        if let Some(scanned) = scan_raw_for_parameters(&bytes) {
+    if first_non_blank(&text, &["parameters", "prompt", "workflow", "Comment", "Description"]).is_none()
+        && let Some(scanned) = scan_raw_for_parameters(&bytes) {
             text.insert("parameters".to_string(), scanned);
         }
-    }
 
     Some(text)
 }
@@ -93,14 +92,13 @@ fn format_from_map(text: &BTreeMap<String, String>) -> Option<String> {
     // samplers that `format_comfyui` can't trace (yielding an empty/garbled result),
     // so the clean `parameters` block wins when present. (Mirrors A1111's own
     // `read_info_from_image`, which pops `parameters` before checking for ComfyUI.)
-    if let Some(p) = text.get("parameters") {
-        if has_steps_anchor(p) {
+    if let Some(p) = text.get("parameters")
+        && has_steps_anchor(p) {
             let formatted = format_a1111(p);
             if !formatted.trim().is_empty() {
                 return Some(formatted);
             }
         }
-    }
 
     // ComfyUI workflows carry both `prompt` and `workflow`; format the node graph.
     if text.contains_key("prompt") && text.contains_key("workflow") {
@@ -126,11 +124,10 @@ fn format_from_map(text: &BTreeMap<String, String>) -> Option<String> {
 /// Mirrors [`format_from_map`]'s source-selection order so it returns the same
 /// underlying field, just unformatted.
 fn raw_from_map(text: &BTreeMap<String, String>) -> Option<String> {
-    if let Some(p) = text.get("parameters") {
-        if has_steps_anchor(p) {
+    if let Some(p) = text.get("parameters")
+        && has_steps_anchor(p) {
             return Some(p.clone());
         }
-    }
     if text.contains_key("prompt") && text.contains_key("workflow") {
         return text.get("prompt").cloned().filter(|s| !s.trim().is_empty());
     }
@@ -141,11 +138,10 @@ fn raw_from_map(text: &BTreeMap<String, String>) -> Option<String> {
 /// Returns the first of `keys` whose value in `map` is non-blank.
 fn first_non_blank<'a>(map: &'a BTreeMap<String, String>, keys: &[&str]) -> Option<&'a str> {
     for k in keys {
-        if let Some(v) = map.get(*k) {
-            if !v.trim().is_empty() {
+        if let Some(v) = map.get(*k)
+            && !v.trim().is_empty() {
                 return Some(v);
             }
-        }
     }
     None
 }
@@ -296,21 +292,18 @@ fn scan_raw_for_parameters(bytes: &[u8]) -> Option<String> {
 
     // UTF-8, then UTF-16LE, then UTF-16BE — same order as before, but each only
     // when its encoded anchor actually occurs, and decoding only a window.
-    if let Some(pos) = anchor_pos(bytes, Encoding::Utf8) {
-        if let Some(s) = isolate_sd(&String::from_utf8_lossy(anchor_window(bytes, pos, false))) {
+    if let Some(pos) = anchor_pos(bytes, Encoding::Utf8)
+        && let Some(s) = isolate_sd(&String::from_utf8_lossy(anchor_window(bytes, pos, false))) {
             return Some(s);
         }
-    }
-    if let Some(pos) = anchor_pos(bytes, Encoding::Utf16Le) {
-        if let Some(s) = isolate_sd(&decode_utf16(anchor_window(bytes, pos, true), false)) {
+    if let Some(pos) = anchor_pos(bytes, Encoding::Utf16Le)
+        && let Some(s) = isolate_sd(&decode_utf16(anchor_window(bytes, pos, true), false)) {
             return Some(s);
         }
-    }
-    if let Some(pos) = anchor_pos(bytes, Encoding::Utf16Be) {
-        if let Some(s) = isolate_sd(&decode_utf16(anchor_window(bytes, pos, true), true)) {
+    if let Some(pos) = anchor_pos(bytes, Encoding::Utf16Be)
+        && let Some(s) = isolate_sd(&decode_utf16(anchor_window(bytes, pos, true), true)) {
             return Some(s);
         }
-    }
     None
 }
 
@@ -439,8 +432,7 @@ fn format_a1111(raw: &str) -> String {
     let mut json_part = String::new();
     if let Some(j) = first_json {
         json_part = params_line[j..]
-            .replace('\n', "")
-            .replace('\r', "")
+            .replace(['\n', '\r'], "")
             .replace("Civitai resources:", "Civitai resources:\n")
             .replace("Civitai metadata:", "\n\nCivitai metadata:\n")
             .trim()
@@ -505,13 +497,12 @@ fn split_negative(pre: &str) -> (String, String) {
         let neg = pre[idx + "\nNegative prompt:".len()..].trim();
         return (prompt, strip_leading_colon(neg));
     }
-    if let Some(idx) = index_of_ignore_case(pre, "negative prompt:") {
-        if idx > 0 {
+    if let Some(idx) = index_of_ignore_case(pre, "negative prompt:")
+        && idx > 0 {
             let prompt = pre[..idx].trim().to_string();
             let neg = pre[idx + "Negative prompt:".len()..].trim();
             return (prompt, strip_leading_colon(neg));
         }
-    }
     (pre.trim().to_string(), String::new())
 }
 
@@ -581,24 +572,21 @@ fn format_comfyui(prompt_json: &str) -> Option<String> {
         let inputs = node.get("inputs").cloned().unwrap_or(serde_json::Value::Null);
 
         match class_type {
-            "CheckpointLoaderSimple" | "CheckpointLoader" => {
-                if model.is_none() {
+            "CheckpointLoaderSimple" | "CheckpointLoader"
+                if model.is_none() => {
                     model = inputs.get("ckpt_name").and_then(s);
                 }
-            }
-            "UNETLoader" => {
-                if model.is_none() {
+            "UNETLoader"
+                if model.is_none() => {
                     model = inputs.get("unet_name").and_then(s);
                 }
-            }
             "EmptyLatentImage" | "EmptySD3LatentImage" => {
                 let w = inputs.get("width").and_then(|v| v.as_i64());
                 let h = inputs.get("height").and_then(|v| v.as_i64());
-                if let (Some(w), Some(h)) = (w, h) {
-                    if w > 0 && h > 0 {
+                if let (Some(w), Some(h)) = (w, h)
+                    && w > 0 && h > 0 {
                         size = Some(format!("{w}x{h}"));
                     }
-                }
             }
             "KSampler" | "KSamplerAdvanced" => {
                 if seed.is_none() {
@@ -624,24 +612,21 @@ fn format_comfyui(prompt_json: &str) -> Option<String> {
                 }
             }
             ct if ct.contains("LoraLoader") => {
-                if let Some(name) = inputs.get("lora_name").and_then(|v| v.as_str()) {
-                    if !name.is_empty() {
+                if let Some(name) = inputs.get("lora_name").and_then(|v| v.as_str())
+                    && !name.is_empty() {
                         loras.push(name.to_string());
                     }
-                }
             }
             "Power Lora Loader (rgthree)" => {
                 if let Some(obj) = inputs.as_object() {
                     for (field, lnode) in obj {
                         if field.starts_with("lora_") && lnode.is_object() {
                             let on = lnode.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
-                            if on {
-                                if let Some(name) = lnode.get("lora").and_then(|v| v.as_str()) {
-                                    if !name.is_empty() {
+                            if on
+                                && let Some(name) = lnode.get("lora").and_then(|v| v.as_str())
+                                    && !name.is_empty() {
                                         loras.push(name.to_string());
                                     }
-                                }
-                            }
                         }
                     }
                 }
@@ -693,8 +678,8 @@ fn trace_prompt(nodes: &serde_json::Map<String, serde_json::Value>, link: Option
     let class_type = node.get("class_type").and_then(|v| v.as_str()).unwrap_or("");
     let inputs = node.get("inputs").cloned().unwrap_or(serde_json::Value::Null);
 
-    if class_type == "CLIPTextEncode" || class_type == "CLIPTextEncodeSDXL" {
-        if let Some(text) = inputs.get("text") {
+    if (class_type == "CLIPTextEncode" || class_type == "CLIPTextEncodeSDXL")
+        && let Some(text) = inputs.get("text") {
             if let Some(t) = text.as_str() {
                 return t.trim().to_string();
             }
@@ -702,18 +687,16 @@ fn trace_prompt(nodes: &serde_json::Map<String, serde_json::Value>, link: Option
                 return trace_prompt(nodes, Some(text));
             }
         }
-    }
     if class_type == "ConditioningZeroOut" {
         return String::new();
     }
     if let Some(cond) = inputs.get("conditioning") {
         return trace_prompt(nodes, Some(cond));
     }
-    if let Some(tg) = inputs.get("text_g") {
-        if let Some(t) = tg.as_str() {
+    if let Some(tg) = inputs.get("text_g")
+        && let Some(t) = tg.as_str() {
             return t.trim().to_string();
         }
-    }
     String::new()
 }
 
@@ -830,11 +813,10 @@ pub fn read_generation(path: &Path) -> Option<DroppedMeta> {
     }
 
     // A1111: a `parameters` block with a `Steps:` anchor (no custom nodes).
-    if out.positive.trim().is_empty() {
-        if let Some(p) = map.get("parameters").filter(|p| has_steps_anchor(p)) {
+    if out.positive.trim().is_empty()
+        && let Some(p) = map.get("parameters").filter(|p| has_steps_anchor(p)) {
             a1111_into(p, &mut out);
         }
-    }
 
     // Civitai resources (checkpoint + LoRAs by version id) — written by the
     // Image-Saver node into the `parameters` block; independent of prompt-fill.
@@ -865,13 +847,11 @@ fn parse_civitai_resources(raw: &str) -> Vec<CivitaiRef> {
         // urn:air:<eco>:<kind>:civitai:<modelId>@<versionId>
         let parts: Vec<&str> = air.split(':').collect();
         let kind = parts.get(3).copied().unwrap_or("").to_string();
-        if let Some(tail) = air.rsplit("civitai:").next() {
-            if let Some(ver) = tail.split('@').nth(1) {
-                if let Ok(version_id) = ver.trim().parse::<i64>() {
+        if let Some(tail) = air.rsplit("civitai:").next()
+            && let Some(ver) = tail.split('@').nth(1)
+                && let Ok(version_id) = ver.trim().parse::<i64>() {
                     out.push(CivitaiRef { version_id, kind });
                 }
-            }
-        }
     }
     out
 }
@@ -964,8 +944,10 @@ fn read_generation_video(path: &Path) -> Option<DroppedMeta> {
     let open = text[..marker].rfind('{')?;
     let workflow_json = balanced_object(&text, open)?;
 
-    let mut out = DroppedMeta::default();
-    out.custom_nodes = comfy_custom_nodes(&workflow_json);
+    let mut out = DroppedMeta {
+        custom_nodes: comfy_custom_nodes(&workflow_json),
+        ..Default::default()
+    };
     workflow_widgets_into(&workflow_json, &mut out);
     if out.is_empty() {
         None
@@ -1033,11 +1015,10 @@ fn workflow_widgets_into(workflow_json: &str, out: &mut DroppedMeta) {
         let wv = node.get("widgets_values").and_then(|v| v.as_array());
         match ty {
             "CLIPTextEncode" | "CLIPTextEncodeSDXL" => {
-                if let Some(s) = wv.and_then(|a| a.first()).and_then(|v| v.as_str()) {
-                    if !s.trim().is_empty() {
+                if let Some(s) = wv.and_then(|a| a.first()).and_then(|v| v.as_str())
+                    && !s.trim().is_empty() {
                         prompts.push(s.trim().to_string());
                     }
-                }
             }
             // KSampler widgets: [seed, control_after_generate, steps, cfg, …].
             "KSampler" | "KSamplerAdvanced" => {
@@ -1065,30 +1046,26 @@ fn workflow_widgets_into(workflow_json: &str, out: &mut DroppedMeta) {
             }
             // LoraLoader UI widgets: [lora_name, strength_model, strength_clip].
             ty if ty.contains("LoraLoader") => {
-                if let Some(a) = wv {
-                    if let Some(name) = a.first().and_then(|v| v.as_str()) {
-                        if !name.is_empty() {
+                if let Some(a) = wv
+                    && let Some(name) = a.first().and_then(|v| v.as_str())
+                        && !name.is_empty() {
                             let strength = num_f(a.get(1)).unwrap_or(1.0) as f32;
                             out.loras.push((name.to_string(), strength));
                         }
-                    }
-                }
             }
             _ => {}
         }
     }
     // Positive = the longest text-encode value; negative = the next longest.
     prompts.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    if out.positive.trim().is_empty() {
-        if let Some(p) = prompts.first() {
+    if out.positive.trim().is_empty()
+        && let Some(p) = prompts.first() {
             out.positive = p.clone();
         }
-    }
-    if out.negative.trim().is_empty() {
-        if let Some(n) = prompts.get(1) {
+    if out.negative.trim().is_empty()
+        && let Some(n) = prompts.get(1) {
             out.negative = n.clone();
         }
-    }
 }
 
 /// Walk a ComfyUI API `prompt` graph, filling the prompt text + generation
@@ -1140,26 +1117,23 @@ fn comfy_prompt_into(prompt_json: &str, out: &mut DroppedMeta) {
                 }
             }
             ct if ct.contains("LoraLoader") => {
-                if let Some(name) = inputs.get("lora_name").and_then(|v| v.as_str()) {
-                    if !name.is_empty() {
+                if let Some(name) = inputs.get("lora_name").and_then(|v| v.as_str())
+                    && !name.is_empty() {
                         let strength = inputs.get("strength_model").and_then(&as_f).unwrap_or(1.0) as f32;
                         out.loras.push((name.to_string(), strength));
                     }
-                }
             }
             "Power Lora Loader (rgthree)" => {
                 if let Some(obj) = inputs.as_object() {
                     for (field, lnode) in obj {
                         if field.starts_with("lora_") && lnode.is_object() {
                             let on = lnode.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
-                            if on {
-                                if let Some(name) = lnode.get("lora").and_then(|v| v.as_str()) {
-                                    if !name.is_empty() {
+                            if on
+                                && let Some(name) = lnode.get("lora").and_then(|v| v.as_str())
+                                    && !name.is_empty() {
                                         let strength = lnode.get("strength").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
                                         out.loras.push((name.to_string(), strength));
                                     }
-                                }
-                            }
                         }
                     }
                 }
@@ -1240,12 +1214,11 @@ fn a1111_into(raw: &str, out: &mut DroppedMeta) {
     out.steps = a1111_field(raw, "Steps:").and_then(|s| s.parse().ok());
     out.cfg = a1111_field(raw, "CFG scale:").and_then(|s| s.parse().ok());
     out.seed = a1111_field(raw, "Seed:").and_then(|s| s.parse().ok());
-    if let Some(size) = a1111_field(raw, "Size:") {
-        if let Some((w, h)) = size.split_once('x') {
+    if let Some(size) = a1111_field(raw, "Size:")
+        && let Some((w, h)) = size.split_once('x') {
             out.width = w.trim().parse().ok();
             out.height = h.trim().parse().ok();
         }
-    }
 }
 
 /// Pull `<lora:name:weight>` tags out of `text` into `out.loras` and return the

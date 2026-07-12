@@ -1,4 +1,4 @@
-name: Build macOS app
+﻿name: Build macOS app
 
 # Build an Apple Silicon (arm64) .app and package it as a .dmg.
 # Triggered manually, or automatically when a v* tag is pushed.
@@ -21,7 +21,7 @@ jobs:
   macos:
     runs-on: macos-14 # Apple Silicon runner.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust (Apple Silicon target)
         uses: dtolnay/rust-toolchain@stable

@@ -258,8 +258,8 @@ pub fn show(
     let mut want_close = false;
 
     let screen = ctx.content_rect();
-    let win_w = (screen.width() * 0.85).min(1150.0).max(480.0);
-    let win_h = (screen.height() * 0.85).min(780.0).max(360.0);
+    let win_w = (screen.width() * 0.85).clamp(480.0, 1150.0);
+    let win_h = (screen.height() * 0.85).clamp(360.0, 780.0);
 
     use crate::PopupPlacement;
     egui::Window::new("gallery_detail")
@@ -365,6 +365,7 @@ pub fn show(
 }
 
 /// The right-hand column — a menu switcher (Details ⇄ Civitai) over the chosen view.
+#[allow(clippy::too_many_arguments)] // threads the view's caches/state, not data
 fn right_column(
     ui: &mut egui::Ui,
     popup: &mut DetailPopup,
@@ -600,17 +601,16 @@ fn actions_row(
             }
         }
 
-        if ui.add_sized(size, egui::Button::new(label("Move"))).clicked() {
-            if let Some(i) = index {
+        if ui.add_sized(size, egui::Button::new(label("Move"))).clicked()
+            && let Some(i) = index {
                 *action = DetailAction::Move(i);
                 *want_close = true;
             }
-        }
 
         let del = egui::Button::new(label("Delete").color(egui::Color32::WHITE))
             .fill(egui::Color32::from_rgb(180, 40, 40));
-        if ui.add_sized(size, del).clicked() {
-            if let Some(i) = index {
+        if ui.add_sized(size, del).clicked()
+            && let Some(i) = index {
                 // Confirm first, unless confirmations are disabled.
                 if confirm_before_delete {
                     popup.show_delete_confirm = true;
@@ -620,7 +620,6 @@ fn actions_row(
                     *want_close = true;
                 }
             }
-        }
     });
 }
 
@@ -638,7 +637,7 @@ fn tags_box_fill(ui: &mut egui::Ui, popup: &mut DetailPopup) {
 
     let artist = popup.artist.clone();
     let character = popup.character.clone();
-    let highlight_roles = !showing_meta && !(artist.is_empty() && character.is_empty());
+    let highlight_roles = !showing_meta && (!artist.is_empty() || !character.is_empty());
     let role_color = if editable { TEXT() } else { TEXT().gamma_multiply(0.8) };
 
     // Lock the box height to the remaining space so it never grows with the text.

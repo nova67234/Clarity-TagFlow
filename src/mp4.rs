@@ -27,7 +27,7 @@ pub fn probe(path: &Path) -> Option<VideoInfo> {
     let file_len = f.len().ok()?;
 
     let (moov_off, moov_total) = find_top_level_box(&mut f, file_len, b"moov")?;
-    if moov_total < 8 || moov_total > MAX_MOOV {
+    if !(8..=MAX_MOOV).contains(&moov_total) {
         return None;
     }
     f.seek(SeekFrom::Start(moov_off)).ok()?;
@@ -58,12 +58,11 @@ pub fn probe(path: &Path) -> Option<VideoInfo> {
         for (ttyp, tbody) in &trak_children {
             match ttyp {
                 b"tkhd" => {
-                    if let Some((w, h)) = parse_tkhd_dims(tbody) {
-                        if w > 0 && h > 0 {
+                    if let Some((w, h)) = parse_tkhd_dims(tbody)
+                        && w > 0 && h > 0 {
                             t_w = Some(w);
                             t_h = Some(h);
                         }
-                    }
                 }
                 b"mdia" => {
                     for (mtyp, mbody) in &parse_boxes(tbody) {

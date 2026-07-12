@@ -519,19 +519,17 @@ impl ZoomState {
         // The on-screen image rectangle, clamped to what's actually visible.
         let irect = self.image_rect(viewport, img).intersect(viewport);
 
-        if resp.drag_started() {
-            if let Some(p) = resp.interact_pointer_pos() {
+        if resp.drag_started()
+            && let Some(p) = resp.interact_pointer_pos() {
                 let c = clamp_pos(p, irect);
                 self.crop_start = Some(c);
                 self.crop_rect = Some(Rect::from_min_max(c, c));
             }
-        }
-        if resp.dragged() {
-            if let (Some(start), Some(p)) = (self.crop_start, resp.interact_pointer_pos()) {
+        if resp.dragged()
+            && let (Some(start), Some(p)) = (self.crop_start, resp.interact_pointer_pos()) {
                 let c = clamp_pos(p, irect);
                 self.crop_rect = Some(Rect::from_two_pos(start, c));
             }
-        }
         if resp.drag_stopped() {
             let result = self.crop_rect.and_then(|cr| {
                 if cr.width() < 4.0 || cr.height() < 4.0 || irect.width() <= 0.0 || irect.height() <= 0.0 {
@@ -707,7 +705,7 @@ impl ZoomState {
         let mut want_exit = false;
         let mut want_favorite = false;
         let mut want_copy = false;
-        egui::Popup::context_menu(&resp)
+        egui::Popup::context_menu(resp)
             .frame(egui::Frame::menu(&resp.ctx.global_style()).corner_radius(CornerRadius::same(22)))
             .show(|ui| {
             if menu_item(ui, egui::include_image!("../icons/spatial_scene.svg"), "Exit Spatial Scene") {
@@ -909,8 +907,8 @@ impl ZoomState {
 
     /// Paint the image as a depth-displaced parallax mesh. Near pixels (`layer`
     /// > 0) and far pixels (`layer` < 0) shift in opposite directions about the
-    /// mid-plane, anchored so the scene doesn't drift, producing the "peek
-    /// around" depth effect as `m` (the smoothed mouse/sway offset) changes.
+    /// >    mid-plane, anchored so the scene doesn't drift, producing the "peek
+    /// >    around" depth effect as `m` (the smoothed mouse/sway offset) changes.
     fn paint_spatial(
         &mut self,
         ui: &egui::Ui,

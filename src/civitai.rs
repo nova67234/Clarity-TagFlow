@@ -963,11 +963,10 @@ fn folders_popup(ctx: &egui::Context, state: &mut CivitaiState) {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     let folder = egui::include_image!("../icons/folder.svg");
-                    if crate::svg_button(ui, folder, "Choose folder", 28.0, crate::theme::icon_tint(MUTED())).clicked() {
-                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    if crate::svg_button(ui, folder, "Choose folder", 28.0, crate::theme::icon_tint(MUTED())).clicked()
+                        && let Some(dir) = rfd::FileDialog::new().pick_folder() {
                             *state.download_dirs.get_mut(cat) = dir.display().to_string();
                         }
-                    }
                     ui.add(
                         egui::TextEdit::singleline(state.download_dirs.get_mut(cat))
                             .desired_width(f32::INFINITY)
@@ -1210,13 +1209,12 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+        if bytes[i] == b'%' && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
                 out.push(b);
                 i += 3;
                 continue;
             }
-        }
         out.push(bytes[i]);
         i += 1;
     }
@@ -1380,8 +1378,8 @@ fn legacy_download_dir_path() -> std::path::PathBuf {
 
 fn load_download_dirs() -> DownloadDirs {
     // New JSON map.
-    if let Ok(text) = std::fs::read_to_string(download_dirs_path()) {
-        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(&text) {
+    if let Ok(text) = std::fs::read_to_string(download_dirs_path())
+        && let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(&text) {
             let mut d = DownloadDirs::default();
             for cat in DlCat::ALL {
                 if let Some(v) = map.get(cat.key()) {
@@ -1390,7 +1388,6 @@ fn load_download_dirs() -> DownloadDirs {
             }
             return d;
         }
-    }
     // Migrate the old single folder: seed every category with it so existing
     // setups keep working until the user splits them out.
     let legacy = std::fs::read_to_string(legacy_download_dir_path())
@@ -1626,25 +1623,20 @@ fn run_fetch(
         }
 
         let mut info = None;
-        if let Some(v) = &task.version_id {
-            if !v.is_empty() {
+        if let Some(v) = &task.version_id
+            && !v.is_empty() {
                 info = fetch_resource_info(&agent, task.kind, LookupMethod::VersionId, v, hd);
             }
-        }
-        if info.is_none() {
-            if let Some(h) = &task.hash {
-                if !h.is_empty() {
+        if info.is_none()
+            && let Some(h) = &task.hash
+                && !h.is_empty() {
                     info = fetch_resource_info(&agent, task.kind, LookupMethod::Hash, h, hd);
                 }
-            }
-        }
-        if info.is_none() {
-            if let Some(n) = &task.name {
-                if !n.is_empty() {
+        if info.is_none()
+            && let Some(n) = &task.name
+                && !n.is_empty() {
                     info = fetch_resource_info(&agent, task.kind, LookupMethod::Name, n, hd);
                 }
-            }
-        }
 
         let Some(info) = info else { continue };
         if !processed.insert(info.url.clone()) {
@@ -1779,11 +1771,10 @@ fn fetch_resource_info(
             if let Some(pos) = clean.rfind(['/', '\\']) {
                 clean = clean[pos + 1..].to_string();
             }
-            if let Some(dot) = clean.rfind('.') {
-                if dot > 0 {
+            if let Some(dot) = clean.rfind('.')
+                && dot > 0 {
                     clean = clean[..dot].to_string();
                 }
-            }
             clean = clean.replace(['_', '-'], " ");
 
             let type_filter = match kind {
@@ -2146,13 +2137,11 @@ fn parse_metadata_for_tasks(metadata: &str) -> Vec<Task> {
     } else {
         None
     };
-    if let Some(js) = json_str {
-        if let Ok(root) = serde_json::from_str::<serde_json::Value>(&js) {
-            if root.is_object() {
+    if let Some(js) = json_str
+        && let Ok(root) = serde_json::from_str::<serde_json::Value>(&js)
+            && root.is_object() {
                 tasks.extend(parse_comfyui(&root));
             }
-        }
-    }
 
     tasks
 }
@@ -2181,13 +2170,12 @@ fn parse_civitai_generator(metadata: &str) -> Vec<Task> {
             _ => block,
         };
 
-        if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&block) {
-            if let Some(items) = arr.as_array() {
+        if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&block)
+            && let Some(items) = arr.as_array() {
                 for node in items {
                     push_resource_node(node, &mut tasks, &mut claimed_versions);
                 }
             }
-        }
     }
 
     // 2) The newer `Civitai metadata: { … "resources": [ … ] }` JSON blob. On-site
@@ -2196,8 +2184,8 @@ fn parse_civitai_generator(metadata: &str) -> Vec<Task> {
     //    images showed "No Civitai resources found".
     if let Some(idx) = metadata.find("Civitai metadata:") {
         let rest = &metadata[idx + "Civitai metadata:".len()..];
-        if let Some(json) = balanced_json_object(rest) {
-            if let Ok(root) = serde_json::from_str::<serde_json::Value>(json) {
+        if let Some(json) = balanced_json_object(rest)
+            && let Ok(root) = serde_json::from_str::<serde_json::Value>(json) {
                 for key in ["resources", "additionalResources"] {
                     if let Some(items) = root.get(key).and_then(|v| v.as_array()) {
                         for node in items {
@@ -2206,7 +2194,6 @@ fn parse_civitai_generator(metadata: &str) -> Vec<Task> {
                     }
                 }
             }
-        }
     }
 
     tasks
@@ -2227,16 +2214,14 @@ fn push_resource_node(
     let mut type_str = node.get("type").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     let mut ver = node.get("modelVersionId").and_then(as_text_opt).unwrap_or_default();
 
-    if ver.is_empty() {
-        if let Some(air) = node.get("air").and_then(|v| v.as_str()) {
-            if let Some((air_type, version_id)) = parse_air(air) {
+    if ver.is_empty()
+        && let Some(air) = node.get("air").and_then(|v| v.as_str())
+            && let Some((air_type, version_id)) = parse_air(air) {
                 if type_str.is_empty() {
                     type_str = air_type;
                 }
                 ver = version_id;
             }
-        }
-    }
 
     if ver.is_empty() || ver == "0" || !claimed_versions.insert(ver.clone()) {
         return;
@@ -2348,13 +2333,12 @@ fn parse_comfyui(root: &serde_json::Value) -> Vec<Task> {
                     for (field, lnode) in io {
                         if field.starts_with("lora_") && lnode.is_object() {
                             let on = lnode.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
-                            if on {
-                                if let Some(lname) =
+                            if on
+                                && let Some(lname) =
                                     lnode.get("lora").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
                                 {
                                     tasks.push(Task::name(ItemType::Lora, lname.to_string()));
                                 }
-                            }
                         }
                     }
                 }
@@ -2376,17 +2360,15 @@ fn parse_a1111(metadata: &str) -> Vec<Task> {
     let mut claimed_names: HashSet<String> = HashSet::new();
 
     // Model hash.
-    if let Some(h) = scan_hash_after(metadata, "Model hash:") {
-        if claimed_hashes.insert(h.clone()) {
+    if let Some(h) = scan_hash_after(metadata, "Model hash:")
+        && claimed_hashes.insert(h.clone()) {
             tasks.push(Task::hash(ItemType::Model, h));
         }
-    }
     // VAE hash.
-    if let Some(h) = scan_hash_after(metadata, "VAE hash:") {
-        if claimed_hashes.insert(h.clone()) {
+    if let Some(h) = scan_hash_after(metadata, "VAE hash:")
+        && claimed_hashes.insert(h.clone()) {
             tasks.push(Task::hash(ItemType::Vae, h));
         }
-    }
 
     // "Lora hashes:" / "Lyco hashes:" / "LyCORIS hashes:" — a block of hashes.
     for label in ["Lora hashes:", "Lyco hashes:", "LyCORIS hashes:"] {

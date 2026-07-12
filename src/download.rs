@@ -360,11 +360,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                             let folder_svg = egui::include_image!("../icons/folder.svg");
                             if crate::svg_button(ui, folder_svg, "Choose output folder", 34.0, crate::theme::icon_tint(MUTED()))
                                 .clicked()
-                            {
-                                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                && let Some(dir) = rfd::FileDialog::new().pick_folder() {
                                     state.output_dir = dir.display().to_string();
                                 }
-                            }
                             field_edit(ui, enabled, egui::TextEdit::singleline(&mut state.output_dir)
                                 .hint_text("Where files are saved"));
                         });
@@ -1310,7 +1308,7 @@ fn parse_posts(body: &str, log: &impl Fn(String)) -> Vec<Post> {
     let add = |p: &serde_json::Value, out: &mut Vec<Post>| {
         let mut file_url = p.get("file_url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         if let Some(rest) = file_url.strip_prefix("//") {
-            file_url = format!("https:{}", format!("//{rest}"));
+            file_url = format!("https://{rest}");
         } else if file_url.starts_with('/') {
             file_url = format!("https://gelbooru.com{file_url}");
         }
@@ -1386,8 +1384,8 @@ fn save_config(cfg: &SavedConfig) {
 
 fn load_download_log() -> HashSet<String> {
     let mut set = HashSet::new();
-    if let Ok(json) = std::fs::read_to_string(download_log_path()) {
-        if let Ok(v) = serde_json::from_str::<Vec<String>>(&json) {
+    if let Ok(json) = std::fs::read_to_string(download_log_path())
+        && let Ok(v) = serde_json::from_str::<Vec<String>>(&json) {
             for s in v {
                 let t = s.trim().to_string();
                 if !t.is_empty() {
@@ -1395,7 +1393,6 @@ fn load_download_log() -> HashSet<String> {
                 }
             }
         }
-    }
     set
 }
 

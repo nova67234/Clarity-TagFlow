@@ -389,7 +389,7 @@ pub fn apply(ctx: &egui::Context) {
         // Light glass: the default (foreground-colour) scrollbar takes the
         // widgets' fg_stroke — the dark ink — so the handle read near-black.
         // Switch it to the widgets' bg fill, the theme's light-grey pills.
-        s.spacing.scroll.foreground_color = !(p.glass && !p.is_dark);
+        s.spacing.scroll.foreground_color = !p.glass || p.is_dark;
     });
     let mut v = if p.is_dark {
         egui::Visuals::dark()

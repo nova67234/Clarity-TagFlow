@@ -150,13 +150,12 @@ impl Tagger {
         // PixAI's "logits" output too; otherwise sniff for out-of-[0,1] values.
         let mut need_sigmoid = matches!(self.kind, TaggerKind::JoyTag) || self.output_is_logits;
         if self.kind == TaggerKind::Pixai && !need_sigmoid {
-            need_sigmoid = raw[..n].iter().any(|&v| v < 0.0 || v > 1.0);
+            need_sigmoid = raw[..n].iter().any(|&v| !(0.0..=1.0).contains(&v));
         }
 
         let mut scored: Vec<(f32, &str)> = Vec::new();
-        for i in 0..n {
-            let p = if need_sigmoid { 1.0 / (1.0 + (-raw[i]).exp()) } else { raw[i] };
-            let info = &self.tags[i];
+        for (&v, info) in raw[..n].iter().zip(&self.tags) {
+            let p = if need_sigmoid { 1.0 / (1.0 + (-v).exp()) } else { v };
 
             // WD14: drop rating tags (category 9).
             if self.kind == TaggerKind::Wd14 && info.category == 9 {
@@ -300,7 +299,7 @@ fn preprocess_wd14(img: &RgbImage) -> Vec<f32> {
 /// JoyTag: pad to square (white), resize 448, CLIP mean/std normalise, planar RGB.
 fn preprocess_joytag(img: &RgbImage) -> Vec<f32> {
     const MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
-    const STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
+    const STD: [f32; 3] = [0.26862954, 0.261_302_6, 0.275_777_1];
 
     let (w, h) = (img.width(), img.height());
     let m = w.max(h);
@@ -364,6 +363,6 @@ fn load_tags_txt(path: &Path) -> Result<Vec<TagInfo>, String> {
     Ok(text
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| TagInfo { name: l.trim().replace('"', "").replace(',', ""), category: 0 })
+        .map(|l| TagInfo { name: l.trim().replace(['"', ','], ""), category: 0 })
         .collect())
 }

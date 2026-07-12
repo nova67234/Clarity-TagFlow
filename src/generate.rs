@@ -36,14 +36,13 @@ static PROMPT_DROP_RECT: std::sync::Mutex<Option<(egui::Rect, f64)>> = std::sync
 /// Windows, where winit emits no cursor-move events mid-drag) — then any fresh,
 /// visible generator prompt claims the drop, since it was showing the highlight.
 pub fn generator_claims_drop(ctx: &egui::Context, pos: Option<egui::Pos2>) -> bool {
-    if let Ok(guard) = PROMPT_DROP_RECT.lock() {
-        if let Some((rect, t)) = *guard {
+    if let Ok(guard) = PROMPT_DROP_RECT.lock()
+        && let Some((rect, t)) = *guard {
             // Only trust a rect published this frame or last (view is live).
             if (ctx.input(|i| i.time) - t).abs() < 0.5 {
-                return pos.map_or(true, |p| rect.contains(p));
+                return pos.is_none_or(|p| rect.contains(p));
             }
         }
-    }
     false
 }
 
@@ -459,8 +458,8 @@ fn read_lora_info(path: &Path) -> LoraInfo {
             }
         }
     }
-    if let Some(tf) = meta.get("ss_tag_frequency").and_then(|v| v.as_str()) {
-        if let Ok(j) = serde_json::from_str::<serde_json::Value>(tf) {
+    if let Some(tf) = meta.get("ss_tag_frequency").and_then(|v| v.as_str())
+        && let Ok(j) = serde_json::from_str::<serde_json::Value>(tf) {
             let mut counts: Vec<(String, u64)> = Vec::new();
             for tags in j.as_object().map(|o| o.values()).into_iter().flatten() {
                 for (tag, n) in tags.as_object().map(|o| o.iter()).into_iter().flatten() {
@@ -474,14 +473,13 @@ fn read_lora_info(path: &Path) -> LoraInfo {
                     }
                 }
             }
-            counts.sort_by(|a, b| b.1.cmp(&a.1));
+            counts.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
             for (t, _) in counts.into_iter().take(24) {
                 if !info.triggers.contains(&t) {
                     info.triggers.push(t);
                 }
             }
         }
-    }
 
     // Facts worth reading, in display order.
     let mut fact = |label: &str, key: &str| {
@@ -780,11 +778,10 @@ fn scan_checkpoints() -> Vec<(String, PathBuf)> {
                     .is_some_and(|x| x.eq_ignore_ascii_case("safetensors") || x.eq_ignore_ascii_case("ckpt"))
             });
         for p in entries {
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()).map(String::from) {
-                if seen.insert(name.clone()) {
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()).map(String::from)
+                && seen.insert(name.clone()) {
                     v.push((name, p));
                 }
-            }
         }
     }
     v.sort_by(|a, b| a.0.cmp(&b.0));
@@ -805,11 +802,10 @@ fn refresh_checkpoints(state: &mut GenerateState) {
             }
         })
         .collect();
-    if let Some(sel) = &state.checkpoint {
-        if !state.checkpoints.iter().any(|c| &c.file == sel) {
+    if let Some(sel) = &state.checkpoint
+        && !state.checkpoints.iter().any(|c| &c.file == sel) {
             state.checkpoint = None;
         }
-    }
 }
 
 /// Make both ComfyUI loaders find a model wherever it landed: cross-register all
@@ -1040,12 +1036,11 @@ fn neg_with(job: &GenJob, default_neg: &str) -> String {
 /// Kill the running ComfyUI server (if any) and wait until it stops responding,
 /// so a fresh start picks up changed config. Used after [`ensure_checkpoint_paths`].
 fn stop_server() {
-    if let Ok(mut lock) = SERVER.lock() {
-        if let Some(mut child) = lock.take() {
+    if let Ok(mut lock) = SERVER.lock()
+        && let Some(mut child) = lock.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
-    }
     for _ in 0..30 {
         if !ping() {
             return;
@@ -1456,8 +1451,8 @@ fn spawn_lora_thumb_fetch(files: Vec<String>, ctx: egui::Context, force: bool) {
     });
 }
 
-/// A LoRA card frame (the Civitai-card look), highlighted with an accent border
-/// + faint accent wash when selected — selection is shown by the whole card, not
+/// A LoRA card frame (the Civitai-card look), highlighted with an accent border +
+/// faint accent wash when selected — selection is shown by the whole card, not
 /// a checkbox.
 fn lora_card(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
     let (fill, stroke) = if selected {
@@ -1586,8 +1581,8 @@ fn lora_row(
                 });
             });
         });
-        if l.info_open {
-            if let Some(info) = &l.info {
+        if l.info_open
+            && let Some(info) = &l.info {
                 ui.add_space(4.0);
                 if info.triggers.is_empty() && info.facts.is_empty() {
                     ui.label(RichText::new("No metadata in this file.").color(MUTED()).size(10.5));
@@ -1621,7 +1616,6 @@ fn lora_row(
                     });
                 }
             }
-        }
     });
     // Whole card clickable: the ℹ slot toggles details, the copy glyph copies
     // triggers, the weight slider keeps its own drag, and a click anywhere else
@@ -2247,13 +2241,12 @@ pub fn update_comfyui(send: &dyn Fn(String)) -> bool {
     }
 
     // Stop the bundled server so its source files aren't held open while we copy.
-    if let Ok(mut guard) = SERVER.lock() {
-        if let Some(mut child) = guard.take() {
+    if let Ok(mut guard) = SERVER.lock()
+        && let Some(mut child) = guard.take() {
             send("== Stopping ComfyUI server…".into());
             let _ = child.kill();
             let _ = child.wait();
         }
-    }
 
     send("== Downloading latest ComfyUI…".into());
     let zip = base.join("comfyui_update.zip");
@@ -2547,7 +2540,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
     }
     let hover_pos = ui.input(|i| i.pointer.hover_pos());
     let drag_over_prompt = dragging_files
-        && state.prompt_rect.map_or(true, |r| hover_pos.map_or(true, |p| r.contains(p)));
+        && state.prompt_rect.is_none_or(|r| hover_pos.is_none_or(|p| r.contains(p)));
 
     // --- Prompt (stretched to the panel; long text scrolls inside). ---
     // Header row: "Prompt" on the left; on the right, the drag-and-drop import
@@ -2773,7 +2766,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
             // unknown (typical for Windows DnD), accept the drop — this
             // generator's box was the highlighted target.
             let release_pos = ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
-            if release_pos.map_or(true, |p| prompt_rect.contains(p)) {
+            if release_pos.is_none_or(|p| prompt_rect.contains(p)) {
                 import_dropped_file(state, &path, ui.ctx());
             }
         }
@@ -3747,20 +3740,18 @@ fn import_dropped_file(state: &mut GenerateState, path: &Path, ctx: &egui::Conte
     if let Some(c) = meta.cfg {
         state.cfg = (c as f32).clamp(1.0, 8.0);
     }
-    if let Some(seed) = meta.seed {
-        if seed >= 0 {
+    if let Some(seed) = meta.seed
+        && seed >= 0 {
             state.seed = seed;
             state.randomize_seed = false;
         }
-    }
-    if let (Some(w), Some(h)) = (meta.width, meta.height) {
-        if w > 0 && h > 0 {
+    if let (Some(w), Some(h)) = (meta.width, meta.height)
+        && w > 0 && h > 0 {
             state.width = w as i32;
             state.height = h as i32;
             // Image families drive every aspect tile off a single "Size" edge.
             state.size = (w.max(h) as i32).clamp(256, 2048);
         }
-    }
 
     // Auto-select the LoRAs the generation used, matching installed files by stem
     // (case-insensitive) and applying the recorded strength.
@@ -4074,11 +4065,10 @@ fn referenced_model_cats(graph: &str) -> std::collections::HashMap<String, Model
                 }
             } else if k.starts_with("lora_") && v.is_object() {
                 // rgthree Power Lora Loader: nested { lora: "name", on, strength }.
-                if let Some(name) = v.get("lora").and_then(|x| x.as_str()) {
-                    if !name.is_empty() {
+                if let Some(name) = v.get("lora").and_then(|x| x.as_str())
+                    && !name.is_empty() {
                         out.insert(base(name), ModelCat::Lora);
                     }
-                }
             }
         }
     }
@@ -4250,11 +4240,10 @@ fn install_one_repo(repo: &str, custom_dir: &Path, send: &dyn Fn(String)) -> Opt
         }
     }
     // Neither default worked — ask GitHub for the repo's real default branch.
-    if let Some(branch) = github_default_branch(repo, send) {
-        if !tried.contains(&branch) && try_branch(&branch, send) {
+    if let Some(branch) = github_default_branch(repo, send)
+        && !tried.contains(&branch) && try_branch(&branch, send) {
             return Some((dest, true));
         }
-    }
     None
 }
 
@@ -4420,13 +4409,12 @@ fn imported_missing_models(graph: &str, comfy: &Path) -> Vec<String> {
     for node in map.values() {
         if let Some(inputs) = node.get("inputs").and_then(|v| v.as_object()) {
             for v in inputs.values() {
-                if let Some(s) = v.as_str() {
-                    if is_model(s) {
+                if let Some(s) = v.as_str()
+                    && is_model(s) {
                         let b = basename(s);
                         display.entry(b.clone()).or_insert_with(|| s.to_string());
                         referenced.insert(b);
                     }
-                }
             }
         }
     }
@@ -4485,13 +4473,11 @@ fn trace_encode_id(
     }
     let inputs = node.get("inputs")?;
     for key in ["conditioning", "positive", "negative", "text"] {
-        if let Some(next) = inputs.get(key) {
-            if next.is_array() {
-                if let Some(r) = trace_encode_id(map, Some(next), depth + 1) {
+        if let Some(next) = inputs.get(key)
+            && next.is_array()
+                && let Some(r) = trace_encode_id(map, Some(next), depth + 1) {
                     return Some(r);
                 }
-            }
-        }
     }
     None
 }
@@ -4927,9 +4913,9 @@ fn build_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
 }
 
 /// Anima Base v1.0 text-to-image (CircleStone Labs / Comfy Org, NVIDIA Cosmos 2):
-/// UNETLoader + CLIPLoader(qwen3, type "stable_diffusion") + VAELoader(qwen image)
-/// + dual CLIPTextEncode + EmptyLatentImage + KSampler (er_sde/simple) + VAEDecode
-/// + SaveImage, with any selected LoRAs chained in model+clip. Mirrors ComfyUI's
+/// UNETLoader + CLIPLoader(qwen3, type "stable_diffusion") + VAELoader(qwen image) +
+/// dual CLIPTextEncode + EmptyLatentImage + KSampler (er_sde/simple) + VAEDecode +
+/// SaveImage, with any selected LoRAs chained in model+clip. Mirrors ComfyUI's
 /// official `image_anima_base_v1` template.
 fn anima_workflow(job: &GenJob) -> serde_json::Value {
     use serde_json::json;
@@ -4948,10 +4934,8 @@ fn anima_workflow(job: &GenJob) -> serde_json::Value {
     // Chain LoraLoader nodes (model + clip thread through), starting at the loaders.
     let mut model_ref = json!(["1", 0]);
     let mut clip_ref = json!(["2", 0]);
-    let mut id = 100;
-    for (file, strength) in &job.loras {
+    for (id, (file, strength)) in (100..).zip(&job.loras) {
         let node = id.to_string();
-        id += 1;
         obj.insert(
             node.clone(),
             json!({"class_type": "LoraLoader", "inputs": {
@@ -5001,10 +4985,8 @@ fn krea2_workflow(job: &GenJob) -> serde_json::Value {
     // Chain LoraLoader nodes (model + clip thread through), starting at the loaders.
     let mut model_ref = json!(["1", 0]);
     let mut clip_ref = json!(["2", 0]);
-    let mut id = 100;
-    for (file, strength) in &job.loras {
+    for (id, (file, strength)) in (100..).zip(&job.loras) {
         let node = id.to_string();
-        id += 1;
         obj.insert(
             node.clone(),
             json!({"class_type": "LoraLoader", "inputs": {
@@ -5051,10 +5033,8 @@ fn sdxl_workflow(job: &GenJob) -> serde_json::Value {
     // Chain LoraLoader nodes (model + clip thread through), starting at the ckpt.
     let mut model_ref = json!(["1", 0]);
     let mut clip_ref = json!(["1", 1]);
-    let mut id = 100;
-    for (file, strength) in &job.loras {
+    for (id, (file, strength)) in (100..).zip(&job.loras) {
         let node = id.to_string();
-        id += 1;
         obj.insert(
             node.clone(),
             json!({"class_type": "LoraLoader", "inputs": {
@@ -5143,8 +5123,8 @@ fn ltx2_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
 /// LTX-Video 0.9.6 distilled text/image-to-video workflow, all native ComfyUI
 /// nodes. Stage 1: CheckpointLoaderSimple (transformer + VAE) + CLIPLoader(ltxv,
 /// t5xxl) → CLIPTextEncode; latent is EmptyLTXVLatentVideo (t2v) or LTXVImgToVideo
-/// from the uploaded image (i2v); LTXVConditioning sets frame rate; LTXVScheduler
-/// + KSamplerSelect drive SamplerCustom. Stage 2 (the key to sharp output):
+/// from the uploaded image (i2v); LTXVConditioning sets frame rate; LTXVScheduler +
+/// KSamplerSelect drive SamplerCustom. Stage 2 (the key to sharp output):
 /// LTXVLatentUpsampler ×2 + a short refine SamplerCustom, then VAEDecode →
 /// SaveWEBM (.webm). Selected LoRAs chain in model-only.
 fn ltx_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
@@ -5167,10 +5147,8 @@ fn ltx_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
 
     // Model-only LoRA chain (LTX has no CLIP-side LoRA path), starting at the ckpt.
     let mut model_ref = json!(["1", 0]);
-    let mut id = 100;
-    for (file, strength) in &job.loras {
+    for (id, (file, strength)) in (100..).zip(&job.loras) {
         let node = id.to_string();
-        id += 1;
         obj.insert(
             node.clone(),
             json!({"class_type": "LoraLoaderModelOnly", "inputs": {
@@ -5281,10 +5259,8 @@ fn wan_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
 
     // Model-only LoRA chain (Wan LoRAs are model-side), starting at the UNet.
     let mut model_ref = json!(["1", 0]);
-    let mut id = 100;
-    for (file, strength) in &job.loras {
+    for (id, (file, strength)) in (100..).zip(&job.loras) {
         let node = id.to_string();
-        id += 1;
         obj.insert(
             node.clone(),
             json!({"class_type": "LoraLoaderModelOnly", "inputs": {
@@ -5307,12 +5283,11 @@ fn wan_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
     let mut latent_inputs = json!({
         "vae": vae_ref.clone(), "width": width, "height": height, "length": length, "batch_size": 1
     });
-    if job.i2v {
-        if let Some(name) = image_name {
+    if job.i2v
+        && let Some(name) = image_name {
             obj.insert("8".into(), json!({"class_type": "LoadImage", "inputs": {"image": name}}));
             latent_inputs["start_image"] = json!(["8", 0]);
         }
-    }
     obj.insert("7".into(), json!({"class_type": "Wan22ImageToVideoLatent", "inputs": latent_inputs}));
 
     obj.insert("9".into(), json!({"class_type": "KSampler", "inputs": {
@@ -5355,10 +5330,8 @@ fn wan14b_workflow(
 
     // Model-only LoRA chain (Wan LoRAs are model-side), starting at the UNet.
     let mut model_ref = json!(["1", 0]);
-    let mut id = 100;
-    for (file, strength) in &job.loras {
+    for (id, (file, strength)) in (100..).zip(&job.loras) {
         let node = id.to_string();
-        id += 1;
         obj.insert(
             node.clone(),
             json!({"class_type": "LoraLoaderModelOnly", "inputs": {
@@ -5383,12 +5356,11 @@ fn wan14b_workflow(
         "positive": ["4", 0], "negative": ["5", 0], "vae": vae_ref.clone(),
         "width": width, "height": height, "length": length, "batch_size": 1
     });
-    if job.i2v {
-        if let Some(name) = image_name {
+    if job.i2v
+        && let Some(name) = image_name {
             obj.insert("8".into(), json!({"class_type": "LoadImage", "inputs": {"image": name}}));
             wi2v["start_image"] = json!(["8", 0]);
         }
-    }
     obj.insert("7".into(), json!({"class_type": "WanImageToVideo", "inputs": wi2v}));
 
     obj.insert("9".into(), json!({"class_type": "KSampler", "inputs": {
@@ -5417,10 +5389,8 @@ fn zimage_workflow(job: &GenJob) -> serde_json::Value {
     // Chain LoraLoader nodes; model/clip start at the loaders and thread through.
     let mut model_ref = json!(["1", 0]);
     let mut clip_ref = json!(["2", 0]);
-    let mut id = 100;
-    for (file, strength) in &job.loras {
+    for (id, (file, strength)) in (100..).zip(&job.loras) {
         let node = id.to_string();
-        id += 1;
         obj.insert(
             node.clone(),
             json!({"class_type": "LoraLoader", "inputs": {
@@ -5463,10 +5433,8 @@ fn flux_workflow(job: &GenJob) -> serde_json::Value {
     // Chain LoraLoader nodes; model/clip start at the loaders and thread through.
     let mut model_ref = json!(["1", 0]);
     let mut clip_ref = json!(["2", 0]);
-    let mut id = 100;
-    for (file, strength) in &job.loras {
+    for (id, (file, strength)) in (100..).zip(&job.loras) {
         let node = id.to_string();
-        id += 1;
         obj.insert(
             node.clone(),
             json!({"class_type": "LoraLoader", "inputs": {
@@ -5586,11 +5554,10 @@ fn parse_progress(s: &str) -> Option<u32> {
         while start > 0 && b[start - 1].is_ascii_digit() {
             start -= 1;
         }
-        if start < abs {
-            if let Ok(n) = s[start..abs].parse::<u32>() {
+        if start < abs
+            && let Ok(n) = s[start..abs].parse::<u32>() {
                 last = Some(n);
             }
-        }
         i = abs + 2;
     }
     last
@@ -5702,12 +5669,11 @@ fn download_auth(url: &str, dest: &Path, bearer: &str, send: &dyn Fn(String)) ->
         }
         out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         got += n as u64;
-        if total > 0 {
-            let pct = got * 100 / total;
-            if pct >= last_pct + 5 {
-                last_pct = pct;
-                send(format!("   {pct}%  ({:.1}/{:.1} MB)", got as f64 / 1e6, total as f64 / 1e6));
-            }
+        if let Some(pct) = (got * 100).checked_div(total)
+            && pct >= last_pct + 5
+        {
+            last_pct = pct;
+            send(format!("   {pct}%  ({:.1}/{:.1} MB)", got as f64 / 1e6, total as f64 / 1e6));
         }
     }
     out.flush().ok();

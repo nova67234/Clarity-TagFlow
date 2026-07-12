@@ -114,11 +114,10 @@ pub fn show(
     // Auto-select the first installed model when nothing valid is chosen (e.g.
     // the "Select AI…" placeholder). `find` is a cheap in-memory catalog lookup,
     // so the disk check only runs while the selection is still the placeholder.
-    if crate::ai_models::find(&state.ai_model).is_none() {
-        if let Some(first) = crate::ai_models::installed_models().first() {
+    if crate::ai_models::find(&state.ai_model).is_none()
+        && let Some(first) = crate::ai_models::installed_models().first() {
             state.ai_model = first.name().to_string();
         }
-    }
 
     // Keep the header status in sync with the selected image. Recompute the
     // "Loaded N tags" count whenever the image changes (or none is selected) so
@@ -365,8 +364,8 @@ pub fn show(
                             .margin(Margin::ZERO)
                             .desired_width(f32::INFINITY),
                     );
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        if let Some(path) = current_image {
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        && let Some(path) = current_image {
                             let before = tags.len();
                             if add_tag(&mut tags, &state.draft) {
                                 let added = tags.len() - before;
@@ -376,7 +375,6 @@ pub fn show(
                                 set_change_status(state, "Added", added, tags.len());
                             }
                         }
-                    }
                 });
 
             ui.add_space(10.0);
@@ -401,8 +399,7 @@ pub fn show(
                 if ui
                     .add_sized(size, egui::Button::new(egui::RichText::new("Add").color(Color32::WHITE)).fill(action_bg))
                     .clicked()
-                {
-                    if let Some(path) = current_image {
+                    && let Some(path) = current_image {
                         let before = tags.len();
                         if add_tag(&mut tags, &state.draft) {
                             let added = tags.len() - before;
@@ -411,7 +408,6 @@ pub fn show(
                             set_change_status(state, "Added", added, tags.len());
                         }
                     }
-                }
 
                 if ui
                     .add_sized(size, egui::Button::new(egui::RichText::new("Add All").color(Color32::WHITE)).fill(action_bg))
@@ -435,11 +431,14 @@ pub fn show(
                 // slack is absorbed here instead of overflowing the panel and
                 // clipping the button against the frame's right edge.
                 let remove_size = egui::vec2(ui.available_width(), size.y);
-                if ui.add_sized(remove_size, remove_btn).clicked() && current_image.is_some() && !state.selected_tags.is_empty() {
+                if ui.add_sized(remove_size, remove_btn).clicked()
+                    && let Some(img) = current_image
+                    && !state.selected_tags.is_empty()
+                {
                     let before = tags.len();
                     tags.retain(|t| !state.selected_tags.contains(t));
                     let removed = before - tags.len();
-                    save(current_image.unwrap(), &tags, current_tags);
+                    save(img, &tags, current_tags);
                     state.selected_tags.clear();
                     set_change_status(state, "Removed", removed, tags.len());
                 }
@@ -634,7 +633,7 @@ fn start_tag_job(state: &mut TagManagerState, current_image: Option<&Path>) {
 /// preserving first-seen order.
 fn parse_tags(s: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for raw in s.split(|c| c == ',' || c == '\n') {
+    for raw in s.split([',', '\n']) {
         let t = raw.trim();
         if !t.is_empty() && !out.iter().any(|e| e.eq_ignore_ascii_case(t)) {
             out.push(t.to_string());

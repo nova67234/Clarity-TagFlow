@@ -154,20 +154,18 @@ fn find_vlc_dir() -> Option<std::path::PathBuf> {
         if d.join("libvlc.dll").exists() { Some(d) } else { None }
     };
 
-    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
-        if let Some(d) = has_dll(exe_dir) {
+    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        && let Some(d) = has_dll(exe_dir) {
             return Some(d);
         }
-    }
     if let Some(d) = std::env::var_os("VLC_DIR").map(std::path::PathBuf::from).and_then(has_dll) {
         return Some(d);
     }
     for var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
-        if let Some(base) = std::env::var_os(var) {
-            if let Some(d) = has_dll(std::path::Path::new(&base).join("VideoLAN").join("VLC")) {
+        if let Some(base) = std::env::var_os(var)
+            && let Some(d) = has_dll(std::path::Path::new(&base).join("VideoLAN").join("VLC")) {
                 return Some(d);
             }
-        }
     }
     registry_vlc_dir()
 }
@@ -285,6 +283,7 @@ impl VideoThumbs {
 /// Stub frame sampler when the `vlc` feature is off — the AI worker turns the
 /// empty Vec into a readable "needs the VLC build" error.
 #[cfg(not(feature = "vlc"))]
+#[cfg_attr(not(feature = "llm"), allow(dead_code))] // only the AI worker samples frames
 pub fn capture_frames(
     _path: &Path,
     _max_frames: usize,
@@ -304,7 +303,11 @@ pub fn capture_poster(_path: &Path, _max_edge: u32) -> Option<egui::ColorImage> 
 // Real libVLC-backed player (feature = "vlc").
 // ---------------------------------------------------------------------------
 #[cfg(feature = "vlc")]
-pub use backend::{capture_frames, capture_poster, VideoPlayer, VideoPreviews, VideoThumbs};
+pub use backend::{capture_poster, VideoPlayer, VideoPreviews, VideoThumbs};
+// Only the AI worker samples frames, so this re-export is idle in non-llm builds.
+#[cfg(feature = "vlc")]
+#[cfg_attr(not(feature = "llm"), allow(unused_imports))]
+pub use backend::capture_frames;
 
 #[cfg(feature = "vlc")]
 mod backend {
@@ -317,6 +320,28 @@ mod backend {
     use vlc::sys;
 
     type SharedFrame = Arc<Mutex<Option<egui::ColorImage>>>;
+
+    /// The video-format ("setup") callback with its true libVLC signature —
+    /// it returns the picture count. vlc-rs 0.3 mis-declares the return type
+    /// as `()`, so the callbacks are transmuted from the real shape to the
+    /// declared one (see the `set_format_callbacks` call sites).
+    type SetupCb = unsafe extern "C" fn(
+        *mut *mut c_void,
+        *mut c_char,
+        *mut c_uint,
+        *mut c_uint,
+        *mut c_uint,
+        *mut c_uint,
+    ) -> c_uint;
+    /// The `()`-returning shape vlc-rs declares for [`SetupCb`].
+    type SetupCbAsDeclared = unsafe extern "C" fn(
+        *mut *mut c_void,
+        *mut c_char,
+        *mut c_uint,
+        *mut c_uint,
+        *mut c_uint,
+        *mut c_uint,
+    );
 
     // --- In-memory media (entries of a mounted zip archive) -----------------
     //
@@ -529,18 +554,8 @@ mod backend {
                     Some(display_cb),
                     ctx_ptr as *mut c_void,
                 );
-                // vlc-rs 0.3 mis-declares the format callback's return type as `()`
-                // instead of `unsigned`. Coerce our correctly-typed fn to a pointer
-                // and transmute it so libVLC actually receives the picture count.
-                let setup_fp: unsafe extern "C" fn(
-                    *mut *mut c_void,
-                    *mut c_char,
-                    *mut c_uint,
-                    *mut c_uint,
-                    *mut c_uint,
-                    *mut c_uint,
-                ) -> c_uint = setup_cb;
-                let setup: sys::libvlc_video_format_cb = Some(std::mem::transmute(setup_fp));
+                let setup: sys::libvlc_video_format_cb =
+                    Some(std::mem::transmute::<SetupCb, SetupCbAsDeclared>(setup_cb));
                 sys::libvlc_video_set_format_callbacks(mp, setup, Some(cleanup_cb));
             }
 
@@ -838,11 +853,10 @@ mod backend {
                 return player.frame(ctx);
             }
             // Not previewing yet — start one if we're under the cap.
-            if self.players.len() < MAX_PREVIEWS {
-                if let Some(player) = VideoPlayer::start_preview(path, ctx) {
+            if self.players.len() < MAX_PREVIEWS
+                && let Some(player) = VideoPlayer::start_preview(path, ctx) {
                     self.players.insert(path.to_path_buf(), player);
                 }
-            }
             None
         }
 
@@ -902,15 +916,8 @@ mod backend {
                 Some(thumb_display_cb),
                 ctx_ptr as *mut c_void,
             );
-            let setup_fp: unsafe extern "C" fn(
-                *mut *mut c_void,
-                *mut c_char,
-                *mut c_uint,
-                *mut c_uint,
-                *mut c_uint,
-                *mut c_uint,
-            ) -> c_uint = thumb_setup_cb;
-            let setup: sys::libvlc_video_format_cb = Some(std::mem::transmute(setup_fp));
+            let setup: sys::libvlc_video_format_cb =
+                Some(std::mem::transmute::<SetupCb, SetupCbAsDeclared>(thumb_setup_cb));
             sys::libvlc_video_set_format_callbacks(mp, setup, Some(thumb_cleanup_cb));
         }
 
@@ -947,6 +954,7 @@ mod backend {
     /// pairs in playback order. The same muted throwaway player as
     /// [`capture_poster`], plus a position seek between grabs. An unplayable
     /// clip returns an empty Vec.
+    #[cfg_attr(not(feature = "llm"), allow(dead_code))] // only the AI worker samples frames
     pub fn capture_frames(
         path: &Path,
         max_frames: usize,
@@ -984,15 +992,8 @@ mod backend {
                 Some(thumb_display_cb),
                 ctx_ptr as *mut c_void,
             );
-            let setup_fp: unsafe extern "C" fn(
-                *mut *mut c_void,
-                *mut c_char,
-                *mut c_uint,
-                *mut c_uint,
-                *mut c_uint,
-                *mut c_uint,
-            ) -> c_uint = thumb_setup_cb;
-            let setup: sys::libvlc_video_format_cb = Some(std::mem::transmute(setup_fp));
+            let setup: sys::libvlc_video_format_cb =
+                Some(std::mem::transmute::<SetupCb, SetupCbAsDeclared>(thumb_setup_cb));
             sys::libvlc_video_set_format_callbacks(mp, setup, Some(thumb_cleanup_cb));
         }
 
@@ -1018,7 +1019,7 @@ mod backend {
                 let n = if len_ms > 0 {
                     ((len_ms as f64 / 1000.0).round() as usize).clamp(2, max_frames.max(1))
                 } else {
-                    max_frames.max(1).min(6)
+                    max_frames.clamp(1, 6)
                 };
                 for i in 0..n {
                     let pos = (i as f32 + 0.5) / n as f32;

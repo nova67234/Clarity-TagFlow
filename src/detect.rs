@@ -119,16 +119,23 @@ static AGE_SESSION: Mutex<Option<Session>> = Mutex::new(None);
 /// Age labels are drawn on the detected face box in teal.
 const AGE_COLOR: Color32 = Color32::from_rgb(90, 200, 245);
 
+/// Finished detections per image path.
+type DetCache = HashMap<PathBuf, Arc<Vec<Detection>>>;
+/// An in-flight detection job: the image path + its result channel.
+type DetJob = Option<(PathBuf, Receiver<Result<Vec<Detection>, String>>)>;
+/// A blocking detector: image path in, detections out.
+type DetectFn = fn(&Path) -> Result<Vec<Detection>, String>;
+
 #[derive(Default)]
 struct Inner {
     /// Finished region results per image path.
-    cache: HashMap<PathBuf, Arc<Vec<Detection>>>,
+    cache: DetCache,
     /// Finished age results per image path.
-    age_cache: HashMap<PathBuf, Arc<Vec<Detection>>>,
-    /// The in-flight region job (path + its result channel), one at a time.
-    job: Option<(PathBuf, Receiver<Result<Vec<Detection>, String>>)>,
+    age_cache: DetCache,
+    /// The in-flight region job, one at a time.
+    job: DetJob,
     /// The in-flight age job, one at a time (independent of the region job).
-    age_job: Option<(PathBuf, Receiver<Result<Vec<Detection>, String>>)>,
+    age_job: DetJob,
     /// The in-flight model download, when the models aren't installed yet
     /// (one catalog entry covers both overlays' models).
     download: Option<crate::ai_models::DownloadHandle>,
@@ -182,11 +189,9 @@ fn drive(kind: Kind, path: &Path, ctx: &egui::Context) -> (Option<Arc<Vec<Detect
 
     // Absorb finished inference jobs (both kinds, so either overlay keeps the
     // other's results fresh too).
-    let absorb = |job: &mut Option<(PathBuf, Receiver<Result<Vec<Detection>, String>>)>,
-                  cache: &mut HashMap<PathBuf, Arc<Vec<Detection>>>,
-                  error: &mut Option<String>| {
-        if let Some((job_path, rx)) = job {
-            if let Ok(result) = rx.try_recv() {
+    let absorb = |job: &mut DetJob, cache: &mut DetCache, error: &mut Option<String>| {
+        if let Some((job_path, rx)) = job
+            && let Ok(result) = rx.try_recv() {
                 let job_path = job_path.clone();
                 *job = None;
                 match result {
@@ -197,28 +202,21 @@ fn drive(kind: Kind, path: &Path, ctx: &egui::Context) -> (Option<Arc<Vec<Detect
                     Err(e) => *error = Some(e),
                 }
             }
-        }
     };
     absorb(job, cache, error);
     absorb(age_job, age_cache, error);
 
     // Absorb a finished model download.
-    if let Some(dl) = &download {
-        if dl.done() {
+    if let Some(dl) = &download
+        && dl.done() {
             if !dl.ok() {
                 *error = Some(dl.error().unwrap_or_else(|| "Model download failed".into()));
             }
             *download = None;
         }
-    }
 
     // Route to this overlay's cache / job / models / worker.
-    let (cache, job, ready, work): (
-        &mut HashMap<PathBuf, Arc<Vec<Detection>>>,
-        &mut Option<(PathBuf, Receiver<Result<Vec<Detection>, String>>)>,
-        bool,
-        fn(&Path) -> Result<Vec<Detection>, String>,
-    ) = match kind {
+    let (cache, job, ready, work): (&mut DetCache, &mut DetJob, bool, DetectFn) = match kind {
         Kind::Regions => (cache, job, installed(), detect_file),
         Kind::Age => (age_cache, age_job, installed_age(), detect_age_file),
     };
@@ -535,6 +533,21 @@ fn run_yolo(
     Ok(kept)
 }
 
+/// Intersection-over-union of two `[x0, y0, x1, y1]` boxes.
+fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
+    let ix = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
+    let iy = (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
+    let inter = ix * iy;
+    let area_a = (a[2] - a[0]).max(0.0) * (a[3] - a[1]).max(0.0);
+    let area_b = (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0);
+    let union = area_a + area_b - inter;
+    if union <= 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,20 +597,5 @@ mod tests {
             let n: i32 = d.label.trim_start_matches("Age ~").parse().expect("numeric age");
             assert!((1..120).contains(&n), "implausible age {n}");
         }
-    }
-}
-
-/// Intersection-over-union of two `[x0, y0, x1, y1]` boxes.
-fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
-    let ix = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
-    let iy = (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
-    let inter = ix * iy;
-    let area_a = (a[2] - a[0]).max(0.0) * (a[3] - a[1]).max(0.0);
-    let area_b = (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0);
-    let union = area_a + area_b - inter;
-    if union <= 0.0 {
-        0.0
-    } else {
-        inter / union
     }
 }

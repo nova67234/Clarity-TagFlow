@@ -278,8 +278,8 @@ impl Inner {
         // Frame the camera to the model bounds, once. Fit the bounding sphere into
         // whichever axis is tighter (a tall, narrow panel is limited horizontally),
         // with margin, so the model never clips the panel edges.
-        if self.needs_framing {
-            if let Some(model) = &gpu.model {
+        if self.needs_framing
+            && let Some(model) = &gpu.model {
                 let mut aabb = AxisAlignedBoundingBox::EMPTY;
                 for part in model {
                     aabb.expand_with_aabb(part.aabb());
@@ -295,7 +295,6 @@ impl Inner {
                 }
                 self.needs_framing = false;
             }
-        }
 
         // Orbit camera from spherical coords (three-d's Camera has no setters, so
         // it's rebuilt each frame — also needed because the viewport changes).

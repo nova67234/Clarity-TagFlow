@@ -1,10 +1,10 @@
-name: CI
+﻿name: CI
 
 # Compile-check on all three platforms for every branch push and pull request, so
 # a platform-specific break (e.g. a macOS-only `#[cfg]` path) is caught here
 # instead of during a release-tag build. Each job mirrors the build flags of its
 # matching release workflow (no-default-features everywhere; libVLC only on
-# Windows). Tag pushes are intentionally excluded — those run the release builds,
+# Windows). Tag pushes are intentionally excluded â€” those run the release builds,
 # which compile anyway.
 on:
   push:
@@ -20,7 +20,7 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Same system libs the Linux release build links against (eframe/egui, rfd,
@@ -45,12 +45,12 @@ jobs:
   macos:
     runs-on: macos-14 # Apple Silicon, like the release build.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      # Compile-check the macOS target — this is the path the v5.3.2 cfg break
+      # Compile-check the macOS target â€” this is the path the v5.3.2 cfg break
       # would have failed on. --all-targets also type-checks the test modules.
       - name: Check (Apple Silicon, no VLC)
         run: cargo check --all-targets --no-default-features --target aarch64-apple-darwin
@@ -58,12 +58,12 @@ jobs:
   windows:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # The vlc feature links `vlc`; generate an MSVC import library from the
       # checked-in export list (ci/vlc.def), same as the release build. (The VLC
-      # SDK's own libvlc.lib is dlltool-format, which breaks /DELAYLOAD — see
+      # SDK's own libvlc.lib is dlltool-format, which breaks /DELAYLOAD â€” see
       # release-windows.yml.) The runtime is never bundled.
       - name: Generate libVLC import library
         shell: pwsh

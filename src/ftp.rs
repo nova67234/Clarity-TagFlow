@@ -133,8 +133,8 @@ impl FtpState {
     /// Poll the test worker (call each frame the settings tab shows).
     pub fn poll_test(&mut self) -> bool {
         let mut done = false;
-        if let Some(rx) = &self.test_rx {
-            if let Ok(r) = rx.try_recv() {
+        if let Some(rx) = &self.test_rx
+            && let Ok(r) = rx.try_recv() {
                 self.test_status = Some(match r {
                     Ok(n) => Ok(format!("Connected — {n} entries in /")),
                     Err(e) => Err(e),
@@ -142,7 +142,6 @@ impl FtpState {
                 self.test_rx = None;
                 done = true;
             }
-        }
         done
     }
 
@@ -342,15 +341,14 @@ fn parent_remote(cwd: &str) -> String {
 /// per frame; returns nothing — a finished download lands in [`FtpState::take_loaded`].
 pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate::settings::Settings) {
     // Drain the list worker.
-    if let Some(rx) = &state.list_rx {
-        if let Ok(result) = rx.try_recv() {
+    if let Some(rx) = &state.list_rx
+        && let Ok(result) = rx.try_recv() {
             state.list_rx = None;
             match result {
                 Ok(entries) => state.entries = Some(entries),
                 Err(e) => state.error = Some(e),
             }
         }
-    }
     // Drain the download worker (into a Vec first so the `&state.dl_rx` borrow
     // ends before the handlers mutate `state`).
     let msgs: Vec<DlMsg> = match &state.dl_rx {
@@ -648,6 +646,20 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
     }
 }
 
+/// "12.3 MB"-style size.
+fn human_size(bytes: usize) -> String {
+    let b = bytes as f64;
+    if b >= 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} GB", b / (1024.0 * 1024.0 * 1024.0))
+    } else if b >= 1024.0 * 1024.0 {
+        format!("{:.1} MB", b / (1024.0 * 1024.0))
+    } else if b >= 1024.0 {
+        format!("{:.0} KB", b / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,19 +728,5 @@ mod tests {
             }
         }
         let _ = ftp.quit();
-    }
-}
-
-/// "12.3 MB"-style size.
-fn human_size(bytes: usize) -> String {
-    let b = bytes as f64;
-    if b >= 1024.0 * 1024.0 * 1024.0 {
-        format!("{:.1} GB", b / (1024.0 * 1024.0 * 1024.0))
-    } else if b >= 1024.0 * 1024.0 {
-        format!("{:.1} MB", b / (1024.0 * 1024.0))
-    } else if b >= 1024.0 {
-        format!("{:.0} KB", b / 1024.0)
-    } else {
-        format!("{bytes} B")
     }
 }

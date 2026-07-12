@@ -47,7 +47,7 @@ pub fn claims_drop(llm: &crate::llm::LlmState, ctx: &egui::Context) -> bool {
         return false;
     }
     let pos = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
-    pos.map_or(true, |p| rect.contains(p))
+    pos.is_none_or(|p| rect.contains(p))
 }
 
 pub fn show(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::settings::Settings) {
@@ -332,12 +332,12 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
     let drag_over_card = dragging_files
         && llm
             .input_rect
-            .map_or(true, |(r, _)| hover_pos.map_or(true, |p| r.contains(p)));
+            .is_none_or(|(r, _)| hover_pos.is_none_or(|p| r.contains(p)));
     let dropped: Vec<std::path::PathBuf> = ui.input(|i| {
         i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
     });
-    if !dropped.is_empty() && claims_drop(llm, ui.ctx()) {
-        if let Some(p) = dropped.into_iter().find(|p| {
+    if !dropped.is_empty() && claims_drop(llm, ui.ctx())
+        && let Some(p) = dropped.into_iter().find(|p| {
             crate::is_video(p)
                 || p.extension()
                     .and_then(|e| e.to_str())
@@ -346,7 +346,6 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
             llm.draft_image = Some(p);
             llm.run_err = None;
         }
-    }
 
     let screen = ui.ctx().content_rect();
     let off_x = panel.center().x - screen.center().x;
@@ -439,7 +438,7 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                             .desired_rows(1)
                             .frame(egui::Frame::NONE)
                             .font(egui::FontId::proportional(15.0))
-                            .hint_text("Ask Gemma")
+                            .hint_text("Ask the AI")
                             .desired_width(f32::INFINITY)
                             .show(ui);
                         // Live spell-check: red squiggles + right-click
@@ -463,15 +462,13 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                 ui.horizontal(|ui| {
                     if icon_button(ui, egui::include_image!("../icons/add.svg"), 20.0, "Attach an image or video", !llm.running)
                         .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
+                        && let Some(path) = rfd::FileDialog::new()
                             .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"])
                             .add_filter("Videos", VIDEO_PICK_EXTS)
                             .pick_file()
                         {
                             llm.draft_image = Some(path);
                         }
-                    }
                     // Tools menu: extra chat abilities with on/off toggles.
                     let tools_resp = icon_button(ui, egui::include_image!("../icons/tools.svg"), 18.0, "Tools", true);
                     if tools_resp.clicked() {
@@ -695,8 +692,8 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
 
     // Model reply. An album picture the AI chose to share shows above the
     // text, on its side of the column.
-    if let Some(path) = &image {
-        if let Some(tex) = msg_thumb(ui.ctx(), llm, path) {
+    if let Some(path) = &image
+        && let Some(tex) = msg_thumb(ui.ctx(), llm, path) {
             let size = tex.size_vec2();
             let scale = (180.0 / size.y).min(280.0 / size.x).min(1.0);
             ui.add(
@@ -706,7 +703,6 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
             );
             ui.add_space(4.0);
         }
-    }
 
     // The thought channel (the 31B reasons before answering):
     // split live while the reply streams; a finished message keeps its

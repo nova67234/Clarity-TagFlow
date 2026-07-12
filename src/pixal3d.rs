@@ -959,17 +959,16 @@ fn download(url: &str, dest: &Path, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Co
         }
         out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         got += n as u64;
-        if total > 0 {
-            let pct = got * 100 / total;
-            if pct >= last_pct + 5 {
-                last_pct = pct;
-                let _ = tx.send(RunnerMsg::Line(format!(
-                    "   {pct}%  ({:.1}/{:.1} MB)",
-                    got as f64 / 1e6,
-                    total as f64 / 1e6
-                )));
-                ctx.request_repaint();
-            }
+        if let Some(pct) = (got * 100).checked_div(total)
+            && pct >= last_pct + 5
+        {
+            last_pct = pct;
+            let _ = tx.send(RunnerMsg::Line(format!(
+                "   {pct}%  ({:.1}/{:.1} MB)",
+                got as f64 / 1e6,
+                total as f64 / 1e6
+            )));
+            ctx.request_repaint();
         }
     }
     out.flush().ok();

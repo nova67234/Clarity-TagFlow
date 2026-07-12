@@ -1,4 +1,4 @@
-name: Build Linux app
+﻿name: Build Linux app
 
 # Build the Linux binary and package it (with a .desktop launcher + icon) as a
 # .tar.gz. Triggered manually, or automatically when a v* tag is pushed.
@@ -15,11 +15,11 @@ permissions:
 jobs:
   linux:
     # 24.04 ships glibc 2.39. The prebuilt ONNX Runtime the `ort` crate downloads
-    # needs the C23 libc symbols (__isoc23_strtoll, …) that 22.04's glibc 2.35
+    # needs the C23 libc symbols (__isoc23_strtoll, â€¦) that 22.04's glibc 2.35
     # lacks, so linking fails there.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

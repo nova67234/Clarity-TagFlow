@@ -234,9 +234,9 @@ fn thumbnail_list(
 
             // If the selection changed this frame, scroll just enough to keep
             // the selected tile within the viewport.
-            if selection_changed {
-                if let Some(sel) = *selected {
-                    if let Some(row) = filtered.iter().position(|&i| i == sel) {
+            if selection_changed
+                && let Some(sel) = *selected
+                    && let Some(row) = filtered.iter().position(|&i| i == sel) {
                         let (tw, th) = sizes[row];
                         let rect = egui::Rect::from_min_size(
                             egui::pos2(left + (avail_w - tw) * 0.5, top + offsets[row]),
@@ -244,8 +244,6 @@ fn thumbnail_list(
                         );
                         ui.scroll_to_rect(rect, None);
                     }
-                }
-            }
 
             for (row, &i) in filtered.iter().enumerate() {
                 let y = offsets[row];
@@ -295,6 +293,7 @@ fn list_signature(images: &[PathBuf], filtered: &[usize]) -> u64 {
 
 /// Paint a single bare-image tile (image, or a placeholder while it loads),
 /// with rounded corners and a selection outline.
+#[allow(clippy::too_many_arguments)] // threads the view's caches/state, not data
 fn draw_tile(
     ui: &egui::Ui,
     thumbs: &mut ImageCache,

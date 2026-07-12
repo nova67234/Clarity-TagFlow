@@ -335,6 +335,7 @@ fn shortest(heights: &[f32]) -> usize {
 }
 
 /// Paint one image tile (thumbnail, video poster, or a placeholder) into `rect`.
+#[allow(clippy::too_many_arguments)] // threads the view's caches/state, not data
 fn tile(
     ui: &mut egui::Ui,
     thumbs: &mut ImageCache,

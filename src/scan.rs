@@ -101,11 +101,10 @@ impl ScanState {
     pub fn open_with(&mut self, folder: Option<&Path>, anchor: Option<egui::Pos2>) {
         self.open = true;
         self.anchor_pos = anchor;
-        if self.input_dir.trim().is_empty() {
-            if let Some(f) = folder {
+        if self.input_dir.trim().is_empty()
+            && let Some(f) = folder {
                 self.input_dir = f.display().to_string();
             }
-        }
     }
 
     fn push_log(&mut self, line: impl Into<String>) {
@@ -245,11 +244,10 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 let folder_svg = egui::include_image!("../icons/folder.svg");
-                if crate::svg_button(ui, folder_svg, "Choose folder to scan", 32.0, crate::theme::icon_tint(MUTED())).clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                if crate::svg_button(ui, folder_svg, "Choose folder to scan", 32.0, crate::theme::icon_tint(MUTED())).clicked()
+                    && let Some(dir) = rfd::FileDialog::new().pick_folder() {
                         state.input_dir = dir.display().to_string();
                     }
-                }
                 ui.scope(|ui| {
                     ui.visuals_mut().extreme_bg_color = PANEL();
                     ui.add_enabled(
@@ -319,15 +317,14 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
             if let Some(p) = to_open {
                 open_in_default(&p);
             }
-            if let Some(i) = to_delete {
-                if i < state.corrupt_files.len() {
+            if let Some(i) = to_delete
+                && i < state.corrupt_files.len() {
                     let (p, _) = state.corrupt_files.remove(i);
                     match std::fs::remove_file(&p) {
                         Ok(_) => state.push_log(format!("Deleted: {}", file_name(&p))),
                         Err(e) => state.push_log(format!("ERROR deleting {}: {e}", file_name(&p))),
                     }
                 }
-            }
 
             ui.add_space(8.0);
 
@@ -969,6 +966,8 @@ impl Sha256 {
         }
     }
 
+    // Index loops mirror the FIPS 180-4 round notation.
+    #[allow(clippy::needless_range_loop)]
     fn compress(&mut self, block: &[u8; 64]) {
         let mut w = [0u32; 64];
         for i in 0..16 {

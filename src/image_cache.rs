@@ -307,11 +307,10 @@ impl ImageCache {
                 }
             }
             None => {
-                if let Some(entry) = self.entries.get_mut(path) {
-                    if matches!(entry.slot, Slot::Loading) {
+                if let Some(entry) = self.entries.get_mut(path)
+                    && matches!(entry.slot, Slot::Loading) {
                         entry.slot = Slot::Failed;
                     }
-                }
             }
         }
     }
@@ -464,16 +463,14 @@ fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::Co
     // once and apply it to whatever the decode paths below produce.
     let orientation = exif_orientation(path);
 
-    if let Some((w, h)) = probe_dimensions(path) {
-        if w > max_edge || h > max_edge {
-            if let Some(mut img) = decode_downscaled(path, w, h, max_edge) {
+    if let Some((w, h)) = probe_dimensions(path)
+        && (w > max_edge || h > max_edge)
+            && let Some(mut img) = decode_downscaled(path, w, h, max_edge) {
                 img.apply_orientation(orientation);
                 // Cheap final fit: the result is already near `max_edge`.
                 let img = img.thumbnail(max_edge, max_edge);
                 return Some(color_image(&img.to_rgba8()));
             }
-        }
-    }
 
     // Fallback: full-resolution decode + downscale. Throttle it so a burst can't
     // spike RAM and freeze the UI (small images skip the gate inside the helper).
@@ -557,14 +554,13 @@ pub fn decode_hdr(path: &Path) -> Option<image::RgbaImage> {
 /// stricter `image` decoder accept the file. Leaves non-`#?` data untouched.
 fn normalize_hdr_signature(bytes: Vec<u8>) -> Vec<u8> {
     const RADIANCE: &[u8] = b"#?RADIANCE";
-    if bytes.starts_with(b"#?") && !bytes.starts_with(RADIANCE) {
-        if let Some(nl) = bytes.iter().position(|&b| b == b'\n') {
+    if bytes.starts_with(b"#?") && !bytes.starts_with(RADIANCE)
+        && let Some(nl) = bytes.iter().position(|&b| b == b'\n') {
             let mut out = Vec::with_capacity(RADIANCE.len() + (bytes.len() - nl));
             out.extend_from_slice(RADIANCE);
             out.extend_from_slice(&bytes[nl..]); // keep the newline + remaining header/body
             return out;
         }
-    }
     bytes
 }
 
@@ -649,7 +645,7 @@ fn decode_png_subsampled(path: &Path, src_w: u32, src_h: u32, max_edge: u32) -> 
     loop {
         match reader.next_row() {
             Ok(Some(row)) => {
-                if src_y % ss == 0 && dst_y < out_h {
+                if src_y.is_multiple_of(ss) && dst_y < out_h {
                     let data = row.data();
                     let row_base = (dst_y * out_w * 4) as usize;
                     for dst_x in 0..out_w {
@@ -719,7 +715,7 @@ fn decode_tiff_subsampled(path: &Path, src_w: u32, src_h: u32, max_edge: u32) ->
             _ => return None,
         };
         for row in 0..ch {
-            if src_y % ss == 0 && dst_y < out_h {
+            if src_y.is_multiple_of(ss) && dst_y < out_h {
                 let row_off = row as usize * cw as usize * channels;
                 let dst_base = (dst_y * out_w * 4) as usize;
                 for dst_x in 0..out_w {

@@ -183,6 +183,8 @@ enum EngineMsg {
     Exited(Option<String>),
 }
 
+// The player thread that reads these only exists in `llm` builds.
+#[cfg_attr(not(feature = "llm"), allow(dead_code))]
 enum PlayerCmd {
     Play(PathBuf),
     Stop,
@@ -518,13 +520,12 @@ fn spawn_player_thread(rx: Receiver<PlayerCmd>, speaking: Arc<AtomicBool>) {
                     }
                     let file = std::fs::File::open(&path);
                     let new_sink = rodio::Sink::try_new(&handle);
-                    if let (Ok(file), Ok(s)) = (file, new_sink) {
-                        if let Ok(dec) = rodio::Decoder::new(std::io::BufReader::new(file)) {
+                    if let (Ok(file), Ok(s)) = (file, new_sink)
+                        && let Ok(dec) = rodio::Decoder::new(std::io::BufReader::new(file)) {
                             s.append(dec);
                             speaking.store(true, Relaxed);
                             sink = Some(s);
                         }
-                    }
                 }
                 Ok(PlayerCmd::Stop) => {
                     if let Some(s) = &sink {
@@ -535,11 +536,10 @@ fn spawn_player_thread(rx: Receiver<PlayerCmd>, speaking: Arc<AtomicBool>) {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            if let Some(s) = &sink {
-                if s.empty() {
+            if let Some(s) = &sink
+                && s.empty() {
                     speaking.store(false, Relaxed);
                 }
-            }
         }
     });
 }
@@ -1048,8 +1048,8 @@ fn download(url: &str, dest: &std::path::Path, send: &dyn Fn(String)) -> Result<
         }
         out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         got += n as u64;
-        if total > 0 {
-            let pct = (got * 100 / total) as u32;
+        if let Some(pct) = (got * 100).checked_div(total) {
+            let pct = pct as u32;
             if pct >= last_pct + 5 {
                 last_pct = pct;
                 send(format!("Downloading… {pct}%"));

@@ -1,4 +1,4 @@
-name: Build Windows app
+﻿name: Build Windows app
 
 # Build the Windows .exe (icon embedded via build.rs) and package it as a .zip.
 # Triggered manually, or automatically when a v* tag is pushed.
@@ -17,7 +17,7 @@ jobs:
     runs-on: windows-2022
     env:
       # llama.cpp's Vulkan build (the `llm-vulkan` feature) nests build dirs so
-      # deep that MSVC blows past MAX_PATH under the workspace target\ — build
+      # deep that MSVC blows past MAX_PATH under the workspace target\ â€” build
       # into a short target dir instead. Every later step that touches build
       # output must use this path, not target/release.
       CARGO_TARGET_DIR: C:\ctf
@@ -27,7 +27,7 @@ jobs:
       # dev environment, set up by the msvc-dev-cmd step below.
       CMAKE_GENERATOR: Ninja
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -35,7 +35,7 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
-      # Puts cl.exe (and friends) on PATH for the whole job — required for the
+      # Puts cl.exe (and friends) on PATH for the whole job â€” required for the
       # Ninja cmake generator that llama.cpp's Vulkan backend needs.
       - name: Set up MSVC dev environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -58,7 +58,7 @@ jobs:
 
       # Generate an MSVC import library for libVLC from the checked-in export
       # list (ci/vlc.def). The official VLC SDK's libvlc.lib is a MinGW/dlltool-
-      # format import library that MSVC's /DELAYLOAD cannot process — link.exe
+      # format import library that MSVC's /DELAYLOAD cannot process â€” link.exe
       # silently keeps libvlc.dll as a LOAD-TIME import, and the shipped exe then
       # fails to start ("libvlc.dll was not found") on machines where VLC isn't
       # on the loader's search path. lib.exe from a .def produces a proper MSVC
@@ -80,9 +80,9 @@ jobs:
       # in .cargo/config.toml, pointing the linker at the import lib generated
       # above. The /DELAYLOAD:libvlc.dll + delayimp.lib link args are emitted by
       # build.rs (so the exe still launches when VLC isn't installed) and need not
-      # be repeated here — repeating them in RUSTFLAGS is what previously left
+      # be repeated here â€” repeating them in RUSTFLAGS is what previously left
       # libvlc as a load-time import in some builds.
-      # llm-vulkan = the local AI (Settings → AI Model, Gemma 4 vision) with
+      # llm-vulkan = the local AI (Settings â†’ AI Model, Gemma 4 vision) with
       # GPU acceleration via Vulkan; the same exe falls back to CPU inference
       # on machines without a usable GPU.
       - name: Build
@@ -92,7 +92,7 @@ jobs:
         run: cargo build --release --no-default-features --features vlc,llm-vulkan
 
       # Guard: libvlc.dll AND vulkan-1.dll must be DELAY-loaded, never
-      # load-time imports — a load-time import means the exe can't even start
+      # load-time imports â€” a load-time import means the exe can't even start
       # on machines missing that DLL (no VLC installed / no GPU driver).
       # Fails the build outright so a broken artifact can never ship again.
       - name: Verify delay-loaded imports
@@ -115,11 +115,11 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force ClarityTagFlow-windows | Out-Null
           Copy-Item C:\ctf\release\Clarity_TagFlow.exe ClarityTagFlow-windows/
-          # Bundle the runtime DLLs that `cargo build` stages next to the exe —
+          # Bundle the runtime DLLs that `cargo build` stages next to the exe â€”
           # the ONNX Runtime DirectML provider (DirectML.dll) and any
-          # onnxruntime*.dll — or the app fails to launch with a missing-DLL error.
+          # onnxruntime*.dll â€” or the app fails to launch with a missing-DLL error.
           # NEVER bundle VLC (libvlc*.dll / plugins): it is LGPL and we don't ship
-          # its license — the app uses the user's own VLC install at runtime and
+          # its license â€” the app uses the user's own VLC install at runtime and
           # offers an install link when it's missing (build.rs also skips staging
           # it when CI is set; this filter is defence in depth).
           $staged = Get-ChildItem C:\ctf\release -Filter *.dll -ErrorAction SilentlyContinue |
@@ -134,7 +134,7 @@ jobs:
           # deployment) so users never need the Visual C++ Redistributable
           # installed. We can't statically link the CRT because the prebuilt
           # ONNX Runtime is built against the dynamic CRT (/MD), which conflicts
-          # with +crt-static — shipping the DLLs is the equivalent guarantee.
+          # with +crt-static â€” shipping the DLLs is the equivalent guarantee.
           foreach ($dll in 'vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll') {
             Copy-Item "$env:SystemRoot\System32\$dll" ClarityTagFlow-windows/ -ErrorAction Stop
           }
@@ -142,7 +142,7 @@ jobs:
 
       # Build a per-user installer (Inno Setup ships on the GitHub Windows image)
       # so users download one Setup.exe; it tucks the exe + DLLs into a private
-      # install folder and creates shortcuts — they never see a loose .dll.
+      # install folder and creates shortcuts â€” they never see a loose .dll.
       - name: Build installer (Inno Setup)
         shell: pwsh
         run: |

@@ -734,15 +734,14 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                 ui.label(egui::RichText::new("Voice sample (cloning)").color(TEXT()).size(12.5));
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Choose audio…").clicked() {
-                        if let Some(p) = rfd::FileDialog::new()
+                    if ui.button("Choose audio…").clicked()
+                        && let Some(p) = rfd::FileDialog::new()
                             .add_filter("Audio", &["wav", "flac", "mp3", "ogg", "m4a"])
                             .pick_file()
                         {
                             settings.ai_voice_ref_audio = p.to_string_lossy().to_string();
                             llm.voice.ref_audio = settings.ai_voice_ref_audio.clone();
                         }
-                    }
                     // The floating always-on-top recorder: capture a voice off
                     // whatever is playing (YouTube, a game) as the sample.
                     let mic = egui::Button::image(
