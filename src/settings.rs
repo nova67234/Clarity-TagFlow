@@ -74,7 +74,8 @@ pub struct Settings {
     pub ai_voice_style: String,
     /// Auto-speak: read every finished AI reply aloud (tools menu toggle).
     pub ai_auto_speak: bool,
-    /// Which local model the AI chat runs (Gemma E4B / 27B / 31B, Qwen3-VL).
+    /// Which local model the AI chat runs (Gemma E4B / 27B / 31B, Qwen3-VL
+    /// 8B / 30B Thinking).
     pub ai_gemma_model: crate::llm::GemmaModel,
     /// AI chat sampling knobs (temperature, top-k/p, reply length) — edited
     /// from the gear in the chat list panel.
@@ -589,9 +590,9 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
     section(ui, "Local model", |ui| {
         hint(
             ui,
-            "Google's Gemma 4 vision models, running fully inside the app. \
-             They understand both text and images — no server, no account, \
-             and nothing ever leaves this device.",
+            "Local vision models (Google's Gemma, Alibaba's Qwen), running \
+             fully inside the app. They understand both text and images — no \
+             server, no account, and nothing ever leaves this device.",
         );
         ui.add_space(6.0);
 

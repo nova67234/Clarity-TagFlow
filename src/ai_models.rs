@@ -255,6 +255,22 @@ const CATALOG: &[ModelInfo] = &[
         ],
     },
     ModelInfo {
+        name: "Qwen3-VL 30B Thinking (local AI, vision)",
+        tab: "Qwen 30B",
+        folder: crate::llm::FOLDER_QWEN_30B,
+        desc: "The big Qwen3-VL — reasons in a thinking block before answering \
+               (shown behind the chat's collapsible Thinking row). A \
+               mixture-of-experts with only 3B active, so it stays quick even \
+               spilling to RAM. Selectable in Settings → AI Model. Not a tagger.",
+        note: "Downloads the Q4_K_M weights (~18.6 GB) + vision projector (~1.1 GB).",
+        repo: "https://huggingface.co/unsloth/Qwen3-VL-30B-A3B-Thinking-GGUF",
+        kind: None,
+        files: &[
+            (crate::llm::MODEL_FILE_QWEN_30B, "https://huggingface.co/unsloth/Qwen3-VL-30B-A3B-Thinking-GGUF/resolve/main/Qwen3-VL-30B-A3B-Thinking-Q4_K_M.gguf"),
+            (crate::llm::MMPROJ_FILE, "https://huggingface.co/unsloth/Qwen3-VL-30B-A3B-Thinking-GGUF/resolve/main/mmproj-F16.gguf"),
+        ],
+    },
+    ModelInfo {
         name: "Region Detection (faces / hands / people / feet / age)",
         tab: "Detect",
         folder: "region-detect",

@@ -41,6 +41,8 @@ pub const FOLDER_31B: &str = "gemma-4-31b";
 pub const MODEL_FILE_31B: &str = "gemma-4-31B-it-Q4_K_M.gguf";
 pub const FOLDER_QWEN: &str = "qwen3-vl-8b";
 pub const MODEL_FILE_QWEN: &str = "Qwen3-VL-8B-Instruct-Q4_K_M.gguf";
+pub const FOLDER_QWEN_30B: &str = "qwen3-vl-30b-thinking";
+pub const MODEL_FILE_QWEN_30B: &str = "Qwen3-VL-30B-A3B-Thinking-Q4_K_M.gguf";
 
 /// Which local model the chat runs (Settings → AI Model). All are
 /// vision-capable; they trade download size + speed for quality.
@@ -57,11 +59,20 @@ pub enum GemmaModel {
     D31B,
     /// Qwen3-VL 8B instruct — ~6 GB, a different flavour to Gemma.
     Qwen8B,
+    /// Qwen3-VL 30B A3B Thinking — ~18.6 GB mixture-of-experts (3B active,
+    /// so it stays quick even spilling to RAM); reasons in a `<think>` block
+    /// before answering.
+    Qwen30B,
 }
 
 impl GemmaModel {
-    pub const ALL: [GemmaModel; 4] =
-        [GemmaModel::E4B, GemmaModel::G27B, GemmaModel::D31B, GemmaModel::Qwen8B];
+    pub const ALL: [GemmaModel; 5] = [
+        GemmaModel::E4B,
+        GemmaModel::G27B,
+        GemmaModel::D31B,
+        GemmaModel::Qwen8B,
+        GemmaModel::Qwen30B,
+    ];
 
     pub fn folder(self) -> &'static str {
         match self {
@@ -69,6 +80,7 @@ impl GemmaModel {
             GemmaModel::G27B => FOLDER_27B,
             GemmaModel::D31B => FOLDER_31B,
             GemmaModel::Qwen8B => FOLDER_QWEN,
+            GemmaModel::Qwen30B => FOLDER_QWEN_30B,
         }
     }
 
@@ -78,6 +90,7 @@ impl GemmaModel {
             GemmaModel::G27B => MODEL_FILE_27B,
             GemmaModel::D31B => MODEL_FILE_31B,
             GemmaModel::Qwen8B => MODEL_FILE_QWEN,
+            GemmaModel::Qwen30B => MODEL_FILE_QWEN_30B,
         }
     }
 
@@ -91,6 +104,7 @@ impl GemmaModel {
             GemmaModel::G27B => "Gemma 3 27B",
             GemmaModel::D31B => "Gemma 4 31B",
             GemmaModel::Qwen8B => "Qwen3-VL 8B",
+            GemmaModel::Qwen30B => "Qwen3-VL 30B Thinking",
         }
     }
 
@@ -100,6 +114,9 @@ impl GemmaModel {
             GemmaModel::G27B => "~16 GB · very strong; wants ~20 GB VRAM, else spills to RAM (slower)",
             GemmaModel::D31B => "~19.5 GB · strongest; on a 16 GB GPU it runs partly on the CPU (slower)",
             GemmaModel::Qwen8B => "~6 GB · fast, a different flavour to Gemma — worth comparing",
+            GemmaModel::Qwen30B => {
+                "~18.6 GB · reasons before answering; only 3B active (MoE), so it stays quick even spilling to RAM"
+            }
         }
     }
 
@@ -837,18 +854,23 @@ impl LlmState {
 /// switches into a named channel, a bare `<channel|>` switches back to the
 /// visible answer. Channels named thought/thinking/analysis collect into the
 /// returned thinking text; anything else (final, …) stays visible, as does
-/// text outside any channel (the E4B never emits channels at all). Safe on
-/// a mid-stream prefix: a trailing half-written marker is hidden so it never
-/// flashes up while tokens arrive.
+/// text outside any channel (the E4B never emits channels at all). Qwen's
+/// thinking model uses `<think>{thinking}</think>{answer}` instead — same
+/// split, different markers. Safe on a mid-stream prefix: a trailing
+/// half-written marker is hidden so it never flashes up while tokens arrive.
 pub fn split_channels(raw: &str) -> (String, String) {
     const START: &str = "<|channel>";
     const END: &str = "<channel|>";
+    const THINK: &str = "<think>";
+    const THINK_END: &str = "</think>";
 
     // Hide a trailing, still-streaming partial marker.
     let mut raw = raw;
     if let Some(i) = raw.rfind('<') {
         let tail = &raw[i..];
-        if !tail.contains('>') && (START.starts_with(tail) || END.starts_with(tail)) {
+        if !tail.contains('>')
+            && [START, END, THINK, THINK_END].iter().any(|m| m.starts_with(tail))
+        {
             raw = &raw[..i];
         }
     }
@@ -858,29 +880,30 @@ pub fn split_channels(raw: &str) -> (String, String) {
     let mut in_thought = false;
     let mut rest = raw;
     loop {
-        // The next marker of either kind decides where this segment ends.
-        let (i, is_start) = match (rest.find(START), rest.find(END)) {
-            (Some(a), Some(b)) if a <= b => (a, true),
-            (Some(a), None) => (a, true),
-            (_, Some(b)) => (b, false),
-            (None, None) => break,
-        };
+        // The earliest marker of any kind decides where this segment ends.
+        // Kinds: 0 = named channel start, 1 = think-open, 2 = close (either).
+        let next = [(START, 0), (THINK, 1), (END, 2), (THINK_END, 2)]
+            .iter()
+            .filter_map(|&(m, kind)| rest.find(m).map(|i| (i, m.len(), kind)))
+            .min_by_key(|&(i, _, _)| i);
+        let Some((i, marker_len, kind)) = next else { break };
         let seg = &rest[..i];
         if in_thought { thinking.push_str(seg) } else { visible.push_str(seg) }
-        if is_start {
-            rest = &rest[i + START.len()..];
-            // The channel name is the word right after the marker.
-            let name_len = rest
-                .find(|c: char| c.is_whitespace() || c == '<')
-                .unwrap_or(rest.len());
-            let name = rest[..name_len].to_ascii_lowercase();
-            in_thought = name.starts_with("thought")
-                || name.starts_with("think")
-                || name == "analysis";
-            rest = &rest[name_len..];
-        } else {
-            in_thought = false;
-            rest = &rest[i + END.len()..];
+        rest = &rest[i + marker_len..];
+        match kind {
+            0 => {
+                // The channel name is the word right after the marker.
+                let name_len = rest
+                    .find(|c: char| c.is_whitespace() || c == '<')
+                    .unwrap_or(rest.len());
+                let name = rest[..name_len].to_ascii_lowercase();
+                in_thought = name.starts_with("thought")
+                    || name.starts_with("think")
+                    || name == "analysis";
+                rest = &rest[name_len..];
+            }
+            1 => in_thought = true,
+            _ => in_thought = false,
         }
         // Don't let a marker leave the next section starting on a blank line.
         rest = rest.strip_prefix('\n').unwrap_or(rest);
@@ -1197,7 +1220,7 @@ mod worker {
                     s
                 }
                 // ChatML, Qwen's wire format.
-                super::GemmaModel::Qwen8B => {
+                super::GemmaModel::Qwen8B | super::GemmaModel::Qwen30B => {
                     let mut s = String::new();
                     for (user, text) in &turns {
                         let role = if *user { "user" } else { "assistant" };
@@ -1208,6 +1231,15 @@ mod worker {
                 }
             },
         };
+        // Qwen's thinking flavour was trained with the assistant turn
+        // pre-opened by `<think>` — its Jinja template hardcodes the prefill,
+        // which both llama.cpp's built-in ChatML formatter and the hand
+        // fallback above miss. Without it the reasoning arrives untagged and
+        // would all land in the visible bubble.
+        let mut formatted = formatted;
+        if matches!(which, super::GemmaModel::Qwen30B) {
+            formatted.push_str("<think>\n");
+        }
         let input = MtmdInputText { text: formatted, add_special: true, parse_special: true };
         let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
         let chunks = mtmd
@@ -1239,6 +1271,13 @@ mod worker {
         // into the context, so everything after it is the visible answer.
         let think_budget = (params.max_tokens / 3).max(256);
         let mut raw = String::new();
+        // Mirror the Qwen prefill into the stream so the open-thought
+        // bookkeeping below and the UI's split_channels both see the block
+        // the prompt already opened.
+        if matches!(which, super::GemmaModel::Qwen30B) {
+            raw.push_str("<think>\n");
+            send(Msg::Token("<think>\n".into()));
+        }
         let mut forced_close = false;
         // Where the visible answer starts after a forced close, plus how many
         // end-of-turn attempts were rejected while that answer was still
@@ -1246,8 +1285,15 @@ mod worker {
         // treating its hidden draft as "already said").
         let mut closed_at: Option<usize> = None;
         let mut eog_rejects = 0;
+        // Gemma reasons in `<|channel>thought … <channel|>`, Qwen's thinking
+        // model in `<think> … </think>` — same budget machinery, different
+        // markers.
+        let (thought_start, thought_end) = match which {
+            super::GemmaModel::Qwen30B => ("<think>", "</think>"),
+            _ => ("<|channel>", "<channel|>"),
+        };
         let thought_open =
-            |raw: &String| raw.contains("<|channel>") && !raw.contains("<channel|>");
+            |raw: &String| raw.contains(thought_start) && !raw.contains(thought_end);
         // Streaming decoder: a token can end mid-way through a multi-byte
         // UTF-8 character (CJK, emoji), so bytes carry over between pieces.
         let mut decoder = encoding_rs::UTF_8.new_decoder();
@@ -1267,7 +1313,7 @@ mod worker {
                     forced_close = true;
                     close_thought(
                         model, &mut context, &mut batch, &mut sampler, &mut n_past, &mut raw,
-                        send,
+                        thought_end, send,
                     )?;
                     closed_at = Some(raw.len());
                     continue;
@@ -1305,7 +1351,8 @@ mod worker {
             {
                 forced_close = true;
                 close_thought(
-                    model, &mut context, &mut batch, &mut sampler, &mut n_past, &mut raw, send,
+                    model, &mut context, &mut batch, &mut sampler, &mut n_past, &mut raw,
+                    thought_end, send,
                 )?;
                 closed_at = Some(raw.len());
             }
@@ -1314,11 +1361,12 @@ mod worker {
     }
 
     /// Force-close a thought channel: feed a hidden first-person wrap-up plus
-    /// the real `<channel|>` control token into the context, so everything
-    /// the model generates next is the visible answer. A bare closing marker
-    /// is not enough — the model carries its interrupted train of thought
-    /// straight into the visible text unless the wrap-up spells out the
-    /// register switch.
+    /// the model's real closing control token (`<channel|>` for Gemma,
+    /// `</think>` for Qwen) into the context, so everything the model
+    /// generates next is the visible answer. A bare closing marker is not
+    /// enough — the model carries its interrupted train of thought straight
+    /// into the visible text unless the wrap-up spells out the register
+    /// switch.
     #[allow(clippy::too_many_arguments)]
     fn close_thought(
         model: &LlamaModel,
@@ -1327,17 +1375,20 @@ mod worker {
         sampler: &mut LlamaSampler,
         n_past: &mut i32,
         raw: &mut String,
+        close_marker: &str,
         send: &dyn Fn(Msg),
     ) -> Result<(), String> {
         // "Nothing above has been shown" matters: the model often drafts its
         // full reply inside the thought and then ends the turn without
         // repeating it, believing it already answered.
-        let close = "\nEnough thinking. Nothing above has been shown to the \
-                     user — it is my private notes, and they are still waiting \
-                     for my reply. I now write it for them, in full: polished \
-                     prose, no notes, no bullets, no self-corrections.\n<channel|>\n";
+        let close = format!(
+            "\nEnough thinking. Nothing above has been shown to the \
+             user — it is my private notes, and they are still waiting \
+             for my reply. I now write it for them, in full: polished \
+             prose, no notes, no bullets, no self-corrections.\n{close_marker}\n"
+        );
         let toks = model
-            .str_to_token(close, AddBos::Never)
+            .str_to_token(&close, AddBos::Never)
             .map_err(|e| format!("Tokenize close: {e}"))?;
         batch.clear();
         for (j, t) in toks.iter().enumerate() {
@@ -1348,8 +1399,8 @@ mod worker {
             sampler.accept(*t);
         }
         context.decode(batch).map_err(|e| format!("Decode: {e}"))?;
-        raw.push_str(close);
-        send(Msg::Token(close.to_string()));
+        raw.push_str(&close);
+        send(Msg::Token(close));
         Ok(())
     }
 
@@ -1438,6 +1489,27 @@ mod split_channel_tests {
         let (t, v) = split_channels("An answer so far<|chann");
         assert_eq!(t, "");
         assert_eq!(v, "An answer so far");
+    }
+
+    #[test]
+    fn qwen_think_tags() {
+        // Qwen's thinking model: `<think>reasoning</think>answer`.
+        let (t, v) =
+            split_channels("<think>\nThe user greets me. Keep it warm.\n</think>\nHello!");
+        assert_eq!(t, "The user greets me. Keep it warm.");
+        assert_eq!(v, "Hello!");
+    }
+
+    #[test]
+    fn qwen_partial_markers_mid_stream() {
+        // Still inside the think block, with the closing tag half-streamed.
+        let (t, v) = split_channels("<think>\nStill working it out</thi");
+        assert_eq!(t, "Still working it out");
+        assert_eq!(v, "");
+        // The seeded prefill alone must not flash anything visible.
+        let (t, v) = split_channels("<think>\n");
+        assert_eq!(t, "");
+        assert_eq!(v, "");
     }
 }
 
