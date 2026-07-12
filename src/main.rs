@@ -72,9 +72,20 @@ mod ai_chat;
 mod voice;
 // Role playing for the AI Chat: persona, names, shared memory diary.
 mod roleplay;
-#[cfg(feature = "avif")]
+// The zip viewer only needs the (non-optional) `zip` crate, so it compiles in
+// every build — including the no-default-features release/CI configurations.
 mod archive;
+// AVIF/HEIC/camera-raw decoding sits behind the `avif` feature (rav1d, heic
+// and zenraw are heavy builds); the stub keeps every caller compiling — those
+// formats simply fail to decode in builds without it.
+#[cfg(feature = "avif")]
 mod avif;
+#[cfg(not(feature = "avif"))]
+mod avif {
+    pub fn decode_avif(_path: &std::path::Path) -> Option<image::RgbaImage> {
+        None
+    }
+}
 mod backup;
 mod bgremove;
 mod civitai;
