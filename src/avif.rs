@@ -51,7 +51,7 @@ pub fn decode_avif(path: &std::path::Path) -> Option<RgbaImage> {
         return decode_raw(path);
     }
 
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = crate::archive::read(path).ok()?;
     let parsed = match avif_parse::read_avif(&mut bytes.as_slice()) {
         Ok(p) => p,
         // A `.heif`/`.avif` that isn't actually AV1 — try the HEVC decoder.
@@ -73,7 +73,7 @@ pub fn decode_avif(path: &std::path::Path) -> Option<RgbaImage> {
 
 /// Decode a HEIC/HEIF (HEVC-coded) file via the pure-Rust `heic` crate.
 fn decode_heic(path: &std::path::Path) -> Option<RgbaImage> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = crate::archive::read(path).ok()?;
     let out = heic::DecoderConfig::new()
         .decode(&bytes, heic::PixelLayout::Rgba8)
         .ok()?;
@@ -210,7 +210,7 @@ fn read_f32(row: &[u8], o: usize) -> f64 {
 /// fit a linear colour transform from develop→preview and apply it, keeping the
 /// develop's full resolution while adopting the camera's correct colour.
 fn decode_raw(path: &std::path::Path) -> Option<RgbaImage> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = crate::archive::read(path).ok()?;
     if let Some(dev) = decode_raw_develop(&bytes) {
         if let Some(prev) = crate::raw_preview::largest_embedded_jpeg(&bytes) {
             if let Some(matched) = color_match_to_preview(&dev, &prev) {
