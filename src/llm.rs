@@ -707,6 +707,19 @@ impl LlmState {
                 }
             }
         }
+        // Videos are the priciest attachment (each re-send costs a whole set
+        // of sampled frames through the vision encoder), so only the newest
+        // one stays in the window; older messages keep their text.
+        let mut kept_video = false;
+        for m in msgs.iter_mut().rev() {
+            if m.image.as_deref().is_some_and(crate::is_video) {
+                if kept_video {
+                    m.image = None;
+                } else {
+                    kept_video = true;
+                }
+            }
+        }
         let id = chat.id;
 
         // Role play: pin the persona/diary priming turn in front of the
@@ -986,7 +999,7 @@ fn spawn_worker(ctx: egui::Context, model: GemmaModel) -> Option<Worker> {
 mod worker {
     use std::ffi::CString;
     use std::num::NonZeroU32;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc::{Receiver, Sender};
 
     use eframe::egui;
@@ -1161,10 +1174,25 @@ mod worker {
         for m in msgs {
             let mut text = m.text.clone();
             if let Some(path) = &m.image {
-                send(Msg::Status("Reading the image…".into()));
-                bitmaps.push(load_bitmap(mtmd, path)?);
-                if !text.contains(marker) {
-                    text = format!("{marker}\n{text}");
+                if crate::is_video(path) {
+                    // A video becomes a handful of evenly-sampled frames, each
+                    // its own vision input, labelled with its timestamp so the
+                    // model can reason about order and motion.
+                    send(Msg::Status("Reading the video…".into()));
+                    let frames = video_frames(path)?;
+                    let mut header =
+                        format!("This is a video, shown as {} sampled frames:\n", frames.len());
+                    for (ms, frame) in &frames {
+                        bitmaps.push(load_bitmap(mtmd, frame)?);
+                        header.push_str(&format!("Frame at {}: {marker}\n", fmt_timestamp(*ms)));
+                    }
+                    text = format!("{header}{text}");
+                } else {
+                    send(Msg::Status("Reading the image…".into()));
+                    bitmaps.push(load_bitmap(mtmd, path)?);
+                    if !text.contains(marker) {
+                        text = format!("{marker}\n{text}");
+                    }
                 }
             }
             turns.push((m.user, text));
@@ -1402,6 +1430,78 @@ mod worker {
         raw.push_str(&close);
         send(Msg::Token(close));
         Ok(())
+    }
+
+    /// How many frames a video attachment is sampled down to. Each frame costs
+    /// what one image costs through the vision encoder (~256 tokens on Gemma,
+    /// more on Qwen), so this stays small next to the 16k context. Gemma 4's
+    /// docs size video input at roughly a frame per second for up to a minute;
+    /// longer clips just get sparser sampling here.
+    const MAX_VIDEO_FRAMES: usize = 8;
+    /// Long edge of the sampled frames handed to the vision encoder.
+    const VIDEO_FRAME_EDGE: u32 = 896;
+
+    /// `93500` ms → `"1:33"`, for the per-frame labels in the prompt.
+    fn fmt_timestamp(ms: i64) -> String {
+        let s = ms.max(0) / 1000;
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+
+    /// The evenly-sampled frames of a video attachment, as temp PNGs with
+    /// their timestamps. Extraction (a throwaway VLC decode, seconds of work)
+    /// runs once per file identity — the frames are cached in a temp dir keyed
+    /// by path + size + mtime, so re-sending the clip with the chat history
+    /// every turn is free after the first.
+    fn video_frames(path: &Path) -> Result<Vec<(i64, PathBuf)>, String> {
+        use std::hash::{Hash, Hasher};
+        if !cfg!(feature = "vlc") {
+            return Err("Video input needs a build with the VLC feature".to_string());
+        }
+        let meta = std::fs::metadata(path).map_err(|e| format!("Read video: {e}"))?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut h);
+        meta.len().hash(&mut h);
+        if let Ok(t) = meta.modified() {
+            if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                d.as_secs().hash(&mut h);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("clarity_tagflow_ai_frames_{:016x}", h.finish()));
+
+        // Frames are named {index:02}_{timestamp ms}.png, so a name sort is
+        // playback order and the label survives the cache round-trip.
+        let list = |dir: &Path| -> Vec<(i64, PathBuf)> {
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+                .map(|rd| rd.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default();
+            paths.sort();
+            paths
+                .into_iter()
+                .filter_map(|p| {
+                    let ms = p.file_stem()?.to_str()?.split_once('_')?.1.parse().ok()?;
+                    Some((ms, p))
+                })
+                .collect()
+        };
+        let cached = list(&dir);
+        if !cached.is_empty() {
+            return Ok(cached);
+        }
+
+        let frames = crate::video::capture_frames(path, MAX_VIDEO_FRAMES, VIDEO_FRAME_EDGE);
+        if frames.is_empty() {
+            return Err("Couldn't decode the video — does it play in the viewer?".to_string());
+        }
+        std::fs::create_dir_all(&dir).map_err(|e| format!("Frame cache: {e}"))?;
+        for (i, (ms, img)) in frames.iter().enumerate() {
+            let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+            let rgba =
+                image::RgbaImage::from_raw(img.size[0] as u32, img.size[1] as u32, bytes)
+                    .ok_or("Frame buffer size mismatch")?;
+            rgba.save_with_format(dir.join(format!("{i:02}_{ms}.png")), image::ImageFormat::Png)
+                .map_err(|e| format!("Save frame: {e}"))?;
+        }
+        Ok(list(&dir))
     }
 
     /// Load an image for the vision pipeline. llama.cpp's own loader (stb)

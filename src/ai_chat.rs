@@ -27,7 +27,12 @@ const PANEL_W: f32 = crate::right_details::PANEL_WIDTH;
 const DROP_BLUE: egui::Color32 = egui::Color32::from_rgb(56, 132, 255);
 
 /// Image types the input card accepts from a drop (matches the + picker).
+/// Videos are accepted too, via `crate::is_video` — the model worker samples
+/// them into a handful of timestamped frames.
 const DROP_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"];
+
+/// Video types offered by the + picker (matches `main::VIDEO_EXTENSIONS`).
+const VIDEO_PICK_EXTS: &[&str] = &["mp4", "mov", "mkv", "webm", "avi", "m4v", "wmv", "flv"];
 
 /// True when the AI Chat's input card (visible this or last frame) claims a
 /// file dropped at the pointer, so the gallery doesn't also add it — the same
@@ -245,8 +250,9 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
     let panel = ui.max_rect();
     let row_h = 20.0;
     let mut input_h = 104.0;
-    if llm.draft_image.is_some() {
-        input_h += 78.0;
+    if let Some(p) = &llm.draft_image {
+        // A video attachment shows as a one-line chip, an image as a 64px thumb.
+        input_h += if crate::is_video(p) { 30.0 } else { 78.0 };
     }
     if llm.run_err.is_some() {
         input_h += 22.0;
@@ -331,9 +337,10 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
     });
     if !dropped.is_empty() && claims_drop(llm, ui.ctx()) {
         if let Some(p) = dropped.into_iter().find(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| DROP_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+            crate::is_video(p)
+                || p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| DROP_EXTS.contains(&e.to_ascii_lowercase().as_str()))
         }) {
             llm.draft_image = Some(p);
             llm.run_err = None;
@@ -385,8 +392,9 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                 ui.vertical(|ui| {
                 ui.set_width(col_w - 24.0);
 
-                // Attached-image thumbnail (rounded, with a remove ✕).
-                if llm.draft_image.is_some() {
+                // Attached-image thumbnail (rounded, with a remove ✕). Videos
+                // have no cheap still, so they show a filename chip instead.
+                if let Some(path) = llm.draft_image.clone() {
                     let tex = llm.draft_thumb.as_ref().map(|(_, t)| t.clone());
                     if let Some(tex) = tex {
                         ui.horizontal(|ui| {
@@ -400,6 +408,23 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                             if ui
                                 .add(egui::Button::new(egui::RichText::new("✕").color(MUTED()).size(11.0)).frame(false))
                                 .on_hover_text("Remove the image")
+                                .clicked()
+                            {
+                                llm.draft_image = None;
+                                llm.draft_thumb = None;
+                            }
+                        });
+                        ui.add_space(6.0);
+                    } else if crate::is_video(&path) {
+                        ui.horizontal(|ui| {
+                            let name = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            ui.label(egui::RichText::new(format!("🎬 {name}")).color(MUTED()).size(12.0));
+                            if ui
+                                .add(egui::Button::new(egui::RichText::new("✕").color(MUTED()).size(11.0)).frame(false))
+                                .on_hover_text("Remove the video")
                                 .clicked()
                             {
                                 llm.draft_image = None;
@@ -446,11 +471,12 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                 // middle, send on the right.
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if icon_button(ui, egui::include_image!("../icons/add.svg"), 20.0, "Attach an image", !llm.running)
+                    if icon_button(ui, egui::include_image!("../icons/add.svg"), 20.0, "Attach an image or video", !llm.running)
                         .clicked()
                     {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"])
+                            .add_filter("Videos", VIDEO_PICK_EXTS)
                             .pick_file()
                         {
                             llm.draft_image = Some(path);
@@ -572,7 +598,8 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
-                        ui.label(egui::RichText::new(format!("🖼 {name}")).color(MUTED()).size(11.5));
+                        let icon = if crate::is_video(path) { "🎬" } else { "🖼" };
+                        ui.label(egui::RichText::new(format!("{icon} {name}")).color(MUTED()).size(11.5));
                     }
                 }
                 if !text.is_empty() {
@@ -888,6 +915,13 @@ fn ensure_draft_thumb(ctx: &egui::Context, llm: &mut LlmState) {
         return;
     };
     if llm.draft_thumb.as_ref().is_some_and(|(p, _)| *p == path) {
+        return;
+    }
+    // Videos can't be decoded here (and grabbing a poster frame would stall
+    // the UI thread) — the input card shows a filename chip instead, and the
+    // worker samples the actual frames at send time.
+    if crate::is_video(&path) {
+        llm.draft_thumb = None;
         return;
     }
     match image::open(&path) {

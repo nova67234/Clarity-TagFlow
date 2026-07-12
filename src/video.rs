@@ -282,11 +282,22 @@ impl VideoThumbs {
     pub fn set_max_edge(&mut self, _max_edge: u32) {}
 }
 
+/// Stub frame sampler when the `vlc` feature is off — the AI worker turns the
+/// empty Vec into a readable "needs the VLC build" error.
+#[cfg(not(feature = "vlc"))]
+pub fn capture_frames(
+    _path: &Path,
+    _max_frames: usize,
+    _max_edge: u32,
+) -> Vec<(i64, egui::ColorImage)> {
+    Vec::new()
+}
+
 // ---------------------------------------------------------------------------
 // Real libVLC-backed player (feature = "vlc").
 // ---------------------------------------------------------------------------
 #[cfg(feature = "vlc")]
-pub use backend::{VideoPlayer, VideoPreviews, VideoThumbs};
+pub use backend::{capture_frames, VideoPlayer, VideoPreviews, VideoThumbs};
 
 #[cfg(feature = "vlc")]
 mod backend {
@@ -299,6 +310,141 @@ mod backend {
     use vlc::sys;
 
     type SharedFrame = Arc<Mutex<Option<egui::ColorImage>>>;
+
+    // --- In-memory media (entries of a mounted zip archive) -----------------
+    //
+    // libVLC can only open real files by path, but zip entries are viewed
+    // without ever being extracted (src/archive.rs). For those, the whole
+    // entry is inflated to memory and handed to libVLC through
+    // `libvlc_media_new_callbacks` — its "read a custom stream" API. vlc-rs
+    // 0.3 doesn't bind it, so it's declared here; the symbol is exported by
+    // the release import library (ci/vlc.def) and the VLC SDK alike.
+
+    type MediaOpenCb =
+        unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut u64) -> std::os::raw::c_int;
+    type MediaReadCb = unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> isize;
+    type MediaSeekCb = unsafe extern "C" fn(*mut c_void, u64) -> std::os::raw::c_int;
+    type MediaCloseCb = unsafe extern "C" fn(*mut c_void);
+
+    unsafe extern "C" {
+        fn libvlc_media_new_callbacks(
+            p_instance: *mut sys::libvlc_instance_t,
+            open_cb: Option<MediaOpenCb>,
+            read_cb: Option<MediaReadCb>,
+            seek_cb: Option<MediaSeekCb>,
+            close_cb: Option<MediaCloseCb>,
+            opaque: *mut c_void,
+        ) -> *mut sys::libvlc_media_t;
+    }
+
+    /// The bytes behind an in-memory media. Owned by the player (or poster
+    /// capture) and freed only after the player stops: looping playback
+    /// re-opens the stream each pass, so the buffer must outlive every
+    /// open/close cycle — a close callback can't own it.
+    pub(super) struct MemShared {
+        data: Vec<u8>,
+    }
+
+    /// One open stream over a [`MemShared`] buffer (libVLC may open the same
+    /// media several times — probing, playing, looping). Created in
+    /// `mem_open_cb`, freed in `mem_close_cb`.
+    struct MemCursor {
+        shared: *const MemShared,
+        pos: usize,
+    }
+
+    unsafe extern "C" fn mem_open_cb(
+        opaque: *mut c_void,
+        datap: *mut *mut c_void,
+        sizep: *mut u64,
+    ) -> std::os::raw::c_int {
+        unsafe {
+            let shared = opaque as *const MemShared;
+            *sizep = (*shared).data.len() as u64;
+            *datap = Box::into_raw(Box::new(MemCursor { shared, pos: 0 })) as *mut c_void;
+        }
+        0
+    }
+
+    unsafe extern "C" fn mem_read_cb(datap: *mut c_void, buf: *mut u8, len: usize) -> isize {
+        unsafe {
+            let cur = &mut *(datap as *mut MemCursor);
+            let data = &(*cur.shared).data;
+            let n = len.min(data.len().saturating_sub(cur.pos));
+            std::ptr::copy_nonoverlapping(data.as_ptr().add(cur.pos), buf, n);
+            cur.pos += n;
+            n as isize
+        }
+    }
+
+    unsafe extern "C" fn mem_seek_cb(datap: *mut c_void, offset: u64) -> std::os::raw::c_int {
+        unsafe {
+            let cur = &mut *(datap as *mut MemCursor);
+            if offset > (*cur.shared).data.len() as u64 {
+                return -1;
+            }
+            cur.pos = offset as usize;
+        }
+        0
+    }
+
+    unsafe extern "C" fn mem_close_cb(datap: *mut c_void) {
+        unsafe { drop(Box::from_raw(datap as *mut MemCursor)) };
+    }
+
+    /// A media handle for `path` — by path for real files, or fed from memory
+    /// for zip entries. `mem` (null for path media) must be freed with
+    /// `Box::from_raw` after the player using the media has stopped.
+    struct MediaSource {
+        /// Keeps the path-based `vlc::Media` alive until it's set on the
+        /// player; `None` for memory media (we manage the raw refcount).
+        media: Option<vlc::Media>,
+        raw: *mut sys::libvlc_media_t,
+        mem: *mut MemShared,
+    }
+
+    fn open_media(instance: &vlc::Instance, path: &Path) -> Option<MediaSource> {
+        if crate::archive::is_entry(path) {
+            let data = crate::archive::read(path).ok()?;
+            let mem = Box::into_raw(Box::new(MemShared { data }));
+            let raw = unsafe {
+                libvlc_media_new_callbacks(
+                    instance.raw(),
+                    Some(mem_open_cb),
+                    Some(mem_read_cb),
+                    Some(mem_seek_cb),
+                    Some(mem_close_cb),
+                    mem as *mut c_void,
+                )
+            };
+            if raw.is_null() {
+                // No stream was opened, so the buffer is still exclusively ours.
+                unsafe { drop(Box::from_raw(mem)) };
+                return None;
+            }
+            Some(MediaSource { media: None, raw, mem })
+        } else {
+            let media = vlc::Media::new_path(instance, path)?;
+            let raw = media.raw();
+            Some(MediaSource { media: Some(media), raw, mem: std::ptr::null_mut() })
+        }
+    }
+
+    impl MediaSource {
+        /// Attach the media to `player` and drop our reference (the player
+        /// retains its own). Returns the keep-alive buffer pointer the caller
+        /// must free once the player has stopped (null for path media).
+        fn set_on(self, player: &vlc::MediaPlayer) -> *mut MemShared {
+            match &self.media {
+                Some(m) => player.set_media(m), // vlc::Media's Drop releases ours
+                None => unsafe {
+                    sys::libvlc_media_player_set_media(player.raw(), self.raw);
+                    sys::libvlc_media_release(self.raw);
+                },
+            }
+            self.mem
+        }
+    }
 
     /// Opaque handed to libVLC's video callbacks. libVLC drives `setup`/`lock`/
     /// `unlock`/`display` serially from its own video thread, so `buffer` needs
@@ -316,6 +462,9 @@ mod backend {
         _instance: vlc::Instance,
         player: vlc::MediaPlayer,
         ctx_ptr: *mut VideoCtx,
+        /// Bytes behind an in-memory (zip entry) media — null for file media.
+        /// Freed on drop, after the player stops.
+        mem_ptr: *mut MemShared,
         latest: SharedFrame,
         texture: Option<egui::TextureHandle>,
     }
@@ -335,13 +484,13 @@ mod backend {
 
         fn start_with(path: &Path, ctx: &egui::Context, looping: bool, muted: bool) -> Option<VideoPlayer> {
             let instance = vlc::Instance::new()?;
-            let media = vlc::Media::new_path(&instance, path)?;
+            let media = open_media(&instance, path)?;
             // Loop the clip when requested. A large repeat count stands in for
             // "infinite" (libVLC has no unbounded value).
             if looping {
                 unsafe {
                     let opt = std::ffi::CString::new(":input-repeat=65535").unwrap();
-                    sys::libvlc_media_add_option(media.raw(), opt.as_ptr());
+                    sys::libvlc_media_add_option(media.raw, opt.as_ptr());
                 }
             }
             // Preview tiles never play sound (a grid of chattering clips would be
@@ -349,11 +498,11 @@ mod backend {
             if muted {
                 unsafe {
                     let opt = std::ffi::CString::new(":no-audio").unwrap();
-                    sys::libvlc_media_add_option(media.raw(), opt.as_ptr());
+                    sys::libvlc_media_add_option(media.raw, opt.as_ptr());
                 }
             }
             let player = vlc::MediaPlayer::new(&instance)?;
-            player.set_media(&media);
+            let mem_ptr = media.set_on(&player);
 
             let latest: SharedFrame = Arc::new(Mutex::new(None));
             let ctx_ptr = Box::into_raw(Box::new(VideoCtx {
@@ -391,10 +540,14 @@ mod backend {
             if player.play().is_err() {
                 // No callbacks have fired yet, so it's safe to free the box.
                 unsafe { drop(Box::from_raw(ctx_ptr)) };
+                if !mem_ptr.is_null() {
+                    // Play never started, so no stream is reading the buffer.
+                    unsafe { drop(Box::from_raw(mem_ptr)) };
+                }
                 return None;
             }
 
-            Some(VideoPlayer { _instance: instance, player, ctx_ptr, latest, texture: None })
+            Some(VideoPlayer { _instance: instance, player, ctx_ptr, mem_ptr, latest, texture: None })
         }
 
         /// Upload the newest decoded frame (if any) to a GPU texture and return a
@@ -417,9 +570,14 @@ mod backend {
     impl Drop for VideoPlayer {
         fn drop(&mut self) {
             // Stop playback first (synchronous in VLC 3.x) so the video callbacks
-            // can't fire again, then free the opaque they were writing into.
+            // can't fire again, then free the opaque they were writing into —
+            // and, for in-memory (zip entry) media, the stream's byte buffer
+            // (the stopped input has closed every cursor over it).
             self.player.stop();
             unsafe { drop(Box::from_raw(self.ctx_ptr)) };
+            if !self.mem_ptr.is_null() {
+                unsafe { drop(Box::from_raw(self.mem_ptr)) };
+            }
         }
     }
 
@@ -706,16 +864,16 @@ mod backend {
     /// `max_edge`, as an RGBA image. `None` if no frame arrives within the timeout.
     fn capture_poster(path: &Path, max_edge: u32) -> Option<egui::ColorImage> {
         let instance = vlc::Instance::new()?;
-        let media = vlc::Media::new_path(&instance, path)?;
+        let media = open_media(&instance, path)?;
         // Poster capture only needs a video frame. Disable the audio output for
         // this media so decoding a thumbnail never plays the soundtrack — otherwise
         // scrolling the browser starts background audio for each video it captures.
         unsafe {
             let opt = std::ffi::CString::new(":no-audio").unwrap();
-            sys::libvlc_media_add_option(media.raw(), opt.as_ptr());
+            sys::libvlc_media_add_option(media.raw, opt.as_ptr());
         }
         let player = vlc::MediaPlayer::new(&instance)?;
-        player.set_media(&media);
+        let mem_ptr = media.set_on(&player);
 
         let latest: SharedFrame = Arc::new(Mutex::new(None));
         let ctx_ptr = Box::into_raw(Box::new(CaptureCtx {
@@ -750,6 +908,9 @@ mod backend {
 
         if player.play().is_err() {
             unsafe { drop(Box::from_raw(ctx_ptr)) };
+            if !mem_ptr.is_null() {
+                unsafe { drop(Box::from_raw(mem_ptr)) };
+            }
             return None;
         }
 
@@ -766,7 +927,118 @@ mod backend {
 
         player.stop();
         unsafe { drop(Box::from_raw(ctx_ptr)) };
+        // The stopped input has closed all cursors over the in-memory buffer.
+        if !mem_ptr.is_null() {
+            unsafe { drop(Box::from_raw(mem_ptr)) };
+        }
         result
+    }
+
+    /// Decode up to `max_frames` evenly-spaced frames of `path` (long edge ≈
+    /// `max_edge`) for the AI chat's video input, as (timestamp ms, frame)
+    /// pairs in playback order. The same muted throwaway player as
+    /// [`capture_poster`], plus a position seek between grabs. An unplayable
+    /// clip returns an empty Vec.
+    pub fn capture_frames(
+        path: &Path,
+        max_frames: usize,
+        max_edge: u32,
+    ) -> Vec<(i64, egui::ColorImage)> {
+        let Some(instance) = vlc::Instance::new() else { return Vec::new() };
+        let Some(media) = open_media(&instance, path) else { return Vec::new() };
+        unsafe {
+            let no_audio = std::ffi::CString::new(":no-audio").unwrap();
+            sys::libvlc_media_add_option(media.raw, no_audio.as_ptr());
+            // A short clip could reach its end (closing the input) between
+            // seeks — keep the throwaway player looping; it's stopped
+            // explicitly below.
+            let repeat = std::ffi::CString::new(":input-repeat=65535").unwrap();
+            sys::libvlc_media_add_option(media.raw, repeat.as_ptr());
+        }
+        let Some(player) = vlc::MediaPlayer::new(&instance) else { return Vec::new() };
+        let mem_ptr = media.set_on(&player);
+
+        let latest: SharedFrame = Arc::new(Mutex::new(None));
+        let ctx_ptr = Box::into_raw(Box::new(CaptureCtx {
+            max_edge,
+            width: 0,
+            height: 0,
+            buffer: Vec::new(),
+            frame_count: 0,
+            latest: latest.clone(),
+        }));
+        unsafe {
+            let mp = player.raw();
+            sys::libvlc_video_set_callbacks(
+                mp,
+                Some(thumb_lock_cb),
+                Some(thumb_unlock_cb),
+                Some(thumb_display_cb),
+                ctx_ptr as *mut c_void,
+            );
+            let setup_fp: unsafe extern "C" fn(
+                *mut *mut c_void,
+                *mut c_char,
+                *mut c_uint,
+                *mut c_uint,
+                *mut c_uint,
+                *mut c_uint,
+            ) -> c_uint = thumb_setup_cb;
+            let setup: sys::libvlc_video_format_cb = Some(std::mem::transmute(setup_fp));
+            sys::libvlc_video_set_format_callbacks(mp, setup, Some(thumb_cleanup_cb));
+        }
+
+        let wait_frame = |timeout: Duration| -> Option<egui::ColorImage> {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if let Some(img) = latest.lock().ok().and_then(|mut g| g.take()) {
+                    return Some(img);
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            None
+        };
+
+        let mut out = Vec::new();
+        if player.play().is_ok() {
+            // The first settled frame proves the clip decodes and makes the
+            // length readable; it isn't itself kept.
+            if wait_frame(Duration::from_secs(6)).is_some() {
+                let len_ms = unsafe { sys::libvlc_media_player_get_length(player.raw()) };
+                // About one frame per second of clip, between 2 and max_frames
+                // — longer clips just get sparser sampling.
+                let n = if len_ms > 0 {
+                    ((len_ms as f64 / 1000.0).round() as usize).clamp(2, max_frames.max(1))
+                } else {
+                    max_frames.max(1).min(6)
+                };
+                for i in 0..n {
+                    let pos = (i as f32 + 0.5) / n as f32;
+                    player.set_position(pos);
+                    // Let the seek land, then drop whatever frame was already
+                    // waiting so the grab below is really post-seek.
+                    std::thread::sleep(Duration::from_millis(100));
+                    if let Ok(mut g) = latest.lock() {
+                        *g = None;
+                    }
+                    if let Some(img) = wait_frame(Duration::from_secs(3)) {
+                        let ts = player
+                            .get_time()
+                            .filter(|t| *t >= 0)
+                            .unwrap_or((pos * len_ms.max(0) as f32) as i64);
+                        out.push((ts, img));
+                    }
+                }
+            }
+            player.stop();
+        }
+        unsafe {
+            drop(Box::from_raw(ctx_ptr));
+            if !mem_ptr.is_null() {
+                drop(Box::from_raw(mem_ptr));
+            }
+        }
+        out
     }
 
     unsafe extern "C" fn thumb_setup_cb(
