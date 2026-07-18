@@ -113,6 +113,7 @@ mod left_panel_settings;
 // `llm` cargo feature.
 mod llm;
 mod mp4;
+mod net;
 // Pixal3D image->3D requirement setup — Linux/Windows only (compiled out on macOS).
 #[cfg(not(target_os = "macos"))]
 mod pixal3d;

@@ -924,57 +924,33 @@ fn run_streamed(
     matches!(child.wait(), Ok(s) if s.success())
 }
 
-/// Stream a URL to `dest` (via `.part` then rename), logging periodic progress.
+/// Stream a URL to `dest` through the shared resumable downloader (net.rs:
+/// `.part` temp, retry with backoff, Range resume), logging periodic progress.
 fn download(url: &str, dest: &Path, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context) -> Result<(), String> {
-    use std::io::{Read, Write};
-
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .provider(ureq::tls::TlsProvider::NativeTls)
-                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                .build(),
-        )
-        .max_redirects(10)
-        .build()
-        .into();
-
-    let resp = agent.get(url).call().map_err(|e| e.to_string())?;
-    let total: u64 = resp
-        .headers()
-        .get("Content-Length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    let tmp = dest.with_extension("part");
-    let mut out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-    let mut reader = resp.into_body().into_reader();
-    let mut buf = vec![0u8; 1 << 16];
-    let mut got: u64 = 0;
     let mut last_pct = 0u64;
-    loop {
-        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
+    crate::net::download(url, dest, "", &mut |note| match note {
+        crate::net::Note::Progress { got, total } => {
+            if let Some(pct) = (got * 100).checked_div(total)
+                && pct >= last_pct + 5
+            {
+                last_pct = pct;
+                let _ = tx.send(RunnerMsg::Line(format!(
+                    "   {pct}%  ({:.1}/{:.1} MB)",
+                    got as f64 / 1e6,
+                    total as f64 / 1e6
+                )));
+                ctx.request_repaint();
+            }
         }
-        out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-        got += n as u64;
-        if let Some(pct) = (got * 100).checked_div(total)
-            && pct >= last_pct + 5
-        {
-            last_pct = pct;
+        crate::net::Note::Retry { attempt, of, err } => {
             let _ = tx.send(RunnerMsg::Line(format!(
-                "   {pct}%  ({:.1}/{:.1} MB)",
-                got as f64 / 1e6,
-                total as f64 / 1e6
+                "   connection dropped ({err}) — retry {}/{}",
+                attempt - 1,
+                of - 1
             )));
             ctx.request_repaint();
         }
-    }
-    out.flush().ok();
-    drop(out);
-    std::fs::rename(&tmp, dest).map_err(|e| e.to_string())
+    })
 }
 
 /// Create alias shim packages so Pixal3D's `import cumesh` / `o_voxel` /

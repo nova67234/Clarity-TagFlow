@@ -5630,56 +5630,23 @@ fn download(url: &str, dest: &Path, send: &dyn Fn(String)) -> Result<(), String>
     download_auth(url, dest, "", send)
 }
 
-/// Stream `url` to `dest` (via `.part` then rename); `bearer` adds an HF token.
+/// Stream `url` to `dest` through the shared resumable downloader (net.rs:
+/// `.part` temp, retry with backoff, Range resume); `bearer` adds an HF token.
 fn download_auth(url: &str, dest: &Path, bearer: &str, send: &dyn Fn(String)) -> Result<(), String> {
-    use std::io::{Read, Write};
-
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .provider(ureq::tls::TlsProvider::NativeTls)
-                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                .build(),
-        )
-        .max_redirects(10)
-        .build()
-        .into();
-
-    let mut req = agent.get(url);
-    if !bearer.is_empty() {
-        req = req.header("Authorization", &format!("Bearer {bearer}"));
-    }
-    let resp = req.call().map_err(|e| e.to_string())?;
-    let total: u64 = resp
-        .headers()
-        .get("Content-Length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    let tmp = dest.with_extension("part");
-    let mut out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-    let mut reader = resp.into_body().into_reader();
-    let mut buf = vec![0u8; 1 << 16];
-    let mut got: u64 = 0;
     let mut last_pct = 0u64;
-    loop {
-        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
+    crate::net::download(url, dest, bearer, &mut |note| match note {
+        crate::net::Note::Progress { got, total } => {
+            if let Some(pct) = (got * 100).checked_div(total)
+                && pct >= last_pct + 5
+            {
+                last_pct = pct;
+                send(format!("   {pct}%  ({:.1}/{:.1} MB)", got as f64 / 1e6, total as f64 / 1e6));
+            }
         }
-        out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-        got += n as u64;
-        if let Some(pct) = (got * 100).checked_div(total)
-            && pct >= last_pct + 5
-        {
-            last_pct = pct;
-            send(format!("   {pct}%  ({:.1}/{:.1} MB)", got as f64 / 1e6, total as f64 / 1e6));
+        crate::net::Note::Retry { attempt, of, err } => {
+            send(format!("   connection dropped ({err}) — retry {}/{}", attempt - 1, of - 1));
         }
-    }
-    out.flush().ok();
-    drop(out);
-    std::fs::rename(&tmp, dest).map_err(|e| e.to_string())
+    })
 }
 
 fn unzip(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {

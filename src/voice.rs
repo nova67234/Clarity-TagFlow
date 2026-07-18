@@ -1016,45 +1016,23 @@ fn run_logged(send: &dyn Fn(String), dir: &std::path::Path, program: &str, args:
     matches!(child.wait(), Ok(s) if s.success())
 }
 
-/// Streaming download with percentage progress lines (same ureq/NativeTls
-/// setup as the model downloader — see ai_models.rs for why NativeTls).
+/// Streaming download with percentage progress lines, through the shared
+/// resumable downloader (net.rs: `.part` temp, retry with backoff, Range
+/// resume — and unlike the old inline version, `dest` only appears once the
+/// download is complete).
 fn download(url: &str, dest: &std::path::Path, send: &dyn Fn(String)) -> Result<(), String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .provider(ureq::tls::TlsProvider::NativeTls)
-                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                .build(),
-        )
-        .max_redirects(10)
-        .build()
-        .into();
-    let resp = agent.get(url).call().map_err(|e| e.to_string())?;
-    let total: u64 = resp
-        .headers()
-        .get("Content-Length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let mut reader = resp.into_body().into_reader();
-    let mut out = std::fs::File::create(dest).map_err(|e| e.to_string())?;
-    let mut buf = vec![0u8; 1 << 16];
-    let mut got: u64 = 0;
-    let mut last_pct = 0;
-    loop {
-        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-        got += n as u64;
-        if let Some(pct) = (got * 100).checked_div(total) {
-            let pct = pct as u32;
-            if pct >= last_pct + 5 {
+    let mut last_pct = 0u64;
+    crate::net::download(url, dest, "", &mut |note| match note {
+        crate::net::Note::Progress { got, total } => {
+            if let Some(pct) = (got * 100).checked_div(total)
+                && pct >= last_pct + 5
+            {
                 last_pct = pct;
                 send(format!("Downloading… {pct}%"));
             }
         }
-    }
-    Ok(())
+        crate::net::Note::Retry { attempt, of, .. } => {
+            send(format!("Connection dropped — retry {}/{}…", attempt - 1, of - 1));
+        }
+    })
 }

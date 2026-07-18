@@ -10,7 +10,6 @@
 //! reporting progress through a shared atomic so the egui frame can paint a
 //! live progress bar without blocking.
 
-use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -598,139 +597,29 @@ fn tab_pill(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
     )
 }
 
-/// Fetch every file for a model into `tools/<folder>/`, streaming each to a
-/// `.part` temp first and renaming on success so partial files never look
-/// installed. Updates `prog` as bytes arrive.
+/// Fetch every file for a model into `tools/<folder>/` through the shared
+/// resumable downloader (net.rs: `.part` temp, retry with backoff, Range
+/// resume). Updates `prog` as bytes arrive.
 fn download_all(files: &[(String, String)], folder: &str, prog: &Progress) -> Result<(), String> {
     let dir = target_dir(folder);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Create {}: {e}", dir.display()))?;
 
-    // native-tls => Windows SChannel; follow HuggingFace's redirect to the CDN.
-    // ureq 3.x defaults to rustls even with the native-tls feature on, so the
-    // provider must be selected explicitly (avoids rustls/ring needing nasm on
-    // MSVC — see Cargo.toml). The connector is managed by ureq internally now.
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .provider(ureq::tls::TlsProvider::NativeTls)
-                // Validate against the OS cert store (with AIA intermediate
-                // fetching) rather than ureq's bundled webpki roots — see
-                // civitai.rs for the CDN incomplete-chain failure this avoids.
-                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                .build(),
-        )
-        .max_redirects(10)
-        .build()
-        .into();
-
     let n = files.len() as f32;
     for (i, (name, url)) in files.iter().enumerate() {
         prog.set_label(format!("Downloading {name}…"));
-        let tmp = dir.join(format!("{name}.part"));
-
-        // Flaky-CDN insurance (HuggingFace's Xet CDN has bad spells): retry
-        // with backoff, resuming the .part from where the stream broke instead
-        // of starting a multi-GB file over. A leftover .part from an earlier
-        // failed run is resumed too — same URL, so same content barring an
-        // upstream re-upload mid-download.
-        let mut last_err = String::new();
-        let mut done = false;
-        for attempt in 1..=DOWNLOAD_ATTEMPTS {
-            if attempt > 1 {
-                prog.set_label(format!(
-                    "Downloading {name}… (retry {}/{})",
-                    attempt - 1,
-                    DOWNLOAD_ATTEMPTS - 1
-                ));
-                std::thread::sleep(std::time::Duration::from_secs(
-                    (1u64 << (attempt - 1)).min(10),
-                ));
-            }
-            match fetch_into(&agent, url, &tmp, prog, i, n) {
-                Ok(()) => {
-                    done = true;
-                    break;
+        crate::net::download(url, &dir.join(name), "", &mut |note| match note {
+            crate::net::Note::Progress { got, total } => {
+                if total > 0 {
+                    // Each file owns an equal 1/n slice of the overall bar.
+                    let frac = (i as f32 + got as f32 / total as f32) / n;
+                    prog.pct.store((frac * 100.0) as u32, Relaxed);
                 }
-                Err(e) => last_err = e,
             }
-        }
-        if !done {
-            return Err(format!("{name}: {last_err}"));
-        }
-        std::fs::rename(&tmp, dir.join(name)).map_err(|e| format!("Save {name}: {e}"))?;
-    }
-    Ok(())
-}
-
-/// Attempts per file before a download gives up (first try + retries).
-const DOWNLOAD_ATTEMPTS: u32 = 5;
-
-/// One streaming GET of `url` into `tmp`. When `tmp` already holds bytes from
-/// a broken earlier attempt, asks the server to resume with a `Range` header —
-/// appending on 206 Partial Content, restarting from zero when the server
-/// ignores the range and sends the whole file (200).
-fn fetch_into(
-    agent: &ureq::Agent,
-    url: &str,
-    tmp: &std::path::Path,
-    prog: &Progress,
-    i: usize,
-    n: f32,
-) -> Result<(), String> {
-    let have = std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
-
-    let req = agent.get(url);
-    let resp = if have > 0 {
-        req.header("Range", &format!("bytes={have}-")).call()
-    } else {
-        req.call()
-    };
-    let resp = match resp {
-        Ok(r) => r,
-        // 416: the requested range starts at/after the end — the .part already
-        // holds the whole file (the previous attempt died between the last
-        // byte and the rename). Nothing left to fetch.
-        Err(ureq::Error::StatusCode(416)) if have > 0 => return Ok(()),
-        Err(e) => return Err(e.to_string()),
-    };
-
-    let resumed = resp.status() == 206;
-    let body_len: u64 = resp
-        .headers()
-        .get("Content-Length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let total_len = if resumed { have + body_len } else { body_len };
-
-    let mut out = if resumed {
-        std::fs::OpenOptions::new().append(true).open(tmp)
-    } else {
-        std::fs::File::create(tmp) // also truncates a .part the server wouldn't resume
-    }
-    .map_err(|e| e.to_string())?;
-    let mut got: u64 = if resumed { have } else { 0 };
-
-    let mut reader = resp.into_body().into_reader();
-    let mut buf = vec![0u8; 1 << 16];
-    loop {
-        let read = reader.read(&mut buf).map_err(|e| e.to_string())?;
-        if read == 0 {
-            break;
-        }
-        out.write_all(&buf[..read]).map_err(|e| e.to_string())?;
-        got += read as u64;
-        if total_len > 0 {
-            // Each file owns an equal 1/n slice of the overall bar.
-            let frac = (i as f32 + got as f32 / total_len as f32) / n;
-            prog.pct.store((frac * 100.0) as u32, Relaxed);
-        }
-    }
-    out.flush().ok();
-    // A truncated body (connection died before Content-Length bytes) must fail
-    // this attempt so the retry resumes it — EOF alone doesn't mean complete.
-    if total_len > 0 && got < total_len {
-        return Err(format!("connection lost at {got} of {total_len} bytes"));
+            crate::net::Note::Retry { attempt, of, .. } => {
+                prog.set_label(format!("Downloading {name}… (retry {}/{})", attempt - 1, of - 1));
+            }
+        })
+        .map_err(|e| format!("{name}: {e}"))?;
     }
     Ok(())
 }

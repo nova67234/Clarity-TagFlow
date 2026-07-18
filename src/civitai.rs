@@ -1041,7 +1041,8 @@ fn start_download(state: &mut CivitaiState, req: DownloadRequest, ctx: &egui::Co
 
 /// Stream a Civitai model file to `dir`, reporting progress. The token goes in the
 /// query string (not a header), since Civitai 302-redirects to S3 and strips
-/// headers on the cross-domain hop.
+/// headers on the cross-domain hop. A stream that breaks (or ends short of
+/// Content-Length) is resumed with a Range request rather than restarted.
 fn run_download(
     mut url: String,
     filename_hint: Option<String>,
@@ -1152,24 +1153,72 @@ fn run_download(
         Err(e) => return send_err(format!("cannot write file: {e}")),
     };
 
-    let mut reader = resp.body_mut().as_reader();
     let mut buf = vec![0u8; 1 << 16];
     let mut got: u64 = 0;
     let mut last_sent = 0u64;
+    let mut resumes = 0u32;
     loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => return send_err(format!("download error: {e}")),
+        // Stream the current response's body. A read error — or an early EOF,
+        // fewer bytes than Content-Length promised — falls through to the
+        // resume path below instead of failing (or, worse, renaming a
+        // truncated .safetensors into place as if complete).
+        let stream_err = {
+            let mut reader = resp.body_mut().as_reader();
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break None,
+                    Ok(n) => {
+                        if out.write_all(&buf[..n]).is_err() {
+                            return send_err("write error".into());
+                        }
+                        got += n as u64;
+                        if got - last_sent >= 1 << 20 {
+                            last_sent = got;
+                            let _ = tx.send(DlMsg::Progress(got, total));
+                            ctx.request_repaint();
+                        }
+                    }
+                    Err(e) => break Some(e.to_string()),
+                }
+            }
         };
-        if out.write_all(&buf[..n]).is_err() {
-            return send_err("write error".into());
+        if stream_err.is_none() && (total == 0 || got >= total) {
+            break; // complete (EOF with no advertised size is trusted)
         }
-        got += n as u64;
-        if got - last_sent >= 1 << 20 {
-            last_sent = got;
-            let _ = tx.send(DlMsg::Progress(got, total));
-            ctx.request_repaint();
+        let why =
+            stream_err.unwrap_or_else(|| format!("connection lost at {got} of {total} bytes"));
+        resumes += 1;
+        if resumes > 4 {
+            return send_err(format!("download error: {why}"));
+        }
+        let _ = tx.send(DlMsg::Status(format!("Connection dropped — resuming… ({resumes}/4)")));
+        ctx.request_repaint();
+        std::thread::sleep(Duration::from_secs((2 * resumes as u64).min(10)));
+        // Re-request the original URL — a fresh GET gets a newly signed
+        // storage redirect, so the first link having expired doesn't matter —
+        // and ask to continue where the stream broke.
+        let r = match agent
+            .get(&url)
+            .header("User-Agent", USER_AGENT)
+            .header("Range", &format!("bytes={got}-"))
+            .call()
+        {
+            Ok(r) => r,
+            Err(e) => return send_err(format!("resume failed: {e}")),
+        };
+        match r.status().as_u16() {
+            206 => resp = r,
+            // The server ignored the range — start the file over.
+            200 => {
+                out = match std::fs::File::create(&tmp) {
+                    Ok(f) => f,
+                    Err(e) => return send_err(format!("cannot write file: {e}")),
+                };
+                got = 0;
+                last_sent = 0;
+                resp = r;
+            }
+            s => return send_err(format!("resume failed: HTTP {s}")),
         }
     }
     out.flush().ok();
