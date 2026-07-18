@@ -640,8 +640,11 @@ fn tags_box_fill(ui: &mut egui::Ui, popup: &mut DetailPopup) {
     let highlight_roles = !showing_meta && (!artist.is_empty() || !character.is_empty());
     let role_color = if editable { TEXT() } else { TEXT().gamma_multiply(0.8) };
 
-    // Lock the box height to the remaining space so it never grows with the text.
-    let box_outer_h = ui.available_height();
+    // Lock the box height to the remaining space so it never grows with the
+    // text. A couple of px are shaved off so the 1px edge stroke and the
+    // bottom corner curves finish inside the popup instead of being clipped
+    // flat at its boundary (same fix as the right panel's tag box).
+    let box_outer_h = (ui.available_height() - 2.0).max(0.0);
     let inner_h = (box_outer_h - 24.0).max(0.0); // minus the 12px margins
 
     // Box background, with the "ready to edit" flash pulsing it toward the

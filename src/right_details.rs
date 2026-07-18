@@ -816,8 +816,10 @@ pub fn show(
 
                                 // Lock the box height to the remaining space *before*
                                 // building the frame, so its size is independent of the
-                                // text it holds.
-                                let box_outer_h = ui.available_height();
+                                // text it holds. A couple of px are shaved off so the 1px
+                                // edge stroke and the bottom corner curves finish inside
+                                // the panel instead of being clipped flat at its boundary.
+                                let box_outer_h = (ui.available_height() - 2.0).max(0.0);
                                 let inner_h = (box_outer_h - 24.0).max(0.0); // minus the 12px margins
 
                                 egui::Frame::new()
