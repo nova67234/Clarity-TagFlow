@@ -227,6 +227,10 @@ pub struct CivitaiState {
     show_settings: bool,
     /// Whether the per-category download-folders popup is open.
     show_folders: bool,
+    /// Skip the click-outside close on the frame a popup was opened, so the
+    /// opening click isn't counted as a click outside (instant hide).
+    settings_just_opened: bool,
+    folders_just_opened: bool,
     /// In-flight / finished model downloads (progress rows).
     downloads: Vec<Download>,
 }
@@ -250,6 +254,8 @@ impl Default for CivitaiState {
             thumb_hd: false,
             show_settings: false,
             show_folders: false,
+            settings_just_opened: false,
+            folders_just_opened: false,
             downloads: Vec::new(),
         }
     }
@@ -420,6 +426,7 @@ pub fn show(
                 .inner;
             if gear_clicked {
                 state.show_settings = !state.show_settings;
+                state.settings_just_opened = state.show_settings;
             }
         });
     });
@@ -735,7 +742,7 @@ pub(crate) fn card_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> e
 /// download folder for models. A modern, sectioned card.
 fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
     use crate::PopupPlacement;
-    egui::Window::new("")
+    let win = egui::Window::new("")
         .id(egui::Id::new("civitai_settings"))
         .title_bar(false)
         .collapsible(false)
@@ -794,107 +801,123 @@ fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
             });
             ui.add_space(14.0);
 
-            // API key section.
-            ui.label(egui::RichText::new("API KEY").color(MUTED()).strong().size(11.0));
-            ui.add_space(4.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut state.api_key)
-                    .password(true)
-                    .desired_width(f32::INFINITY)
-                    .margin(egui::Margin::symmetric(10, 8))
-                    .hint_text("Paste your Civitai API key"),
-            );
-            ui.add_space(3.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Stored encrypted on this device.").color(MUTED()).size(10.5),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    crate::arrow_link(ui, "Get a key", "https://civitai.com/user/account", Some(10.5));
+            // API key section: the field spans the card (keys are long), with
+            // the encrypted note + account link beneath it. Everything in this
+            // popup saves as it changes — there is no Save button; close with
+            // the ✕ or by clicking outside.
+            crate::settings::section(ui, "API key", |ui| {
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut state.api_key)
+                            .password(true)
+                            .desired_width(f32::INFINITY)
+                            .margin(egui::Margin::symmetric(10, 8))
+                            .hint_text("Paste your Civitai API key"),
+                    )
+                    .changed()
+                {
+                    save_civitai_key(&state.api_key);
+                }
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Stored encrypted on this device.").color(MUTED()).size(10.5),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        crate::arrow_link(ui, "Get a key", "https://civitai.com/user/account", Some(10.5));
+                    });
                 });
             });
 
-            ui.add_space(14.0);
-
-            // Download folders section — opens a popup with one folder per resource
+            // Download folders — opens a popup with one folder per resource
             // type (checkpoints / LoRAs / embeddings / …).
-            ui.label(egui::RichText::new("DOWNLOAD FOLDERS").color(MUTED()).strong().size(11.0));
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let folder = egui::include_image!("../icons/folder.svg");
-                let open = crate::svg_button(ui, folder, "Set a folder per resource type", 30.0, crate::theme::icon_tint(MUTED())).clicked();
+            crate::settings::section(ui, "Downloads", |ui| {
                 let summary = if state.download_dirs.any_set() {
                     let n = DlCat::ALL.iter().filter(|c| !state.download_dirs.get(**c).trim().is_empty()).count();
-                    format!("{n} of {} set — click to edit", DlCat::ALL.len())
+                    format!("{n} of {} set", DlCat::ALL.len())
                 } else {
-                    "Not set — click the folder to choose per type".to_string()
+                    "Not set".to_string()
                 };
-                let label = ui.add(
-                    egui::Label::new(egui::RichText::new(summary).color(MUTED()).size(11.5))
-                        .sense(egui::Sense::click()),
+                crate::settings::row(
+                    ui,
+                    "Download folders",
+                    Some(&format!("One folder per resource type — {summary}.")),
+                    |ui| {
+                        let folder = egui::include_image!("../icons/folder.svg");
+                        if crate::svg_button(ui, folder, "Set a folder per resource type", 26.0, crate::theme::icon_tint(MUTED())).clicked() {
+                            state.show_folders = true;
+                            state.folders_just_opened = true;
+                        }
+                    },
                 );
-                if open || label.clicked() {
-                    state.show_folders = true;
-                }
             });
 
-            ui.add_space(16.0);
+            crate::settings::section(ui, "Thumbnails", |ui| {
+                crate::settings::row(
+                    ui,
+                    "Preview size",
+                    Some("Applies live to the resource cards."),
+                    |ui| {
+                        ui.spacing_mut().slider_width = 110.0;
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut state.thumb_size, THUMB_SIZE_MIN..=THUMB_SIZE_MAX)
+                                    .show_value(false),
+                            )
+                            .changed()
+                        {
+                            save_thumb_size(state.thumb_size);
+                        }
+                    },
+                );
+                crate::settings::row_sep(ui);
+                crate::settings::row(
+                    ui,
+                    "HD thumbnails",
+                    Some("Crisper cards; more bandwidth and memory."),
+                    |ui| {
+                        if crate::settings::switch(ui, &mut state.thumb_hd).changed() {
+                            // A changed HD setting needs a refetch so previews come
+                            // back at the new resolution — clearing loaded_key
+                            // re-runs the lookup for the current image next frame.
+                            state.loaded_key = None;
+                            save_thumb_hd(state.thumb_hd);
+                        }
+                    },
+                );
+            });
 
-            // Preview thumbnail size — same styled slider as the main app's
-            // browser Thumbnail-size control. Applies live to the resource cards.
-            ui.label(egui::RichText::new("THUMBNAIL SIZE").color(MUTED()).strong().size(11.0));
             ui.add_space(4.0);
-            ui.spacing_mut().slider_width = ui.available_width() - 8.0;
-            ui.add(
-                egui::Slider::new(&mut state.thumb_size, THUMB_SIZE_MIN..=THUMB_SIZE_MAX)
-                    .show_value(false),
-            );
 
-            ui.add_space(8.0);
-            ui.checkbox(
-                &mut state.thumb_hd,
-                egui::RichText::new("HD thumbnails").color(TEXT()).size(12.5),
-            )
-            .on_hover_text("Decode previews at a higher resolution for crisper cards (more bandwidth and memory).");
-
-            ui.add_space(18.0);
-
-            // Actions (right-aligned: Save, then Clear key).
+            // The one remaining action: forget the stored key.
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    if ui.add_sized(egui::vec2(80.0, 32.0), egui::Button::new("Clear key")).clicked() {
+                    if ui.add_sized(egui::vec2(80.0, 30.0), egui::Button::new("Clear key")).clicked() {
                         state.api_key.clear();
                         save_civitai_key("");
-                    }
-                    let save = egui::Button::new(
-                        egui::RichText::new("Save").color(egui::Color32::WHITE).strong(),
-                    )
-                    .fill(crate::theme::ACCENT1());
-                    if ui.add_sized(egui::vec2(90.0, 32.0), save).clicked() {
-                        save_civitai_key(&state.api_key);
-                        save_download_dirs(&state.download_dirs);
-                        save_thumb_size(state.thumb_size);
-                        // A changed HD setting needs a refetch so previews come back
-                        // at the new resolution — clearing loaded_key re-runs the
-                        // lookup for the current image next frame.
-                        if load_thumb_hd() != state.thumb_hd {
-                            state.loaded_key = None;
-                        }
-                        save_thumb_hd(state.thumb_hd);
-                        state.show_settings = false;
                     }
                 });
             });
         });
+
+    // Click outside dismisses (everything is already saved). Skipped on the
+    // opening frame — the gear click would count as outside — and while the
+    // folders popup is open, so working in it doesn't close this one.
+    if state.settings_just_opened {
+        state.settings_just_opened = false;
+    } else if !state.show_folders
+        && let Some(win) = &win
+        && win.response.clicked_elsewhere()
+    {
+        state.show_settings = false;
+    }
 }
 
 /// The per-category download-folders popup: one row per resource type, each with
 /// a folder-picker icon and an editable path. Opened from the settings folder icon.
 fn folders_popup(ctx: &egui::Context, state: &mut CivitaiState) {
     use crate::PopupPlacement;
-    egui::Window::new("")
+    let win = egui::Window::new("")
         .id(egui::Id::new("civitai_folders"))
         .title_bar(false)
         .collapsible(false)
@@ -956,7 +979,10 @@ fn folders_popup(ctx: &egui::Context, state: &mut CivitaiState) {
             );
             ui.add_space(12.0);
 
-            // One row per category: label, folder picker, editable path.
+            // One row per category: label, folder picker, editable path. Every
+            // change saves immediately (no Save button — ✕, Done, or a click
+            // outside closes).
+            let mut dirs_changed = false;
             for cat in DlCat::ALL {
                 ui.label(egui::RichText::new(cat.label()).color(TEXT()).size(12.0));
                 ui.add_space(2.0);
@@ -966,15 +992,21 @@ fn folders_popup(ctx: &egui::Context, state: &mut CivitaiState) {
                     if crate::svg_button(ui, folder, "Choose folder", 28.0, crate::theme::icon_tint(MUTED())).clicked()
                         && let Some(dir) = rfd::FileDialog::new().pick_folder() {
                             *state.download_dirs.get_mut(cat) = dir.display().to_string();
+                            dirs_changed = true;
                         }
-                    ui.add(
-                        egui::TextEdit::singleline(state.download_dirs.get_mut(cat))
-                            .desired_width(f32::INFINITY)
-                            .margin(egui::Margin::symmetric(10, 6))
-                            .hint_text("Folder for this type"),
-                    );
+                    dirs_changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(state.download_dirs.get_mut(cat))
+                                .desired_width(f32::INFINITY)
+                                .margin(egui::Margin::symmetric(10, 6))
+                                .hint_text("Folder for this type"),
+                        )
+                        .changed();
                 });
                 ui.add_space(8.0);
+            }
+            if dirs_changed {
+                save_download_dirs(&state.download_dirs);
             }
 
             ui.add_space(6.0);
@@ -984,11 +1016,20 @@ fn folders_popup(ctx: &egui::Context, state: &mut CivitaiState) {
                 )
                 .fill(crate::theme::ACCENT1());
                 if ui.add_sized(egui::vec2(90.0, 32.0), done).clicked() {
-                    save_download_dirs(&state.download_dirs);
                     state.show_folders = false;
                 }
             });
         });
+
+    // Click outside dismisses (paths are already saved). Skipped on the frame
+    // the popup was opened, when the opening click would count as outside.
+    if state.folders_just_opened {
+        state.folders_just_opened = false;
+    } else if let Some(win) = &win
+        && win.response.clicked_elsewhere()
+    {
+        state.show_folders = false;
+    }
 }
 
 /// Validate + start a model download on a worker thread.
@@ -998,7 +1039,9 @@ fn start_download(state: &mut CivitaiState, req: DownloadRequest, ctx: &egui::Co
     if dir.is_empty() {
         // No folder for this type yet — open the folders popup so the user can set one.
         state.show_settings = true;
+        state.settings_just_opened = true;
         state.show_folders = true;
+        state.folders_just_opened = true;
         let cat = dl_category(&req.resource_type);
         state.downloads.push(Download {
             name: req.name,

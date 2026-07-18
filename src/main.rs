@@ -1467,6 +1467,7 @@ impl eframe::App for ViewerApp {
             top_bar::TopBarAction::OpenFolder(pos) => {
                 if self.settings.ftp_enabled {
                     self.ftp.browser_open = !self.ftp.browser_open;
+                    self.ftp.browser_just_opened = self.ftp.browser_open;
                 } else {
                     self.folder_popup.open = !self.folder_popup.open;
                     self.folder_popup.just_opened = self.folder_popup.open;

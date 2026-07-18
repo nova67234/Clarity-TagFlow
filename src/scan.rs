@@ -171,7 +171,7 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
     // to fill a large display.
     let screen = ctx.content_rect();
     let win_w = 460.0_f32.min(screen.width() - 40.0);
-    let win_h = 440.0_f32.min(screen.height() - 40.0);
+    let win_h = 470.0_f32.min(screen.height() - 40.0);
     let content_w = win_w - 28.0; // minus the window's 14px inner margins
     let console_h = 110.0_f32;
 
@@ -230,33 +230,39 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
 
             let enabled = !state.running;
 
-            // Input folder + browse.
-            ui.label(egui::RichText::new("Input folder").color(MUTED()).size(12.0));
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let folder_svg = egui::include_image!("../icons/folder.svg");
-                if crate::svg_button(ui, folder_svg, "Choose folder to scan", 32.0, crate::theme::icon_tint(MUTED())).clicked()
-                    && let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        state.input_dir = dir.display().to_string();
-                    }
-                ui.scope(|ui| {
-                    ui.visuals_mut().extreme_bg_color = PANEL();
-                    ui.add_enabled(
-                        enabled,
-                        egui::TextEdit::singleline(&mut state.input_dir)
-                            .desired_width(f32::INFINITY)
-                            .margin(egui::Margin::symmetric(10, 6))
-                            .hint_text("Folder to scan"),
-                    );
+            // The scan form, in the Settings-style card: the folder field spans
+            // the card (paths are long), the duplicate toggle is a switch row.
+            crate::settings::section(ui, "Scan", |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let folder_svg = egui::include_image!("../icons/folder.svg");
+                    if crate::svg_button(ui, folder_svg, "Choose folder to scan", 30.0, crate::theme::icon_tint(MUTED())).clicked()
+                        && let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                            state.input_dir = dir.display().to_string();
+                        }
+                    ui.scope(|ui| {
+                        ui.visuals_mut().extreme_bg_color = FIELD();
+                        ui.add_enabled(
+                            enabled,
+                            egui::TextEdit::singleline(&mut state.input_dir)
+                                .desired_width(f32::INFINITY)
+                                .margin(egui::Margin::symmetric(10, 6))
+                                .hint_text("Folder to scan"),
+                        );
+                    });
                 });
+                crate::settings::row_sep(ui);
+                crate::settings::row(
+                    ui,
+                    "Find exact duplicates",
+                    Some("SHA-256 — extra copies move to a 'duplicates' folder."),
+                    |ui| {
+                        ui.add_enabled_ui(enabled, |ui| {
+                            crate::settings::switch(ui, &mut state.scan_duplicates);
+                        });
+                    },
+                );
             });
-            ui.add_space(6.0);
-            ui.add_enabled(
-                enabled,
-                egui::Checkbox::new(&mut state.scan_duplicates, "Also scan for exact duplicates (SHA-256)"),
-            );
-
-            ui.add_space(8.0);
             // Status line (Gelbooru-downloader style — no progress bar): the
             // frame-inspect icon + percentage while scanning, a green checkmark
             // when done, plus the current status text.

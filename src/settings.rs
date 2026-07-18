@@ -221,15 +221,16 @@ pub fn show(
         .fixed_size(egui::vec2(530.0, win_h))
         .show(ctx, |ui| {
 
-            // Square-but-rounded checkboxes (the global theme rounds them into
-            // pills otherwise).
-            let square_radius = egui::CornerRadius::same(4);
+            // Pill-ish inputs everywhere (text fields, buttons, combos) — the
+            // rounded-10 look the FTP Server fields established, applied
+            // window-wide so every tab's boxes match.
+            let radius = egui::CornerRadius::same(10);
             let visuals = ui.visuals_mut();
-            visuals.widgets.noninteractive.corner_radius = square_radius;
-            visuals.widgets.inactive.corner_radius = square_radius;
-            visuals.widgets.hovered.corner_radius = square_radius;
-            visuals.widgets.active.corner_radius = square_radius;
-            visuals.widgets.open.corner_radius = square_radius;
+            visuals.widgets.noninteractive.corner_radius = radius;
+            visuals.widgets.inactive.corner_radius = radius;
+            visuals.widgets.hovered.corner_radius = radius;
+            visuals.widgets.active.corner_radius = radius;
+            visuals.widgets.open.corner_radius = radius;
 
             // Two columns: a left sidebar (gear + "Settings" title over a
             // vertical tab list) and the active tab's body on the right, with
@@ -323,66 +324,79 @@ pub fn show(
 /// The General tab: the original viewer / browser / files / about sections.
 fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
     section(ui, "Interface", |ui| {
-        dot_toggle(ui, &mut settings.show_stats, "Show CPU / RAM stats");
-        hint(
+        row(
             ui,
-            "The live CPU and memory graphs in the top bar. Turn off for a cleaner \
-             bar (and to skip the periodic system sampling).",
+            "Show CPU / RAM stats",
+            Some("Live graphs in the top bar. Off is cleaner and skips the sampling."),
+            |ui| {
+                switch(ui, &mut settings.show_stats);
+            },
         );
-
-        ui.add_space(6.0);
-        dot_toggle(ui, &mut settings.movable_popups, "Movable popups");
-        hint(
+        row_sep(ui);
+        row(
             ui,
-            "Let popups (Civitai settings, the LoRA picker, the image detail view, and \
-             Find Issues) be dragged around — and remember where you leave them next \
-             time. Turn off to keep them centred and fixed.",
+            "Movable popups",
+            Some("Drag popups around; they remember where you leave them."),
+            |ui| {
+                switch(ui, &mut settings.movable_popups);
+            },
         );
     });
 
     section(ui, "Viewer", |ui| {
-        // Stack vertically to center nicely
-        ui.label(egui::RichText::new("Prefetch radius").color(TEXT()));
-        ui.add(egui::Slider::new(&mut settings.prefetch_radius, 0..=3));
-        hint(
+        row(
             ui,
-            "Images to decode ahead/behind the current one. Higher feels \
-             smoother when paging, but does more work per selection.",
+            "Prefetch radius",
+            Some("Images decoded ahead/behind the current one — smoother paging."),
+            |ui| {
+                ui.spacing_mut().slider_width = 110.0;
+                ui.add(egui::Slider::new(&mut settings.prefetch_radius, 0..=3));
+            },
         );
     });
 
     section(ui, "Browser", |ui| {
-        ui.label(egui::RichText::new("Thumbnail size").color(TEXT()));
-        ui.add(
-            egui::Slider::new(&mut settings.thumbnail_size, 120.0..=400.0)
-                .step_by(10.0)
-                .suffix(" px"),
-        );
-        hint(ui, "Largest height a thumbnail tile can take in the list.");
-
-        ui.add_space(6.0);
-        dot_toggle(ui, &mut settings.hd_thumbnails, "HD thumbnails");
-        hint(
+        row(
             ui,
-            "Decode thumbnails at a higher resolution for crisper tiles. \
-             Uses more memory and CPU, so loading and scrolling can be slower.",
+            "Thumbnail size",
+            Some("Largest height a tile can take in the list."),
+            |ui| {
+                ui.spacing_mut().slider_width = 90.0;
+                ui.add(
+                    egui::Slider::new(&mut settings.thumbnail_size, 120.0..=400.0)
+                        .step_by(10.0)
+                        .suffix(" px"),
+                );
+            },
         );
-
-        ui.add_space(6.0);
-        dot_toggle(ui, &mut settings.unload_offscreen_thumbs, "Unload off-screen thumbnails");
-        hint(
+        row_sep(ui);
+        row(
             ui,
-            "Frees thumbnail memory as you scroll; tiles re-decode when \
-             scrolled back. Turn off to cache them for instant scroll-back.",
+            "HD thumbnails",
+            Some("Crisper tiles; uses more memory and CPU."),
+            |ui| {
+                switch(ui, &mut settings.hd_thumbnails);
+            },
+        );
+        row_sep(ui);
+        row(
+            ui,
+            "Unload off-screen thumbnails",
+            Some("Frees memory as you scroll; tiles re-decode when scrolled back."),
+            |ui| {
+                switch(ui, &mut settings.unload_offscreen_thumbs);
+            },
         );
     });
 
     section(ui, "Files", |ui| {
-        dot_toggle(ui, &mut settings.confirm_before_delete, "Confirm before deleting");
-        hint(
+        row(
             ui,
-            "Show a confirmation dialog before deleting an image and its \
-             .txt sidecar.",
+            "Confirm before deleting",
+            Some("Ask before deleting an image and its .txt sidecar."),
+            |ui| {
+                switch(ui, &mut settings.confirm_before_delete);
+            },
         );
 
         // Only shown in builds that actually compiled in a decoder for the
@@ -390,196 +404,180 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
         // toggle would do nothing useful, so it's hidden entirely.
         #[cfg(feature = "avif")]
         {
-            ui.add_space(6.0);
-            dot_toggle(ui, &mut settings.enable_extended_formats, "Enable extended formats (AVIF / HEIC / RAW)");
-            hint(
+            row_sep(ui);
+            row(
                 ui,
-                "Recognise .avif, .heic, and camera raw (.dng, .arw, .cr2, .nef) files. These \
-                 use heavy decoders, so loading is slower.",
+                "Extended formats",
+                Some("AVIF / HEIC / camera raw (.dng, .arw, .cr2, .nef). Heavier decoders — slower loads."),
+                |ui| {
+                    switch(ui, &mut settings.enable_extended_formats);
+                },
             );
         }
     });
 
     section(ui, "Video", |ui| {
-        dot_toggle(ui, &mut settings.loop_video, "Loop videos");
-        hint(
+        row(
             ui,
-            "Restart a video from the beginning when it reaches the end. \
-             Applies the next time a video starts playing.",
+            "Loop videos",
+            Some("Restart from the beginning when a clip ends."),
+            |ui| {
+                switch(ui, &mut settings.loop_video);
+            },
         );
-
-        ui.add_space(6.0);
-        dot_toggle(ui, &mut settings.video_thumbnail_play, "Video thumbnail play");
-        hint(
+        row_sep(ui);
+        row(
             ui,
-            "Play a live, muted, looping preview on each visible video thumbnail. \
-             Previews keep playing while in view and stop when scrolled away. Uses \
-             more CPU while playing; only a few play at once.",
+            "Video thumbnail play",
+            Some("Muted looping previews on visible video tiles. Uses more CPU."),
+            |ui| {
+                switch(ui, &mut settings.video_thumbnail_play);
+            },
         );
     });
 
     section(ui, "About", |ui| {
-        ui.label(egui::RichText::new("Clarity TagFlow").color(TEXT()).strong());
-        ui.label(
-            egui::RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION")))
-                .color(MUTED())
-                .size(12.0),
-        );
+        row(ui, "Clarity TagFlow", None, |ui| {
+            ui.label(
+                egui::RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION")))
+                    .color(MUTED())
+                    .size(12.0),
+            );
+        });
     });
 }
 
 /// The Appearance tab: pick the app colour theme. Changing it updates
 /// `settings.theme`; `main.rs` applies the new palette live next frame.
 fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
-    section(ui, "Layout", |ui| {
-        ui.radio_value(
-            &mut settings.layout,
-            Layout::Panels,
-            egui::RichText::new("Panels").color(TEXT()),
-        );
-        ui.add_space(2.0);
-        ui.radio_value(
-            &mut settings.layout,
-            Layout::Gallery,
-            egui::RichText::new("Gallery").color(TEXT()),
-        );
-        hint(
+    section(ui, "Appearance", |ui| {
+        row(
             ui,
-            "Panels is the classic browser · viewer · details layout. Gallery hides \
-             the panels and shows every image in the open folder as a grid — click \
-             one to open it back in Panels view.",
-        );
-    });
-
-    section(ui, "Theme", |ui| {
-        ui.label(egui::RichText::new("Colour theme").color(TEXT()));
-        ui.add_space(6.0);
-        ui.radio_value(
-            &mut settings.theme,
-            Theme::Dark,
-            egui::RichText::new("Dark").color(TEXT()),
-        );
-        ui.add_space(2.0);
-        ui.radio_value(
-            &mut settings.theme,
-            Theme::Light,
-            egui::RichText::new("Light").color(TEXT()),
-        );
-        ui.add_space(2.0);
-        ui.radio_value(
-            &mut settings.theme,
-            Theme::Space,
-            egui::RichText::new("Space").color(TEXT()),
-        );
-        ui.add_space(2.0);
-        ui.radio_value(
-            &mut settings.theme,
-            Theme::Aurora,
-            egui::RichText::new("Aurora").color(TEXT()),
-        );
-        ui.add_space(2.0);
-        ui.radio_value(
-            &mut settings.theme,
-            Theme::Glass,
-            egui::RichText::new("Glass").color(TEXT()),
-        );
-        hint(
-            ui,
-            "Dark and Light recolour the whole app. Space is dark with an animated \
-             starfield, and Aurora is light with a soft drifting glow behind the \
-             panels and image. Glass has translucent dark panels over a background \
-             you choose below. Applies instantly.",
-        );
-    });
-
-    // Background controls for the Glass theme: a colour picker plus the animated
-    // backdrop. Only shown when Glass is the active theme, since they don't apply
-    // to the other themes.
-    if settings.theme == Theme::Glass {
-        section(ui, "Glass panels", |ui| {
-            // Dark keeps the original translucent-dark glass exactly as it is;
-            // Light swaps to frosted-white panels with dark-grey text and icons.
-            ui.radio_value(
-                &mut settings.glass_light,
-                false,
-                egui::RichText::new("Dark").color(TEXT()),
-            );
-            ui.add_space(2.0);
-            ui.radio_value(
-                &mut settings.glass_light,
-                true,
-                egui::RichText::new("Light").color(TEXT()),
-            );
-            hint(
-                ui,
-                "Dark is the classic translucent-dark glass; Light turns the panels \
-                 frosted white with dark-grey text and icons. Applies instantly.",
-            );
-        });
-
-        section(ui, "Glass background", |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Colour").color(TEXT()));
-                ui.add_space(6.0);
-
-                // A pill-shaped colour swatch. egui's own colour button hard-caps
-                // its corner radius at 2px (the alpha checker grid can't round), so
-                // we paint our own pill and open the picker in a popup on click.
-                let mut col = {
-                    let [r, g, b] = settings.glass_bg;
-                    egui::Color32::from_rgb(r, g, b)
+            "Layout",
+            Some("Gallery hides the panels and shows the folder as a grid."),
+            |ui| {
+                let label = match settings.layout {
+                    Layout::Panels => "Panels",
+                    Layout::Gallery => "Gallery",
                 };
-                let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(46.0, 18.0), egui::Sense::click());
-                let radius = rect.height() / 2.0;
-                ui.painter().rect_filled(rect, radius, col);
-                ui.painter().rect_stroke(
-                    rect,
-                    radius,
-                    egui::Stroke::new(1.0, EDGE()),
-                    egui::StrokeKind::Inside,
-                );
-                if resp.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                egui::Popup::from_toggle_button_response(&resp).show(|ui| {
-                    // The picker's saturation square / hue bar are sized by
-                    // `slider_width`; the default leaves them much narrower than
-                    // the U8/RGB header row, so the popup showed a big empty gap
-                    // on the right. Widen them to fill the popup instead.
-                    ui.spacing_mut().slider_width = 260.0;
-                    if egui::widgets::color_picker::color_picker_color32(
-                        ui,
-                        &mut col,
-                        egui::widgets::color_picker::Alpha::Opaque,
-                    ) {
-                        settings.glass_bg = [col.r(), col.g(), col.b()];
-                    }
-                });
-            });
-            hint(ui, "Shows through the translucent panels and fills the gutters.");
+                egui::ComboBox::from_id_salt("layout_combo")
+                    .width(130.0)
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut settings.layout, Layout::Panels, "Panels");
+                        ui.selectable_value(&mut settings.layout, Layout::Gallery, "Gallery");
+                    });
+            },
+        );
+        row_sep(ui);
+        row(
+            ui,
+            "Colour theme",
+            Some("Space and Aurora are animated; Glass is translucent. Applies instantly."),
+            |ui| {
+                let label = match settings.theme {
+                    Theme::Dark => "Dark",
+                    Theme::Light => "Light",
+                    Theme::Space => "Space",
+                    Theme::Aurora => "Aurora",
+                    Theme::Glass => "Glass",
+                };
+                egui::ComboBox::from_id_salt("theme_combo")
+                    .width(130.0)
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut settings.theme, Theme::Dark, "Dark");
+                        ui.selectable_value(&mut settings.theme, Theme::Light, "Light");
+                        ui.selectable_value(&mut settings.theme, Theme::Space, "Space");
+                        ui.selectable_value(&mut settings.theme, Theme::Aurora, "Aurora");
+                        ui.selectable_value(&mut settings.theme, Theme::Glass, "Glass");
+                    });
+            },
+        );
+    });
 
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Backdrop").color(TEXT()));
-            ui.add_space(4.0);
-            ui.radio_value(
-                &mut settings.glass_backdrop,
-                Backdrop::Solid,
-                egui::RichText::new("Solid").color(TEXT()),
+    // Glass-only controls: panel brightness, background colour, backdrop
+    // animation. Hidden for the other themes, which they don't affect.
+    if settings.theme == Theme::Glass {
+        section(ui, "Glass", |ui| {
+            row(
+                ui,
+                "Panels",
+                Some("Dark is the classic glass; Light is frosted white."),
+                |ui| {
+                    let label = if settings.glass_light { "Light" } else { "Dark" };
+                    egui::ComboBox::from_id_salt("glass_light_combo")
+                        .width(130.0)
+                        .selected_text(label)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut settings.glass_light, false, "Dark");
+                            ui.selectable_value(&mut settings.glass_light, true, "Light");
+                        });
+                },
             );
-            ui.add_space(2.0);
-            ui.radio_value(
-                &mut settings.glass_backdrop,
-                Backdrop::Starfield,
-                egui::RichText::new("Starfield").color(TEXT()),
+            row_sep(ui);
+            row(
+                ui,
+                "Background colour",
+                Some("Shows through the panels and fills the gutters."),
+                |ui| {
+                    // A pill-shaped colour swatch. egui's own colour button hard-caps
+                    // its corner radius at 2px (the alpha checker grid can't round), so
+                    // we paint our own pill and open the picker in a popup on click.
+                    let mut col = {
+                        let [r, g, b] = settings.glass_bg;
+                        egui::Color32::from_rgb(r, g, b)
+                    };
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(46.0, 18.0), egui::Sense::click());
+                    let radius = rect.height() / 2.0;
+                    ui.painter().rect_filled(rect, radius, col);
+                    ui.painter().rect_stroke(
+                        rect,
+                        radius,
+                        egui::Stroke::new(1.0, EDGE()),
+                        egui::StrokeKind::Inside,
+                    );
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    egui::Popup::from_toggle_button_response(&resp).show(|ui| {
+                        // The picker's saturation square / hue bar are sized by
+                        // `slider_width`; the default leaves them much narrower than
+                        // the U8/RGB header row, so the popup showed a big empty gap
+                        // on the right. Widen them to fill the popup instead.
+                        ui.spacing_mut().slider_width = 260.0;
+                        if egui::widgets::color_picker::color_picker_color32(
+                            ui,
+                            &mut col,
+                            egui::widgets::color_picker::Alpha::Opaque,
+                        ) {
+                            settings.glass_bg = [col.r(), col.g(), col.b()];
+                        }
+                    });
+                },
             );
-            ui.add_space(2.0);
-            ui.radio_value(
-                &mut settings.glass_backdrop,
-                Backdrop::Aurora,
-                egui::RichText::new("Aurora glow").color(TEXT()),
+            row_sep(ui);
+            row(
+                ui,
+                "Backdrop",
+                Some("An optional animation over the background colour."),
+                |ui| {
+                    let label = match settings.glass_backdrop {
+                        Backdrop::Solid => "Solid",
+                        Backdrop::Starfield => "Starfield",
+                        Backdrop::Aurora => "Aurora glow",
+                    };
+                    egui::ComboBox::from_id_salt("glass_backdrop_combo")
+                        .width(130.0)
+                        .selected_text(label)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut settings.glass_backdrop, Backdrop::Solid, "Solid");
+                            ui.selectable_value(&mut settings.glass_backdrop, Backdrop::Starfield, "Starfield");
+                            ui.selectable_value(&mut settings.glass_backdrop, Backdrop::Aurora, "Aurora glow");
+                        });
+                },
             );
-            hint(ui, "An optional animation painted over the background colour.");
         });
     }
 }
@@ -686,19 +684,17 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
 
     if llm.installed && crate::llm::BUILT_WITH_LLM {
         section(ui, "AI Chat", |ui| {
-            dot_toggle(ui, &mut settings.ai_chat, "Activate AI Chat");
-            hint(
+            row(
                 ui,
-                "Swaps the main view for a full-window chat with the model — \
-                 ask anything, attach images with the +, and switch between \
-                 conversations with the tabs on the left. Turn it off to get \
-                 the panels back.",
-            );
-            ui.add_space(4.0);
-            hint(
-                ui,
-                "The first question loads the model into memory and can take \
-                 a minute; after that it stays loaded.",
+                "Activate AI Chat",
+                Some(
+                    "Swaps the main view for a full-window chat with the model — \
+                     attach images with the +, switch conversations with the tabs. \
+                     The first question loads the model and can take a minute.",
+                ),
+                |ui| {
+                    switch(ui, &mut settings.ai_chat);
+                },
             );
         });
 
@@ -840,75 +836,69 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
 /// FTP mode is on, the top bar's folder button opens the remote browser
 /// (`src/ftp.rs`) instead of the local folder picker.
 fn ftp_tab(ui: &mut egui::Ui, settings: &mut Settings, ftp: &mut crate::ftp::FtpState) {
-    // Round the input boxes (Host/Port/etc). The settings window pins widgets to
-    // a near-square radius for its checkboxes; this tab's fields look better
-    // pill-ish, and the scope keeps the override local to this tab.
-    let r = egui::CornerRadius::same(10);
-    let v = ui.visuals_mut();
-    v.widgets.inactive.corner_radius = r;
-    v.widgets.hovered.corner_radius = r;
-    v.widgets.active.corner_radius = r;
-
     section(ui, "FTP mode", |ui| {
-        dot_toggle(ui, &mut settings.ftp_enabled, "Browse an FTP server");
-        hint(
+        row(
             ui,
-            "Replaces the top bar's folder button with a remote browser: pick a \
-             directory on the server and its images download into a local cache \
-             for viewing and tagging.",
+            "Browse an FTP server",
+            Some(
+                "Replaces the folder button with a remote browser; images \
+                 download into a local cache for viewing and tagging.",
+            ),
+            |ui| {
+                switch(ui, &mut settings.ftp_enabled);
+            },
         );
     });
 
     section(ui, "Server", |ui| {
-        let field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint_text: &str, password: bool| {
-            ui.label(egui::RichText::new(label).color(TEXT()).size(12.5));
-            ui.add_space(2.0);
-            let resp = ui.add(
+        let field = |ui: &mut egui::Ui, value: &mut String, hint_text: &str, password: bool| {
+            ui.add(
                 egui::TextEdit::singleline(value)
                     .password(password)
-                    .desired_width(f32::INFINITY)
-                    .margin(egui::Margin::symmetric(8, 6))
+                    .desired_width(ROW_CONTROL_W - 10.0)
+                    .margin(egui::Margin::symmetric(8, 5))
                     .hint_text(hint_text),
-            );
-            ui.add_space(6.0);
-            resp
+            )
         };
 
-        field(ui, "Host", &mut settings.ftp_host, "ftp.example.com", false);
-
-        ui.label(egui::RichText::new("Port").color(TEXT()).size(12.5));
-        ui.add_space(2.0);
-        let mut port = settings.ftp_port as u32;
-        ui.add(egui::DragValue::new(&mut port).range(1..=65535));
-        settings.ftp_port = port as u16;
-        ui.add_space(6.0);
-
-        field(ui, "Username", &mut settings.ftp_user, "anonymous", false);
-
-        // The password is stored encrypted (src/secret.rs), never in the plain
-        // settings file — save it whenever the field changes.
-        let pass = ftp.ensure_password();
-        let mut pass_edit = pass.clone();
-        let resp = field(ui, "Password", &mut pass_edit, "", true);
-        if resp.changed() {
-            *pass = pass_edit;
-            crate::ftp::save_password(pass);
-        }
-        hint(ui, "Stored encrypted on this device.");
-
-        ui.add_space(4.0);
-        dot_toggle(ui, &mut settings.ftp_secure, "Use FTPS (TLS)");
-        hint(
+        row(ui, "Host", None, |ui| {
+            field(ui, &mut settings.ftp_host, "ftp.example.com", false);
+        });
+        row_sep(ui);
+        row(ui, "Port", None, |ui| {
+            let mut port = settings.ftp_port as u32;
+            ui.add(egui::DragValue::new(&mut port).range(1..=65535));
+            settings.ftp_port = port as u16;
+        });
+        row_sep(ui);
+        row(ui, "Username", None, |ui| {
+            field(ui, &mut settings.ftp_user, "anonymous", false);
+        });
+        row_sep(ui);
+        row(ui, "Password", Some("Stored encrypted on this device."), |ui| {
+            // The password is stored encrypted (src/secret.rs), never in the
+            // plain settings file — save it whenever the field changes.
+            let pass = ftp.ensure_password();
+            let mut pass_edit = pass.clone();
+            if field(ui, &mut pass_edit, "", true).changed() {
+                *pass = pass_edit;
+                crate::ftp::save_password(pass);
+            }
+        });
+        row_sep(ui);
+        row(
             ui,
-            "Encrypts the connection before logging in (explicit TLS / AUTH TLS). \
-             Servers that require TLS session resumption on transfers aren't \
-             supported yet and will report it when listing.",
+            "Use FTPS (TLS)",
+            Some("Encrypts the connection before logging in (explicit TLS)."),
+            |ui| {
+                switch(ui, &mut settings.ftp_secure);
+            },
         );
     });
 
     section(ui, "Connection", |ui| {
         ftp.poll_test();
-        ui.horizontal(|ui| {
+        row(ui, "Check the server details work", None, |ui| {
             // A proper fixed-size accent button (like Civitai's Save), not a
             // text-hugging sliver.
             let btn = egui::Button::new(
@@ -920,7 +910,7 @@ fn ftp_tab(ui: &mut egui::Ui, settings: &mut Settings, ftp: &mut crate::ftp::Ftp
             // A huge radius clamps to half the button height → a full pill.
             .corner_radius(egui::CornerRadius::same(255));
             if ui
-                .add_enabled_ui(!ftp.testing(), |ui| ui.add_sized(egui::vec2(150.0, 32.0), btn))
+                .add_enabled_ui(!ftp.testing(), |ui| ui.add_sized(egui::vec2(150.0, 30.0), btn))
                 .inner
                 .clicked()
             {
@@ -986,28 +976,79 @@ fn tab_button(ui: &mut egui::Ui, settings: &mut Settings, tab: SettingsTab, labe
     }
 }
 
-/// A flat section: an uppercase muted label with its controls directly below,
-/// left-aligned (matches the Civitai / Backup popups — no bordered card).
+/// A settings group, macOS System Settings style: an uppercase muted header
+/// above a rounded card (PANEL-flat with a faint edge) holding the controls —
+/// typically [`row`]s separated by [`row_sep`] hairlines.
 pub(crate) fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(4.0);
     ui.label(egui::RichText::new(title.to_uppercase()).color(MUTED()).strong().size(11.0));
-    ui.add_space(6.0);
-    ui.scope(|ui| {
-        ui.set_width(ui.available_width());
-        add(ui);
-    });
-    ui.add_space(12.0);
+    ui.add_space(5.0);
+    egui::Frame::new()
+        .fill(PANEL())
+        .stroke(egui::Stroke::new(1.0, EDGE()))
+        .corner_radius(egui::CornerRadius::same(12))
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui);
+        });
+    ui.add_space(14.0);
 }
 
-/// A boolean toggle drawn as a radio-style dot (matching the Appearance tab's
-/// selectors) instead of a square checkbox tick. Clicking flips `value`.
-fn dot_toggle(ui: &mut egui::Ui, value: &mut bool, label: &str) -> egui::Response {
-    let mut resp = ui.radio(*value, egui::RichText::new(label).color(TEXT()));
+/// Width reserved for a row's right-aligned control (switch, slider, combo…).
+const ROW_CONTROL_W: f32 = 180.0;
+
+/// One settings row: the label (with an optional muted description wrapping
+/// beneath it) on the left, `control` right-aligned — macOS style.
+pub(crate) fn row(ui: &mut egui::Ui, label: &str, sub: Option<&str>, control: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        let text_w = ui.available_width() - ROW_CONTROL_W;
+        ui.vertical(|ui| {
+            ui.set_width(text_w);
+            ui.label(egui::RichText::new(label).color(TEXT()).size(13.0));
+            if let Some(s) = sub {
+                ui.add_space(1.0);
+                ui.label(egui::RichText::new(s).color(MUTED()).size(10.5));
+            }
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control);
+    });
+}
+
+/// The hairline between two [`row`]s of a card.
+pub(crate) fn row_sep(ui: &mut egui::Ui) {
+    ui.add_space(7.0);
+    let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().hline(r.x_range(), r.center().y, egui::Stroke::new(1.0, EDGE()));
+    ui.add_space(7.0);
+}
+
+/// A macOS-style sliding toggle switch. Clicking flips `on`; the knob and
+/// track colour animate between states.
+pub(crate) fn switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(40.0, 22.0), egui::Sense::click());
     if resp.clicked() {
-        *value = !*value;
+        *on = !*on;
         resp.mark_changed();
     }
-    resp
+    let t = ui.ctx().animate_bool(resp.id, *on);
+    let off = if crate::theme::is_light() {
+        egui::Color32::from_gray(200)
+    } else {
+        egui::Color32::from_gray(62)
+    };
+    let track = mix(off, crate::theme::ACCENT1(), t);
+    let radius = rect.height() / 2.0;
+    ui.painter().rect_filled(rect, radius, track);
+    ui.painter().rect_stroke(rect, radius, egui::Stroke::new(1.0, EDGE()), egui::StrokeKind::Inside);
+    let x = egui::lerp((rect.left() + 11.0)..=(rect.right() - 11.0), t);
+    ui.painter().circle_filled(egui::pos2(x, rect.center().y), 8.0, egui::Color32::WHITE);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Linear blend from `a` to `b` by `t` (0..1).
+fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    egui::Color32::from(egui::Rgba::from(a) * (1.0 - t) + egui::Rgba::from(b) * t)
 }
 
 /// A small muted explanatory line, shown under a control.

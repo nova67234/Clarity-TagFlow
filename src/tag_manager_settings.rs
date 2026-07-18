@@ -142,76 +142,93 @@ fn segmented_control(ui: &mut egui::Ui, current: &mut usize) {
     }
 }
 
-/// The preferences tab (the original settings body).
+/// The preferences tab: Apple-style cards of label-left/switch-right rows
+/// (the shared helpers from settings.rs).
 fn settings_tab(ui: &mut egui::Ui, s: &mut TagManagerSettings) {
-    // The global theme rounds checkboxes into pills; square them off.
-    let sq = egui::CornerRadius::same(4);
-    ui.visuals_mut().widgets.inactive.corner_radius = sq;
-    ui.visuals_mut().widgets.hovered.corner_radius = sq;
-    ui.visuals_mut().widgets.active.corner_radius = sq;
+    use crate::settings::{row, row_sep, section, switch};
 
-    section_title(ui, "General Behavior");
-    ui.checkbox(&mut s.auto_save, rich("Auto-save sidecar files after AI tagging"));
-    ui.add_space(6.0);
-    ui.checkbox(&mut s.autocomplete, rich("Enable tag autocomplete while typing"));
-    ui.add_space(6.0);
-
-    // Mutually exclusive: enabling one clears the other (matches the Java).
-    if ui
-        .checkbox(&mut s.auto_tag_append, rich("Auto tag all images (Keep existing tags)"))
-        .changed()
-        && s.auto_tag_append
-    {
-        s.auto_tag_overwrite = false;
-    }
-    ui.add_space(6.0);
-    if ui
-        .checkbox(&mut s.auto_tag_overwrite, rich("Auto tag all images (Remove old tags)"))
-        .changed()
-        && s.auto_tag_overwrite
-    {
-        s.auto_tag_append = false;
-    }
-
-    ui.add_space(10.0);
-    ui.horizontal(|ui| {
-        ui.label(rich("Tag Separator:"));
-        // Inline pills instead of a nested combo — a combo's dropdown
-        // would count as a click outside this popup and close it.
-        for (i, label) in SEPARATOR_LABELS.iter().enumerate() {
-            ui.selectable_value(&mut s.separator_idx, i, *label);
-        }
+    section(ui, "General", |ui| {
+        row(
+            ui,
+            "Auto-save sidecar files",
+            Some("Write the .txt automatically after AI tagging."),
+            |ui| {
+                switch(ui, &mut s.auto_save);
+            },
+        );
+        row_sep(ui);
+        row(
+            ui,
+            "Tag autocomplete",
+            Some("Suggest tags while typing."),
+            |ui| {
+                switch(ui, &mut s.autocomplete);
+            },
+        );
+        row_sep(ui);
+        // The two auto-tag modes are mutually exclusive: enabling one clears
+        // the other (matches the Java).
+        row(
+            ui,
+            "Auto tag all — keep tags",
+            Some("Tag every image, keeping its existing tags."),
+            |ui| {
+                if switch(ui, &mut s.auto_tag_append).changed() && s.auto_tag_append {
+                    s.auto_tag_overwrite = false;
+                }
+            },
+        );
+        row_sep(ui);
+        row(
+            ui,
+            "Auto tag all — overwrite",
+            Some("Tag every image, removing its old tags first."),
+            |ui| {
+                if switch(ui, &mut s.auto_tag_overwrite).changed() && s.auto_tag_overwrite {
+                    s.auto_tag_append = false;
+                }
+            },
+        );
+        row_sep(ui);
+        row(ui, "Tag separator", None, |ui| {
+            // Inline pills instead of a combo — a combo's dropdown would count
+            // as a click outside this popup and close it. The right-to-left
+            // control layout lays children rightmost-first, so iterate reversed
+            // to keep Comma · Space · Newline reading left to right.
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (i, label) in SEPARATOR_LABELS.iter().enumerate().rev() {
+                ui.selectable_value(&mut s.separator_idx, i, *label);
+            }
+        });
     });
 
-    ui.add_space(14.0);
-    section_title(ui, "AI Tagger Defaults");
-    ui.horizontal(|ui| {
-        ui.label(rich("Confidence Threshold:"));
-        ui.add(
-            egui::DragValue::new(&mut s.default_threshold)
-                .range(0.1..=1.0)
-                .speed(0.01)
-                .fixed_decimals(2),
+    section(ui, "AI tagger", |ui| {
+        row(
+            ui,
+            "Confidence threshold",
+            Some("Minimum score for a predicted tag to be added."),
+            |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut s.default_threshold)
+                        .range(0.1..=1.0)
+                        .speed(0.01)
+                        .fixed_decimals(2),
+                );
+            },
         );
     });
 
-    ui.add_space(14.0);
-    section_title(ui, "Global Tag Blacklist");
-    ui.label(egui::RichText::new("Comma or newline separated").color(MUTED()).size(12.0));
-    ui.add_space(4.0);
-    ui.add(
-        egui::TextEdit::multiline(&mut s.blacklist)
-            .desired_width(f32::INFINITY)
-            .desired_rows(3),
-    );
-}
-
-fn rich(text: &str) -> egui::RichText {
-    egui::RichText::new(text).color(TEXT())
-}
-
-/// Muted mini-header above each settings group.
-fn section_title(ui: &mut egui::Ui, title: &str) {
-    ui.label(egui::RichText::new(title).color(MUTED()).strong().size(12.0));
-    ui.add_space(6.0);
+    section(ui, "Tag blacklist", |ui| {
+        ui.add(
+            egui::TextEdit::multiline(&mut s.blacklist)
+                .desired_width(f32::INFINITY)
+                .desired_rows(3),
+        );
+        ui.add_space(3.0);
+        ui.label(
+            egui::RichText::new("Tags the AI never adds — comma or newline separated.")
+                .color(MUTED())
+                .size(10.5),
+        );
+    });
 }

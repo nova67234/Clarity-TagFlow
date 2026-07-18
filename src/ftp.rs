@@ -22,7 +22,7 @@ use eframe::egui;
 use suppaftp::native_tls::TlsConnector;
 use suppaftp::{NativeTlsConnector, NativeTlsFtpStream};
 
-use crate::theme::{ACCENT1, EDGE, MUTED, PANEL, TEXT};
+use crate::theme::{ACCENT1, EDGE, FIELD, MUTED, PANEL, TEXT};
 
 /// Everything needed to open one connection. Snapshotted from `Settings` (+ the
 /// decrypted password) when an operation starts, so background threads never
@@ -62,6 +62,9 @@ pub struct FtpState {
     /// Whether the remote-browser popup is open (the top bar's folder button
     /// opens it while FTP mode is enabled).
     pub browser_open: bool,
+    /// Skip the click-outside close on the frame the browser was opened, so
+    /// the folder-button click isn't counted as a click outside.
+    pub browser_just_opened: bool,
     /// Current remote directory ("/" rooted).
     cwd: String,
     /// Entries of `cwd`, once listed.
@@ -401,7 +404,7 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
     let mut load_files: Option<Vec<String>> = None;
     let mut save_files: Option<Vec<String>> = None;
 
-    egui::Window::new("")
+    let win = egui::Window::new("")
         .id(egui::Id::new("ftp_browser"))
         .title_bar(false)
         .collapsible(false)
@@ -498,7 +501,12 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
                                 ui.label(egui::RichText::new("(empty directory)").color(MUTED()).size(12.0));
                                 ui.add_space(12.0);
                             }
-                            for e in entries {
+                            // macOS-list style rows: fixed height, a rounded
+                            // full-row hover highlight on clickable (directory)
+                            // rows, and inset hairlines between entries.
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let n = entries.len();
+                            for (i, e) in entries.iter().enumerate() {
                                 let icon = if e.is_dir {
                                     egui::include_image!("../icons/folder.svg")
                                 } else if crate::is_media(std::path::Path::new(&e.name)) {
@@ -506,32 +514,44 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
                                 } else {
                                     egui::include_image!("../icons/metadata.svg")
                                 };
-                                let resp = ui
-                                    .horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 8.0;
-                                        ui.add(
-                                            egui::Image::new(icon)
-                                                .fit_to_exact_size(egui::vec2(16.0, 16.0))
-                                                .tint(crate::theme::icon_tint(MUTED())),
-                                        );
-                                        ui.label(egui::RichText::new(&e.name).color(TEXT()).size(13.0));
-                                        if !e.is_dir && e.size > 0 {
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.label(
-                                                    egui::RichText::new(human_size(e.size)).color(MUTED()).size(11.0),
-                                                );
-                                            });
-                                        }
-                                    })
-                                    .response;
-                                if e.is_dir {
-                                    let resp = resp.interact(egui::Sense::click());
-                                    if resp.hovered() {
+                                let sense = if e.is_dir { egui::Sense::click() } else { egui::Sense::hover() };
+                                let (rect, resp) = ui
+                                    .allocate_exact_size(egui::vec2(ui.available_width(), 28.0), sense);
+                                if ui.is_rect_visible(rect) {
+                                    if e.is_dir && resp.hovered() {
+                                        ui.painter().rect_filled(rect, egui::CornerRadius::same(8), FIELD());
                                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                     }
-                                    if resp.clicked() {
-                                        navigate = Some(join_remote(&state.cwd, &e.name));
+                                    let mut row_ui = ui.new_child(
+                                        egui::UiBuilder::new()
+                                            .max_rect(rect.shrink2(egui::vec2(8.0, 0.0)))
+                                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                                    );
+                                    row_ui.spacing_mut().item_spacing.x = 8.0;
+                                    row_ui.add(
+                                        egui::Image::new(icon)
+                                            .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                                            .tint(crate::theme::icon_tint(MUTED())),
+                                    );
+                                    row_ui.label(egui::RichText::new(&e.name).color(TEXT()).size(13.0));
+                                    if !e.is_dir && e.size > 0 {
+                                        row_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(
+                                                egui::RichText::new(human_size(e.size)).color(MUTED()).size(11.0),
+                                            );
+                                        });
                                     }
+                                    // Hairline between rows, inset past the icon gutter.
+                                    if i + 1 < n {
+                                        ui.painter().hline(
+                                            (rect.left() + 32.0)..=rect.right(),
+                                            rect.bottom(),
+                                            egui::Stroke::new(1.0, EDGE()),
+                                        );
+                                    }
+                                }
+                                if e.is_dir && resp.clicked() {
+                                    navigate = Some(join_remote(&state.cwd, &e.name));
                                 }
                             }
                         }
@@ -637,6 +657,17 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
             let cwd = state.cwd.clone();
             state.start_download(params, cwd, files, dest, false);
         }
+    }
+    // Click outside dismisses, like the other popups (an in-flight download
+    // keeps going — messages are still drained at the top of `show_browser`).
+    // Skipped on the opening frame, when the folder-button click would count
+    // as a click outside.
+    if state.browser_just_opened {
+        state.browser_just_opened = false;
+    } else if let Some(win) = &win
+        && win.response.clicked_elsewhere()
+    {
+        open = false;
     }
     state.browser_open = open;
     // Re-list on next open so a fresh session starts from a live listing.

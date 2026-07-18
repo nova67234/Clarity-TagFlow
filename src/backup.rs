@@ -34,8 +34,6 @@ const FLASH: Duration = Duration::from_millis(450);
 /// auto-sized egui window the available width is infinite, which leaks into the
 /// persisted `last_content_size` as `inf` and reloads as a NaN rect that panics.
 const DIALOG_WIDTH: f32 = 380.0;
-/// Usable content width — fields fill it (flat sections, like the Civitai popup).
-const FIELD_WIDTH: f32 = DIALOG_WIDTH - 4.0;
 
 /// GIF is animated — decode-validating only its first frame is pointless, so it's
 /// included as-is like videos rather than corruption-scanned as a still image.
@@ -227,30 +225,11 @@ impl BackupState {
             // panics on the next launch. Capping max keeps every width finite.
             ui.set_width(380.0);
             ui.set_max_width(380.0);
-            // Per-dialog widget styling — match the Settings / Tag Manager look:
-            //  * square-but-rounded checkboxes (4px); the global theme rounds them
-            //    into pills otherwise. Everything else (checkmark colour, fills)
-            //    stays at the theme default so the checkbox looks identical to the
-            //    Tag Manager settings one.
-            //  * only the text wells use the darker BG() fill so the name/password
-            //    boxes read as distinct inputs against the lighter FIELD() cards.
-            let mut style = ui.style().as_ref().clone();
-            let sq = egui::CornerRadius::same(4);
-            for w in [
-                &mut style.visuals.widgets.noninteractive,
-                &mut style.visuals.widgets.inactive,
-                &mut style.visuals.widgets.hovered,
-                &mut style.visuals.widgets.active,
-                &mut style.visuals.widgets.open,
-            ] {
-                w.corner_radius = sq;
-            }
-            // TextEdit fill comes from extreme_bg_color — set it to the section
-            // card colour so the name/password boxes blend with the card behind
-            // them. The input outline lives in `text_field` (scoped), NOT here:
-            // a dialog-wide bg_stroke would outline every button too.
-            style.visuals.extreme_bg_color = FIELD();
-            ui.set_style(style);
+            // TextEdit fill comes from extreme_bg_color — FIELD so the name/
+            // password boxes read as inputs against the section cards. The input
+            // outline lives in `text_field` (scoped), NOT here: a dialog-wide
+            // bg_stroke would outline every button too.
+            ui.visuals_mut().extreme_bg_color = FIELD();
 
             // Custom title row (Civitai-style): backup icon + phase title + close.
             ui.horizontal(|ui| {
@@ -298,21 +277,23 @@ impl BackupState {
     fn options_body(&mut self, ui: &mut egui::Ui) {
         header(ui, "Archive this folder's media and tags into a .zip.");
 
-        section(ui, "Details", |ui| {
-            ui.label(RichText::new("Backup name").color(MUTED()).size(12.0));
-            ui.add_space(4.0);
+        crate::settings::section(ui, "Name", |ui| {
             text_field(ui, &mut self.name, "e.g. my_dataset", false);
             hint(ui, "Saved to a \"backups\" folder inside the source, dated automatically.");
         });
 
-        section(ui, "Security", |ui| {
-            ui.checkbox(
-                &mut self.encrypt,
-                RichText::new("Encrypt with password (AES-256)").color(TEXT()).size(13.0),
+        crate::settings::section(ui, "Security", |ui| {
+            crate::settings::row(
+                ui,
+                "Encrypt with password",
+                Some("AES-256 — the password can't be recovered if lost."),
+                |ui| {
+                    crate::settings::switch(ui, &mut self.encrypt);
+                },
             );
 
             if self.encrypt {
-                ui.add_space(8.0);
+                crate::settings::row_sep(ui);
                 ui.label(RichText::new("Password").color(MUTED()).size(12.0));
                 ui.add_space(4.0);
                 text_field(ui, &mut self.password, "", true);
@@ -320,7 +301,6 @@ impl BackupState {
                 ui.label(RichText::new("Confirm password").color(MUTED()).size(12.0));
                 ui.add_space(4.0);
                 text_field(ui, &mut self.confirm, "", true);
-                hint(ui, "Keep this password safe — it can't be recovered if lost.");
             }
         });
 
@@ -430,21 +410,22 @@ impl BackupState {
     fn running_body(ui: &mut egui::Ui, prog: &Progress) {
         header(ui, "Compressing and writing the archive…");
 
-        section(ui, "Progress", |ui| {
+        crate::settings::section(ui, "Progress", |ui| {
             let label = prog.label.lock().unwrap().clone();
             ui.label(RichText::new(label).color(MUTED()).size(12.0));
             ui.add_space(8.0);
 
+            let w = ui.available_width();
             let total = prog.total.load(Relaxed);
             if total == 0 {
-                ui.add(egui::ProgressBar::new(0.0).animate(true).desired_width(FIELD_WIDTH));
+                ui.add(egui::ProgressBar::new(0.0).animate(true).desired_width(w));
             } else {
                 let cur = prog.current.load(Relaxed);
                 let frac = (cur as f32 / total as f32).clamp(0.0, 1.0);
                 ui.add(
                     egui::ProgressBar::new(frac)
                         .text(format!("{cur} / {total}"))
-                        .desired_width(FIELD_WIDTH),
+                        .desired_width(w),
                 );
             }
         });
@@ -470,7 +451,7 @@ fn done_body(ui: &mut egui::Ui, outcome: &Outcome) -> bool {
     match outcome {
         Outcome::Success(s) => {
             header(ui, "Your archive was created successfully.");
-            section(ui, "Summary", |ui| {
+            crate::settings::section(ui, "Summary", |ui| {
                 kv(ui, "Location", &s.zip_name);
                 kv(ui, "Files written", &format!("{} / {}", s.written, s.total_selected));
                 if s.encrypted {
@@ -496,19 +477,19 @@ fn done_body(ui: &mut egui::Ui, outcome: &Outcome) -> bool {
         }
         Outcome::NoFiles => {
             header(ui, "Nothing was archived.");
-            section(ui, "Details", |ui| {
+            crate::settings::section(ui, "Details", |ui| {
                 ui.label(RichText::new("No valid files found to back up.").color(MUTED()).size(13.0));
             });
         }
         Outcome::Cancelled => {
             header(ui, "The backup was stopped.");
-            section(ui, "Details", |ui| {
+            crate::settings::section(ui, "Details", |ui| {
                 ui.label(RichText::new("Backup operation canceled.").color(MUTED()).size(13.0));
             });
         }
         Outcome::Error(e) => {
             header(ui, "Something went wrong during the backup.");
-            section(ui, "Details", |ui| {
+            crate::settings::section(ui, "Details", |ui| {
                 ui.label(
                     RichText::new(e)
                         .color(Color32::from_rgb(235, 110, 110))
@@ -539,20 +520,6 @@ fn done_body(ui: &mut egui::Ui, outcome: &Outcome) -> bool {
 fn header(ui: &mut egui::Ui, subtitle: &str) {
     ui.label(RichText::new(subtitle).color(MUTED()).size(11.0));
     ui.add_space(10.0);
-}
-
-/// A flat section: an uppercase muted label with controls directly below (matches
-/// the Civitai popup — no bordered card).
-fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    ui.label(RichText::new(title.to_uppercase()).color(MUTED()).strong().size(11.0));
-    ui.add_space(6.0);
-    // Fixed width, never `available_width()` (which is infinite in an auto-sized
-    // window and would leak `inf` into the persisted state).
-    ui.scope(|ui| {
-        ui.set_width(FIELD_WIDTH);
-        add(ui);
-    });
-    ui.add_space(14.0);
 }
 
 /// A small muted explanatory line, shown under a control.

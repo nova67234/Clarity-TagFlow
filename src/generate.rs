@@ -2341,9 +2341,10 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// the image families).
 pub fn show(ui: &mut egui::Ui, state: &mut GenerateState, current_image: Option<&Path>) {
     // The whole view is one scrollable column. Normally everything fits exactly
-    // (the prompt box is stretched so the Log row bottoms out at the panel
-    // edge); expanding the log console overflows the panel and this scroll area
-    // lets you scroll down to read it.
+    // (the prompt box is stretched so the Log row — and the log console while
+    // open — bottoms out at the panel edge); the scroll area is the fallback
+    // for short windows where the prompt's minimum height pushes content past
+    // the edge.
     let panel_h = ui.available_height();
     // Push the scrollbar into the card's right margin so it rides the panel
     // edge instead of sitting on the controls (same treatment as the gallery).
@@ -2941,17 +2942,6 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
             }
         });
     });
-    // Remember how tall everything between the prompt box and the end of the Log
-    // row is — next frame the Z-Image prompt stretches to push this row to the
-    // panel's bottom edge (the open log console below is deliberately excluded:
-    // it overflows and is reached by scrolling). Both cursor reads sit one
-    // item-spacing past their widget, so the difference needs no correction.
-    let below_h = ui.cursor().min.y - after_prompt_y;
-    if (below_h - state.below_h).abs() > 0.5 {
-        // Sizing settles one frame after a layout change — repaint to get there.
-        state.below_h = below_h;
-        ui.ctx().request_repaint();
-    }
     if state.show_log {
         let bg = if is_light() { FIELD() } else { Color32::from_rgb(15, 15, 17) };
         egui::Frame::new()
@@ -2961,14 +2951,43 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
             .stroke(egui::Stroke::new(1.0, EDGE()))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                egui::ScrollArea::vertical().max_height(180.0).stick_to_bottom(true).show(ui, |ui| {
-                    // Keep scrolling while a text selection is dragged past the edge.
-                    crate::drag_select_autoscroll(ui);
-                    for l in &state.log {
-                        ui.label(RichText::new(l).color(TEXT()).monospace().size(11.0));
-                    }
-                });
+                // Same fixed-height well as the Gelbooru downloader console:
+                // auto_shrink off so it holds its size instead of collapsing
+                // to however few lines are logged.
+                egui::ScrollArea::vertical()
+                    .max_height(120.0)
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        // Keep scrolling while a text selection is dragged past the edge.
+                        crate::drag_select_autoscroll(ui);
+                        if state.log.is_empty() {
+                            ui.label(
+                                RichText::new("Log output will appear here.")
+                                    .color(MUTED())
+                                    .monospace()
+                                    .size(12.0),
+                            );
+                        } else {
+                            for l in &state.log {
+                                ui.label(RichText::new(l).color(TEXT()).monospace().size(12.0));
+                            }
+                        }
+                    });
             });
+    }
+    // Remember how tall everything between the prompt box and the panel bottom
+    // is — the settings + Log row, plus the log console while it's open — so
+    // next frame the prompt stretches (or shrinks) to land it all exactly on
+    // the panel's bottom edge. Including the open console here is what keeps
+    // it fully on screen instead of overflowing past the edge. Both cursor
+    // reads sit one item-spacing past their widget, so the difference needs no
+    // correction.
+    let below_h = ui.cursor().min.y - after_prompt_y;
+    if (below_h - state.below_h).abs() > 0.5 {
+        // Sizing settles one frame after a layout change — repaint to get there.
+        state.below_h = below_h;
+        ui.ctx().request_repaint();
     }
 }
 

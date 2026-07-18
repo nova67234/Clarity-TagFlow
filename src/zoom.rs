@@ -318,10 +318,12 @@ impl ZoomState {
         let mut want_spatial = false;
         let mut want_bgremove = false;
         egui::Popup::context_menu(&resp)
-            .frame(egui::Frame::menu(&resp.ctx.global_style()).corner_radius(CornerRadius::same(22)))
+            .frame(menu_frame())
             .show(|ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            // Grouped macOS-style: quick actions | edits | analysis overlays.
             let (fav_icon, fav_label) = if is_favorite {
-                (egui::include_image!("../icons/heart_minus.svg"), "Remove favorite")
+                (egui::include_image!("../icons/heart_minus.svg"), "Remove Favorite")
             } else {
                 (egui::include_image!("../icons/heart_plus.svg"), "Favorite")
             };
@@ -329,11 +331,12 @@ impl ZoomState {
                 want_favorite = true;
                 ui.close();
             }
-            if menu_item(ui, egui::include_image!("../icons/copy.svg"), "Copy image") {
+            if menu_item(ui, egui::include_image!("../icons/copy.svg"), "Copy Image") {
                 want_copy = true;
                 ui.close();
             }
-            if menu_item(ui, egui::include_image!("../icons/crop.svg"), "Crop image…") {
+            menu_sep(ui);
+            if menu_item(ui, egui::include_image!("../icons/crop.svg"), "Crop Image") {
                 want_crop = true;
                 ui.close();
             }
@@ -345,6 +348,7 @@ impl ZoomState {
                 want_spatial = true;
                 ui.close();
             }
+            menu_sep(ui);
             // Region detection overlay (faces / hands / people / feet boxes). The
             // state is a process-wide singleton (src/detect.rs), so the toggle and
             // the per-image result cache are shared with the gallery-detail popup.
@@ -706,14 +710,16 @@ impl ZoomState {
         let mut want_favorite = false;
         let mut want_copy = false;
         egui::Popup::context_menu(resp)
-            .frame(egui::Frame::menu(&resp.ctx.global_style()).corner_radius(CornerRadius::same(22)))
+            .frame(menu_frame())
             .show(|ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
             if menu_item(ui, egui::include_image!("../icons/spatial_scene.svg"), "Exit Spatial Scene") {
                 want_exit = true;
                 ui.close();
             }
+            menu_sep(ui);
             let (fav_icon, fav_label) = if is_favorite {
-                (egui::include_image!("../icons/heart_minus.svg"), "Remove favorite")
+                (egui::include_image!("../icons/heart_minus.svg"), "Remove Favorite")
             } else {
                 (egui::include_image!("../icons/heart_plus.svg"), "Favorite")
             };
@@ -721,7 +727,7 @@ impl ZoomState {
                 want_favorite = true;
                 ui.close();
             }
-            if menu_item(ui, egui::include_image!("../icons/copy.svg"), "Copy image") {
+            if menu_item(ui, egui::include_image!("../icons/copy.svg"), "Copy Image") {
                 want_copy = true;
                 ui.close();
             }
@@ -1037,12 +1043,68 @@ impl ZoomState {
     }
 }
 
-/// A right-click context-menu entry with a leading SVG icon (tinted to the menu's
-/// text colour so it stays visible in light and dark themes). Returns true when
-/// clicked.
+/// Context-menu row width — sized to the longest label ("Remove Background" /
+/// "Exit Spatial Scene") so the menu stays as compact as the old button menu.
+const MENU_W: f32 = 158.0;
+
+/// The image context menu's frame — an Apple-style compact rounded card with a
+/// faint edge and soft drop shadow (replaces egui's default menu frame).
+fn menu_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(crate::theme::PANEL())
+        .stroke(Stroke::new(1.0, crate::theme::EDGE()))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(egui::Margin::same(5))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 6],
+            blur: 18,
+            spread: 0,
+            color: Color32::from_black_alpha(120),
+        })
+}
+
+/// A macOS-style context-menu row: leading icon + label, highlighted as an
+/// accent pill (white ink) while hovered. Fixed compact size ([`MENU_W`] × 22).
+/// Returns true when clicked.
 fn menu_item(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, label: &str) -> bool {
-    let image = egui::Image::new(icon)
-        .fit_to_exact_size(egui::vec2(16.0, 16.0))
-        .tint(ui.visuals().text_color());
-    ui.add(egui::Button::image_and_text(image, label)).clicked()
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(MENU_W, 22.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let hovered = resp.hovered();
+        if hovered {
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(7), crate::theme::ACCENT1());
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let ink = if hovered { Color32::WHITE } else { ui.visuals().text_color() };
+        egui::Image::new(icon)
+            .fit_to_exact_size(egui::vec2(14.0, 14.0))
+            .tint(ink)
+            .paint_at(
+                ui,
+                Rect::from_center_size(
+                    Pos2::new(rect.left() + 13.0, rect.center().y),
+                    Vec2::new(14.0, 14.0),
+                ),
+            );
+        ui.painter().text(
+            Pos2::new(rect.left() + 25.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(12.5),
+            ink,
+        );
+    }
+    resp.clicked()
+}
+
+/// The inset hairline between context-menu groups.
+fn menu_sep(ui: &mut egui::Ui) {
+    ui.add_space(2.0);
+    let (r, _) = ui.allocate_exact_size(egui::vec2(MENU_W, 1.0), Sense::hover());
+    ui.painter().hline(
+        (r.left() + 6.0)..=(r.right() - 6.0),
+        r.center().y,
+        Stroke::new(1.0, crate::theme::EDGE()),
+    );
+    ui.add_space(2.0);
 }

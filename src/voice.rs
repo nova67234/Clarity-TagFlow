@@ -811,47 +811,82 @@ pub fn recorder_window(ctx: &egui::Context, voice: &mut VoiceState) {
                     }
 
                     ui.horizontal(|ui| {
-                        // Mic button — red while recording.
-                        let tint = if voice.rec.recording {
-                            egui::Color32::from_rgb(230, 70, 70)
-                        } else {
-                            icon_tint(TEXT())
-                        };
-                        let (rect, resp) = ui.allocate_exact_size(
-                            egui::vec2(34.0, 34.0),
-                            egui::Sense::click(),
-                        );
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        // Apple-style record control: a ringed red circle (with a
+                        // mic glyph) that morphs into a rounded "stop" square and
+                        // gains a soft pulsing halo while recording.
+                        let recording = voice.rec.recording;
+                        let (rect, resp) =
+                            ui.allocate_exact_size(egui::vec2(38.0, 38.0), egui::Sense::click());
                         let resp = resp
-                            .on_hover_text(if voice.rec.recording { "Stop" } else { "Record what's playing" })
+                            .on_hover_text(if recording { "Stop" } else { "Record what's playing" })
                             .on_hover_cursor(egui::CursorIcon::PointingHand);
-                        egui::Image::new(egui::include_image!("../icons/mic.svg"))
-                            .tint(tint)
-                            .paint_at(ui, egui::Rect::from_center_size(rect.center(), egui::vec2(22.0, 22.0)));
+                        let center = rect.center();
+                        let red = egui::Color32::from_rgb(255, 69, 58);
+                        let t = ui.ctx().animate_bool(egui::Id::new("rec_morph"), recording);
+                        ui.painter().circle_stroke(
+                            center,
+                            17.0,
+                            egui::Stroke::new(1.5, if recording { red } else { EDGE() }),
+                        );
+                        if recording {
+                            let now = ui.input(|i| i.time);
+                            let pulse = ((now * 2.4).sin() as f32 * 0.5 + 0.5) * 0.35 + 0.10;
+                            ui.painter().circle_stroke(
+                                center,
+                                20.0,
+                                egui::Stroke::new(2.0, red.gamma_multiply(pulse)),
+                            );
+                        }
+                        // The red core: full circle when idle, stop square when live.
+                        let size = egui::lerp(28.0..=15.0, t);
+                        let corner = egui::lerp(14.0..=4.0, t);
+                        ui.painter().rect_filled(
+                            egui::Rect::from_center_size(center, egui::vec2(size, size)),
+                            egui::CornerRadius::same(corner as u8),
+                            red,
+                        );
+                        // Mic glyph inside the idle circle, fading out on record.
+                        if t < 0.99 {
+                            egui::Image::new(egui::include_image!("../icons/mic.svg"))
+                                .tint(egui::Color32::WHITE.gamma_multiply(1.0 - t))
+                                .paint_at(ui, egui::Rect::from_center_size(center, egui::vec2(15.0, 15.0)));
+                        }
                         if resp.clicked() {
                             voice.rec.toggle_recording(ui.ctx());
                         }
 
                         ui.vertical(|ui| {
-                            let status = if voice.rec.recording {
-                                format!("Recording… {}s (max {MAX_RECORD_SECS}s)", voice.rec.seconds())
+                            ui.add_space(2.0);
+                            let s = voice.rec.seconds();
+                            let (line1, c1, line2): (String, egui::Color32, &str) = if recording {
+                                (
+                                    format!("0:{s:02} / 0:{MAX_RECORD_SECS}"),
+                                    TEXT(),
+                                    "Recording what's playing…",
+                                )
                             } else if let Some(e) = &voice.rec.err {
-                                e.clone()
+                                (
+                                    e.clone(),
+                                    egui::Color32::from_rgb(255, 105, 97),
+                                    "Play the audio, then try again",
+                                )
                             } else if voice.rec.just_saved {
-                                "Saved as the voice sample!".to_string()
+                                (
+                                    "Saved as the voice sample".into(),
+                                    egui::Color32::from_rgb(48, 209, 88),
+                                    "Record again to replace it",
+                                )
                             } else {
-                                "Play the voice, then hit the mic".to_string()
+                                (
+                                    "Record what's playing".into(),
+                                    TEXT(),
+                                    "3–10s of one clean voice is best",
+                                )
                             };
-                            let color = if voice.rec.err.is_some() {
-                                egui::Color32::from_rgb(210, 70, 70)
-                            } else {
-                                MUTED()
-                            };
-                            ui.label(egui::RichText::new(status).color(color).size(11.5));
-                            ui.label(
-                                egui::RichText::new("3–10s of one clean voice works best")
-                                    .color(MUTED())
-                                    .size(10.0),
-                            );
+                            ui.label(egui::RichText::new(line1).color(c1).size(12.5).strong());
+                            ui.add_space(1.0);
+                            ui.label(egui::RichText::new(line2).color(MUTED()).size(10.0));
                         });
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
@@ -866,7 +901,8 @@ pub fn recorder_window(ctx: &egui::Context, voice: &mut VoiceState) {
                     });
 
                     if voice.rec.recording {
-                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                        // Fast enough for the halo pulse to read as smooth.
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
                     }
                         });
                 });
