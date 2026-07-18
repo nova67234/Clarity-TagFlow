@@ -67,6 +67,19 @@ pub struct TagManagerState {
     /// Chips flashing amber because the user tried to re-add them (already
     /// present), with the flash start time.
     pub dup_flash: Option<(HashSet<String>, Instant)>,
+
+    /// The tag chip currently being dragged to a new position in the list,
+    /// if any.
+    pub drag_tag: Option<String>,
+
+    /// In-place chip rename (started by right-clicking a chip): the original
+    /// tag and the live edit buffer.
+    pub edit_tag: Option<(String, String)>,
+    /// Give the rename box keyboard focus on its first frame.
+    pub edit_focus: bool,
+
+    /// Spell-check state for the "add a tag" box (right-click suggestions).
+    pub spell: crate::spellcheck::SpellcheckState,
 }
 
 /// A timed status flash: shows `label` (e.g. "Added 1 tag · 7 total"), then
@@ -109,6 +122,10 @@ impl Default for TagManagerState {
             tag_job: None,
             flash: None,
             dup_flash: None,
+            drag_tag: None,
+            edit_tag: None,
+            edit_focus: false,
+            spell: crate::spellcheck::SpellcheckState::default(),
         }
     }
 }
@@ -157,8 +174,11 @@ pub fn show(
     if current_image != state.status_image.as_deref() {
         state.status_image = current_image.map(Path::to_path_buf);
         state.flash = None;
-        // A selection only makes sense for the image it was made on.
+        // A selection (or an in-progress chip drag/rename) only makes sense
+        // for the image it was made on.
         state.selected_tags.clear();
+        state.drag_tag = None;
+        state.edit_tag = None;
         set_loaded_status(state, current_image, &tags);
     }
 
@@ -404,7 +424,11 @@ pub fn show(
                     if draft_is_dup {
                         edit = edit.text_color(DUP_TEXT_AMBER);
                     }
-                    let resp = ui.add(edit);
+                    let out = edit.show(ui);
+                    // Live spell-check: red squiggles + right-click suggestions
+                    // (same treatment as the generator prompt boxes).
+                    crate::spellcheck::attach(ui, &out, &mut state.draft, &mut state.spell);
+                    let resp = &out.response.response;
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
                         && let Some(path) = current_image
                         && commit_draft(state, &mut tags, path, current_tags)
@@ -574,18 +598,52 @@ pub fn show(
                                         ui.ctx().request_repaint();
                                     }
                                 }
+                                let mut chip_rects: Vec<egui::Rect> = Vec::new();
+                                let mut start_edit: Option<String> = None;
+                                // Some(Some(..)) = commit rename, Some(None) = cancel.
+                                let mut finish_edit: Option<Option<(String, String)>> = None;
                                 ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
                                     for tag in &tags {
+                                        // A chip being renamed (right-click) shows as
+                                        // an inline edit box in its place.
+                                        if state.edit_tag.as_ref().is_some_and(|(orig, _)| orig == tag) {
+                                            let resp = {
+                                                let (_, buf) = state.edit_tag.as_mut().unwrap();
+                                                edit_chip(ui, buf)
+                                            };
+                                            chip_rects.push(resp.rect);
+                                            if state.edit_focus {
+                                                resp.request_focus();
+                                                state.edit_focus = false;
+                                            }
+                                            // Enter commits; Escape / clicking away
+                                            // cancels (both surrender focus).
+                                            if resp.lost_focus() {
+                                                let commit =
+                                                    ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                                let (orig, buf) = state.edit_tag.as_ref().unwrap();
+                                                finish_edit =
+                                                    Some(commit.then(|| (orig.clone(), buf.clone())));
+                                            }
+                                            continue;
+                                        }
                                         let selected = state.selected_tags.contains(tag);
                                         let flash = flash_t.filter(|_| {
                                             state.dup_flash.as_ref().is_some_and(|(set, _)| set.contains(tag))
                                         });
                                         let resp = tag_chip(ui, tag, selected, flash.map(flash_strength));
+                                        chip_rects.push(resp.rect);
                                         // Bring the already-there chip on screen as
                                         // the flash starts.
                                         if flash.is_some_and(|t| t * DUP_FLASH_SECS < 0.15) {
                                             resp.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        if resp.drag_started() {
+                                            state.drag_tag = Some(tag.clone());
+                                        }
+                                        if resp.secondary_clicked() {
+                                            start_edit = Some(tag.clone());
                                         }
                                         if resp.clicked() {
                                             if selected {
@@ -596,6 +654,61 @@ pub fn show(
                                         }
                                     }
                                 });
+                                // Order matters: finishing (e.g. focus lost to a
+                                // right-click on another chip) before starting the
+                                // next rename keeps the new edit alive.
+                                if let Some(done) = finish_edit {
+                                    state.edit_tag = None;
+                                    if let Some((orig, new)) = done {
+                                        rename_tag(state, &mut tags, &orig, new.trim(), current_image, current_tags);
+                                    }
+                                }
+                                if let Some(orig) = start_edit {
+                                    state.edit_tag = Some((orig.clone(), orig));
+                                    state.edit_focus = true;
+                                }
+
+                                // Drag-to-reorder: a floating copy of the dragged
+                                // chip follows the cursor and a caret marks the gap
+                                // it would land in; dropping there commits the new
+                                // order to the sidecar. Releasing outside the list
+                                // cancels.
+                                if let Some(dragged) = state.drag_tag.clone() {
+                                    match tags.iter().position(|t| *t == dragged) {
+                                        // The tag vanished under us (removed, or the
+                                        // list changed) — abandon the drag.
+                                        None => state.drag_tag = None,
+                                        Some(from) => {
+                                            let pointer = ui.ctx().pointer_latest_pos();
+                                            let released =
+                                                ui.input(|i| i.pointer.any_released());
+                                            if let Some(pos) = pointer {
+                                                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                                let to = insertion_index(&chip_rects, pos);
+                                                drop_caret(ui, &chip_rects, to);
+                                                floating_chip(ui.ctx(), &dragged, pos);
+                                                if released {
+                                                    state.drag_tag = None;
+                                                    let inside = ui.clip_rect().contains(pos);
+                                                    // Removing shifts everything after
+                                                    // `from` left by one.
+                                                    let to = if to > from { to - 1 } else { to };
+                                                    if inside
+                                                        && to != from
+                                                        && let Some(img) = current_image
+                                                    {
+                                                        let t = tags.remove(from);
+                                                        tags.insert(to, t);
+                                                        save(img, &tags, current_tags);
+                                                        set_change_status(state, "Moved", 1, tags.len());
+                                                    }
+                                                }
+                                            } else if released {
+                                                state.drag_tag = None;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         });
                 });
@@ -622,7 +735,8 @@ fn tag_chip(ui: &mut egui::Ui, text: &str, selected: bool, flash: Option<f32>) -
     let font = egui::FontId::proportional(13.0);
     let pad = egui::vec2(10.0, 5.0);
     let galley = ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), font, Color32::PLACEHOLDER));
-    let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::click());
+    // click = toggle selection; drag = reorder (handled by the caller).
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::click_and_drag());
     if ui.is_rect_visible(rect) {
         let (mut fill, mut ink) = if selected {
             (selection_outline(), Color32::WHITE)
@@ -644,6 +758,116 @@ fn tag_chip(ui: &mut egui::Ui, text: &str, selected: bool, flash: Option<f32>) -
         ui.painter().galley(rect.min + pad, galley, ink);
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The in-place rename box a chip turns into on right-click: a chip-shaped
+/// frame (selection-coloured edge) around a bare single-line editor sized to
+/// its text.
+fn edit_chip(ui: &mut egui::Ui, buf: &mut String) -> egui::Response {
+    let font = egui::FontId::proportional(13.0);
+    let w = ui
+        .painter()
+        .layout_no_wrap(buf.clone(), font.clone(), Color32::PLACEHOLDER)
+        .size()
+        .x
+        .max(40.0)
+        + 8.0;
+    egui::Frame::new()
+        .fill(FIELD())
+        .stroke(egui::Stroke::new(1.0, selection_outline()))
+        .corner_radius(CornerRadius::same(13))
+        .inner_margin(Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(buf)
+                    .frame(egui::Frame::NONE)
+                    .margin(Margin::ZERO)
+                    .font(font)
+                    .desired_width(w),
+            )
+        })
+        .inner
+}
+
+/// Commit a chip rename: swap `orig` for `new` in place (same position), carry
+/// any selection over, and save. Renaming onto a different existing tag
+/// flashes that chip amber instead (the same "already there" cue as re-adding
+/// a duplicate); an empty edit or no-op is a cancel. Case-only changes are
+/// allowed through the duplicate check.
+fn rename_tag(
+    state: &mut TagManagerState,
+    tags: &mut [String],
+    orig: &str,
+    new: &str,
+    current_image: Option<&Path>,
+    current_tags: &mut String,
+) {
+    let Some(i) = tags.iter().position(|t| t == orig) else { return };
+    if new.is_empty() || new == orig {
+        return;
+    }
+    if let Some(j) = tags.iter().position(|t| t.eq_ignore_ascii_case(new))
+        && j != i
+    {
+        state.dup_flash = Some((std::iter::once(tags[j].clone()).collect(), Instant::now()));
+        return;
+    }
+    tags[i] = new.to_string();
+    if state.selected_tags.remove(orig) {
+        state.selected_tags.insert(new.to_string());
+    }
+    if let Some(img) = current_image {
+        save(img, tags, current_tags);
+        set_change_status(state, "Renamed", 1, tags.len());
+    }
+}
+
+/// Where a chip dropped at `pos` should land in the laid-out list: the index
+/// of the first chip in the pointer's row whose centre is past the pointer —
+/// or, past every chip, the end of the list. Chips wrap in rows, so anything
+/// in a row above counts as before the pointer.
+fn insertion_index(rects: &[egui::Rect], pos: egui::Pos2) -> usize {
+    for (i, r) in rects.iter().enumerate() {
+        if pos.y < r.top() {
+            return i; // the pointer's row ended (or it's above the first row)
+        }
+        if pos.y <= r.bottom() && pos.x < r.center().x {
+            return i;
+        }
+    }
+    rects.len()
+}
+
+/// Vertical caret marking the gap a dragged chip would drop into: before chip
+/// `idx`, or after the last chip when `idx` is one past the end.
+fn drop_caret(ui: &egui::Ui, rects: &[egui::Rect], idx: usize) {
+    let (x, top, bottom) = if let Some(r) = rects.get(idx) {
+        (r.left() - 4.0, r.top(), r.bottom())
+    } else if let Some(r) = rects.last() {
+        (r.right() + 4.0, r.top(), r.bottom())
+    } else {
+        return;
+    };
+    ui.painter().line_segment(
+        [egui::pos2(x, top), egui::pos2(x, bottom)],
+        egui::Stroke::new(2.0, selection_outline()),
+    );
+}
+
+/// The dragged chip's stand-in: a selection-coloured copy of the pill floating
+/// under the cursor, on the tooltip layer so it rides above the list.
+fn floating_chip(ctx: &egui::Context, text: &str, pos: egui::Pos2) {
+    let font = egui::FontId::proportional(13.0);
+    let pad = egui::vec2(10.0, 5.0);
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("tag_drag_ghost"),
+    ));
+    let galley = painter.layout_no_wrap(text.to_string(), font, Color32::PLACEHOLDER);
+    let rect = egui::Rect::from_center_size(pos, galley.size() + pad * 2.0);
+    let radius = CornerRadius::same((rect.height() / 2.0) as u8);
+    painter.rect_filled(rect, radius, selection_outline().gamma_multiply(0.85));
+    painter.galley(rect.min + pad, galley, Color32::WHITE);
 }
 
 /// Linear blend from `a` to `b` by `k` (0..1).

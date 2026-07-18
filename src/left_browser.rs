@@ -309,9 +309,13 @@ fn draw_tile(
 
     if crate::is_video(path) {
         // Prefer a live preview frame (the "Video thumbnail play" setting); else
-        // the decoded poster; else a placeholder tile with a video glyph.
-        let live = video_previews.frame(path, ui.ctx());
-        match live.or_else(|| video_thumbs.request(path, ui.ctx())) {
+        // the decoded poster; else a placeholder tile with a video glyph. The
+        // poster is still requested every frame: it feeds the tile's aspect
+        // ratio, and skipping it while a preview plays would leave finished
+        // captures unabsorbed — tiles then keep the placeholder size until
+        // scrolled back in.
+        let poster = video_thumbs.request(path, ui.ctx());
+        match video_previews.frame(path, ui.ctx()).or(poster) {
             Some(tex) => {
                 egui::Image::from_texture(&tex)
                     .corner_radius(radius)

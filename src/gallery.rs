@@ -349,9 +349,12 @@ fn tile(
     let radius = CornerRadius::same(CORNER);
     if crate::is_video(path) {
         // A live preview frame (the "Video thumbnail play" setting) wins over the
-        // static poster when one is playing for this tile.
-        let live = video_previews.frame(path, ui.ctx());
-        match live.or_else(|| video_thumbs.request(path, ui.ctx())) {
+        // static poster when one is playing for this tile. The poster is still
+        // requested every frame: it feeds the tile's aspect ratio, and skipping
+        // it while a preview plays would leave finished captures unabsorbed —
+        // tiles then sit at the square placeholder size until scrolled back in.
+        let poster = video_thumbs.request(path, ui.ctx());
+        match video_previews.frame(path, ui.ctx()).or(poster) {
             Some(tex) => {
                 egui::Image::from_texture(&tex).corner_radius(radius).paint_at(ui, rect);
             }

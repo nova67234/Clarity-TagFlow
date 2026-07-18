@@ -504,17 +504,24 @@ mod backend {
     impl VideoPlayer {
         /// Start normal playback (audio on; loops per the user's Settings).
         pub fn start(path: &Path, ctx: &egui::Context) -> Option<VideoPlayer> {
-            Self::start_with(path, ctx, loop_enabled(), false)
+            Self::start_with(path, ctx, loop_enabled(), false, None)
         }
 
         /// Start a muted thumbnail preview (no audio, loops so a short clip keeps
         /// moving instead of freezing) — used by [`VideoPreviews`] for the
-        /// auto-playing tiles.
+        /// auto-playing tiles. Only the first [`PREVIEW_SECS`] seconds play; the
+        /// loop restarts there, so a long video never decodes past that point.
         pub fn start_preview(path: &Path, ctx: &egui::Context) -> Option<VideoPlayer> {
-            Self::start_with(path, ctx, true, true)
+            Self::start_with(path, ctx, true, true, Some(PREVIEW_SECS))
         }
 
-        fn start_with(path: &Path, ctx: &egui::Context, looping: bool, muted: bool) -> Option<VideoPlayer> {
+        fn start_with(
+            path: &Path,
+            ctx: &egui::Context,
+            looping: bool,
+            muted: bool,
+            stop_secs: Option<u64>,
+        ) -> Option<VideoPlayer> {
             let instance = vlc::Instance::new()?;
             let media = open_media(&instance, path)?;
             // Loop the clip when requested. A large repeat count stands in for
@@ -522,6 +529,15 @@ mod backend {
             if looping {
                 unsafe {
                     let opt = std::ffi::CString::new(":input-repeat=65535").unwrap();
+                    sys::libvlc_media_add_option(media.raw, opt.as_ptr());
+                }
+            }
+            // End the input early when capped: with looping on, each repeat then
+            // plays only the first `stop_secs` seconds (clips shorter than the
+            // cap just loop at their natural end as before).
+            if let Some(s) = stop_secs {
+                unsafe {
+                    let opt = std::ffi::CString::new(format!(":stop-time={s}")).unwrap();
                     sys::libvlc_media_add_option(media.raw, opt.as_ptr());
                 }
             }
@@ -804,8 +820,9 @@ mod backend {
 
     /// Plays muted, looping previews on visible video tiles (the "Video thumbnail
     /// play" setting). Bounded in count so a folder of clips can't spin up dozens
-    /// of decoders. A preview keeps playing the whole time its tile is on screen
-    /// and is stopped as soon as the tile scrolls out of view.
+    /// of decoders. A preview loops the first [`PREVIEW_SECS`] seconds of the
+    /// clip the whole time its tile is on screen and is stopped as soon as the
+    /// tile scrolls out of view.
     pub struct VideoPreviews {
         players: HashMap<PathBuf, VideoPlayer>,
         /// Paths a tile asked to preview this frame (mark-and-sweep for offscreen).
@@ -815,6 +832,10 @@ mod backend {
 
     /// Most previews decoding at once (each is a full libVLC pipeline).
     const MAX_PREVIEWS: usize = 6;
+
+    /// How much of a clip a preview plays before looping back to the start —
+    /// tiles tease the opening seconds instead of playing a long video through.
+    const PREVIEW_SECS: u64 = 15;
 
     impl VideoPreviews {
         pub fn new() -> Self {
