@@ -66,9 +66,10 @@ pub fn show(
                 let card_top = ui.min_rect().top() - 12.0;
 
                 // --- Filter bar: search fills the row, gear embedded inside ---
+                // Same darker PANEL + faint-edge box style as the rest of the app.
                 let search_frame = egui::Frame::default()
-                    .fill(ui.visuals().extreme_bg_color)
-                    .stroke(ui.visuals().widgets.inactive.bg_stroke)
+                    .fill(PANEL())
+                    .stroke(egui::Stroke::new(1.0, EDGE()))
                     .corner_radius(CornerRadius::same(16))
                     .inner_margin(Margin::symmetric(10, 3));
 

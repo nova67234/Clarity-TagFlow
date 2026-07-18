@@ -688,6 +688,10 @@ pub struct FolderPopup {
     /// The folder button's bottom-left, captured on click — the popup drops
     /// down from there.
     pub anchor: Option<egui::Pos2>,
+    /// True on the frame the popup was opened, so the opening click on the
+    /// folder button isn't counted as a click outside (which would close it
+    /// immediately).
+    pub just_opened: bool,
 }
 
 /// What the folder popup asked the app to do this frame.
@@ -730,7 +734,7 @@ pub fn folder_popup(
     let y = anchor.y.min(screen.bottom() - 280.0).max(screen.top() + 10.0);
 
     use crate::PopupPlacement;
-    egui::Window::new("Open Folder")
+    let win = egui::Window::new("Open Folder")
         .id(egui::Id::new("folder_popup"))
         .title_bar(false) // custom header inside (matches Find Issues)
         .collapsible(false)
@@ -743,7 +747,8 @@ pub fn folder_popup(
             // Width pinned; the height hugs the content.
             ui.set_width(win_w - 36.0);
 
-            // Title row: folder icon + "Open Folder" + close.
+            // Title row: folder icon + "Open Folder" (no close button — click
+            // anywhere outside the popup, or press Escape, to dismiss).
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.add(
@@ -752,25 +757,6 @@ pub fn folder_popup(
                         .tint(icon_tint(TEXT())),
                 );
                 ui.heading(egui::RichText::new("Open Folder").color(TEXT()).strong().size(17.0));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // click_and_drag so a click that slips a pixel is swallowed
-                    // by the button instead of dragging the popup.
-                    if ui
-                        .add(
-                            egui::Button::image(
-                                egui::Image::new(egui::include_image!("../icons/close.svg"))
-                                    .fit_to_exact_size(egui::vec2(24.0, 24.0))
-                                    .tint(icon_tint(TEXT())),
-                            )
-                            .frame(false)
-                            .sense(egui::Sense::click_and_drag()),
-                        )
-                        .on_hover_text("Close")
-                        .clicked()
-                    {
-                        close = true;
-                    }
-                });
             });
             ui.add_space(10.0);
 
@@ -835,6 +821,17 @@ pub fn folder_popup(
                 close = true;
             }
         });
+
+    // Click anywhere outside the popup to dismiss it, like a native menu —
+    // except on the frame it opened, when the folder-button click that spawned
+    // it would register as "outside" and close it straight away.
+    if state.just_opened {
+        state.just_opened = false;
+    } else if let Some(win) = &win
+        && win.response.clicked_elsewhere()
+    {
+        close = true;
+    }
 
     if close {
         state.open = false;

@@ -651,6 +651,9 @@ fn tags_box_fill(ui: &mut egui::Ui, popup: &mut DetailPopup) {
     egui::Frame::new()
         .fill(box_fill)
         .corner_radius(egui::CornerRadius::same(22))
+        // Faint edge so the PANEL-on-PANEL box still reads (same as the right
+        // panel's tag box).
+        .stroke(egui::Stroke::new(1.0, EDGE()))
         .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
             ui.set_height(inner_h);

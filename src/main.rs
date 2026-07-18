@@ -184,6 +184,8 @@ fn main() -> eframe::Result {
                     app.settings = saved;
                     // Restore the last-used AI tagger model into the Tag Manager.
                     app.tag_manager.ai_model = app.settings.last_ai_model.clone();
+                    // Restore the Tag Manager's gear-popup preferences.
+                    app.tag_manager.settings = app.settings.tag_manager.clone();
                 }
             // Apply the saved colour theme before the first paint so a Light-mode
             // user doesn't see a dark flash on launch. The Glass config (incl.
@@ -1466,6 +1468,7 @@ impl eframe::App for ViewerApp {
                     self.ftp.browser_open = !self.ftp.browser_open;
                 } else {
                     self.folder_popup.open = !self.folder_popup.open;
+                    self.folder_popup.just_opened = self.folder_popup.open;
                     self.folder_popup.anchor = Some(pos + egui::vec2(0.0, 8.0));
                 }
             }
@@ -1608,6 +1611,11 @@ impl eframe::App for ViewerApp {
         // Remember the chosen AI model so it's restored next launch.
         if self.settings.last_ai_model != self.tag_manager.ai_model {
             self.settings.last_ai_model = self.tag_manager.ai_model.clone();
+        }
+        // Mirror any Tag Manager settings edits into the persisted Settings so
+        // they auto-save (the gear popup has no Save button).
+        if self.settings.tag_manager != self.tag_manager.settings {
+            self.settings.tag_manager = self.tag_manager.settings.clone();
         }
 
         match action {

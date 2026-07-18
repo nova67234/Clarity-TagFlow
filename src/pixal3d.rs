@@ -141,7 +141,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&
 
     // --- Header bar (title + status + orb), mirroring the Tag Manager. ---
     egui::Frame::new()
-        .fill(FIELD())
+        .fill(PANEL())
+        .stroke(egui::Stroke::new(1.0, EDGE()))
         .corner_radius(CornerRadius::same(18))
         .inner_margin(Margin::symmetric(12, 6))
         .show(ui, |ui| {

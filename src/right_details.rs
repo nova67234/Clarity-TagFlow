@@ -823,6 +823,9 @@ pub fn show(
                                 egui::Frame::new()
                                     .fill(box_fill)
                                     .corner_radius(radius)
+                                    // Faint edge so the PANEL-on-PANEL box still
+                                    // reads (same as the Tag Manager's boxes).
+                                    .stroke(egui::Stroke::new(1.0, EDGE()))
                                     .inner_margin(egui::Margin::same(12))
                                     .show(ui, |ui| {
                                         ui.set_height(inner_h); // fixed — never grows with text
@@ -971,18 +974,12 @@ pub(crate) fn image_details_section(ui: &mut egui::Ui, meta: &ImageMeta) {
     ui.add_space(8.0);
 
     let frame = egui::Frame::new()
-        .fill(FIELD())
+        .fill(PANEL())
         .corner_radius(egui::CornerRadius::same(22)) // match the tag box
         .inner_margin(egui::Margin::symmetric(16, 12))
-        // On the dark themes, borrow the same soft light edge the tag box gets
-        // from egui's default field border (a gentle highlight). On the light
-        // themes that default stroke is a plainly visible grey outline — drop it
-        // there; the field tint separates the card on its own.
-        .stroke(if crate::theme::is_light() {
-            egui::Stroke::NONE
-        } else {
-            ui.visuals().widgets.noninteractive.bg_stroke
-        });
+        // Faint edge so the PANEL-on-PANEL box still reads (same as the tag box
+        // and the Tag Manager's boxes).
+        .stroke(egui::Stroke::new(1.0, EDGE()));
 
     frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -1545,7 +1542,7 @@ pub(crate) fn flash_fill(
 /// accent just after entering edit mode. Shared by the right panel and the
 /// gallery detail popup.
 pub(crate) fn edit_flash_fill(ui: &egui::Ui, start: Option<Instant>) -> egui::Color32 {
-    let mut fill = FIELD();
+    let mut fill = PANEL();
     if let Some(start) = start {
         let elapsed = start.elapsed().as_secs_f32();
         if elapsed < EDIT_FLASH_SECS {
@@ -1553,7 +1550,7 @@ pub(crate) fn edit_flash_fill(ui: &egui::Ui, start: Option<Instant>) -> egui::Co
             let envelope = 1.0 - t;                     // overall fade-out
             let osc = (t * std::f32::consts::PI * 2.0).sin().abs(); // two pulses
             let intensity = (envelope * osc).clamp(0.0, 1.0);
-            fill = lerp_color(FIELD(), ACCENT1(), intensity * 0.55);
+            fill = lerp_color(PANEL(), ACCENT1(), intensity * 0.55);
             ui.ctx().request_repaint(); // keep the animation smooth
         }
     }

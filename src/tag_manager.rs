@@ -11,6 +11,13 @@ use egui::{CornerRadius, Margin, Color32};
 
 use crate::theme::*;
 
+/// Amber for duplicate-tag feedback: the draft text while it matches an
+/// existing tag, and the chip flash after trying to re-add one.
+const DUP_TEXT_AMBER: Color32 = Color32::from_rgb(216, 162, 36);
+const DUP_FLASH_AMBER: Color32 = Color32::from_rgb(240, 198, 60);
+/// How long the duplicate chip flash runs (two pulses fading out).
+const DUP_FLASH_SECS: f32 = 1.6;
+
 /// UI state for the tag manager.
 pub struct TagManagerState {
     /// Buffer for the "add a tag" input.
@@ -41,7 +48,8 @@ pub struct TagManagerState {
     /// The "living" 3D particle orb shown in the AI bar.
     pub orb: crate::ai_orb::AiOrb,
 
-    /// The "Get Models" downloader window (AI Model Manager).
+    /// The model downloader (AI Model Manager) — the settings popup's
+    /// Get Models tab; ticked every frame so downloads finish regardless.
     pub models: crate::ai_models::ModelManager,
 
     /// The currently loaded ONNX tagger, cached between Tag clicks, plus the
@@ -55,6 +63,10 @@ pub struct TagManagerState {
     /// A transient two-stage status flash after a manual add/remove
     /// (count → "Saved" → back to the loaded-count status).
     pub flash: Option<TagFlash>,
+
+    /// Chips flashing amber because the user tried to re-add them (already
+    /// present), with the flash start time.
+    pub dup_flash: Option<(HashSet<String>, Instant)>,
 }
 
 /// A timed status flash: shows `label` (e.g. "Added 1 tag · 7 total"), then
@@ -96,6 +108,7 @@ impl Default for TagManagerState {
             tagger_folder: String::new(),
             tag_job: None,
             flash: None,
+            dup_flash: None,
         }
     }
 }
@@ -110,6 +123,23 @@ pub fn show(
     all_images: &[PathBuf],
 ) {
     let mut tags = parse_tags(current_tags);
+
+    // Poll model downloads every frame so they finalize and their progress
+    // bars animate even while the settings popup (Get Models tab) is closed.
+    state.models.tick(ui.ctx());
+
+    // Ctrl+A (⌘A on macOS) selects every tag. Scoped to the pointer being over
+    // the Tag Manager, and skipped while any text field owns the keyboard so
+    // select-all inside the input box keeps working.
+    if !tags.is_empty()
+        && ui.ui_contains_pointer()
+        && !ui.ctx().egui_wants_keyboard_input()
+        && ui.input_mut(|i| {
+            i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::A))
+        })
+    {
+        state.selected_tags = tags.iter().cloned().collect();
+    }
 
     // Auto-select the first installed model when nothing valid is chosen (e.g.
     // the "Select AI…" placeholder). `find` is a cheap in-memory catalog lookup,
@@ -127,6 +157,8 @@ pub fn show(
     if current_image != state.status_image.as_deref() {
         state.status_image = current_image.map(Path::to_path_buf);
         state.flash = None;
+        // A selection only makes sense for the image it was made on.
+        state.selected_tags.clear();
         set_loaded_status(state, current_image, &tags);
     }
 
@@ -211,9 +243,11 @@ pub fn show(
         .show_separator_line(false)
         .frame(egui::Frame::NONE)
         .show_inside(ui, |ui| {
-            // Header bar
+            // Header bar — same darker PANEL fill as the tag list box below,
+            // with the same faint edge so it still reads as a bar.
             egui::Frame::new()
-                .fill(FIELD())
+                .fill(PANEL())
+                .stroke(egui::Stroke::new(1.0, EDGE()))
                 .corner_radius(CornerRadius::same(18))
                 .inner_margin(Margin::symmetric(12, 6))
                 .show(ui, |ui| {
@@ -257,40 +291,23 @@ pub fn show(
 
             ui.add_space(10.0);
 
-            // Utility row: Get Models + settings gear
+            // Header row: no section title (the bar below is self-explanatory),
+            // just the settings gear on the right (Get Models lives inside it).
             ui.horizontal(|ui| {
-                let get_models_icon = egui::Image::new(egui::include_image!("../icons/extension.svg"))
-                    .tint(Color32::WHITE)
-                    .fit_to_exact_size(egui::vec2(16.0, 16.0));
-                let get_models = ui.add_sized(
-                    egui::vec2(110.0, 30.0),
-                    egui::Button::image_and_text(
-                        get_models_icon,
-                        egui::RichText::new("Get Models").color(Color32::WHITE),
-                    )
-                    // Same dark grey as the Text to Image "Setup Requirements"
-                    // button, so the white label reads in every theme (the light
-                    // Glass default fill is too pale for white text).
-                    .fill(Color32::from_rgb(96, 99, 105))
-                    .corner_radius(CornerRadius::same(12)),
-                );
-                if get_models.clicked() {
-                    state.models.toggle(); // toggle the AI Model Manager dropdown
-                }
-                // Dropdown drops down under the Get Models button.
-                state.models.show(&get_models);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let gear = egui::include_image!("../icons/settings.svg");
-                    let gear_resp = crate::svg_button(ui, gear, "Settings", 20.0, MUTED());
+                    let gear_resp = crate::svg_button(ui, gear, "Settings", 18.0, MUTED());
                     if gear_resp.clicked() {
                         state.settings.open = !state.settings.open;
                     }
-                    // Settings popup drops down under the gear icon.
-                    crate::tag_manager_settings::show(&gear_resp, &mut state.settings);
+                    // Settings popup drops down under the gear icon; its
+                    // Get Models tab renders (and starts downloads on) the
+                    // model manager.
+                    crate::tag_manager_settings::show(&gear_resp, &mut state.settings, &mut state.models);
                 });
             });
 
-            ui.add_space(10.0);
+            ui.add_space(6.0);
 
             // AI selection bar — model dropdown + Tag button.
             egui::Frame::new()
@@ -322,11 +339,23 @@ pub fn show(
                                     ui.selectable_value(&mut state.ai_model, "Select AI...".to_string(), "Select AI...");
                                     let installed = crate::ai_models::installed_models();
                                     if installed.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new("No models — click Get Models")
-                                                .color(MUTED())
-                                                .italics(),
-                                        );
+                                        // "No models — ⚙ → Get Models", with real
+                                        // icons instead of glyphs.
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            let muted = |t: &str| {
+                                                egui::RichText::new(t).color(MUTED()).italics()
+                                            };
+                                            let icon = |src: egui::ImageSource<'static>| {
+                                                egui::Image::new(src)
+                                                    .tint(MUTED())
+                                                    .fit_to_exact_size(egui::vec2(13.0, 13.0))
+                                            };
+                                            ui.label(muted("No models —"));
+                                            ui.add(icon(egui::include_image!("../icons/settings.svg")));
+                                            ui.add(icon(egui::include_image!("../icons/arrow_right_alt.svg")));
+                                            ui.label(muted("Get Models"));
+                                        });
                                     } else {
                                         for m in installed {
                                             ui.selectable_value(&mut state.ai_model, m.name().to_string(), m.name());
@@ -348,7 +377,7 @@ pub fn show(
         .show_inside(ui, |ui| {
             ui.add_space(12.0);
 
-            ui.label(egui::RichText::new("Add Tags (manual):").color(TEXT()).strong().size(14.0));
+            section_label(ui, "Add Tags");
             ui.add_space(6.0);
             egui::Frame::new()
                 .fill(PANEL())
@@ -358,36 +387,44 @@ pub fn show(
                 // poking out the top edge.
                 .inner_margin(Margin::symmetric(8, 6))
                 .show(ui, |ui| {
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut state.draft)
-                            .frame(egui::Frame::NONE)
-                            .margin(Margin::ZERO)
-                            .desired_width(f32::INFINITY),
-                    );
+                    // Amber text while any typed segment (comma-separated, so
+                    // multi-word tags match whole) is already in the list.
+                    let draft_is_dup = state.draft.split(',').any(|raw| {
+                        let t = raw.trim();
+                        !t.is_empty() && tags.iter().any(|e| e.eq_ignore_ascii_case(t))
+                    });
+                    let mut edit = egui::TextEdit::singleline(&mut state.draft)
+                        .frame(egui::Frame::NONE)
+                        .margin(Margin::ZERO)
+                        .hint_text(
+                            egui::RichText::new("Type a tag and press Enter — commas add several")
+                                .color(MUTED()),
+                        )
+                        .desired_width(f32::INFINITY);
+                    if draft_is_dup {
+                        edit = edit.text_color(DUP_TEXT_AMBER);
+                    }
+                    let resp = ui.add(edit);
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                        && let Some(path) = current_image {
-                            let before = tags.len();
-                            if add_tag(&mut tags, &state.draft) {
-                                let added = tags.len() - before;
-                                save(path, &tags, current_tags);
-                                state.draft.clear();
-                                resp.request_focus();
-                                set_change_status(state, "Added", added, tags.len());
-                            }
-                        }
+                        && let Some(path) = current_image
+                        && commit_draft(state, &mut tags, path, current_tags)
+                    {
+                        resp.request_focus();
+                    }
                 });
 
             ui.add_space(10.0);
 
-            // Three equal buttons spanning the panel width, matching the right
-            // details panel's action-button row.
+            // Two equal batch-action buttons spanning the panel width (single
+            // adds live in the input box above — Enter or the inline +).
             ui.horizontal(|ui| {
                 let gap = 8.0;
                 ui.spacing_mut().item_spacing.x = gap;
-                let btn_w = (ui.available_width() - gap * 2.0) / 3.0;
+                let btn_w = (ui.available_width() - gap) / 2.0;
                 let size = egui::vec2(btn_w, 35.0);
 
                 let r = CornerRadius::same(12);
+                ui.visuals_mut().widgets.noninteractive.corner_radius = r;
                 ui.visuals_mut().widgets.inactive.corner_radius = r;
                 ui.visuals_mut().widgets.hovered.corner_radius = r;
                 ui.visuals_mut().widgets.active.corner_radius = r;
@@ -395,45 +432,36 @@ pub fn show(
                 // Same dark grey as the Text to Image "Setup Requirements" button,
                 // so the white labels read in every theme.
                 let action_bg = Color32::from_rgb(96, 99, 105);
+                let has_draft = !state.draft.trim().is_empty();
 
+                // Add All — writes to every loaded file, so it asks first.
+                let all_hint = if has_draft { "No images loaded" } else { "Type a tag first" };
+                let all_btn = egui::Button::new(egui::RichText::new("Add All").color(Color32::WHITE)).fill(action_bg);
                 if ui
-                    .add_sized(size, egui::Button::new(egui::RichText::new("Add").color(Color32::WHITE)).fill(action_bg))
-                    .clicked()
-                    && let Some(path) = current_image {
-                        let before = tags.len();
-                        if add_tag(&mut tags, &state.draft) {
-                            let added = tags.len() - before;
-                            save(path, &tags, current_tags);
-                            state.draft.clear();
-                            set_change_status(state, "Added", added, tags.len());
-                        }
-                    }
-
-                if ui
-                    .add_sized(size, egui::Button::new(egui::RichText::new("Add All").color(Color32::WHITE)).fill(action_bg))
+                    .add_enabled_ui(has_draft && !all_images.is_empty(), |ui| ui.add_sized(size, all_btn))
+                    .inner
                     .on_hover_text("Add these tags to every loaded file")
+                    .on_disabled_hover_text(all_hint)
                     .clicked()
                 {
-                    if state.draft.trim().is_empty() {
-                        state.status_msg = "Type a tag first".to_string();
-                        state.status_is_error = true;
-                    } else if all_images.is_empty() {
-                        state.status_msg = "No images loaded".to_string();
-                        state.status_is_error = true;
-                    } else {
-                        state.confirm_add_all = true; // ask before touching many files
-                    }
+                    state.confirm_add_all = true; // ask before touching many files
                 }
 
+                // Remove — the label carries the selection count.
+                let sel_count = tags.iter().filter(|t| state.selected_tags.contains(t.as_str())).count();
+                let remove_label = if sel_count > 0 { format!("Remove ({sel_count})") } else { "Remove".to_string() };
                 let danger_bg = egui::Color32::from_rgb(180, 40, 40);
-                let remove_btn = egui::Button::new(egui::RichText::new("Remove").color(Color32::WHITE)).fill(danger_bg);
+                let remove_btn = egui::Button::new(egui::RichText::new(remove_label).color(Color32::WHITE)).fill(danger_bg);
                 // Last button takes the remaining width so float-division rounding
                 // slack is absorbed here instead of overflowing the panel and
                 // clipping the button against the frame's right edge.
                 let remove_size = egui::vec2(ui.available_width(), size.y);
-                if ui.add_sized(remove_size, remove_btn).clicked()
+                if ui
+                    .add_enabled_ui(sel_count > 0, |ui| ui.add_sized(remove_size, remove_btn))
+                    .inner
+                    .on_disabled_hover_text("Click tags in the list to select them")
+                    .clicked()
                     && let Some(img) = current_image
-                    && !state.selected_tags.is_empty()
                 {
                     let before = tags.len();
                     tags.retain(|t| !state.selected_tags.contains(t));
@@ -478,8 +506,10 @@ pub fn show(
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show_inside(ui, |ui| {
+            let sel_count = tags.iter().filter(|t| state.selected_tags.contains(t.as_str())).count();
+            // No section title here — the header status already reports the
+            // loaded-tag count; this row only carries the right-aligned tools.
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Current Tags:").color(TEXT()).strong().size(14.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let copy_icon = egui::include_image!("../icons/copy.svg");
                     if crate::svg_button(ui, copy_icon, "Copy", 16.0, MUTED()).clicked() {
@@ -488,56 +518,137 @@ pub fn show(
                         state.status_msg = "Copied to clipboard".to_string();
                         state.status_is_error = false;
                     }
+                    // While tags are selected: a live count plus a Clear shortcut.
+                    if sel_count > 0 {
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("Clear").color(MUTED()).size(12.0)).frame(false))
+                            .clicked()
+                        {
+                            state.selected_tags.clear();
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("{sel_count} selected"))
+                                .color(selection_outline())
+                                .size(12.0),
+                        );
+                    }
                 });
             });
             ui.add_space(6.0);
 
-            // Tag list box: 22 rounded corners, fills the remaining vertical space.
+            // Tag list box: 22 rounded corners, fills the remaining vertical
+            // space. Tags render as wrapping pill chips; click one to select it.
             let list_h = ui.available_height().max(120.0);
             egui::Frame::new()
                 .fill(PANEL())
                 .corner_radius(CornerRadius::same(22))
                 .stroke(egui::Stroke::new(1.0, EDGE()))
-                .inner_margin(Margin::same(6))
+                .inner_margin(Margin::same(10))
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
-                        .max_height(list_h - 12.0)
+                        .max_height(list_h - 20.0)
                         .show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
                             if tags.is_empty() {
-                                ui.add_space(16.0);
-                                ui.vertical_centered(|ui| ui.label(egui::RichText::new("No tags").color(MUTED())));
+                                ui.add_space(24.0);
+                                ui.vertical_centered(|ui| {
+                                    ui.label(egui::RichText::new("No tags yet").color(TEXT()).strong());
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        egui::RichText::new("Add one below, or click Tag to auto-tag with AI")
+                                            .color(MUTED())
+                                            .size(12.0),
+                                    );
+                                });
                             } else {
-                                for tag in &tags {
-                                    let is_selected = state.selected_tags.contains(tag);
-                                    let bg_color = if is_selected {
-                                        ACCENT1().gamma_multiply(0.4)
+                                // Expire the duplicate-chip flash; keep repainting
+                                // while it animates.
+                                let mut flash_t = None; // 0..1 through the flash
+                                if let Some((_, start)) = &state.dup_flash {
+                                    let t = start.elapsed().as_secs_f32() / DUP_FLASH_SECS;
+                                    if t >= 1.0 {
+                                        state.dup_flash = None;
                                     } else {
-                                        Color32::TRANSPARENT
-                                    };
-                                    let resp = egui::Frame::new()
-                                        .fill(bg_color)
-                                        .corner_radius(CornerRadius::same(8))
-                                        .inner_margin(Margin::symmetric(10, 6))
-                                        .show(ui, |ui| {
-                                            ui.set_width(ui.available_width());
-                                            ui.label(egui::RichText::new(tag).color(TEXT()).size(13.0))
-                                        })
-                                        .response;
-                                    let interact = ui.interact(resp.rect, ui.id().with(tag), egui::Sense::click());
-                                    if interact.clicked() {
-                                        if is_selected {
-                                            state.selected_tags.remove(tag);
-                                        } else {
-                                            state.selected_tags.insert(tag.clone());
-                                        }
+                                        flash_t = Some(t);
+                                        ui.ctx().request_repaint();
                                     }
                                 }
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                                    for tag in &tags {
+                                        let selected = state.selected_tags.contains(tag);
+                                        let flash = flash_t.filter(|_| {
+                                            state.dup_flash.as_ref().is_some_and(|(set, _)| set.contains(tag))
+                                        });
+                                        let resp = tag_chip(ui, tag, selected, flash.map(flash_strength));
+                                        // Bring the already-there chip on screen as
+                                        // the flash starts.
+                                        if flash.is_some_and(|t| t * DUP_FLASH_SECS < 0.15) {
+                                            resp.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        if resp.clicked() {
+                                            if selected {
+                                                state.selected_tags.remove(tag);
+                                            } else {
+                                                state.selected_tags.insert(tag.clone());
+                                            }
+                                        }
+                                    }
+                                });
                             }
                         });
                 });
         });
+}
+
+/// Muted mini-header above each panel section, matching the settings dialog's
+/// group-title style.
+fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).color(MUTED()).strong().size(12.0));
+}
+
+/// Turn flash progress (0..1) into blend strength: two amber pulses fading out.
+fn flash_strength(t: f32) -> f32 {
+    let fade = 1.0 - t;
+    let pulse = 0.6 + 0.4 * (t * std::f32::consts::TAU * 2.0).cos();
+    (fade * pulse).clamp(0.0, 1.0)
+}
+
+/// A rounded tag pill: FIELD fill (FIELD2 on hover), theme selection colour with
+/// white text while selected. `flash` (0..1) blends the chip toward amber — the
+/// "already added" pulse. Returns the click response; the caller toggles.
+fn tag_chip(ui: &mut egui::Ui, text: &str, selected: bool, flash: Option<f32>) -> egui::Response {
+    let font = egui::FontId::proportional(13.0);
+    let pad = egui::vec2(10.0, 5.0);
+    let galley = ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), font, Color32::PLACEHOLDER));
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let (mut fill, mut ink) = if selected {
+            (selection_outline(), Color32::WHITE)
+        } else if resp.hovered() {
+            (FIELD2(), TEXT())
+        } else {
+            (FIELD(), TEXT())
+        };
+        if let Some(k) = flash {
+            fill = blend(fill, DUP_FLASH_AMBER, k);
+            // Dark ink at peak so the label stays readable on amber.
+            ink = blend(ink, Color32::from_rgb(64, 48, 12), k);
+        }
+        let radius = CornerRadius::same((rect.height() / 2.0) as u8);
+        ui.painter().rect_filled(rect, radius, fill);
+        if !selected {
+            ui.painter().rect_stroke(rect, radius, egui::Stroke::new(1.0, EDGE()), egui::StrokeKind::Inside);
+        }
+        ui.painter().galley(rect.min + pad, galley, ink);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Linear blend from `a` to `b` by `k` (0..1).
+fn blend(a: Color32, b: Color32, k: f32) -> Color32 {
+    Color32::from(egui::Rgba::from(a) * (1.0 - k) + egui::Rgba::from(b) * k)
 }
 
 /// Begin the two-stage status flash after a manual add/remove. The flash shows
@@ -589,7 +700,7 @@ fn start_tag_job(state: &mut TagManagerState, current_image: Option<&Path>) {
         crate::tagger::resolve(info.folder(), "model.onnx"),
         crate::tagger::resolve(info.folder(), info.tags_file()),
     ) else {
-        state.status_msg = "Model not found — click 'Get Models'".to_string();
+        state.status_msg = "Model not found — Settings → Get Models".to_string();
         state.status_is_error = true;
         return;
     };
@@ -642,19 +753,57 @@ fn parse_tags(s: &str) -> Vec<String> {
     out
 }
 
-/// Add `draft` to `tags` if it's non-empty. Splits commas to support batch pasting.
-fn add_tag(tags: &mut Vec<String>, draft: &str) -> bool {
-    if draft.trim().is_empty() { return false; }
-
+/// Add `draft`'s tags (comma-split to support batch pasting). Returns whether
+/// anything was added, plus the canonical spelling of every segment that was
+/// already present (for the amber "already added" chip flash).
+fn add_tags_reporting_dups(tags: &mut Vec<String>, draft: &str) -> (bool, Vec<String>) {
     let mut changed = false;
+    let mut dups: Vec<String> = Vec::new();
     for raw in draft.split(',') {
         let t = raw.trim();
-        if !t.is_empty() && !tags.iter().any(|e| e.eq_ignore_ascii_case(t)) {
-            tags.push(t.to_string());
-            changed = true;
+        if t.is_empty() {
+            continue;
+        }
+        match tags.iter().position(|e| e.eq_ignore_ascii_case(t)) {
+            Some(i) => {
+                if !dups.contains(&tags[i]) {
+                    dups.push(tags[i].clone());
+                }
+            }
+            None => {
+                tags.push(t.to_string());
+                changed = true;
+            }
         }
     }
-    changed
+    (changed, dups)
+}
+
+/// Shared Enter / Add-button handler: add the draft's tags, save on change,
+/// and flash any chips that were already present. Returns whether the draft
+/// was consumed (something added or duplicates flagged).
+fn commit_draft(
+    state: &mut TagManagerState,
+    tags: &mut Vec<String>,
+    path: &Path,
+    current_tags: &mut String,
+) -> bool {
+    let before = tags.len();
+    let (changed, dups) = add_tags_reporting_dups(tags, &state.draft);
+    if changed {
+        let added = tags.len() - before;
+        save(path, tags, current_tags);
+        set_change_status(state, "Added", added, tags.len());
+    }
+    let had_dups = !dups.is_empty();
+    if had_dups {
+        state.dup_flash = Some((dups.into_iter().collect(), Instant::now()));
+    }
+    let consumed = changed || had_dups;
+    if consumed {
+        state.draft.clear();
+    }
+    consumed
 }
 
 /// Serialize tags back to the comma-separated sidecar form.

@@ -718,7 +718,7 @@ fn video_placeholder(ui: &mut egui::Ui) {
 /// LoRA picker, so its cards match this panel's.)
 pub(crate) fn card_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
     let r = egui::Frame::new()
-        .fill(FIELD())
+        .fill(PANEL())
         .corner_radius(egui::CornerRadius::same(12))
         .inner_margin(egui::Margin::same(10))
         .stroke(egui::Stroke::new(1.0, EDGE()))

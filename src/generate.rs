@@ -1457,11 +1457,11 @@ fn spawn_lora_thumb_fetch(files: Vec<String>, ctx: egui::Context, force: bool) {
 fn lora_card(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
     let (fill, stroke) = if selected {
         (
-            lerp_color(FIELD(), ACCENT1(), 0.14),
+            lerp_color(PANEL(), ACCENT1(), 0.14),
             egui::Stroke::new(2.0, ACCENT1()),
         )
     } else {
-        (FIELD(), egui::Stroke::new(1.0, EDGE()))
+        (PANEL(), egui::Stroke::new(1.0, EDGE()))
     };
     let r = egui::Frame::new()
         .fill(fill)
@@ -2391,7 +2391,8 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
 
     // --- Header (title + status + orb), mirroring Pixal3D. ---
     egui::Frame::new()
-        .fill(FIELD())
+        .fill(PANEL())
+        .stroke(egui::Stroke::new(1.0, EDGE()))
         .corner_radius(CornerRadius::same(18))
         .inner_margin(Margin::symmetric(12, 6))
         .show(ui, |ui| {
@@ -3246,9 +3247,9 @@ fn aspect_selector(ui: &mut egui::Ui, state: &mut GenerateState) {
 /// on click.
 fn aspect_tile(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, label: &str, dims: &str, selected: bool) -> bool {
     let (fill, stroke) = if selected {
-        (lerp_color(FIELD(), ACCENT1(), 0.14), egui::Stroke::new(2.0, ACCENT1()))
+        (lerp_color(PANEL(), ACCENT1(), 0.14), egui::Stroke::new(2.0, ACCENT1()))
     } else {
-        (FIELD(), egui::Stroke::new(1.0, EDGE()))
+        (PANEL(), egui::Stroke::new(1.0, EDGE()))
     };
     let inner = egui::Frame::new()
         .fill(fill)

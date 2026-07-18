@@ -65,6 +65,9 @@ pub struct Settings {
     /// The last AI tagger model selected in the Tag Manager, restored on launch
     /// so the user doesn't have to re-pick it each run.
     pub last_ai_model: String,
+    /// Tag Manager preferences (the gear popup). Values apply live and are
+    /// auto-saved here — the popup has no Save/Cancel buttons.
+    pub tag_manager: crate::tag_manager_settings::TagManagerSettings,
     /// AI Chat mode: the main view swaps the three panels for a full-window
     /// chat with the local model (src/ai_chat.rs). Toggled from the AI Model
     /// tab; the top bar stays.
@@ -157,6 +160,7 @@ impl Default for Settings {
             confirm_before_delete: true,
             enable_extended_formats: false,
             last_ai_model: "Select AI...".to_string(),
+            tag_manager: Default::default(),
             ai_chat: false,
             ai_voice_style: crate::voice::DEFAULT_STYLE.to_string(),
             ai_auto_speak: false,

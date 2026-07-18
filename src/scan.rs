@@ -74,6 +74,9 @@ pub struct ScanState {
     /// Anchor for the window — the Find Issues button's bottom-right, captured
     /// when opened. The window is right-aligned to it (drops down, extends left).
     anchor_pos: Option<egui::Pos2>,
+    /// True on the frame the window was opened, so the Find Issues button click
+    /// that spawned it isn't counted as a click outside (instant hide).
+    just_opened: bool,
 }
 
 impl Default for ScanState {
@@ -91,6 +94,7 @@ impl Default for ScanState {
             rx: None,
             finished_tick: false,
             anchor_pos: None,
+            just_opened: false,
         }
     }
 }
@@ -100,6 +104,7 @@ impl ScanState {
     /// pre-filling the folder with the currently-open one.
     pub fn open_with(&mut self, folder: Option<&Path>, anchor: Option<egui::Pos2>) {
         self.open = true;
+        self.just_opened = true;
         self.anchor_pos = anchor;
         if self.input_dir.trim().is_empty()
             && let Some(f) = folder {
@@ -181,7 +186,7 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
 
     let mut want_minimize = false;
     use crate::PopupPlacement;
-    egui::Window::new("Find Issues")
+    let win = egui::Window::new("Find Issues")
         .id(egui::Id::new("deep_scan_window"))
         .title_bar(false) // custom header inside (matches the Civitai / Backup popups)
         .collapsible(false)
@@ -202,8 +207,9 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
                 v.widgets.noninteractive.corner_radius = radius;
             }
 
-            // Title row: frame-inspect icon + "Find Issues" + close (which just
-            // hides the window — a running scan keeps going in the background).
+            // Title row: frame-inspect icon + "Find Issues". No close button —
+            // clicking anywhere outside hides the window (a running scan keeps
+            // going in the background).
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.add(
@@ -212,21 +218,6 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
                         .tint(TEXT()),
                 );
                 ui.heading(egui::RichText::new("Find Issues").color(TEXT()).strong().size(17.0));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // click_and_drag so a click that slips a pixel is swallowed
-                    // by the button instead of dragging the popup.
-                    if ui
-                        .add(egui::Button::image(
-                            egui::Image::new(egui::include_image!("../icons/close.svg"))
-                                .fit_to_exact_size(egui::vec2(24.0, 24.0))
-                                .tint(TEXT()),
-                        ).frame(false).sense(egui::Sense::click_and_drag()))
-                        .on_hover_text("Close (a running scan keeps going)")
-                        .clicked()
-                    {
-                        want_minimize = true;
-                    }
-                });
             });
             ui.add_space(10.0);
 
@@ -328,8 +319,7 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
 
             ui.add_space(8.0);
 
-            // Right-aligned footer buttons (matches the Create Backup popup):
-            // primary Start Scan / Cancel rightmost, Minimize to its left.
+            // Right-aligned footer: the primary Start Scan / Cancel button.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 if state.running {
@@ -340,14 +330,20 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
                 } else if footer_button(ui, "Start Scan", Some(ACCENT1())).clicked() {
                     start_scan(state, ctx);
                 }
-                // Minimize: hide the window but keep any running scan going in the
-                // background (messages are still drained at the top of `show`).
-                if footer_button(ui, "Minimize", None).clicked() {
-                    want_minimize = true;
-                }
             });
         });
-    // The ✕ and the Minimize button both just hide it (scan keeps running).
+
+    // Clicking anywhere outside hides the window (a running scan keeps going —
+    // messages are still drained at the top of `show`). Skipped on the opening
+    // frame, when the Find Issues button click would count as "outside".
+    if state.just_opened {
+        state.just_opened = false;
+    } else if let Some(win) = &win
+        && win.response.clicked_elsewhere()
+    {
+        want_minimize = true;
+    }
+
     state.open = !want_minimize;
 }
 

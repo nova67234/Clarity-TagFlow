@@ -59,7 +59,7 @@ pub struct CropFraction {
 const DEPTH_FOLDER: &str = "depth-anything-v2-base-onnx";
 /// Shown when the depth model hasn't been downloaded yet.
 const MODEL_MISSING_MSG: &str =
-    "Depth model not installed — open the AI panel → Get Models → Depth (~27 MB).";
+    "Depth model not installed — Tag Manager Settings → Get Models → Depth (~370 MB).";
 /// Max screen-space shift (px) of the most-displaced depth layer. Kept small so
 /// the single-mesh warp reads as gentle depth rather than a stretchy rubber sheet
 /// (this mesh warps the texture; it can't move rigid layers like Apple's does).

@@ -1,29 +1,33 @@
 //! Tag Manager settings — a Rust port of terminus2's `TagManagerSettings` dialog,
 //! opened from the Tag Manager panel's gear button.
 //!
-//! In-memory only for now: the values are held here but not yet persisted across
-//! runs or wired into tagging behaviour (there's no AI tagger backend yet).
-
-use std::time::{Duration, Instant};
+//! Two tabs behind a segmented control: **Settings** (preferences, apply live
+//! and auto-save — the struct is persisted inside `Settings`, see `main.rs`)
+//! and **Get Models** (the AI Model Manager catalog, `ai_models.rs`). There are
+//! no Save/Cancel buttons — click anywhere outside the popup (or press Escape)
+//! to close it.
 
 use eframe::egui;
 
 use crate::theme::*;
 
-/// Separator choices, mirroring the Java combo box.
-const SEPARATOR_LABELS: [&str; 3] = [", (Comma)", "(Space)", "\\n (Newline)"];
+/// Separator choices, mirroring the Java combo box (comma / space / newline).
+const SEPARATOR_LABELS: [&str; 3] = ["Comma", "Space", "Newline"];
 
-/// Green flash shown on the Save button before the popup closes.
-const SAVED_GREEN: egui::Color32 = egui::Color32::from_rgb(46, 160, 67);
-/// Red flash shown on the Cancel button before the popup closes.
-const CANCEL_RED: egui::Color32 = egui::Color32::from_rgb(200, 55, 55);
-/// How long a button flash lingers before the popup closes.
-const SAVE_FLASH: Duration = Duration::from_millis(450);
+/// Segmented-control tabs across the top of the popup.
+const TABS: [&str; 2] = ["Settings", "Get Models"];
 
-/// Tag-manager preferences plus the dialog's open state. Defaults match the Java.
+/// Tag-manager preferences plus the dialog's open state. Defaults match the
+/// Java. Persisted across runs as `Settings::tag_manager`.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct TagManagerSettings {
-    /// Whether the settings dialog is currently shown.
+    /// Whether the settings dialog is currently shown (never persisted).
+    #[serde(skip)]
     pub open: bool,
+    /// Active tab index into [`TABS`] (never persisted).
+    #[serde(skip)]
+    pub tab: usize,
     pub auto_save: bool,
     pub autocomplete: bool,
     pub auto_tag_append: bool,
@@ -32,16 +36,13 @@ pub struct TagManagerSettings {
     pub separator_idx: usize,
     pub default_threshold: f32,
     pub blacklist: String,
-    /// When Save was clicked — drives the green flash before the popup closes.
-    pub save_flash: Option<Instant>,
-    /// When Cancel was clicked — drives the red flash before the popup closes.
-    pub cancel_flash: Option<Instant>,
 }
 
 impl Default for TagManagerSettings {
     fn default() -> Self {
         Self {
             open: false,
+            tab: 0,
             auto_save: true,
             autocomplete: true,
             auto_tag_append: false,
@@ -49,171 +50,168 @@ impl Default for TagManagerSettings {
             separator_idx: 0,
             default_threshold: 0.35,
             blacklist: "sensitive, nsfw".into(),
-            save_flash: None,
-            cancel_flash: None,
         }
     }
 }
 
-/// Render the settings as a popup dropping down under the gear `anchor`. Save,
-/// Cancel, or Escape close it (values apply live — no persistence yet, so
-/// there's nothing to revert).
-pub fn show(anchor: &egui::Response, s: &mut TagManagerSettings) {
+/// Render the settings as a popup dropping down under the gear `anchor`.
+/// Values apply live; clicking outside or pressing Escape closes the popup.
+/// `models` backs the Get Models tab (downloads keep running after close —
+/// the Tag Manager ticks it every frame).
+pub fn show(
+    anchor: &egui::Response,
+    s: &mut TagManagerSettings,
+    models: &mut crate::ai_models::ModelManager,
+) {
     if !s.open {
         return;
     }
 
     let mut open = true;
-    let mut close = false;
-
-    // Button flashes: once Save/Cancel is clicked we keep the popup open showing
-    // a coloured button, then close after `SAVE_FLASH`.
-    let save_flashing = s.save_flash.is_some();
-    let cancel_flashing = s.cancel_flash.is_some();
-    let flash_done = s.save_flash.is_some_and(|t| t.elapsed() >= SAVE_FLASH)
-        || s.cancel_flash.is_some_and(|t| t.elapsed() >= SAVE_FLASH);
+    let mut esc = false;
 
     egui::Popup::from_response(anchor)
         .open_bool(&mut open)
         .align(egui::RectAlign::BOTTOM_END)
-        .width(320.0)
+        .width(380.0)
         .gap(6.0)
         .frame(crate::card_frame(22))
-        .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
-            // The global theme rounds checkboxes into pills; square them off.
-            let sq = egui::CornerRadius::same(4);
-            ui.visuals_mut().widgets.inactive.corner_radius = sq;
-            ui.visuals_mut().widgets.hovered.corner_radius = sq;
-            ui.visuals_mut().widgets.active.corner_radius = sq;
+            esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
 
-            section(ui, "General Behavior", |ui| {
-                ui.checkbox(&mut s.auto_save, rich("Auto-save sidecar files after AI tagging"));
-                ui.add_space(6.0);
-                ui.checkbox(&mut s.autocomplete, rich("Enable tag autocomplete while typing"));
+            segmented_control(ui, &mut s.tab);
+            ui.add_space(12.0);
 
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                // Mutually exclusive: enabling one clears the other (matches the Java).
-                if ui
-                    .checkbox(&mut s.auto_tag_append, rich("Auto tag all images (Keep existing tags)"))
-                    .changed()
-                    && s.auto_tag_append
-                {
-                    s.auto_tag_overwrite = false;
-                }
-                ui.add_space(6.0);
-                if ui
-                    .checkbox(&mut s.auto_tag_overwrite, rich("Auto tag all images (Remove old tags)"))
-                    .changed()
-                    && s.auto_tag_overwrite
-                {
-                    s.auto_tag_append = false;
-                }
-
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.label(rich("Tag Separator:"));
-                    egui::ComboBox::from_id_salt("tms_separator")
-                        .selected_text(SEPARATOR_LABELS[s.separator_idx])
-                        .show_ui(ui, |ui| {
-                            for (i, label) in SEPARATOR_LABELS.iter().enumerate() {
-                                ui.selectable_value(&mut s.separator_idx, i, *label);
-                            }
-                        });
-                });
-            });
-
-            section(ui, "AI Tagger Defaults", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(rich("Default Confidence Threshold:"));
-                    ui.add(
-                        egui::DragValue::new(&mut s.default_threshold)
-                            .range(0.1..=1.0)
-                            .speed(0.01)
-                            .fixed_decimals(2),
-                    );
-                });
-            });
-
-            section(ui, "Global Tag Blacklist", |ui| {
-                ui.label(egui::RichText::new("Comma or newline separated").color(MUTED()).size(12.0));
-                ui.add_space(4.0);
-                ui.add(
-                    egui::TextEdit::multiline(&mut s.blacklist)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(3),
-                );
-            });
-
-            ui.add_space(10.0);
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let r = egui::CornerRadius::same(10);
-                ui.visuals_mut().widgets.inactive.corner_radius = r;
-                ui.visuals_mut().widgets.hovered.corner_radius = r;
-                ui.visuals_mut().widgets.active.corner_radius = r;
-
-                // Both buttons share the same base style and flash a colour once
-                // clicked (green = Save, red = Cancel) before the popup closes.
-                let save = if save_flashing {
-                    egui::Button::new(egui::RichText::new("Save").color(egui::Color32::WHITE)).fill(SAVED_GREEN)
-                } else {
-                    egui::Button::new(rich("Save"))
-                };
-                if ui.add_sized(egui::vec2(90.0, 32.0), save).clicked() && s.save_flash.is_none() {
-                    s.save_flash = Some(Instant::now());
-                }
-
-                let cancel = if cancel_flashing {
-                    egui::Button::new(egui::RichText::new("Cancel").color(egui::Color32::WHITE)).fill(CANCEL_RED)
-                } else {
-                    egui::Button::new(rich("Cancel"))
-                };
-                if ui.add_sized(egui::vec2(90.0, 32.0), cancel).clicked() && s.cancel_flash.is_none() {
-                    s.cancel_flash = Some(Instant::now());
-                }
-            });
-
-            if save_flashing || cancel_flashing {
-                ui.ctx().request_repaint(); // keep the flash animating, then close
+            if s.tab == 1 {
+                models.ui(ui);
+            } else {
+                settings_tab(ui, s);
             }
         });
 
-    // Close once the green flash has been shown long enough.
-    if flash_done {
-        close = true;
+    s.open = open && !esc;
+}
+
+/// An Apple-style segmented control: a full-width capsule track with equal
+/// segments, the active one raised as an accent-tinted pill.
+fn segmented_control(ui: &mut egui::Ui, current: &mut usize) {
+    let height = 30.0;
+    let (track, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+    ui.painter().rect(
+        track,
+        egui::CornerRadius::same(10),
+        FIELD(),
+        egui::Stroke::new(1.0, EDGE()),
+        egui::StrokeKind::Inside,
+    );
+
+    let pad = 3.0;
+    let seg_w = (track.width() - pad * 2.0) / TABS.len() as f32;
+    for (i, label) in TABS.iter().enumerate() {
+        let seg = egui::Rect::from_min_size(
+            egui::pos2(track.min.x + pad + seg_w * i as f32, track.min.y + pad),
+            egui::vec2(seg_w, height - pad * 2.0),
+        );
+        let resp = ui.interact(seg, ui.id().with(("tm_settings_tab", i)), egui::Sense::click());
+        let selected = *current == i;
+        if selected {
+            ui.painter().rect_filled(
+                seg,
+                egui::CornerRadius::same(8),
+                ACCENT1().gamma_multiply(0.30),
+            );
+        } else if resp.hovered() {
+            ui.painter().rect_filled(
+                seg,
+                egui::CornerRadius::same(8),
+                TEXT().gamma_multiply(0.06),
+            );
+        }
+        ui.painter().text(
+            seg.center(),
+            egui::Align2::CENTER_CENTER,
+            *label,
+            egui::FontId::proportional(12.0),
+            if selected { TEXT() } else { MUTED() },
+        );
+        if resp.clicked() {
+            *current = i;
+        }
     }
-    let staying_open = open && !close;
-    if !staying_open {
-        // reset so the next open starts clean
-        s.save_flash = None;
-        s.cancel_flash = None;
+}
+
+/// The preferences tab (the original settings body).
+fn settings_tab(ui: &mut egui::Ui, s: &mut TagManagerSettings) {
+    // The global theme rounds checkboxes into pills; square them off.
+    let sq = egui::CornerRadius::same(4);
+    ui.visuals_mut().widgets.inactive.corner_radius = sq;
+    ui.visuals_mut().widgets.hovered.corner_radius = sq;
+    ui.visuals_mut().widgets.active.corner_radius = sq;
+
+    section_title(ui, "General Behavior");
+    ui.checkbox(&mut s.auto_save, rich("Auto-save sidecar files after AI tagging"));
+    ui.add_space(6.0);
+    ui.checkbox(&mut s.autocomplete, rich("Enable tag autocomplete while typing"));
+    ui.add_space(6.0);
+
+    // Mutually exclusive: enabling one clears the other (matches the Java).
+    if ui
+        .checkbox(&mut s.auto_tag_append, rich("Auto tag all images (Keep existing tags)"))
+        .changed()
+        && s.auto_tag_append
+    {
+        s.auto_tag_overwrite = false;
     }
-    s.open = staying_open;
+    ui.add_space(6.0);
+    if ui
+        .checkbox(&mut s.auto_tag_overwrite, rich("Auto tag all images (Remove old tags)"))
+        .changed()
+        && s.auto_tag_overwrite
+    {
+        s.auto_tag_append = false;
+    }
+
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.label(rich("Tag Separator:"));
+        // Inline pills instead of a nested combo — a combo's dropdown
+        // would count as a click outside this popup and close it.
+        for (i, label) in SEPARATOR_LABELS.iter().enumerate() {
+            ui.selectable_value(&mut s.separator_idx, i, *label);
+        }
+    });
+
+    ui.add_space(14.0);
+    section_title(ui, "AI Tagger Defaults");
+    ui.horizontal(|ui| {
+        ui.label(rich("Confidence Threshold:"));
+        ui.add(
+            egui::DragValue::new(&mut s.default_threshold)
+                .range(0.1..=1.0)
+                .speed(0.01)
+                .fixed_decimals(2),
+        );
+    });
+
+    ui.add_space(14.0);
+    section_title(ui, "Global Tag Blacklist");
+    ui.label(egui::RichText::new("Comma or newline separated").color(MUTED()).size(12.0));
+    ui.add_space(4.0);
+    ui.add(
+        egui::TextEdit::multiline(&mut s.blacklist)
+            .desired_width(f32::INFINITY)
+            .desired_rows(3),
+    );
 }
 
 fn rich(text: &str) -> egui::RichText {
     egui::RichText::new(text).color(TEXT())
 }
 
-/// A titled rounded group card, matching the app's settings style.
-fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(6.0);
+/// Muted mini-header above each settings group.
+fn section_title(ui: &mut egui::Ui, title: &str) {
     ui.label(egui::RichText::new(title).color(MUTED()).strong().size(12.0));
-    ui.add_space(4.0);
-
-    egui::Frame::new()
-        .fill(FIELD())
-        .corner_radius(egui::CornerRadius::same(22))
-        .inner_margin(egui::Margin::symmetric(14, 12))
-        .stroke(egui::Stroke::new(1.0, EDGE()))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add(ui);
-        });
-    ui.add_space(2.0);
+    ui.add_space(6.0);
 }

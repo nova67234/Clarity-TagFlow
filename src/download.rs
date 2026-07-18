@@ -535,7 +535,7 @@ fn section_with_pill(ui: &mut egui::Ui, title: &str, api: u8, add: impl FnOnce(&
 /// The rounded card body shared by both section variants.
 fn section_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
-        .fill(FIELD())
+        .fill(PANEL())
         .corner_radius(egui::CornerRadius::same(12))
         .inner_margin(egui::Margin::symmetric(12, 10))
         .stroke(egui::Stroke::new(1.0, EDGE()))

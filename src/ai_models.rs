@@ -1,4 +1,4 @@
-//! AI Model Manager — the "Get Models" dialog.
+//! AI Model Manager — the "Get Models" tab of the Tag Manager settings popup.
 //!
 //! A Rust/egui port of terminus2's `TagDownloader.java`. Presents a catalog of
 //! supported tagger models (PixAI, JoyTag, the WD14 family) and downloads their
@@ -353,10 +353,8 @@ struct Entry {
 // ---------------------------------------------------------------------------
 
 pub struct ModelManager {
-    pub open: bool,
     entries: Vec<Entry>,
     selected: usize,
-    close_requested: bool,
 }
 
 impl Default for ModelManager {
@@ -373,40 +371,18 @@ impl Default for ModelManager {
                 progress: None,
             })
             .collect();
-        Self { open: false, entries, selected: 0, close_requested: false }
+        Self { entries, selected: 0 }
     }
 }
 
 impl ModelManager {
-    /// Toggle the dropdown open/closed (driven by the "Get Models" button click).
-    pub fn toggle(&mut self) {
-        self.open = !self.open;
-    }
-
-    /// Drive the manager each frame: poll active downloads and, when open, draw
-    /// the dropdown anchored under `anchor` (the "Get Models" button). Call every
-    /// frame regardless of `open` so downloads still finalize while it's closed.
-    pub fn show(&mut self, anchor: &egui::Response) {
+    /// Drive the manager each frame, whether or not its UI is visible: poll
+    /// active downloads so they finalize, and keep repainting while any is in
+    /// flight so progress bars animate.
+    pub fn tick(&mut self, ctx: &egui::Context) {
         self.poll();
-
-        if self.open {
-            let mut open = self.open;
-            egui::Popup::from_response(anchor)
-                .open_bool(&mut open)
-                .align(egui::RectAlign::BOTTOM_START) // drop down under the button
-                .width(400.0)
-                .gap(6.0)
-                .frame(crate::card_frame(22))
-                .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
-                .show(|ui| self.body(ui));
-            // Closed by clicking outside, the in-body Close button, or re-clicking.
-            self.open = open && !self.close_requested;
-            self.close_requested = false;
-        }
-
-        // Keep repainting while any download is in flight so the bar animates.
         if self.entries.iter().any(|e| e.progress.is_some()) {
-            anchor.ctx.request_repaint();
+            ctx.request_repaint();
         }
     }
 
@@ -427,11 +403,10 @@ impl ModelManager {
         }
     }
 
-    fn body(&mut self, ui: &mut egui::Ui) {
-        // No title bar on a popup — render our own header.
-        ui.label(RichText::new("AI Model Manager").color(TEXT()).strong().size(14.0));
-        ui.add_space(1.0);
-        ui.label(RichText::new("Download high-performance tagging models.").color(MUTED()).size(11.0));
+    /// Render the model catalog inline — the body of the Tag Manager settings
+    /// popup's "Get Models" tab. Host must call [`Self::tick`] every frame.
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Download high-performance AI models.").color(MUTED()).size(11.0));
         ui.add_space(8.0);
 
         // Tab pills.
@@ -451,7 +426,7 @@ impl ModelManager {
 
         // Model card.
         egui::Frame::new()
-            .fill(FIELD())
+            .fill(PANEL())
             .corner_radius(egui::CornerRadius::same(22))
             .stroke(egui::Stroke::new(1.0, EDGE()))
             .inner_margin(egui::Margin::same(12))
@@ -516,25 +491,6 @@ impl ModelManager {
                 ui.add_space(6.0);
                 ui.label(RichText::new(info.note).color(MUTED()).italics().size(10.0));
             });
-
-        ui.add_space(8.0);
-
-        // Footer: Close button on the right. The row height is pinned via
-        // allocate_ui_with_layout — a bare right_to_left layout would otherwise
-        // anchor to the right and stretch to fill the (screen-tall) auto_sized
-        // region, leaving a large dead space below the window.
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), 28.0),
-            egui::Layout::right_to_left(egui::Align::Center),
-            |ui| {
-                let close = egui::Button::new(RichText::new("Close").color(TEXT()))
-                    .corner_radius(egui::CornerRadius::same(10))
-                    .min_size(egui::vec2(78.0, 26.0));
-                if ui.add(close).clicked() {
-                    self.close_requested = true;
-                }
-            },
-        );
     }
 
     fn start_download(&mut self, idx: usize) {
@@ -560,7 +516,7 @@ impl ModelManager {
 
 // ---------------------------------------------------------------------------
 // Headless download — lets the Spatial Scene viewer fetch the depth model on
-// first use, without opening the Model Manager dropdown. Reuses the same
+// first use, without opening the Get Models tab. Reuses the same
 // streaming downloader (`download_all`) and `Progress` as the manager.
 // ---------------------------------------------------------------------------
 
