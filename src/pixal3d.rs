@@ -56,6 +56,8 @@ pub struct Pixal3DState {
     hf_token: String,
     /// Low-VRAM mode (loads models on-demand; ~fits 16 GB vs ~18 GB standard).
     low_vram: bool,
+    /// Whether the gear's settings popup (runtime setup + HF token) is open.
+    settings_open: bool,
     // --- Log (collapsible, Z-Image style) ---
     show_log: bool,
     /// Brief green/red flash on the copy-log button after a click.
@@ -89,6 +91,7 @@ impl Default for Pixal3DState {
             texture_size: 1024,
             hf_token: load_hf_token(),
             low_vram: true,
+            settings_open: false,
             show_log: false,
             copy_flash: None,
             status: "Ready".to_string(),
@@ -139,6 +142,24 @@ pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&
         }
     }
 
+    // The column is taller than short windows — scroll the whole view, with
+    // the scrollbar riding the panel edge (same treatment as the generator
+    // views and the Settings window).
+    const SCROLL_GUTTER: f32 = 12.0;
+    let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
+    egui::ScrollArea::vertical()
+        .id_salt("pixal3d_scroll")
+        .auto_shrink([false, false])
+        .show(&mut scroll_ui, |ui| {
+            ui.set_max_width(ui.available_width() - SCROLL_GUTTER);
+            show_body(ui, state, current_image);
+        });
+    crate::edge_scroll_done(ui, &scroll_ui, SCROLL_GUTTER);
+}
+
+/// The scrollable column: header bar, the Setup / Generation / Quality / GLB
+/// cards, the Generate button, and the collapsible log.
+fn show_body(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&Path>) {
     // --- Header bar (title + status + orb), mirroring the Tag Manager. ---
     egui::Frame::new()
         .fill(PANEL())
@@ -165,142 +186,119 @@ pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&
             });
         });
 
-    ui.add_space(8.0);
+    ui.add_space(6.0);
 
-    // --- Setup row (Z-Image style: button + right-aligned status). ---
+    // --- Settings gear (Tag Manager style): opens the popup holding the
+    // one-time runtime setup + the optional HF token. ---
     ui.horizontal(|ui| {
-        let setup = egui::Button::new(RichText::new("Setup Requirements").color(Color32::WHITE))
-            .fill(Color32::from_rgb(96, 99, 105))
-            .corner_radius(CornerRadius::same(12));
-        if ui.add_enabled_ui(!state.running, |ui| ui.add_sized(egui::vec2(150.0, 28.0), setup)).inner.clicked() {
-            start_setup(state, ui.ctx());
-        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new("NVIDIA GPU required").color(MUTED()).size(11.0));
+            let gear = egui::include_image!("../icons/settings.svg");
+            let gear_resp = crate::svg_button(ui, gear, "Setup & settings", 18.0, MUTED());
+            if gear_resp.clicked() {
+                state.settings_open = !state.settings_open;
+            }
+            settings_popup(&gear_resp, state);
         });
     });
-
-    ui.add_space(8.0);
-
-    // --- HF token (optional). Setup Requirements pulls every model from public
-    // sources (DINOv3 via the open camenduru mirror, BiRefNet for background
-    // removal), so no Hugging Face login is needed — the field only exists in case
-    // someone wants to use their own gated model. ---
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        ui.label(RichText::new("HF token (optional)").color(MUTED()).size(11.0));
-        // Info icon: hover for an explanation + a clickable link.
-        ui.add(
-            egui::Image::new(egui::include_image!("../icons/info.svg"))
-                .fit_to_exact_size(egui::vec2(14.0, 14.0))
-                .tint(crate::theme::icon_tint(MUTED())),
-        )
-        .on_hover_ui(|ui| {
-            ui.set_max_width(260.0);
-            ui.label(
-                "No Hugging Face login is needed — \"Setup Requirements\" downloads \
-                 every model from public sources. Only add a token if you want to use \
-                 your own gated model.",
-            );
-            crate::arrow_link(ui, "Manage Hugging Face tokens", "https://huggingface.co/settings/tokens", None);
-        });
-    });
-    ui.add_space(2.0);
-    let resp = ui.add(
-        egui::TextEdit::singleline(&mut state.hf_token)
-            .password(true)
-            .desired_width(f32::INFINITY),
-    );
-    // Persist (encrypted) once the user finishes editing, so it survives restarts.
-    if resp.lost_focus() {
-        save_hf_token(&state.hf_token);
-    }
-
-    ui.add_space(8.0);
-
-    // --- Source image card. ---
-    section(ui, "Source Image", |ui| {
-        match current_image {
-            Some(p) => {
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("<unknown>");
-                ui.label(RichText::new(name).color(TEXT()).size(12.5));
-            }
-            None => {
-                ui.label(RichText::new("No image selected — pick one in the browser.").color(MUTED()).size(12.0));
-            }
-        }
-    });
-
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut state.low_vram, RichText::new("Low VRAM mode").color(TEXT()).size(12.0));
-        ui.label(RichText::new("recommended for ≤16 GB").color(MUTED()).size(11.0));
-    });
-
-    ui.add_space(8.0);
-
-    // --- Generation settings (inline, Z-Image style). ---
-    labeled(ui, "Resolution", |ui| {
-        egui::ComboBox::from_id_salt("pixal3d_res")
-            .selected_text(state.resolution.to_string())
-            .show_ui(ui, |ui| {
-                for r in [512, 1024, 1536] {
-                    ui.selectable_value(&mut state.resolution, r, r.to_string());
-                }
-            });
-    });
-
-    ui.add_space(4.0);
-    ui.label(RichText::new("Sparse structure").color(MUTED()).size(11.0));
-    slider(ui, "Guidance", &mut state.ss_guidance, 0.0..=12.0);
-    int_slider(ui, "Steps", &mut state.ss_steps, 1..=50);
-    ui.add_space(2.0);
-    ui.label(RichText::new("Shape").color(MUTED()).size(11.0));
-    slider(ui, "Guidance", &mut state.shape_guidance, 0.0..=12.0);
-    int_slider(ui, "Steps", &mut state.shape_steps, 1..=50);
-    ui.add_space(2.0);
-    ui.label(RichText::new("Texture").color(MUTED()).size(11.0));
-    slider(ui, "Guidance", &mut state.tex_guidance, 0.0..=12.0);
-    int_slider(ui, "Steps", &mut state.tex_steps, 1..=50);
 
     ui.add_space(6.0);
-    // Randomize seed — radio-style filled dot, matching Z-Image.
-    ui.horizontal(|ui| {
-        ui.spacing_mut().icon_width_inner = 11.0;
-        if ui.radio(state.randomize_seed, "").clicked() {
-            state.randomize_seed = !state.randomize_seed;
-        }
-        ui.label(RichText::new("Randomize seed").color(TEXT()).size(12.0));
-    });
-    if !state.randomize_seed {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Seed").color(MUTED()).size(12.0));
-            ui.add(egui::DragValue::new(&mut state.seed).range(0..=i64::MAX));
+
+    // --- Generation card: source, VRAM mode, resolution, seed. ---
+    crate::settings::section(ui, "Generation", |ui| {
+        let name = current_image
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+        crate::settings::row(ui, "Source image", None, |ui| {
+            match &name {
+                Some(n) => ui.add(
+                    egui::Label::new(RichText::new(n).color(TEXT()).size(12.0)).truncate(),
+                ),
+                None => ui.label(
+                    RichText::new("None — pick one in the browser").color(MUTED()).size(12.0),
+                ),
+            };
         });
-    }
-
-    ui.add_space(8.0);
-    // --- GLB extraction (inline). ---
-    ui.label(RichText::new("GLB Extraction").color(MUTED()).size(11.0));
-    int_slider(ui, "Simplify (tris)", &mut state.decimation, 5_000..=200_000);
-    labeled(ui, "Texture size", |ui| {
-        egui::ComboBox::from_id_salt("pixal3d_texsize")
-            .selected_text(state.texture_size.to_string())
-            .show_ui(ui, |ui| {
-                for t in [512, 1024, 2048] {
-                    ui.selectable_value(&mut state.texture_size, t, t.to_string());
-                }
+        crate::settings::row_sep(ui);
+        crate::settings::row(
+            ui,
+            "Low VRAM mode",
+            Some("Recommended for 16 GB of VRAM or less."),
+            |ui| {
+                crate::settings::switch(ui, &mut state.low_vram);
+            },
+        );
+        crate::settings::row_sep(ui);
+        crate::settings::row(ui, "Resolution", None, |ui| {
+            egui::ComboBox::from_id_salt("pixal3d_res")
+                .width(100.0)
+                .selected_text(state.resolution.to_string())
+                .show_ui(ui, |ui| {
+                    for r in [512, 1024, 1536] {
+                        ui.selectable_value(&mut state.resolution, r, r.to_string());
+                    }
+                });
+        });
+        crate::settings::row_sep(ui);
+        crate::settings::row(
+            ui,
+            "Randomize seed",
+            Some("Off lets you re-run the exact same generation."),
+            |ui| {
+                crate::settings::switch(ui, &mut state.randomize_seed);
+            },
+        );
+        if !state.randomize_seed {
+            crate::settings::row_sep(ui);
+            crate::settings::row(ui, "Seed", None, |ui| {
+                ui.add(egui::DragValue::new(&mut state.seed).range(0..=i64::MAX));
             });
+        }
     });
-    ui.add_space(4.0);
-    let extract = egui::Button::new(RichText::new("Extract GLB").color(TEXT()))
-        .corner_radius(CornerRadius::same(10));
-    if ui.add_enabled(!state.running, extract).clicked() {
-        state.status = "Pixal3D runtime not installed — Extract GLB unavailable".into();
-        state.status_err = true;
-    }
 
-    ui.add_space(10.0);
+    // --- Quality card: guidance/steps for the three pipeline stages. ---
+    crate::settings::section(ui, "Quality", |ui| {
+        slider_row(ui, "Sparse guidance", &mut state.ss_guidance, 0.0..=12.0);
+        crate::settings::row_sep(ui);
+        int_slider_row(ui, "Sparse steps", &mut state.ss_steps, 1..=50);
+        crate::settings::row_sep(ui);
+        slider_row(ui, "Shape guidance", &mut state.shape_guidance, 0.0..=12.0);
+        crate::settings::row_sep(ui);
+        int_slider_row(ui, "Shape steps", &mut state.shape_steps, 1..=50);
+        crate::settings::row_sep(ui);
+        slider_row(ui, "Texture guidance", &mut state.tex_guidance, 0.0..=12.0);
+        crate::settings::row_sep(ui);
+        int_slider_row(ui, "Texture steps", &mut state.tex_steps, 1..=50);
+    });
+
+    // --- GLB extraction card. ---
+    crate::settings::section(ui, "GLB Extraction", |ui| {
+        int_slider_row(ui, "Simplify (tris)", &mut state.decimation, 5_000..=200_000);
+        crate::settings::row_sep(ui);
+        crate::settings::row(ui, "Texture size", None, |ui| {
+            egui::ComboBox::from_id_salt("pixal3d_texsize")
+                .width(100.0)
+                .selected_text(state.texture_size.to_string())
+                .show_ui(ui, |ui| {
+                    for t in [512, 1024, 2048] {
+                        ui.selectable_value(&mut state.texture_size, t, t.to_string());
+                    }
+                });
+        });
+        crate::settings::row_sep(ui);
+        crate::settings::row(
+            ui,
+            "Extract from the last run",
+            None,
+            |ui| {
+                let extract = egui::Button::new(RichText::new("Extract GLB").color(TEXT()))
+                    .corner_radius(CornerRadius::same(10));
+                if ui.add_enabled(!state.running, extract).clicked() {
+                    state.status = "Pixal3D runtime not installed — Extract GLB unavailable".into();
+                    state.status_err = true;
+                }
+            },
+        );
+    });
 
     // --- Generate (primary), after the settings like Z-Image. ---
     let gen_btn = egui::Button::new(RichText::new("Generate 3D").color(Color32::WHITE).strong())
@@ -411,44 +409,102 @@ pub fn show(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<&
     }
 }
 
-/// A titled card (PANEL fill, rounded) wrapping `contents`.
-fn section(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
-    ui.label(RichText::new(title).color(MUTED()).size(11.0));
-    ui.add_space(2.0);
-    egui::Frame::new()
-        .fill(PANEL())
-        .corner_radius(CornerRadius::same(12))
-        .stroke(egui::Stroke::new(1.0, EDGE()))
-        .inner_margin(Margin::same(10))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            contents(ui);
+/// The gear's settings popup, dropping down under the anchor (the Tag Manager
+/// pattern): the one-time runtime install and the optional HF token. Values
+/// apply live; a click outside or Escape closes it.
+fn settings_popup(anchor: &egui::Response, state: &mut Pixal3DState) {
+    if !state.settings_open {
+        return;
+    }
+    let mut open = true;
+    let mut esc = false;
+
+    egui::Popup::from_response(anchor)
+        .open_bool(&mut open)
+        .align(egui::RectAlign::BOTTOM_END)
+        .width(340.0)
+        .gap(6.0)
+        .frame(crate::card_frame(22))
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+
+            crate::settings::section(ui, "Setup", |ui| {
+                crate::settings::row(
+                    ui,
+                    "Runtime",
+                    Some("One-time install — NVIDIA GPU required."),
+                    |ui| {
+                        let setup =
+                            egui::Button::new(RichText::new("Setup Requirements").color(Color32::WHITE))
+                                .fill(Color32::from_rgb(96, 99, 105))
+                                .corner_radius(CornerRadius::same(12));
+                        if ui
+                            .add_enabled_ui(!state.running, |ui| {
+                                ui.add_sized(egui::vec2(150.0, 28.0), setup)
+                            })
+                            .inner
+                            .clicked()
+                        {
+                            start_setup(state, ui.ctx());
+                        }
+                    },
+                );
+                crate::settings::row_sep(ui);
+                // Setup pulls every model from public sources (DINOv3 via the
+                // open camenduru mirror, BiRefNet for background removal), so no
+                // Hugging Face login is needed — the field only exists for
+                // gated models.
+                crate::settings::row(
+                    ui,
+                    "HF token",
+                    Some("Optional — every model comes from public sources."),
+                    |ui| {
+                        let resp = ui
+                            .add(
+                                egui::TextEdit::singleline(&mut state.hf_token)
+                                    .password(true)
+                                    .desired_width(150.0)
+                                    .margin(Margin::symmetric(8, 5)),
+                            )
+                            .on_hover_ui(|ui| {
+                                ui.set_max_width(260.0);
+                                ui.label(
+                                    "Only add a token if you want to use your own gated model — \
+                                     \"Setup Requirements\" needs no Hugging Face login.",
+                                );
+                                crate::arrow_link(
+                                    ui,
+                                    "Manage Hugging Face tokens",
+                                    "https://huggingface.co/settings/tokens",
+                                    None,
+                                );
+                            });
+                        // Persist (encrypted) once the user finishes editing.
+                        if resp.lost_focus() {
+                            save_hf_token(&state.hf_token);
+                        }
+                    },
+                );
+            });
         });
+
+    state.settings_open = open && !esc;
 }
 
-/// A label on the left, a right-aligned control on the right.
-fn labeled(ui: &mut egui::Ui, label: &str, contents: impl FnOnce(&mut egui::Ui)) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).color(TEXT()).size(12.0));
-        ui.with_layout(Layout::right_to_left(Align::Center), contents);
+/// A Settings-style row holding a right-aligned float slider.
+fn slider_row(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
+    crate::settings::row(ui, label, None, |ui| {
+        ui.spacing_mut().slider_width = 90.0;
+        ui.add(egui::Slider::new(value, range).fixed_decimals(1));
     });
 }
 
-fn slider(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).color(MUTED()).size(12.0));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.add(egui::Slider::new(value, range).fixed_decimals(1));
-        });
-    });
-}
-
-fn int_slider(ui: &mut egui::Ui, label: &str, value: &mut i32, range: std::ops::RangeInclusive<i32>) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).color(MUTED()).size(12.0));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.add(egui::Slider::new(value, range));
-        });
+/// A Settings-style row holding a right-aligned integer slider.
+fn int_slider_row(ui: &mut egui::Ui, label: &str, value: &mut i32, range: std::ops::RangeInclusive<i32>) {
+    crate::settings::row(ui, label, None, |ui| {
+        ui.spacing_mut().slider_width = 90.0;
+        ui.add(egui::Slider::new(value, range));
     });
 }
 

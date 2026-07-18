@@ -878,6 +878,18 @@ impl ViewerApp {
                         // end); otherwise keep whatever input image is selected.
                         if self.images.len() > orig_len {
                             self.selected = Some(self.images.len() - 1);
+                        } else if self.selected.is_some_and(|i| i >= self.images.len()) {
+                            // Coming from a text-to-image tab, `selected` indexed
+                            // THAT tab's output list, which can be longer than this
+                            // one — fall back to the stashed folder selection (an
+                            // index into `orig`, so always valid here) instead of
+                            // letting the stale index panic the next frame.
+                            self.selected = self
+                                .images_backup
+                                .as_ref()
+                                .and_then(|(_, s)| *s)
+                                .filter(|&i| i < self.images.len())
+                                .or(if self.images.is_empty() { None } else { Some(0) });
                         }
                     } else {
                         self.images = gen_list;
@@ -1600,6 +1612,14 @@ impl eframe::App for ViewerApp {
         }
 
         // 2. Right Panel (Evaluate Action Logic)
+        // Defensive clamp: the generator views swap `images` for their output
+        // lists, and a missed selection fix-up there once left a stale index
+        // that panicked here — never let that take the whole app down again.
+        if let Some(i) = self.selected
+            && i >= self.images.len()
+        {
+            self.selected = if self.images.is_empty() { None } else { Some(self.images.len() - 1) };
+        }
         let current_image_path = self.selected.map(|idx| self.images[idx].as_path());
         let action = right_details::show(
             ui,
