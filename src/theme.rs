@@ -193,8 +193,11 @@ static GLASS: Palette = Palette {
 static GLASS_LIGHT: Palette = Palette {
     bg: Color32::TRANSPARENT,
     panel: glass(246, 247, 250, 185),
-    field: glass(233, 235, 240, 205),
-    field2: glass(222, 225, 231, 205),
+    // Noticeably darker than `panel` (and a touch more opaque) so input wells
+    // stay visible on the frosted white cards — at the old 233-ish values a
+    // text box vanished into the panel.
+    field: glass(215, 218, 226, 215),
+    field2: glass(203, 207, 216, 215),
     text: Color32::from_rgb(55, 58, 64),
     muted: Color32::from_rgb(108, 113, 121),
     accent1: Color32::from_rgb(28, 110, 235),

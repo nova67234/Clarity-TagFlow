@@ -1049,7 +1049,8 @@ const MENU_W: f32 = 158.0;
 
 /// The image context menu's frame — an Apple-style compact rounded card with a
 /// faint edge and soft drop shadow (replaces egui's default menu frame).
-fn menu_frame() -> egui::Frame {
+/// Shared with other context menus (e.g. the LoRA picker's).
+pub(crate) fn menu_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(crate::theme::PANEL())
         .stroke(Stroke::new(1.0, crate::theme::EDGE()))
@@ -1066,7 +1067,7 @@ fn menu_frame() -> egui::Frame {
 /// A macOS-style context-menu row: leading icon + label, highlighted as an
 /// accent pill (white ink) while hovered. Fixed compact size ([`MENU_W`] × 22).
 /// Returns true when clicked.
-fn menu_item(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, label: &str) -> bool {
+pub(crate) fn menu_item(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, label: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(MENU_W, 22.0), Sense::click());
     if ui.is_rect_visible(rect) {
         let hovered = resp.hovered();
@@ -1098,7 +1099,7 @@ fn menu_item(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, label: &str) -> boo
 }
 
 /// The inset hairline between context-menu groups.
-fn menu_sep(ui: &mut egui::Ui) {
+pub(crate) fn menu_sep(ui: &mut egui::Ui) {
     ui.add_space(2.0);
     let (r, _) = ui.allocate_exact_size(egui::vec2(MENU_W, 1.0), Sense::hover());
     ui.painter().hline(

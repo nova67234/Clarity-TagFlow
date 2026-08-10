@@ -1160,6 +1160,8 @@ pub struct GenerateState {
     /// Installed LoRAs (Z-Image), with their multi-select + weight state.
     loras: Vec<LoraEntry>,
     show_lora_popup: bool,
+    /// A LoRA file awaiting delete confirmation (right-click → Delete LoRA…).
+    lora_delete_confirm: Option<String>,
     /// Reveal LoRAs trained for other model families in the picker (off by
     /// default — they're hidden behind a checkbox at the bottom of the popup).
     show_other_loras: bool,
@@ -1279,6 +1281,7 @@ impl GenerateState {
             gen_images: load_outputs(family),
             loras: Vec::new(),
             show_lora_popup: false,
+            lora_delete_confirm: None,
             show_other_loras: false,
             checkpoints: Vec::new(),
             checkpoint: None,
@@ -1457,22 +1460,28 @@ fn spawn_lora_thumb_fetch(files: Vec<String>, ctx: egui::Context, force: bool) {
 fn lora_card(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
     let (fill, stroke) = if selected {
         (
-            lerp_color(PANEL(), ACCENT1(), 0.14),
-            egui::Stroke::new(2.0, ACCENT1()),
+            lerp_color(PANEL(), ACCENT1(), 0.12),
+            egui::Stroke::new(1.5, ACCENT1()),
         )
     } else {
         (PANEL(), egui::Stroke::new(1.0, EDGE()))
     };
     let r = egui::Frame::new()
         .fill(fill)
-        .corner_radius(CornerRadius::same(12))
+        .corner_radius(CornerRadius::same(14))
         .inner_margin(Margin::same(10))
         .stroke(stroke)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui);
         });
-    ui.add_space(4.0);
+    let rect = r.response.rect;
+    // A whisper of a hover veil so unselected cards read as clickable.
+    if !selected && ui.rect_contains_pointer(rect) {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(14), TEXT().gamma_multiply(0.04));
+    }
+    ui.add_space(6.0);
     r.response
 }
 
@@ -1494,7 +1503,7 @@ fn lora_row(
     loras_dir: &Path,
     tdir: &Path,
     off_family: bool,
-) {
+) -> bool {
     // Pick up a freshly downloaded thumbnail from the cache.
     if l.thumb.is_none() && !l.thumb_missing {
         let stem = l.file.trim_end_matches(".safetensors");
@@ -1521,13 +1530,32 @@ fn lora_row(
     let inner = lora_card(ui, l.selected, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            if let Some(tex) = l.thumb.clone() {
-                ui.add(
-                    egui::Image::new(&tex)
-                        .max_height(80.0)
-                        .max_width(130.0)
-                        .corner_radius(8),
-                );
+            // Leading preview slot — every card gets one (a FIELD well with the
+            // LoRA glyph while no Civitai preview exists) so the names line up
+            // in a clean App Store-style list.
+            match l.thumb.clone() {
+                Some(tex) => {
+                    ui.add(
+                        egui::Image::new(&tex)
+                            .max_height(80.0)
+                            .max_width(130.0)
+                            .corner_radius(8),
+                    );
+                }
+                None => {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(96.0, 64.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, CornerRadius::same(8), FIELD());
+                    ui.painter().rect_stroke(
+                        rect,
+                        CornerRadius::same(8),
+                        egui::Stroke::new(1.0, EDGE()),
+                        egui::StrokeKind::Inside,
+                    );
+                    egui::Image::new(egui::include_image!("../icons/lora.svg"))
+                        .tint(icon_tint(MUTED()))
+                        .paint_at(ui, egui::Rect::from_center_size(rect.center(), egui::vec2(22.0, 22.0)));
+                }
             }
             // Right slot added FIRST (reserves its width), then the name/weight
             // fill and wrap in what's left — same trick as the Civitai cards.
@@ -1548,32 +1576,34 @@ fn lora_row(
                 info_rect = Some(r.rect);
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
                     ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        // Off-family LoRAs get a coloured base dot + family label.
-                        if off_family {
+                    // One-line name, ellipsised so long file names can never
+                    // widen the card — hover for the full name.
+                    let name = l.file.trim_end_matches(".safetensors");
+                    let col = if l.selected { TEXT() } else { MUTED() };
+                    ui.add(egui::Label::new(RichText::new(name).color(col).size(12.0)).truncate())
+                        .on_hover_text(name);
+                    // The base-family note sits UNDER the name (a coloured dot +
+                    // family for off-family LoRAs; "base?" when unidentified).
+                    if off_family {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
                             let (rect, dr) = ui
-                                .allocate_exact_size(egui::vec2(10.0, 12.0), egui::Sense::hover());
-                            ui.painter().circle_filled(rect.center(), 4.0, l.base.dot_color());
+                                .allocate_exact_size(egui::vec2(8.0, 10.0), egui::Sense::hover());
+                            ui.painter().circle_filled(rect.center(), 3.5, l.base.dot_color());
                             dr.on_hover_text(format!(
                                 "Trained for {} — may not work on this model.",
                                 l.base.label()
                             ));
-                        }
-                        let name = l.file.trim_end_matches(".safetensors");
-                        let col = if l.selected { TEXT() } else { MUTED() };
-                        ui.add(egui::Label::new(RichText::new(name).color(col).size(12.0)));
-                        if off_family {
                             ui.label(RichText::new(l.base.label()).color(l.base.dot_color()).size(10.0));
-                        } else if l.base == LoraBase::Unknown {
-                            ui.label(RichText::new("base?").color(MUTED()).size(10.0)).on_hover_text(
-                                "Couldn't identify this LoRA's base model from its file — it may not be made for this model.",
-                            );
-                        }
-                    });
+                        });
+                    } else if l.base == LoraBase::Unknown {
+                        ui.label(RichText::new("base?").color(MUTED()).size(10.0)).on_hover_text(
+                            "Couldn't identify this LoRA's base model from its file — it may not be made for this model.",
+                        );
+                    }
                     if l.selected {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("weight").color(MUTED()).size(10.5));
+                            ui.label(RichText::new("Weight").color(MUTED()).size(10.5));
                             let sr = ui.add(egui::Slider::new(&mut l.strength, 0.0..=2.0));
                             slider_rect = Some(sr.rect);
                         });
@@ -1583,7 +1613,12 @@ fn lora_row(
         });
         if l.info_open
             && let Some(info) = &l.info {
-                ui.add_space(4.0);
+                // Hairline between the card body and its details, Settings-style.
+                ui.add_space(8.0);
+                let (lr, _) =
+                    ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+                ui.painter().hline(lr.x_range(), lr.center().y, egui::Stroke::new(1.0, EDGE()));
+                ui.add_space(6.0);
                 if info.triggers.is_empty() && info.facts.is_empty() {
                     ui.label(RichText::new("No metadata in this file.").color(MUTED()).size(10.5));
                 }
@@ -1642,6 +1677,45 @@ fn lora_row(
             l.selected = !l.selected;
         }
     }
+
+    // Right-click menu (same Apple styling as the image viewer's): pick a
+    // custom preview image, or delete the LoRA file (confirmed by the caller).
+    let mut want_thumb = false;
+    let mut want_delete = false;
+    egui::Popup::context_menu(&resp)
+        .frame(crate::zoom::menu_frame())
+        .show(|ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            if crate::zoom::menu_item(ui, egui::include_image!("../icons/image.svg"), "Set Thumbnail…") {
+                want_thumb = true;
+                ui.close();
+            }
+            crate::zoom::menu_sep(ui);
+            if crate::zoom::menu_item(ui, egui::include_image!("../icons/delete.svg"), "Delete LoRA…") {
+                want_delete = true;
+                ui.close();
+            }
+        });
+    if want_thumb
+        && let Some(src) = rfd::FileDialog::new()
+            .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
+            .pick_file()
+    {
+        // The thumb cache stores the raw image bytes ({stem}.img) and decodes
+        // them on load — so the picked file's bytes are stored as-is, after a
+        // decode check so a broken image can't wedge the card in "missing".
+        let stem = l.file.trim_end_matches(".safetensors");
+        if let Ok(bytes) = std::fs::read(&src)
+            && crate::civitai::decode_thumb(&bytes, 200).is_some()
+        {
+            let _ = std::fs::create_dir_all(tdir);
+            let _ = std::fs::write(tdir.join(format!("{stem}.img")), &bytes);
+            let _ = std::fs::remove_file(tdir.join(format!("{stem}.none")));
+            l.thumb = None; // reload from the new bytes next frame
+            l.thumb_missing = false;
+        }
+    }
+    want_delete
 }
 
 /// The LoRA multi-select popup: an accent-highlighted card + weight slider per
@@ -1829,6 +1903,7 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
                 let shown = state.loras.iter().filter(|l| l.base.matches(family)).count();
                 let hidden = state.loras.len() - shown;
                 let show_other = state.show_other_loras;
+                let mut delete_req: Option<String> = None;
                 // Push the scrollbar into the popup's margin so it rides the
                 // window edge instead of sitting on the LoRA cards.
                 const SCROLL_GUTTER: f32 = 12.0;
@@ -1845,34 +1920,40 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
                         ui.add_space(6.0);
                     }
                     for l in state.loras.iter_mut().filter(|l| l.base.matches(family)) {
-                        lora_row(ui, l, &loras_dir, &tdir, false);
+                        if lora_row(ui, l, &loras_dir, &tdir, false) {
+                            delete_req = Some(l.file.clone());
+                        }
                     }
                     if hidden > 0 && show_other {
                         ui.add_space(2.0);
                         ui.label(
-                            RichText::new(format!("For other models ({hidden})"))
+                            RichText::new(format!("FOR OTHER MODELS ({hidden})"))
                                 .color(MUTED())
                                 .strong()
                                 .size(11.0),
                         );
                         ui.add_space(6.0);
                         for l in state.loras.iter_mut().filter(|l| !l.base.matches(family)) {
-                            lora_row(ui, l, &loras_dir, &tdir, true);
+                            if lora_row(ui, l, &loras_dir, &tdir, true) {
+                                delete_req = Some(l.file.clone());
+                            }
                         }
                     }
                 });
                 crate::edge_scroll_done(ui, &scroll_ui, SCROLL_GUTTER);
+                if delete_req.is_some() {
+                    state.lora_delete_confirm = delete_req;
+                }
                 // Reveal/hide the other-model LoRAs (where the "… hidden" note used
                 // to be).
                 if hidden > 0 {
                     ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.checkbox(
-                            &mut state.show_other_loras,
-                            RichText::new(format!("Show {hidden} LoRA(s) for other models"))
-                                .color(MUTED())
-                                .size(11.5),
-                        );
+                    crate::settings::row(
+                        ui,
+                        &format!("Show LoRAs for other models ({hidden})"),
+                        Some("Architecture-bound — they usually have no effect on this model."),
+                        |ui| {
+                        crate::settings::switch(ui, &mut state.show_other_loras);
                         // Only once the others are revealed: a warning glyph that
                         // pops a disclaimer about cross-architecture LoRAs.
                         if state.show_other_loras {
@@ -1923,6 +2004,66 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
                 }
             });
         });
+
+    // Delete confirmation (right-click → Delete LoRA…): a compact centred
+    // modal naming the file — deleting a couple-hundred-MB download by
+    // accident would sting.
+    if let Some(file) = state.lora_delete_confirm.clone() {
+        egui::Window::new("Delete LoRA")
+            .id(egui::Id::new("lora_delete_confirm"))
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(window_frame().corner_radius(CornerRadius::same(22)))
+            .show(ctx, |ui| {
+                ui.set_max_width(280.0);
+                ui.vertical_centered(|ui| {
+                    ui.add(
+                        egui::Image::new(egui::include_image!("../icons/warning.svg"))
+                            .fit_to_exact_size(egui::vec2(32.0, 32.0))
+                            .tint(Color32::from_rgb(220, 160, 50)),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Delete this LoRA?").size(15.0).strong().color(TEXT()));
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(file.trim_end_matches(".safetensors")).color(MUTED()).size(11.5),
+                        )
+                        .truncate(),
+                    );
+                    ui.label(
+                        RichText::new("The file is removed from models/loras — this can't be undone.")
+                            .color(MUTED())
+                            .size(11.0),
+                    );
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        let btn_w = 90.0;
+                        let gap = 12.0;
+                        ui.add_space((ui.available_width() - (btn_w * 2.0 + gap)) / 2.0);
+                        ui.spacing_mut().item_spacing.x = gap;
+                        if ui.add_sized(egui::vec2(btn_w, 30.0), egui::Button::new("Cancel")).clicked() {
+                            state.lora_delete_confirm = None;
+                        }
+                        let del = egui::Button::new(RichText::new("Delete").color(Color32::WHITE).strong())
+                            .fill(Color32::from_rgb(180, 40, 40));
+                        if ui.add_sized(egui::vec2(btn_w, 30.0), del).clicked() {
+                            let loras_dir = comfy_base().join("ComfyUI").join("models").join("loras");
+                            let _ = std::fs::remove_file(loras_dir.join(&file));
+                            // Drop its cached thumbnail state too.
+                            let stem = file.trim_end_matches(".safetensors");
+                            let tdir = lora_thumbs_dir();
+                            let _ = std::fs::remove_file(tdir.join(format!("{stem}.img")));
+                            let _ = std::fs::remove_file(tdir.join(format!("{stem}.none")));
+                            state.lora_delete_confirm = None;
+                            refresh_loras(state, ui.ctx());
+                        }
+                    });
+                });
+            });
+    }
 }
 
 /// The embeddings (textual-inversion) picker. Mirrors the LoRA popup, but each
@@ -2045,7 +2186,7 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
                     if hidden > 0 && show_other {
                         ui.add_space(2.0);
                         ui.label(
-                            RichText::new(format!("For other models ({hidden})"))
+                            RichText::new(format!("FOR OTHER MODELS ({hidden})"))
                                 .color(MUTED())
                                 .strong()
                                 .size(11.0),

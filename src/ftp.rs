@@ -522,25 +522,51 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
                                         ui.painter().rect_filled(rect, egui::CornerRadius::same(8), FIELD());
                                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                     }
+                                    // Right-to-left: the size claims the right
+                                    // edge first, then icon + name fill what's
+                                    // left — a long name truncates with an
+                                    // ellipsis instead of spilling past the
+                                    // popup edge (hover shows the full name).
                                     let mut row_ui = ui.new_child(
                                         egui::UiBuilder::new()
                                             .max_rect(rect.shrink2(egui::vec2(8.0, 0.0)))
-                                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                                            .layout(egui::Layout::right_to_left(egui::Align::Center)),
                                     );
                                     row_ui.spacing_mut().item_spacing.x = 8.0;
-                                    row_ui.add(
-                                        egui::Image::new(icon)
-                                            .fit_to_exact_size(egui::vec2(16.0, 16.0))
-                                            .tint(crate::theme::icon_tint(MUTED())),
-                                    );
-                                    row_ui.label(egui::RichText::new(&e.name).color(TEXT()).size(13.0));
                                     if !e.is_dir && e.size > 0 {
-                                        row_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.label(
-                                                egui::RichText::new(human_size(e.size)).color(MUTED()).size(11.0),
-                                            );
-                                        });
+                                        row_ui.label(
+                                            egui::RichText::new(human_size(e.size)).color(MUTED()).size(11.0),
+                                        );
                                     }
+                                    row_ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Image::new(icon)
+                                                    .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                                                    .tint(crate::theme::icon_tint(MUTED())),
+                                            );
+                                            let full_w = ui
+                                                .painter()
+                                                .layout_no_wrap(
+                                                    e.name.clone(),
+                                                    egui::FontId::proportional(13.0),
+                                                    TEXT(),
+                                                )
+                                                .size()
+                                                .x;
+                                            let clipped = full_w > ui.available_width();
+                                            let name = ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(&e.name).color(TEXT()).size(13.0),
+                                                )
+                                                .truncate(),
+                                            );
+                                            if clipped {
+                                                name.on_hover_text(&e.name);
+                                            }
+                                        },
+                                    );
                                     // Hairline between rows, inset past the icon gutter.
                                     if i + 1 < n {
                                         ui.painter().hline(
@@ -573,10 +599,19 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
                 let (done, total) = state.dl_progress;
                 ui.horizontal(|ui| {
                     ui.add(egui::Spinner::new().size(16.0).color(ACCENT1()));
-                    ui.label(
-                        egui::RichText::new(format!("Downloading {}/{} — {}", done + 1, total, state.dl_current))
+                    // Truncate: a long file name would stretch the popup.
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "Downloading {}/{} — {}",
+                                done + 1,
+                                total,
+                                state.dl_current
+                            ))
                             .color(MUTED())
                             .size(12.0),
+                        )
+                        .truncate(),
                     );
                 });
                 let frac = if total == 0 { 0.0 } else { done as f32 / total as f32 };

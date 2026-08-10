@@ -29,6 +29,11 @@ const FLASH_RED: Color32 = Color32::from_rgb(200, 55, 55);
 /// How long a button flash lingers before its action fires.
 const FLASH: Duration = Duration::from_millis(450);
 
+/// Shortest password Create accepts for an encrypted archive. Zip AES derives
+/// its key with low-iteration PBKDF2, so very short passwords give AES-256 in
+/// name only.
+const MIN_PASSWORD_LEN: usize = 8;
+
 /// Fixed dialog body width. Everything inside uses finite widths derived from
 /// this — NEVER `f32::INFINITY` or `ui.available_width()` — because in an
 /// auto-sized egui window the available width is infinite, which leaks into the
@@ -286,7 +291,7 @@ impl BackupState {
             crate::settings::row(
                 ui,
                 "Encrypt with password",
-                Some("AES-256 — the password can't be recovered if lost."),
+                Some("AES-256, at least 8 characters — the password can't be recovered if lost."),
                 |ui| {
                     crate::settings::switch(ui, &mut self.encrypt);
                 },
@@ -364,6 +369,12 @@ impl BackupState {
                 self.form_error = Some(
                     "Enter a password, or uncheck \"Encrypt with password\".".into(),
                 );
+                return;
+            }
+            if self.password.chars().count() < MIN_PASSWORD_LEN {
+                self.form_error = Some(format!(
+                    "Password must be at least {MIN_PASSWORD_LEN} characters."
+                ));
                 return;
             }
             if self.password != self.confirm {
@@ -456,22 +467,38 @@ fn done_body(ui: &mut egui::Ui, outcome: &Outcome) -> bool {
                 kv(ui, "Files written", &format!("{} / {}", s.written, s.total_selected));
                 if s.encrypted {
                     ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("🔒 Password-protected (AES-256).")
-                            .color(Color32::from_rgb(120, 200, 120))
-                            .size(12.0),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.add(
+                            egui::Image::new(egui::include_image!("../icons/encrypted.svg"))
+                                .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                                .tint(crate::theme::icon_tint(TEXT())),
+                        );
+                        ui.label(
+                            RichText::new("Password-protected (AES-256).").color(TEXT()).size(12.0),
+                        );
+                    });
                 }
                 if s.skipped_corrupt > 0 {
                     ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(format!(
-                            "⚠ Skipped {} potentially corrupt image(s).",
-                            s.skipped_corrupt
-                        ))
-                            .color(Color32::from_rgb(220, 180, 90))
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.add(
+                            egui::Image::new(egui::include_image!("../icons/warning.svg"))
+                                .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                                // The app's warning orange (matches the Civitai
+                                // download-failed glyph).
+                                .tint(Color32::from_rgb(235, 150, 45)),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "Skipped {} potentially corrupt image(s).",
+                                s.skipped_corrupt
+                            ))
+                            .color(TEXT())
                             .size(12.0),
-                    );
+                        );
+                    });
                 }
             });
         }

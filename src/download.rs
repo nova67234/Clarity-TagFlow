@@ -216,8 +216,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
         ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
 
-    // Round every widget in this view and give text fields an inset (PANEL)
-    // background so they read as wells inside the lighter FIELD section cards.
+    // Round every widget in this view; text fields get the theme FIELD well
+    // via `field_edit` so they read against the PANEL section cards.
     let radius = egui::CornerRadius::same(10);
     {
         let v = ui.visuals_mut();
@@ -663,11 +663,11 @@ fn download_indicator(ui: &mut egui::Ui, running: bool, done: bool) {
         .paint_at(ui, icon_rect);
 }
 
-/// A full-width text field with an inset (PANEL) background so it stands out
-/// against the lighter section card.
+/// A full-width text field with the theme's FIELD well background so it stands
+/// out against the PANEL section card (PANEL-on-PANEL made the box invisible).
 fn field_edit(ui: &mut egui::Ui, enabled: bool, edit: egui::TextEdit<'_>) {
     ui.scope(|ui| {
-        ui.visuals_mut().extreme_bg_color = PANEL();
+        ui.visuals_mut().extreme_bg_color = FIELD();
         ui.add_enabled(
             enabled,
             edit.desired_width(f32::INFINITY).margin(egui::Margin::symmetric(10, 6)),

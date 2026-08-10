@@ -66,10 +66,12 @@ pub enum GemmaModel {
 }
 
 impl GemmaModel {
+    /// Display order: 31B leads as the developer's pick (best answers in
+    /// testing so far), then the rest by family and size.
     pub const ALL: [GemmaModel; 5] = [
+        GemmaModel::D31B,
         GemmaModel::E4B,
         GemmaModel::G27B,
-        GemmaModel::D31B,
         GemmaModel::Qwen8B,
         GemmaModel::Qwen30B,
     ];
@@ -110,7 +112,7 @@ impl GemmaModel {
 
     pub fn hint(self) -> &'static str {
         match self {
-            GemmaModel::E4B => "~6 GB · fast, fits fully on 8 GB+ GPUs — recommended",
+            GemmaModel::E4B => "~6 GB · fast, fits fully on 8 GB+ GPUs — the light pick",
             GemmaModel::G27B => "~16 GB · very strong; wants ~20 GB VRAM, else spills to RAM (slower)",
             GemmaModel::D31B => "~19.5 GB · strongest; on a 16 GB GPU it runs partly on the CPU (slower)",
             GemmaModel::Qwen8B => "~6 GB · fast, a different flavour to Gemma — worth comparing",
@@ -346,6 +348,10 @@ pub struct LlmState {
     /// The variant the resident worker actually loaded — a mismatch drops
     /// the worker so the next ask loads the newly selected model.
     worker_model: GemmaModel,
+    /// AI Chat was deactivated while a reply was streaming: drop the worker
+    /// (freeing the weights) as soon as that reply finishes. Cleared if the
+    /// chat is re-activated first.
+    unload_when_done: bool,
     /// Auto-speak finished replies (mirrors the persisted setting; synced
     /// each frame by main.rs, toggled from the tools menu).
     pub auto_speak: bool,
@@ -388,6 +394,7 @@ impl Default for LlmState {
             input_rect: None,
             run_err: None,
             running: false,
+            unload_when_done: false,
             status: String::new(),
             md_cache: egui_commonmark::CommonMarkCache::default(),
             think_orbs: std::collections::HashMap::new(),
@@ -436,6 +443,23 @@ impl LlmState {
         if !self.running {
             self.worker = None;
         }
+    }
+
+    /// AI Chat was deactivated: free the resident worker — and the model
+    /// weights it holds — immediately when idle, or right after the in-flight
+    /// reply finishes (see `unload_when_done`). The next activation reloads
+    /// the model on its first ask.
+    pub fn unload(&mut self) {
+        if self.running {
+            self.unload_when_done = true;
+        } else {
+            self.worker = None;
+        }
+    }
+
+    /// AI Chat re-activated before a pending unload fired — keep the worker.
+    pub fn cancel_unload(&mut self) {
+        self.unload_when_done = false;
     }
 
     /// Drive background work — poll the setup download and drain any streamed
@@ -621,6 +645,12 @@ impl LlmState {
                 self.worker = None;
                 self.running = false;
                 self.gen_chat = None;
+            }
+            // Chat was deactivated mid-reply; that reply is done now, so
+            // release the worker and free the weights.
+            if !self.running && self.unload_when_done {
+                self.unload_when_done = false;
+                self.worker = None;
             }
         }
     }

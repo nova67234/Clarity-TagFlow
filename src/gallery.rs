@@ -155,8 +155,6 @@ pub fn search_pill(
     search: &mut String,
     settings: &mut crate::settings::Settings,
 ) -> bool {
-    use crate::left_panel_settings::MediaFilter;
-
     let mut changed = false;
     let pill_w = 320.0;
     let pill_h = 46.0;
@@ -239,10 +237,10 @@ pub fn search_pill(
                         crate::theme::icon_tint(MUTED()),
                     );
                     // The filters popup opens UPWARD (the pill sits at the
-                    // bottom of the screen). Same look as the left panel's Filter
-                    // Settings (card frame, title, radio dots) but landscape —
-                    // the options in one row. (Thumbnail size lives in the main
-                    // Settings → Browser only.)
+                    // bottom of the screen). Identical to the left panel's
+                    // Filter Settings — same shared panel, card frame and
+                    // switch rows. (Thumbnail size lives in the main Settings →
+                    // Browser only.)
                     egui::Popup::from_toggle_button_response(&gear_resp)
                         // Anchor to the whole pill and centre-align above it, so
                         // the popup lines up with the middle of the search bar.
@@ -251,36 +249,13 @@ pub fn search_pill(
                         .align(egui::RectAlign::TOP)
                         .gap(12.0)
                         .frame(crate::card_frame(22))
+                        .width(232.0)
                         .show(|ui| {
-                            ui.label(
-                                egui::RichText::new("Filter Settings")
-                                    .color(TEXT())
-                                    .strong()
-                                    .size(14.0),
-                            );
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("MEDIA CONTENT")
-                                    .color(MUTED())
-                                    .strong()
-                                    .size(10.0),
-                            );
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 12.0;
-                                for opt in MediaFilter::OPTIONS {
-                                    if ui
-                                        .radio_value(
-                                            &mut settings.media_filter,
-                                            opt,
-                                            egui::RichText::new(opt.label()).color(TEXT()),
-                                        )
-                                        .changed()
-                                    {
-                                        changed = true;
-                                    }
-                                }
-                            });
+                            let before = settings.media_filter;
+                            crate::left_panel_settings::panel(ui, &mut settings.media_filter);
+                            if settings.media_filter != before {
+                                changed = true;
+                            }
                         });
 
                     // Search field fills the remaining pill width.

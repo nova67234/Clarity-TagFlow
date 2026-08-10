@@ -444,7 +444,6 @@ impl ViewerApp {
     /// Update the cached list of filtered indices based on the search string.
     /// The query matches the file name OR the sidecar .txt tags (cached).
     fn update_filtered(&mut self) {
-        use left_panel_settings::MediaFilter;
         let query = self.search.trim().to_lowercase();
         let filter = self.settings.media_filter;
         let mut filtered = Vec::with_capacity(self.images.len());
@@ -458,15 +457,16 @@ impl ViewerApp {
             {
                 continue;
             }
-            let keep = match filter {
-                MediaFilter::All => true,
-                // `is_image` counts GIFs as images, so exclude them here to keep
-                // the "Images" and "GIFs" buckets distinct (matching the Java filter).
-                MediaFilter::Images => is_image(&path) && !is_gif(&path),
-                MediaFilter::Videos => is_video(&path),
-                MediaFilter::Gifs => is_gif(&path),
-                MediaFilter::Favorites => self.favorites.is_favorite(&path),
-            };
+            // Selected type kinds union together; Favorites intersects (so
+            // Images + Favorites = favorite images). No kinds selected = all
+            // types pass. `is_image` counts GIFs as images, so exclude them
+            // there to keep the "Images" and "GIFs" buckets distinct (matching
+            // the Java filter).
+            let type_ok = !(filter.images || filter.videos || filter.gifs)
+                || (filter.images && is_image(&path) && !is_gif(&path))
+                || (filter.videos && is_video(&path))
+                || (filter.gifs && is_gif(&path));
+            let keep = type_ok && (!filter.favorites || self.favorites.is_favorite(&path));
             if keep {
                 filtered.push(i);
             }

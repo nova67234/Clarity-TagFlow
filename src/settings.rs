@@ -350,6 +350,8 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             Some("Images decoded ahead/behind the current one — smoother paging."),
             |ui| {
                 ui.spacing_mut().slider_width = 110.0;
+                // Air between the value box and the slider rail.
+                ui.spacing_mut().item_spacing.x = 10.0;
                 ui.add(egui::Slider::new(&mut settings.prefetch_radius, 0..=3));
             },
         );
@@ -362,6 +364,8 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             Some("Largest height a tile can take in the list."),
             |ui| {
                 ui.spacing_mut().slider_width = 90.0;
+                // Air between the value box and the slider rail.
+                ui.spacing_mut().item_spacing.x = 10.0;
                 ui.add(
                     egui::Slider::new(&mut settings.thumbnail_size, 120.0..=400.0)
                         .step_by(10.0)
@@ -600,40 +604,43 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
 
         // Variant picker: pick the size that fits the hardware; the chat
         // switches models on its next question (the old one unloads).
-        for m in crate::llm::GemmaModel::ALL {
+        // Switch rows with radio semantics — turning one on selects it and
+        // turns the rest off; the active model can't be switched off directly.
+        let n = crate::llm::GemmaModel::ALL.len();
+        for (i, m) in crate::llm::GemmaModel::ALL.into_iter().enumerate() {
             ui.horizontal(|ui| {
-                let selected = settings.ai_gemma_model == m;
-                if ui.radio(selected, egui::RichText::new(m.label()).color(TEXT())).clicked()
-                    && !selected
-                {
-                    settings.ai_gemma_model = m;
-                    llm.set_model(m);
-                }
-                if m.installed() {
+                ui.label(egui::RichText::new(m.label()).color(TEXT()).size(13.0));
+                if m == crate::llm::GemmaModel::D31B {
                     ui.label(
-                        egui::RichText::new("installed")
-                            .color(egui::Color32::from_rgb(46, 160, 67))
+                        egui::RichText::new(" Developer's choice")
+                            .color(crate::theme::ACCENT1())
                             .size(10.5),
                     );
                 }
+                if m.installed() {
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::Image::new(egui::include_image!("../icons/check_circle.svg"))
+                            .fit_to_exact_size(egui::vec2(13.0, 13.0))
+                            // Status green stays green on every theme — icon_tint
+                            // would grey it out on light Glass.
+                            .tint(egui::Color32::from_rgb(46, 160, 67)),
+                    )
+                    .on_hover_text("Installed");
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut on = settings.ai_gemma_model == m;
+                    if switch(ui, &mut on).changed() && on {
+                        settings.ai_gemma_model = m;
+                        llm.set_model(m);
+                    }
+                });
             });
             hint(ui, m.hint());
-            ui.add_space(2.0);
+            if i + 1 < n {
+                row_sep(ui);
+            }
         }
-        ui.add_space(2.0);
-        // Which inference engine this exe was built with — makes it obvious
-        // when a CPU-only build is running instead of the Vulkan one.
-        if crate::llm::BUILT_WITH_GPU {
-            ui.label(
-                egui::RichText::new("Engine: GPU (Vulkan)")
-                    .color(egui::Color32::from_rgb(46, 160, 67))
-                    .size(11.5),
-            );
-        } else if crate::llm::BUILT_WITH_LLM {
-            ui.label(egui::RichText::new("Engine: CPU").color(MUTED()).size(11.5));
-            hint(ui, "For GPU acceleration, run the build made by scripts\\build-vulkan.cmd.");
-        }
-
         if !crate::llm::BUILT_WITH_LLM {
             ui.add_space(4.0);
             ui.label(
@@ -690,10 +697,38 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                 Some(
                     "Swaps the main view for a full-window chat with the model — \
                      attach images with the +, switch conversations with the tabs. \
-                     The first question loads the model and can take a minute.",
+                     The first question loads the model and can take a minute; \
+                     switching off frees the model from memory.",
                 ),
                 |ui| {
-                    switch(ui, &mut settings.ai_chat);
+                    if switch(ui, &mut settings.ai_chat).changed() {
+                        if settings.ai_chat {
+                            llm.cancel_unload();
+                        } else {
+                            llm.unload();
+                        }
+                    }
+                },
+            );
+            row_sep(ui);
+            // Which inference engine this exe was built with — makes it
+            // obvious when a CPU-only build is running instead of the Vulkan
+            // one.
+            row(
+                ui,
+                "Engine",
+                (!crate::llm::BUILT_WITH_GPU)
+                    .then_some("For GPU acceleration, run the build made by scripts\\build-vulkan.cmd."),
+                |ui| {
+                    if crate::llm::BUILT_WITH_GPU {
+                        ui.label(
+                            egui::RichText::new("GPU (Vulkan)")
+                                .color(egui::Color32::from_rgb(46, 160, 67))
+                                .size(13.0),
+                        );
+                    } else {
+                        ui.label(egui::RichText::new("CPU").color(MUTED()).size(13.0));
+                    }
                 },
             );
         });
@@ -983,6 +1018,11 @@ pub(crate) fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui
     ui.add_space(4.0);
     ui.label(egui::RichText::new(title.to_uppercase()).color(MUTED()).strong().size(11.0));
     ui.add_space(5.0);
+    card(ui, add);
+}
+
+/// A [`section`]'s rounded card without the header line.
+pub(crate) fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(PANEL())
         .stroke(egui::Stroke::new(1.0, EDGE()))

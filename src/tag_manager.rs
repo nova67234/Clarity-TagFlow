@@ -730,11 +730,19 @@ fn flash_strength(t: f32) -> f32 {
 
 /// A rounded tag pill: FIELD fill (FIELD2 on hover), theme selection colour with
 /// white text while selected. `flash` (0..1) blends the chip toward amber — the
-/// "already added" pulse. Returns the click response; the caller toggles.
+/// "already added" pulse. Caption-length tags wrap into multi-line chips at the
+/// panel width rather than clipping. Returns the click response; the caller
+/// toggles.
 fn tag_chip(ui: &mut egui::Ui, text: &str, selected: bool, flash: Option<f32>) -> egui::Response {
     let font = egui::FontId::proportional(13.0);
     let pad = egui::vec2(10.0, 5.0);
-    let galley = ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), font, Color32::PLACEHOLDER));
+    let wrap_w = (ui.max_rect().width() - pad.x * 2.0).max(40.0);
+    let (galley, row_h) = ui.fonts_mut(|f| {
+        (
+            f.layout(text.to_string(), font.clone(), Color32::PLACEHOLDER, wrap_w),
+            f.row_height(&font),
+        )
+    });
     // click = toggle selection; drag = reorder (handled by the caller).
     let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::click_and_drag());
     if ui.is_rect_visible(rect) {
@@ -750,7 +758,9 @@ fn tag_chip(ui: &mut egui::Ui, text: &str, selected: bool, flash: Option<f32>) -
             // Dark ink at peak so the label stays readable on amber.
             ink = blend(ink, Color32::from_rgb(64, 48, 12), k);
         }
-        let radius = CornerRadius::same((rect.height() / 2.0) as u8);
+        // Cap at the single-line pill radius so multi-line chips stay
+        // rounded-rectangular instead of lozenge-shaped.
+        let radius = CornerRadius::same((rect.height().min(row_h + pad.y * 2.0) / 2.0) as u8);
         ui.painter().rect_filled(rect, radius, fill);
         if !selected {
             ui.painter().rect_stroke(rect, radius, egui::Stroke::new(1.0, EDGE()), egui::StrokeKind::Inside);
@@ -765,13 +775,16 @@ fn tag_chip(ui: &mut egui::Ui, text: &str, selected: bool, flash: Option<f32>) -
 /// its text.
 fn edit_chip(ui: &mut egui::Ui, buf: &mut String) -> egui::Response {
     let font = egui::FontId::proportional(13.0);
-    let w = ui
+    // Size to the text, but never wider than the panel — a caption-length
+    // rename scrolls inside the editor instead of clipping at the edge.
+    let w = (ui
         .painter()
         .layout_no_wrap(buf.clone(), font.clone(), Color32::PLACEHOLDER)
         .size()
         .x
         .max(40.0)
-        + 8.0;
+        + 8.0)
+        .min((ui.max_rect().width() - 30.0).max(40.0));
     egui::Frame::new()
         .fill(FIELD())
         .stroke(egui::Stroke::new(1.0, selection_outline()))
@@ -863,9 +876,16 @@ fn floating_chip(ctx: &egui::Context, text: &str, pos: egui::Pos2) {
         egui::Order::Tooltip,
         egui::Id::new("tag_drag_ghost"),
     ));
-    let galley = painter.layout_no_wrap(text.to_string(), font, Color32::PLACEHOLDER);
+    // Wrap caption-length tags like the list chips do, so the ghost stays
+    // a readable card instead of one screen-wide line.
+    let wrap_w = (ctx.content_rect().width() * 0.5).max(120.0);
+    let galley = painter.layout(text.to_string(), font.clone(), Color32::PLACEHOLDER, wrap_w);
+    let row_h = painter
+        .layout_no_wrap(" ".to_string(), font, Color32::PLACEHOLDER)
+        .size()
+        .y;
     let rect = egui::Rect::from_center_size(pos, galley.size() + pad * 2.0);
-    let radius = CornerRadius::same((rect.height() / 2.0) as u8);
+    let radius = CornerRadius::same((rect.height().min(row_h + pad.y * 2.0) / 2.0) as u8);
     painter.rect_filled(rect, radius, selection_outline().gamma_multiply(0.85));
     painter.galley(rect.min + pad, galley, Color32::WHITE);
 }
