@@ -180,7 +180,23 @@ impl Style {
         }
 
         if self.code {
-            text = text.code();
+            // PATCH(Clarity TagFlow): monospace only — no `.code()`. That
+            // helper also sets `TextFormat.background`, which epaint bakes
+            // into the text mesh as SQUARE rectangles (add_row_backgrounds
+            // has no corner support). The viewer paints a rounded chip
+            // beneath inline code instead (see pulldown.rs event_text).
+            // The text colour is keyed to the EFFECTIVE body ink (which
+            // tracks the real background) rather than the chip fill — with a
+            // translucent chip, the chip's own colour says nothing about
+            // what's behind it. Dark ink (light background) → dark grey code
+            // text; light ink (dark background) → light grey.
+            let ink = ui.style().visuals.text_color();
+            let dark_ink = (ink.r() as u16 + ink.g() as u16 + ink.b() as u16) < 384;
+            text = text.monospace().color(if dark_ink {
+                egui::Color32::from_gray(60)
+            } else {
+                egui::Color32::from_gray(220)
+            });
         }
 
         text
@@ -199,7 +215,12 @@ impl Link {
 
         let mut layout_job = LayoutJob::default();
         for t in text {
-            t.append_to(
+            // PATCH(Clarity TagFlow): colour link text with the theme's
+            // hyperlink colour explicitly. Resolving through `append_to`
+            // lets a global `override_text_color` (the chat's ink) win,
+            // which painted links the same colour as body text instead of
+            // link blue.
+            t.color(ui.visuals().hyperlink_color).append_to(
                 &mut layout_job,
                 ui.style(),
                 egui::FontSelection::Default,

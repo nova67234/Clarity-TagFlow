@@ -582,6 +582,29 @@ impl CommonMarkViewerInternal {
             block.content.push_str(&text);
         } else if let Some(link) = &mut self.link {
             link.text.push(rich_text);
+        } else if self.text_style.code {
+            // PATCH(Clarity TagFlow): inline code renders on a ROUNDED chip.
+            // egui bakes `TextFormat.background` into the text mesh as sharp
+            // rectangles (epaint's add_row_backgrounds has no corner
+            // support), so no corner-radius setting can round the built-in
+            // `.code()` highlight. The background is stripped in the backend
+            // (misc.rs keeps only monospace) and a rounded rect is painted
+            // here beneath each text row instead — one chip per visual row,
+            // so a span that wraps gets a clean chip on every line.
+            let chip = ui.visuals().code_bg_color;
+            let (pos, galley, response) = egui::Label::new(rich_text).layout_in_ui(ui);
+            let painter = ui.painter();
+            for row in &galley.rows {
+                // Excluding the leading space keeps a chip that starts
+                // mid-paragraph from stretching back to the line start.
+                let rect = row.rect_without_leading_space().translate(pos.to_vec2());
+                painter.rect_filled(rect.expand2(egui::vec2(2.0, 1.5)), 5.0, chip);
+            }
+            let text = galley.text().to_owned();
+            painter.galley(pos, galley, ui.visuals().text_color());
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), &text)
+            });
         } else if !text_has_emoji(&text) {
             ui.label(rich_text);
         } else {

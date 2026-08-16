@@ -152,12 +152,10 @@ fn chat_list(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::settin
                 let mut btn = egui::Button::new(
                     egui::RichText::new(title).color(text_color).size(13.0),
                 )
-                    // Increase radius to 18 so it beautifully matches your chat bubbles
                     .corner_radius(egui::CornerRadius::same(18))
                     .min_size(egui::vec2(ui.available_width() - 26.0, 30.0));
 
                 btn = if selected {
-                    // Use a soft, glassy translucent tint instead of a heavy solid block
                     btn.fill(ACCENT1().gamma_multiply(0.15))
                 } else {
                     btn.fill(egui::Color32::TRANSPARENT)
@@ -227,8 +225,8 @@ fn gen_settings_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings) 
 
     if *p != crate::llm::GenParams::default()
         && ui
-            .button(egui::RichText::new("Reset to defaults").size(11.5))
-            .clicked()
+        .button(egui::RichText::new("Reset to defaults").size(11.5))
+        .clicked()
     {
         *p = crate::llm::GenParams::default();
     }
@@ -330,21 +328,21 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
     let hover_pos = ui.input(|i| i.pointer.hover_pos());
     let drag_over_card = dragging_files
         && llm
-            .input_rect
-            .is_none_or(|(r, _)| hover_pos.is_none_or(|p| r.contains(p)));
+        .input_rect
+        .is_none_or(|(r, _)| hover_pos.is_none_or(|p| r.contains(p)));
     let dropped: Vec<std::path::PathBuf> = ui.input(|i| {
         i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
     });
     if !dropped.is_empty() && claims_drop(llm, ui.ctx())
         && let Some(p) = dropped.into_iter().find(|p| {
-            crate::is_video(p)
-                || p.extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| DROP_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-        }) {
-            llm.draft_image = Some(p);
-            llm.run_err = None;
-        }
+        crate::is_video(p)
+            || p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| DROP_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+    }) {
+        llm.draft_image = Some(p);
+        llm.run_err = None;
+    }
 
     let screen = ui.ctx().content_rect();
     let off_x = panel.center().x - screen.center().x;
@@ -352,218 +350,218 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(off_x, -14.0))
         .show(ui.ctx(), |ui| {
-        // Glass themes: repaint the window backdrop (pixel-aligned) as an
-        // opaque patch under the card, so the card can share the other
-        // panels' translucent PANEL fill — matching the top bar and chat
-        // list exactly — without messages scrolled beneath showing through.
-        // Uses last frame's rect (stored below); the one-frame lag while the
-        // card grows is invisible. No-op outside Glass.
-        if let Some((r, _)) = llm.input_rect {
-            crate::theme::paint_glass_patch(ui.ctx(), ui.painter(), r);
-        }
-        // While a file is dragged over: the expanded blue drop zone replaces
-        // the whole card.
-        if drag_over_card {
-            let drop_h = 8.0 * row_h + 44.0;
+            // Glass themes: repaint the window backdrop (pixel-aligned) as an
+            // opaque patch under the card, so the card can share the other
+            // panels' translucent PANEL fill — matching the top bar and chat
+            // list exactly — without messages scrolled beneath showing through.
+            // Uses last frame's rect (stored below); the one-frame lag while the
+            // card grows is invisible. No-op outside Glass.
+            if let Some((r, _)) = llm.input_rect {
+                crate::theme::paint_glass_patch(ui.ctx(), ui.painter(), r);
+            }
+            // While a file is dragged over: the expanded blue drop zone replaces
+            // the whole card.
+            if drag_over_card {
+                let drop_h = 8.0 * row_h + 44.0;
+                egui::Frame::new()
+                    .fill(DROP_BLUE.gamma_multiply(0.18))
+                    .stroke(egui::Stroke::new(1.5, DROP_BLUE))
+                    .corner_radius(egui::CornerRadius::same(24))
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(col_w - 24.0);
+                        ui.set_height(drop_h);
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(drop_h / 2.0 - 34.0);
+                            ui.add(
+                                egui::Image::new(egui::include_image!("../icons/attach_file.svg"))
+                                    .fit_to_exact_size(egui::vec2(38.0, 38.0))
+                                    .tint(DROP_BLUE),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("Add files here").color(DROP_BLUE).size(13.5));
+                        });
+                    });
+                return;
+            }
+
+            if let Some(e) = llm.run_err.clone() {
+                ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(12.0));
+                ui.add_space(2.0);
+            }
+            // The same translucent PANEL fill as the top bar / chat list cards —
+            // the glass-patch underlay painted above keeps messages from showing
+            // through it. A soft shadow (same family as card_frame's) lifts the
+            // card visually above the chat.
             egui::Frame::new()
-                .fill(DROP_BLUE.gamma_multiply(0.18))
-                .stroke(egui::Stroke::new(1.5, DROP_BLUE))
+                .fill(PANEL())
+                .stroke(egui::Stroke::new(1.0, EDGE()))
                 .corner_radius(egui::CornerRadius::same(24))
                 .inner_margin(egui::Margin::symmetric(12, 10))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 4],
+                    blur: 14,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(110),
+                })
                 .show(ui, |ui| {
-                    ui.set_width(col_w - 24.0);
-                    ui.set_height(drop_h);
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(drop_h / 2.0 - 34.0);
-                        ui.add(
-                            egui::Image::new(egui::include_image!("../icons/attach_file.svg"))
-                                .fit_to_exact_size(egui::vec2(38.0, 38.0))
-                                .tint(DROP_BLUE),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new("Add files here").color(DROP_BLUE).size(13.5));
-                    });
-                });
-            return;
-        }
+                    ui.vertical(|ui| {
+                        ui.set_width(col_w - 24.0);
 
-        if let Some(e) = llm.run_err.clone() {
-            ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(12.0));
-            ui.add_space(2.0);
-        }
-        // The same translucent PANEL fill as the top bar / chat list cards —
-        // the glass-patch underlay painted above keeps messages from showing
-        // through it. A soft shadow (same family as card_frame's) lifts the
-        // card visually above the chat.
-        egui::Frame::new()
-            .fill(PANEL())
-            .stroke(egui::Stroke::new(1.0, EDGE()))
-            .corner_radius(egui::CornerRadius::same(24))
-            .inner_margin(egui::Margin::symmetric(12, 10))
-            .shadow(egui::epaint::Shadow {
-                offset: [0, 4],
-                blur: 14,
-                spread: 0,
-                color: egui::Color32::from_black_alpha(110),
-            })
-            .show(ui, |ui| {
-                ui.vertical(|ui| {
-                ui.set_width(col_w - 24.0);
-
-                // Attached-media preview (rounded, with a remove ✕): image
-                // thumbnail, or a video's poster still with a play badge —
-                // a filename chip while the poster is still being captured.
-                if let Some(path) = llm.draft_image.clone() {
-                    let tex = llm.draft_thumb.as_ref().map(|(_, t)| t.clone());
-                    ui.horizontal(|ui| {
-                        if let Some(tex) = tex {
-                            let size = tex.size_vec2();
-                            let scale = (64.0 / size.y).min(64.0 / size.x);
-                            let resp = ui.add(
-                                egui::Image::new(&tex)
-                                    .fit_to_exact_size(size * scale)
-                                    .corner_radius(egui::CornerRadius::same(10)),
-                            );
-                            if crate::is_video(&path) {
-                                paint_play_badge(ui, resp.rect);
-                            }
-                        } else {
-                            media_chip(ui, &path, icon_tint(MUTED()));
-                        }
-                        if ui
-                            .add(egui::Button::new(egui::RichText::new("✕").color(MUTED()).size(11.0)).frame(false))
-                            .on_hover_text("Remove the attachment")
-                            .clicked()
-                        {
-                            llm.draft_image = None;
-                            llm.draft_thumb = None;
-                        }
-                    });
-                    ui.add_space(6.0);
-                }
-
-                // Draft text: grows with its content (the card extends upward
-                // because it's bottom-anchored), scrolls inside past 8 lines.
-                // Enter sends; Shift+Enter makes a newline.
-                let mut send_now = false;
-                egui::ScrollArea::vertical()
-                    .id_salt("ai_chat_draft")
-                    .max_height(8.0 * row_h)
-                    .auto_shrink([false, true])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        let out = egui::TextEdit::multiline(&mut llm.draft)
-                            .desired_rows(1)
-                            .frame(egui::Frame::NONE)
-                            .font(egui::FontId::proportional(15.0))
-                            .hint_text("Ask the AI")
-                            .desired_width(f32::INFINITY)
-                            .show(ui);
-                        // Live spell-check: red squiggles + right-click
-                        // suggestions, same as the generator prompt boxes.
-                        crate::spellcheck::attach(ui, &out, &mut llm.draft, &mut llm.spell);
-                        let resp = &out.response.response;
-                        let enter = resp.has_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                        if enter {
-                            // Drop the newline the Enter keystroke inserted.
-                            while llm.draft.ends_with('\n') {
-                                llm.draft.pop();
-                            }
-                            send_now = true;
-                        }
-                    });
-
-                // Bottom row: attach on the left, streaming status in the
-                // middle, send on the right.
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if icon_button(ui, egui::include_image!("../icons/add.svg"), 20.0, "Attach an image or video", !llm.running)
-                        .clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"])
-                            .add_filter("Videos", VIDEO_PICK_EXTS)
-                            .pick_file()
-                        {
-                            llm.draft_image = Some(path);
-                        }
-                    // Tools menu: extra chat abilities with on/off toggles.
-                    let tools_resp = icon_button(ui, egui::include_image!("../icons/tools.svg"), 18.0, "Tools", true);
-                    if tools_resp.clicked() {
-                        llm.tools_open = !llm.tools_open;
-                    }
-                    if llm.tools_open {
-                        let mut open = llm.tools_open;
-                        egui::Popup::from_response(&tools_resp)
-                            .open_bool(&mut open)
-                            .align(egui::RectAlign::TOP_START) // opens upward (card sits at the bottom)
-                            .width(240.0)
-                            .gap(8.0)
-                            .frame(crate::card_frame(14))
-                            .show(|ui| {
-                                ui.label(egui::RichText::new("TOOLS").color(MUTED()).strong().size(10.5));
-                                ui.add_space(4.0);
-                                let mut on = llm.roleplay.enabled;
-                                let resp = ui.checkbox(&mut on, egui::RichText::new("Role playing").color(TEXT()));
-                                if resp.changed() {
-                                    llm.roleplay.enabled = on;
-                                    llm.roleplay.save();
+                        // Attached-media preview (rounded, with a remove ✕): image
+                        // thumbnail, or a video's poster still with a play badge —
+                        // a filename chip while the poster is still being captured.
+                        if let Some(path) = llm.draft_image.clone() {
+                            let tex = llm.draft_thumb.as_ref().map(|(_, t)| t.clone());
+                            ui.horizontal(|ui| {
+                                if let Some(tex) = tex {
+                                    let size = tex.size_vec2();
+                                    let scale = (64.0 / size.y).min(64.0 / size.x);
+                                    let resp = ui.add(
+                                        egui::Image::new(&tex)
+                                            .fit_to_exact_size(size * scale)
+                                            .corner_radius(egui::CornerRadius::same(10)),
+                                    );
+                                    if crate::is_video(&path) {
+                                        paint_play_badge(ui, resp.rect);
+                                    }
+                                } else {
+                                    media_chip(ui, &path, icon_tint(MUTED()));
                                 }
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Give the AI a persona and a shared memory \
-                                         diary (left panel). It remembers facts, \
-                                         permissions and the story as it unfolds.",
-                                    )
-                                    .color(MUTED())
-                                    .size(10.5),
-                                );
-                                ui.add_space(6.0);
-                                let mut speak = settings.ai_auto_speak;
-                                let resp = ui.checkbox(&mut speak, egui::RichText::new("Auto-speak replies").color(TEXT()));
-                                if resp.changed() {
-                                    settings.ai_auto_speak = speak;
-                                    llm.auto_speak = speak;
-                                }
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Read every reply aloud the moment it \
-                                         finishes — click any reply's listen \
-                                         icon to stop.",
-                                    )
-                                    .color(MUTED())
-                                    .size(10.5),
-                                );
-                            });
-                        llm.tools_open = open;
-                    }
-                    let can_send = !llm.running
-                        && (!llm.draft.trim().is_empty() || llm.draft_image.is_some());
-                    // While a reply streams the send icon becomes a stop
-                    // button, same as the text-to-image view.
-                    let send_clicked = ui
-                        .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if llm.running {
-                                if icon_button(ui, egui::include_image!("../icons/stop.svg"), 16.0, "Stop generating", true)
+                                if ui
+                                    .add(egui::Button::new(egui::RichText::new("✕").color(MUTED()).size(11.0)).frame(false))
+                                    .on_hover_text("Remove the attachment")
                                     .clicked()
                                 {
-                                    llm.stop_generation();
+                                    llm.draft_image = None;
+                                    llm.draft_thumb = None;
                                 }
-                                false
-                            } else {
-                                icon_button(ui, egui::include_image!("../icons/send.svg"), 19.0, "Send", can_send)
-                                    .clicked()
-                            }
-                        })
-                        .inner;
+                            });
+                            ui.add_space(6.0);
+                        }
 
-                    if (send_now || send_clicked) && can_send {
-                        llm.send_draft(ui.ctx());
-                    }
+                        // Draft text: grows with its content (the card extends upward
+                        // because it's bottom-anchored), scrolls inside past 8 lines.
+                        // Enter sends; Shift+Enter makes a newline.
+                        let mut send_now = false;
+                        egui::ScrollArea::vertical()
+                            .id_salt("ai_chat_draft")
+                            .max_height(8.0 * row_h)
+                            .auto_shrink([false, true])
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                let out = egui::TextEdit::multiline(&mut llm.draft)
+                                    .desired_rows(1)
+                                    .frame(egui::Frame::NONE)
+                                    .font(egui::FontId::proportional(15.0))
+                                    .hint_text("Ask the AI")
+                                    .desired_width(f32::INFINITY)
+                                    .show(ui);
+                                // Live spell-check: red squiggles + right-click
+                                // suggestions, same as the generator prompt boxes.
+                                crate::spellcheck::attach(ui, &out, &mut llm.draft, &mut llm.spell);
+                                let resp = &out.response.response;
+                                let enter = resp.has_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                                if enter {
+                                    // Drop the newline the Enter keystroke inserted.
+                                    while llm.draft.ends_with('\n') {
+                                        llm.draft.pop();
+                                    }
+                                    send_now = true;
+                                }
+                            });
+
+                        // Bottom row: attach on the left, streaming status in the
+                        // middle, send on the right.
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if icon_button(ui, egui::include_image!("../icons/add.svg"), 20.0, "Attach an image or video", !llm.running)
+                                .clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"])
+                                .add_filter("Videos", VIDEO_PICK_EXTS)
+                                .pick_file()
+                            {
+                                llm.draft_image = Some(path);
+                            }
+                            // Tools menu: extra chat abilities with on/off toggles.
+                            let tools_resp = icon_button(ui, egui::include_image!("../icons/tools.svg"), 18.0, "Tools", true);
+                            if tools_resp.clicked() {
+                                llm.tools_open = !llm.tools_open;
+                            }
+                            if llm.tools_open {
+                                let mut open = llm.tools_open;
+                                egui::Popup::from_response(&tools_resp)
+                                    .open_bool(&mut open)
+                                    .align(egui::RectAlign::TOP_START) // opens upward (card sits at the bottom)
+                                    .width(240.0)
+                                    .gap(8.0)
+                                    .frame(crate::card_frame(14))
+                                    .show(|ui| {
+                                        ui.label(egui::RichText::new("TOOLS").color(MUTED()).strong().size(10.5));
+                                        ui.add_space(4.0);
+                                        let mut on = llm.roleplay.enabled;
+                                        let resp = ui.checkbox(&mut on, egui::RichText::new("Role playing").color(TEXT()));
+                                        if resp.changed() {
+                                            llm.roleplay.enabled = on;
+                                            llm.roleplay.save();
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Give the AI a persona and a shared memory \
+                                         diary (left panel). It remembers facts, \
+                                         permissions and the story as it unfolds.",
+                                            )
+                                                .color(MUTED())
+                                                .size(10.5),
+                                        );
+                                        ui.add_space(6.0);
+                                        let mut speak = settings.ai_auto_speak;
+                                        let resp = ui.checkbox(&mut speak, egui::RichText::new("Auto-speak replies").color(TEXT()));
+                                        if resp.changed() {
+                                            settings.ai_auto_speak = speak;
+                                            llm.auto_speak = speak;
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Read every reply aloud the moment it \
+                                         finishes — click any reply's listen \
+                                         icon to stop.",
+                                            )
+                                                .color(MUTED())
+                                                .size(10.5),
+                                        );
+                                    });
+                                llm.tools_open = open;
+                            }
+                            let can_send = !llm.running
+                                && (!llm.draft.trim().is_empty() || llm.draft_image.is_some());
+                            // While a reply streams the send icon becomes a stop
+                            // button, same as the text-to-image view.
+                            let send_clicked = ui
+                                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if llm.running {
+                                        if icon_button(ui, egui::include_image!("../icons/stop.svg"), 16.0, "Stop generating", true)
+                                            .clicked()
+                                        {
+                                            llm.stop_generation();
+                                        }
+                                        false
+                                    } else {
+                                        icon_button(ui, egui::include_image!("../icons/send.svg"), 19.0, "Send", can_send)
+                                            .clicked()
+                                    }
+                                })
+                                .inner;
+
+                            if (send_now || send_clicked) && can_send {
+                                llm.send_draft(ui.ctx());
+                            }
+                        });
+                    });
                 });
-                });
-            });
-    });
+        });
 
     // Publish the card's rect for next frame's drag-highlight and for the
     // gallery's drop handler to check (claims_drop).
@@ -644,7 +642,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                                     "Send — the conversation continues from here",
                                     can_send,
                                 )
-                                .clicked();
+                                    .clicked();
                                 let cancel = msg_icon_button(
                                     ui,
                                     egui::include_image!("../icons/x.svg"),
@@ -652,7 +650,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                                     "Cancel editing",
                                     true,
                                 )
-                                .clicked();
+                                    .clicked();
                                 if (send || enter) && can_send {
                                     // Drop the newline the Enter keystroke inserted.
                                     while llm.edit_draft.ends_with('\n') {
@@ -717,15 +715,15 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
     // text, on its side of the column.
     if let Some(path) = &image
         && let Some(tex) = msg_thumb(ui.ctx(), llm, path) {
-            let size = tex.size_vec2();
-            let scale = (180.0 / size.y).min(280.0 / size.x).min(1.0);
-            ui.add(
-                egui::Image::new(&tex)
-                    .fit_to_exact_size(size * scale)
-                    .corner_radius(egui::CornerRadius::same(12)),
-            );
-            ui.add_space(4.0);
-        }
+        let size = tex.size_vec2();
+        let scale = (180.0 / size.y).min(280.0 / size.x).min(1.0);
+        ui.add(
+            egui::Image::new(&tex)
+                .fit_to_exact_size(size * scale)
+                .corner_radius(egui::CornerRadius::same(12)),
+        );
+        ui.add_space(4.0);
+    }
 
     // The thought channel (the 31B reasons before answering):
     // split live while the reply streams; a finished message keeps its
@@ -787,29 +785,46 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
             let dark_ink = (ink.r() as u16 + ink.g() as u16 + ink.b() as u16) < 384;
             let use_light_code_bg = crate::theme::is_light() || dark_ink;
 
-            let (code_bg, inline_bg) = if use_light_code_bg {
-                (egui::Color32::from_rgb(238, 240, 245), egui::Color32::from_rgb(228, 231, 238))
+            // Multi-line code blocks keep their solid background (these DO get rounded corners)
+            let code_bg = if use_light_code_bg {
+                egui::Color32::from_rgb(238, 240, 245)
             } else {
-                (egui::Color32::from_rgb(24, 26, 31), egui::Color32::from_rgb(48, 51, 58))
+                egui::Color32::from_rgb(24, 26, 31)
             };
+
+            // Inline `code` chips: a see-through grey veil — the backdrop
+            // stays visible through the rounded chip. The vendored viewer
+            // pairs it with light-grey text (it keys the code text colour
+            // off the chip's brightness, see misc.rs).
+            let inline_bg = egui::Color32::from_rgba_unmultiplied(128, 132, 140, 90);
 
             let v = ui.visuals_mut();
             v.extreme_bg_color = code_bg;
             v.code_bg_color = inline_bg;
-            v.selection.bg_fill = ACCENT1().gamma_multiply(0.25);
-            v.selection.stroke.color = TEXT();
 
-            v.extreme_bg_color = code_bg;
-
-            // FIX: Force egui's syntax highlighter to match our background choice
             v.dark_mode = !use_light_code_bg;
+
+            // Keep the mouse text selection highlight soft as well
+            v.selection.bg_fill = ACCENT1().gamma_multiply(0.20);
+            v.selection.stroke.color = TEXT();
 
             v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(12);
             v.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
             // Reply text follows the Appearance tab's chat text-colour override
             // (chat_text() falls back to the theme's normal ink without one).
             v.override_text_color = Some(chat_text());
-            egui_commonmark::CommonMarkViewer::new().show(ui, &mut llm.md_cache, &shown);
+            // Bold/heading text resolves through strong_text_color() — the
+            // widgets.active colour — which BYPASSES override_text_color
+            // (egui RichText::get_text_color), so under a dark ink it stayed
+            // near-white and washed out over the bright backdrop. Pin it to
+            // the ink. Links get a deep readable blue when the ink is dark.
+            v.widgets.active.fg_stroke.color = chat_text();
+            if dark_ink {
+                v.hyperlink_color = egui::Color32::from_rgb(28, 110, 235);
+            }
+            egui_commonmark::CommonMarkViewer::new()
+                .render_math_fn(Some(&render_math))
+                .show(ui, &mut llm.md_cache, &shown);
         });
     }
 
@@ -1034,6 +1049,65 @@ fn media_chip(ui: &mut egui::Ui, path: &std::path::Path, tint: egui::Color32) {
         icon.tint(tint).paint_at(ui, rect);
         ui.label(egui::RichText::new(name).color(MUTED()).size(11.5));
     });
+}
+
+/// Render chat math (`$...$` / `$$...$$`) via a minimal TeX → Unicode
+/// fallback — there's no real math engine, but local models mostly emit
+/// simple symbols (`$\pi$`, `$r^2$`), which used to show as raw TeX.
+/// Unmapped commands pass through as-is, which still beats raw `$…$`.
+fn render_math(ui: &mut egui::Ui, tex: &str, inline: bool) {
+    let rt = egui::RichText::new(tex_to_unicode(tex))
+        .italics()
+        .color(chat_text())
+        .size(if inline { 14.5 } else { 15.5 });
+    if inline {
+        ui.label(rt);
+    } else {
+        // Display math gets its own centred line, roughly like real LaTeX.
+        ui.vertical_centered(|ui| {
+            ui.label(rt);
+        });
+    }
+}
+
+/// Map the TeX commands local models actually emit to Unicode. Entries whose
+/// name prefixes another (`\int`/`\in`, `\infty`/`\in`, `\leq`/`\le`) are
+/// ordered longest-first because replacement is sequential.
+fn tex_to_unicode(tex: &str) -> String {
+    const MAP: &[(&str, &str)] = &[
+        ("\\varepsilon", "ε"), ("\\epsilon", "ε"), ("\\varphi", "φ"), ("\\upsilon", "υ"),
+        ("\\alpha", "α"), ("\\beta", "β"), ("\\gamma", "γ"), ("\\delta", "δ"),
+        ("\\zeta", "ζ"), ("\\eta", "η"), ("\\theta", "θ"), ("\\iota", "ι"),
+        ("\\kappa", "κ"), ("\\lambda", "λ"), ("\\mu", "μ"), ("\\nu", "ν"),
+        ("\\xi", "ξ"), ("\\rho", "ρ"), ("\\sigma", "σ"), ("\\tau", "τ"),
+        ("\\phi", "φ"), ("\\chi", "χ"), ("\\psi", "ψ"), ("\\omega", "ω"),
+        ("\\Gamma", "Γ"), ("\\Delta", "Δ"), ("\\Theta", "Θ"), ("\\Lambda", "Λ"),
+        ("\\Xi", "Ξ"), ("\\Pi", "Π"), ("\\Sigma", "Σ"), ("\\Phi", "Φ"),
+        ("\\Psi", "Ψ"), ("\\Omega", "Ω"),
+        ("\\times", "×"), ("\\cdot", "·"), ("\\div", "÷"), ("\\pm", "±"), ("\\mp", "∓"),
+        ("\\leq", "≤"), ("\\geq", "≥"), ("\\neq", "≠"), ("\\approx", "≈"),
+        ("\\infty", "∞"), ("\\int", "∫"), ("\\notin", "∉"),
+        ("\\sqrt", "√"), ("\\sum", "∑"), ("\\prod", "∏"), ("\\partial", "∂"),
+        ("\\rightarrow", "→"), ("\\leftarrow", "←"), ("\\Rightarrow", "⇒"),
+        ("\\Leftarrow", "⇐"), ("\\to", "→"),
+        ("\\subset", "⊂"), ("\\cup", "∪"), ("\\cap", "∩"),
+        ("\\forall", "∀"), ("\\exists", "∃"),
+        ("\\degree", "°"), ("\\circ", "∘"), ("\\ldots", "…"), ("\\dots", "…"),
+        ("\\left", ""), ("\\right", ""),
+        // Short forms LAST — they prefix longer commands above (\le → \left,
+        // \leftarrow; \in → \int, \infty), which must be consumed first.
+        ("\\le", "≤"), ("\\ge", "≥"), ("\\ne", "≠"), ("\\in", "∈"),
+        ("\\pi", "π"),
+        ("^2", "²"), ("^3", "³"),
+    ];
+    let mut s = tex.to_string();
+    for (from, to) in MAP {
+        s = s.replace(from, to);
+    }
+    // Drop TeX grouping braces — for the simple math this handles, they only
+    // add noise (`{area:.2f}`-style text lives in code spans, not math).
+    s.retain(|c| c != '{' && c != '}');
+    s.trim().to_string()
 }
 
 /// Tint for icons in the conversation (messages) area: the Appearance tab's
