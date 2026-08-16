@@ -93,6 +93,7 @@ mod avif {
 mod backup;
 mod bgremove;
 mod civitai;
+mod crash;
 mod depth;
 mod detect;
 mod dictate;
@@ -139,6 +140,10 @@ mod video; // embedded VLC playback (real backend only under --features vlc)
 mod zoom; // zoom + pan for the centre image viewer
 
 fn main() -> eframe::Result {
+    // First thing, before anything can fail: crash reports + stderr log into
+    // %APPDATA%\Clarity TagFlow\crash reports (see src/crash.rs).
+    crash::install();
+
     // libVLC playback needs its DLLs + plugins beside the exe; build.rs stages
     // them there on Windows (libVLC finds the plugins relative to its own DLL).
 
