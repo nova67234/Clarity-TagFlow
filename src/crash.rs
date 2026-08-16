@@ -216,12 +216,15 @@ fn install_seh() {
             let dmp = dir.join(format!("crash_{when}.dmp"));
             let wide: Vec<u16> =
                 dmp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+            // MiniDumpWriteDump wants read AND write access on the handle —
+            // write-only produced a 0-byte dump.
+            const GENERIC_READ: u32 = 0x8000_0000;
             const GENERIC_WRITE: u32 = 0x4000_0000;
             const CREATE_ALWAYS: u32 = 2;
             const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
             let hfile = CreateFileW(
                 wide.as_ptr(),
-                GENERIC_WRITE,
+                GENERIC_READ | GENERIC_WRITE,
                 0,
                 std::ptr::null_mut(),
                 CREATE_ALWAYS,

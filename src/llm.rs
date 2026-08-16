@@ -1540,8 +1540,13 @@ mod worker {
     /// every turn is free after the first.
     fn video_frames(path: &Path) -> Result<Vec<(i64, PathBuf)>, String> {
         use std::hash::{Hash, Hasher};
-        if !cfg!(feature = "vlc") {
-            return Err("Video input needs a build with the VLC feature".to_string());
+        // Covers both a build without the VLC feature and a machine without
+        // VLC installed (the probe also sets up the DLL search path, which
+        // the delay-loaded libvlc.dll needs before the first call).
+        if !crate::video::vlc_available() {
+            return Err(
+                "Video input needs VLC — install it from videolan.org and try again".to_string()
+            );
         }
         let meta = std::fs::metadata(path).map_err(|e| format!("Read video: {e}"))?;
         let mut h = std::collections::hash_map::DefaultHasher::new();

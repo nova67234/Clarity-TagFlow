@@ -107,6 +107,18 @@ fn vlc_runtime_available() -> bool {
     true
 }
 
+/// True when the libVLC runtime is present (probing sets up the DLL search
+/// path as a side effect). Public so the AI chat can explain a missing VLC
+/// instead of failing opaquely.
+#[cfg(feature = "vlc")]
+pub fn vlc_available() -> bool {
+    vlc_runtime_available()
+}
+#[cfg(not(feature = "vlc"))]
+pub fn vlc_available() -> bool {
+    false
+}
+
 /// Locate a libVLC install, add its folder to the DLL search path, and pre-load
 /// `libvlc.dll` by full path so later delay-loaded calls reuse that module.
 /// Returns whether the load succeeded.
@@ -941,6 +953,13 @@ mod backend {
     /// `max_edge`, as an RGBA image. `None` if no frame arrives within the timeout.
     /// Also used by the AI chat for its video-attachment thumbnails (pub).
     pub fn capture_poster(path: &Path, max_edge: u32) -> Option<egui::ColorImage> {
+        // MUST run before any libVLC symbol is touched: on Windows libvlc.dll
+        // is delay-loaded, and this probe registers its folder on the DLL
+        // search path. Without it, an installed build whose FIRST VLC call is
+        // this capture dies with a delay-load exception (0xC06D007E).
+        if !super::vlc_runtime_available() {
+            return None;
+        }
         let instance = vlc::Instance::new()?;
         let media = open_media(&instance, path)?;
         // Poster capture only needs a video frame. Disable the audio output for
@@ -1017,6 +1036,12 @@ mod backend {
         max_frames: usize,
         max_edge: u32,
     ) -> Vec<(i64, egui::ColorImage)> {
+        // Same delay-load guard as capture_poster — this WAS the installed-
+        // build crash sending a video to the AI chat: the sampler was the
+        // process's first VLC call and skipped the DLL-path setup.
+        if !super::vlc_runtime_available() {
+            return Vec::new();
+        }
         let Some(instance) = vlc::Instance::new() else { return Vec::new() };
         let Some(media) = open_media(&instance, path) else { return Vec::new() };
         unsafe {
