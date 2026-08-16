@@ -98,6 +98,122 @@ pub fn show(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::setting
         .show_inside(ui, |ui| {
             conversation(ui, llm, settings);
         });
+
+    // Click-to-enlarge overlay for message attachments, above everything.
+    lightbox_ui(ui.ctx(), llm);
+}
+
+/// A clicked chat attachment, enlarged over the whole app: images decode
+/// hi-res on a worker thread; videos actually play (audio on, looping per
+/// the user's Settings) through the embedded VLC player. Esc, the ✕, or a
+/// click on the backdrop closes it — closing drops the player, which stops
+/// playback.
+pub struct Lightbox {
+    path: std::path::PathBuf,
+    /// Hi-res still arriving from the decode thread (images only).
+    rx: Option<std::sync::mpsc::Receiver<Option<egui::ColorImage>>>,
+    tex: Option<egui::TextureHandle>,
+    player: Option<crate::video::VideoPlayer>,
+}
+
+impl Lightbox {
+    fn open(path: &std::path::Path, ctx: &egui::Context) -> Self {
+        let mut lb = Lightbox { path: path.to_path_buf(), rx: None, tex: None, player: None };
+        if crate::is_video(path) {
+            lb.player = crate::video::VideoPlayer::start(path, ctx);
+        }
+        if lb.player.is_none() {
+            // Off-thread hi-res decode; until it lands (or if it fails — e.g.
+            // a video in a VLC-less build) the cached message thumbnail shows.
+            let (tx, rx) = std::sync::mpsc::channel();
+            lb.rx = Some(rx);
+            let p = path.to_path_buf();
+            let repaint = ctx.clone();
+            std::thread::spawn(move || {
+                let img = image::open(&p).ok().map(|img| {
+                    let t = img.thumbnail(2048, 2048).to_rgba8();
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [t.width() as usize, t.height() as usize],
+                        t.as_raw(),
+                    )
+                });
+                let _ = tx.send(img);
+                repaint.request_repaint();
+            });
+        }
+        lb
+    }
+}
+
+fn lightbox_ui(ctx: &egui::Context, llm: &mut LlmState) {
+    let Some(mut lb) = llm.lightbox.take() else { return };
+    if let Some(rx) = &lb.rx
+        && let Ok(res) = rx.try_recv() {
+        lb.rx = None;
+        lb.tex =
+            res.map(|img| ctx.load_texture("ai_chat_lightbox", img, egui::TextureOptions::LINEAR));
+    }
+
+    let screen = ctx.content_rect();
+    let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    egui::Area::new(egui::Id::new("ai_chat_lightbox"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            // Dimmed backdrop over the whole app; clicking it closes.
+            let bg = ui.interact(screen, egui::Id::new("ai_lightbox_bg"), egui::Sense::click());
+            ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(180));
+
+            // The media: the playing video's frame, the hi-res still, or —
+            // while the still decodes — the message thumbnail as a stand-in.
+            let tex = if let Some(p) = &mut lb.player { p.frame(ctx) } else { lb.tex.clone() }
+                .or_else(|| llm.msg_thumbs.get(&lb.path).cloned().flatten());
+            match tex {
+                Some(tex) => {
+                    let size = tex.size_vec2();
+                    let max = screen.size() * 0.88;
+                    let scale = (max.x / size.x).min(max.y / size.y).min(6.0);
+                    let rect = egui::Rect::from_center_size(screen.center(), size * scale);
+                    ui.put(
+                        rect,
+                        egui::Image::new(&tex)
+                            .fit_to_exact_size(size * scale)
+                            .corner_radius(egui::CornerRadius::same(10)),
+                    );
+                    // Swallow clicks on the media so they don't hit the
+                    // backdrop's click-to-close.
+                    let _ = ui.interact(rect, egui::Id::new("ai_lightbox_media"), egui::Sense::click());
+                }
+                None => {
+                    ui.put(
+                        egui::Rect::from_center_size(screen.center(), egui::vec2(40.0, 40.0)),
+                        egui::Spinner::new().size(32.0),
+                    );
+                }
+            }
+
+            // ✕ pinned top-right, inking up on hover.
+            let crect = egui::Rect::from_center_size(
+                egui::pos2(screen.right() - 26.0, screen.top() + 26.0),
+                egui::vec2(28.0, 28.0),
+            );
+            let cresp = ui
+                .interact(crect, egui::Id::new("ai_lightbox_close"), egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let ink = if cresp.hovered() { egui::Color32::WHITE } else { egui::Color32::from_gray(190) };
+            egui::Image::new(egui::include_image!("../icons/x.svg")).tint(ink).paint_at(
+                ui,
+                egui::Rect::from_center_size(crect.center(), egui::vec2(18.0, 18.0)),
+            );
+
+            if bg.clicked() || cresp.clicked() {
+                close = true;
+            }
+        });
+
+    if !close {
+        llm.lightbox = Some(lb);
+    }
 }
 
 /// The chat list card: a "Chats" header with a new-chat button and the
@@ -614,16 +730,27 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                 match msg_thumb(ui.ctx(), llm, path) {
                     Some(tex) => {
                         let size = tex.size_vec2();
-                        let scale = (180.0 / size.y).min(280.0 / size.x).min(1.0);
-                        let resp = ui.add(
-                            egui::Image::new(&tex)
-                                .fit_to_exact_size(size * scale)
-                                .corner_radius(egui::CornerRadius::same(12)),
-                        );
-                        // A clip's poster gets a play badge — it's a still,
-                        // not a player, but shouldn't pass for a photo.
+                        let scale = (260.0 / size.y).min(400.0 / size.x).min(1.0);
+                        let resp = ui
+                            .add(
+                                egui::Image::new(&tex)
+                                    .fit_to_exact_size(size * scale)
+                                    .corner_radius(egui::CornerRadius::same(12))
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(if crate::is_video(path) {
+                                "Click to play"
+                            } else {
+                                "Click to enlarge"
+                            });
+                        // A clip's poster gets a play badge — the lightbox
+                        // (click) is where it actually plays.
                         if crate::is_video(path) {
                             paint_play_badge(ui, resp.rect);
+                        }
+                        if resp.clicked() {
+                            llm.lightbox = Some(Lightbox::open(path, ui.ctx()));
                         }
                     }
                     None => {
@@ -741,12 +868,22 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
     if let Some(path) = &image
         && let Some(tex) = msg_thumb(ui.ctx(), llm, path) {
         let size = tex.size_vec2();
-        let scale = (180.0 / size.y).min(280.0 / size.x).min(1.0);
-        ui.add(
-            egui::Image::new(&tex)
-                .fit_to_exact_size(size * scale)
-                .corner_radius(egui::CornerRadius::same(12)),
-        );
+        let scale = (260.0 / size.y).min(400.0 / size.x).min(1.0);
+        let resp = ui
+            .add(
+                egui::Image::new(&tex)
+                    .fit_to_exact_size(size * scale)
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(if crate::is_video(path) { "Click to play" } else { "Click to enlarge" });
+        if crate::is_video(path) {
+            paint_play_badge(ui, resp.rect);
+        }
+        if resp.clicked() {
+            llm.lightbox = Some(Lightbox::open(path, ui.ctx()));
+        }
         ui.add_space(4.0);
     }
 

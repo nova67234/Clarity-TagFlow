@@ -1127,7 +1127,11 @@ pub(crate) fn load_meta(path: &Path) -> ImageMeta {
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_default();
-        if ext == "hdr" {
+        if ext == "svg" {
+            // Vector — rasterize at the document's declared size so the
+            // dimensions shown are the SVG's own, not the viewer's.
+            crate::image_cache::decode_svg(path, 0).map(image::DynamicImage::ImageRgba8)
+        } else if ext == "hdr" {
             crate::image_cache::decode_hdr(path).map(image::DynamicImage::ImageRgba8)
         } else if matches!(ext.as_str(), "tif" | "tiff") && image::image_dimensions(path).is_err() {
             // A raw/JPEG-compressed TIFF the `image` crate can't read (rendered

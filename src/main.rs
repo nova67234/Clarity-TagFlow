@@ -12,7 +12,7 @@ use egui::{Color32, CornerRadius, Margin, Stroke};
 /// `hdr` (Radiance RGBE) decodes via the `image` crate's lightweight HDR decoder
 /// and is tone-mapped for display (see `image_cache::decode_hdr`).
 const IMAGE_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "jfif", "gif", "bmp", "webp", "ico", "tif", "tiff", "hdr",
+    "png", "jpg", "jpeg", "jfif", "gif", "bmp", "webp", "ico", "tif", "tiff", "hdr", "svg",
 ];
 
 /// "Extended" image extensions decoded via the heavier pure-Rust crates: AVIF

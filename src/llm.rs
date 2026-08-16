@@ -303,6 +303,9 @@ pub struct LlmState {
     /// both for the hover highlight and to claim drops away from the gallery
     /// (same freshness scheme as the generator's prompt box).
     pub input_rect: Option<(egui::Rect, f64)>,
+    /// Click-to-enlarge overlay for a message attachment (src/ai_chat.rs):
+    /// images blow up hi-res, videos actually play. `None` = closed.
+    pub lightbox: Option<crate::ai_chat::Lightbox>,
 
     pub run_err: Option<String>,
     /// A generation is in flight.
@@ -394,6 +397,7 @@ impl Default for LlmState {
             video_poster_rx,
             video_posters_pending: std::collections::HashSet::new(),
             input_rect: None,
+            lightbox: None,
             run_err: None,
             running: false,
             unload_when_done: false,

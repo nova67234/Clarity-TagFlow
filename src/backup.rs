@@ -636,6 +636,10 @@ fn is_image_valid(path: &Path) -> bool {
     if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("hdr")) {
         return crate::image_cache::decode_hdr(path).is_some();
     }
+    // SVG: `image` can't parse vectors — validate through the rasterizer.
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")) {
+        return crate::image_cache::decode_svg(path, 64).is_some();
+    }
     match image::image_dimensions(path) {
         Ok((w, h)) => w > 0 && h > 0,
         Err(_) => false,

@@ -213,7 +213,12 @@ pub(crate) fn load_rgb_on_white(path: &Path) -> Result<RgbImage, String> {
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
 
-    let rgba = if ext == "hdr" {
+    let rgba = if ext == "svg" {
+        // Vector — rasterize (1024 long side; the taggers downscale to ~448
+        // anyway) so SVGs can be AI-tagged like any raster image.
+        crate::image_cache::decode_svg(path, 1024)
+            .ok_or_else(|| "Read image: SVG rasterize failed".to_string())?
+    } else if ext == "hdr" {
         // HDR can't be read by `image::open` directly (linear floats + strict
         // signature check); tone-map it the same way the viewer does so the tagger
         // sees the displayed image.

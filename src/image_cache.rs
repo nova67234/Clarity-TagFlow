@@ -429,6 +429,13 @@ fn worker_loop(queue: JobQueue, results: Sender<Decoded>, max_edge: Arc<AtomicU3
 /// `ImageReader.setSourceSubsampling`). Everything else, and any failure of the
 /// fast path, falls back to a full decode + downscale (memory-gated).
 fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::ColorImage> {
+    // SVG is vector — rasterize at the requested edge so thumbnails and the
+    // big viewer are both pixel-sharp regardless of the document's size.
+    if ext_eq(path, "svg") {
+        let img = decode_svg(path, max_edge)?;
+        return Some(color_image(&img));
+    }
+
     // Radiance HDR (.hdr) decodes to linear, scene-referred floats whose values
     // exceed 1.0; the `image` crate's default 8-bit conversion just clamps, which
     // blows out highlights and skips gamma. Route it through our tone-mapper so it
@@ -521,6 +528,52 @@ fn ext_eq(path: &Path, ext: &str) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+}
+
+/// Rasterize an SVG to straight-alpha RGBA. Vector sources have no native
+/// pixel size, so the long side renders at `max_edge` (up- OR downscaled —
+/// always sharp); `max_edge == 0` renders at the SVG's own declared size
+/// (used by the details panel so the reported dimensions are the document's).
+/// resvg is already in the tree via egui_extras' svg feature (the UI icons).
+pub fn decode_svg(path: &Path, max_edge: u32) -> Option<image::RgbaImage> {
+    use std::sync::OnceLock;
+    // System fonts for SVGs containing <text>, loaded once per run.
+    static FONTDB: OnceLock<std::sync::Arc<resvg::usvg::fontdb::Database>> = OnceLock::new();
+    let fontdb = FONTDB
+        .get_or_init(|| {
+            let mut db = resvg::usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            std::sync::Arc::new(db)
+        })
+        .clone();
+    // archive::read so SVGs inside a zip being viewed decode too (same as HDR).
+    let data = crate::archive::read(path).ok()?;
+    let opt = resvg::usvg::Options { fontdb, ..Default::default() };
+    let tree = resvg::usvg::Tree::from_data(&data, &opt).ok()?;
+    let size = tree.size();
+    let (w0, h0) = (size.width(), size.height());
+    if !(w0.is_finite() && h0.is_finite() && w0 > 0.0 && h0 > 0.0) {
+        return None;
+    }
+    let long = w0.max(h0);
+    let scale = if max_edge == 0 { 1.0f32 } else { max_edge as f32 / long };
+    // Cap the raster so a huge declared viewBox can't allocate absurd buffers.
+    let scale = scale.min(8192.0 / long);
+    let w = ((w0 * scale).round() as u32).max(1);
+    let h = ((h0 * scale).round() as u32).max(1);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h)?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    // tiny-skia pixels are premultiplied; the viewer wants straight RGBA.
+    let mut out = Vec::with_capacity((w as usize) * (h as usize) * 4);
+    for px in pixmap.pixels() {
+        let c = px.demultiply();
+        out.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+    }
+    image::RgbaImage::from_raw(w, h, out)
 }
 
 /// Decode a Radiance HDR (`.hdr`, RGBE) file to a display-ready 8-bit sRGB image.
@@ -843,6 +896,21 @@ mod tests {
         let (dw, dh) = oriented_dimensions(p).unwrap();
         println!("stored {sw}x{sh} -> displayed {dw}x{dh} (orientation {:?})", exif_orientation(p));
         assert_eq!((dw, dh), (sh, sw), "portrait photo should report swapped dims");
+    }
+
+    // Rasterize one of the app's own UI icons: parses, honours the size
+    // request, and produces non-empty pixels.
+    // cargo test svg_smoke -- --nocapture
+    #[test]
+    fn svg_smoke() {
+        let p = std::path::Path::new("icons/mic.svg");
+        let img = decode_svg(p, 256).expect("decode failed");
+        assert_eq!(img.width().max(img.height()), 256, "long side should match the request");
+        assert!(img.pixels().any(|px| px.0[3] > 0), "raster came out fully transparent");
+        // Natural-size render (max_edge = 0) must also produce something sane.
+        let nat = decode_svg(p, 0).expect("natural-size decode failed");
+        assert!(nat.width() > 0 && nat.height() > 0);
+        println!("OK {}x{} (natural {}x{})", img.width(), img.height(), nat.width(), nat.height());
     }
 
     // Tone-map every Radiance HDR sample to a PNG so the result can be eyeballed.

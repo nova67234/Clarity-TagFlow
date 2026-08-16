@@ -484,9 +484,42 @@ mod backend {
     struct VideoCtx {
         width: u32,
         height: u32,
-        buffer: Vec<u8>, // RGBA, width*height*4
+        /// Bytes per buffer row as negotiated with libVLC — 32-aligned, so it
+        /// can exceed `width * 4` (see [`align32`]).
+        pitch: u32,
+        buffer: Vec<u8>, // RGBA, pitch * aligned(height)
         latest: SharedFrame,
         ctx: egui::Context,
+    }
+
+    /// libVLC's format contract: the pitch (bytes per row) and the line count
+    /// handed back from a format callback must be multiples of 32 — its
+    /// SIMD-optimized copy routines write whole 32-byte chunks up to those
+    /// bounds. Sizing the buffer to the unaligned values lets the decoder
+    /// write past the end: silent heap corruption that the debug CRT's padded
+    /// heap absorbed in dev runs but crashed release/installed builds (hit by
+    /// the AI chat's video frame sampler).
+    fn align32(v: u32) -> u32 {
+        (v + 31) & !31
+    }
+
+    /// Copy the used `w*4` bytes of each of `h` rows out of a `pitch`-strided
+    /// buffer into a packed RGBA image. When the pitch is already tight the
+    /// buffer is used directly (the common case for native-size playback).
+    fn packed_image(w: u32, h: u32, pitch: u32, buffer: &[u8]) -> Option<egui::ColorImage> {
+        let (w_, h_, pitch_) = (w as usize, h as usize, pitch as usize);
+        let row = w_ * 4;
+        if row == 0 || h_ == 0 || buffer.len() < pitch_ * h_ {
+            return None;
+        }
+        if pitch_ == row {
+            return Some(egui::ColorImage::from_rgba_unmultiplied([w_, h_], &buffer[..row * h_]));
+        }
+        let mut packed = Vec::with_capacity(row * h_);
+        for y in 0..h_ {
+            packed.extend_from_slice(&buffer[y * pitch_..y * pitch_ + row]);
+        }
+        Some(egui::ColorImage::from_rgba_unmultiplied([w_, h_], &packed))
     }
 
     pub struct VideoPlayer {
@@ -556,6 +589,7 @@ mod backend {
             let ctx_ptr = Box::into_raw(Box::new(VideoCtx {
                 width: 0,
                 height: 0,
+                pitch: 0,
                 buffer: Vec::new(),
                 latest: latest.clone(),
                 ctx: ctx.clone(),
@@ -641,12 +675,15 @@ mod backend {
             // RGBA byte order matches egui's ColorImage. If colours come out
             // wrong, switch this to b"BGRA" (the upload stays the same).
             std::ptr::copy_nonoverlapping(b"RGBA".as_ptr(), chroma as *mut u8, 4);
-            *pitches = w * 4;
-            *lines = h;
+            // 32-aligned pitch/lines per libVLC's contract (see align32).
+            let pitch = align32(w * 4);
+            *pitches = pitch;
+            *lines = align32(h);
 
             vc.width = w;
             vc.height = h;
-            vc.buffer = vec![0u8; (w * 4 * h) as usize];
+            vc.pitch = pitch;
+            vc.buffer = vec![0u8; (pitch * align32(h)) as usize];
             1 // one picture buffer
         }
     }
@@ -676,14 +713,9 @@ mod backend {
     unsafe extern "C" fn display_cb(opaque: *mut c_void, _picture: *mut c_void) {
         unsafe {
             let vc = &mut *(opaque as *mut VideoCtx);
-            let expected = (vc.width * vc.height * 4) as usize;
-            if expected == 0 || vc.buffer.len() != expected {
+            let Some(img) = packed_image(vc.width, vc.height, vc.pitch, &vc.buffer) else {
                 return;
-            }
-            let img = egui::ColorImage::from_rgba_unmultiplied(
-                [vc.width as usize, vc.height as usize],
-                &vc.buffer,
-            );
+            };
             if let Ok(mut g) = vc.latest.lock() {
                 *g = Some(img);
             }
@@ -894,6 +926,9 @@ mod backend {
         max_edge: u32,
         width: u32,
         height: u32,
+        /// Bytes per buffer row as negotiated with libVLC (32-aligned; can
+        /// exceed `width * 4` — see [`align32`]).
+        pitch: u32,
         buffer: Vec<u8>,
         frame_count: u32,
         latest: SharedFrame,
@@ -923,6 +958,7 @@ mod backend {
             max_edge,
             width: 0,
             height: 0,
+            pitch: 0,
             buffer: Vec::new(),
             frame_count: 0,
             latest: latest.clone(),
@@ -1000,6 +1036,7 @@ mod backend {
             max_edge,
             width: 0,
             height: 0,
+            pitch: 0,
             buffer: Vec::new(),
             frame_count: 0,
             latest: latest.clone(),
@@ -1091,14 +1128,21 @@ mod backend {
             let sh = ((nh as f32 * scale) as u32).max(2);
 
             std::ptr::copy_nonoverlapping(b"RGBA".as_ptr(), chroma as *mut u8, 4);
+            // Unlike playback (which keeps VLC's proposed, already-aligned
+            // native size), this path shrinks to an arbitrary max_edge fit —
+            // so the 32-alignment of pitch/lines matters doubly here. The
+            // unaligned values let the decoder scribble past the buffer:
+            // the installed-build crash when sending a video to the AI chat.
+            let pitch = align32(sw * 4);
             *width = sw;
             *height = sh;
-            *pitches = sw * 4;
-            *lines = sh;
+            *pitches = pitch;
+            *lines = align32(sh);
 
             cc.width = sw;
             cc.height = sh;
-            cc.buffer = vec![0u8; (sw * 4 * sh) as usize];
+            cc.pitch = pitch;
+            cc.buffer = vec![0u8; (pitch * align32(sh)) as usize];
             1
         }
     }
@@ -1127,17 +1171,44 @@ mod backend {
             if cc.frame_count < THUMB_SKIP_FRAMES {
                 return;
             }
-            let expected = (cc.width * cc.height * 4) as usize;
-            if expected == 0 || cc.buffer.len() != expected {
+            let Some(img) = packed_image(cc.width, cc.height, cc.pitch, &cc.buffer) else {
                 return;
-            }
-            let img = egui::ColorImage::from_rgba_unmultiplied(
-                [cc.width as usize, cc.height as usize],
-                &cc.buffer,
-            );
+            };
             if let Ok(mut g) = cc.latest.lock() {
                 *g = Some(img);
             }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "vlc"))]
+mod tests {
+    // Exercise the AI chat's video-frame sampler on a local sample — the path
+    // that crashed installed builds via the unaligned-pitch heap overrun.
+    // Saves the frames as PNGs for eyeballing (skew would mean a bad
+    // de-stride). Skips cleanly when no sample video is present.
+    // cargo test frames_smoke -- --nocapture
+    #[test]
+    fn frames_smoke() {
+        let dir = std::path::Path::new("tests/bug");
+        let Some(sample) = std::fs::read_dir(dir).ok().and_then(|rd| {
+            rd.flatten().map(|e| e.path()).find(|p| crate::is_video(p))
+        }) else {
+            eprintln!("skipping frames_smoke: no video in tests/bug");
+            return;
+        };
+        let frames = super::capture_frames(&sample, 8, 896);
+        assert!(!frames.is_empty(), "no frames captured from {}", sample.display());
+        for (i, (ms, img)) in frames.iter().enumerate() {
+            let [w, h] = img.size;
+            assert!(w >= 2 && h >= 2);
+            let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+            let out = sample.with_extension(format!("frame{i}.png"));
+            image::RgbaImage::from_raw(w as u32, h as u32, bytes)
+                .unwrap()
+                .save(&out)
+                .unwrap();
+            println!("frame {i} @{ms}ms {w}x{h} -> {}", out.display());
         }
     }
 }

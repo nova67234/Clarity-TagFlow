@@ -1,6 +1,6 @@
 [package]
 name = "Clarity_TagFlow"
-version = "5.6.5"
+version = "5.6.6"
 edition = "2024"
 license = "MIT"
 
@@ -9,7 +9,7 @@ license = "MIT"
 # "glow" enables the OpenGL backend: eframe 0.34 defaults to wgpu, but the
 # Pixal3D 3D viewer (src/scene3d.rs) renders via three-d, which needs an OpenGL
 # context — so we select the glow renderer in NativeOptions. wgpu stays compiled
-# but unused.
+# but unused.vg
 eframe = { version = "0.34.2", features = ["persistence", "glow"] }
 serde = { version = "1", features = ["derive"] }
 image = { version = "0.25.10", features = ["png", "jpeg", "gif", "bmp", "webp", "ico", "tiff", "hdr"] }
@@ -58,6 +58,10 @@ heic = { version = "0.1.6", optional = true }
 # (`Unstoppable`). Both optional, behind `avif`.
 zenraw = { version = "0.2.0", optional = true }
 enough = { version = "0.4.4", optional = true }
+# Rasterizes .svg files for viewing/tagging (image_cache::decode_svg). The same
+# version egui_extras' svg feature already pulls in for UI icons, so this adds
+# no extra build cost.
+resvg = "0.45"
 # Inline color-emoji rendering (src/emoji.rs): twemoji-assets bundles the Twemoji
 # SVGs as static data (egui's text rasterizer can't draw color emoji from a font),
 # unicode-segmentation splits text into grapheme clusters so multi-codepoint emoji

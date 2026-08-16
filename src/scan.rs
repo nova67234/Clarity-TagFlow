@@ -28,7 +28,7 @@ const DUPLICATES_FOLDER: &str = "duplicates";
 const HEADER_H: f32 = 22.0;
 
 /// Image extensions the corruption scan will try to decode.
-const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp", "ico", "hdr"];
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp", "ico", "hdr", "svg"];
 /// Extended formats only decodable when built with `--features avif`.
 const EXTENDED_EXTS: &[&str] = &["avif", "heic", "heif", "dng", "arw", "cr2", "nef"];
 /// Media we list but never decode-validate.
@@ -713,6 +713,15 @@ fn validate_image(p: &Path) -> Result<(), String> {
     }
 
     let ext = ext_of(p);
+
+    // SVG is a vector the `image` crate can't parse — validate it through the
+    // rasterizer (small target: parsing is the check, size doesn't matter).
+    if ext == "svg" {
+        return match crate::image_cache::decode_svg(p, 64) {
+            Some(_) => Ok(()),
+            None => Err("Could not decode".to_string()),
+        };
+    }
 
     // HDR goes through our tone-mapping decoder — `image`'s reader rejects the
     // valid `#?RGBE` signature variant, which would wrongly flag good files.
