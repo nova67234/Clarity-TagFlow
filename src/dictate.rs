@@ -166,8 +166,9 @@ fn record_and_transcribe(
 /// (src/voice.rs), but on the microphone instead of the loopback.
 #[cfg(feature = "llm")]
 fn record_mic(stop: &AtomicBool) -> Result<Vec<f32>, String> {
-    use rodio::cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    use rodio::cpal::{self, SampleFormat};
+    // rodio 0.22 no longer re-exports cpal — it's a direct dependency now.
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::SampleFormat;
     use std::sync::Mutex;
 
     let host = cpal::default_host();
@@ -175,7 +176,8 @@ fn record_mic(stop: &AtomicBool) -> Result<Vec<f32>, String> {
     let config = device
         .default_input_config()
         .map_err(|e| format!("Microphone config: {e}"))?;
-    let sample_rate = config.sample_rate().0;
+    // cpal 0.17: sample_rate() returns a plain u32 (was a tuple struct).
+    let sample_rate = config.sample_rate();
     let channels = config.channels() as usize;
 
     let buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));

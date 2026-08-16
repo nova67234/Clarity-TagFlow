@@ -508,36 +508,37 @@ impl VoiceState {
 #[cfg(feature = "llm")]
 fn spawn_player_thread(rx: Receiver<PlayerCmd>, speaking: Arc<AtomicBool>) {
     std::thread::spawn(move || {
-        let Ok((_stream, handle)) = rodio::OutputStream::try_default() else {
+        // rodio 0.22: OutputStream/Sink became DeviceSinkBuilder/Player.
+        let Ok(mut device) = rodio::DeviceSinkBuilder::open_default_sink() else {
             return;
         };
-        let mut sink: Option<rodio::Sink> = None;
+        device.log_on_drop(false);
+        let mut player: Option<rodio::Player> = None;
         loop {
             match rx.recv_timeout(std::time::Duration::from_millis(200)) {
                 Ok(PlayerCmd::Play(path)) => {
-                    if let Some(s) = &sink {
-                        s.stop();
+                    if let Some(p) = &player {
+                        p.stop();
                     }
-                    let file = std::fs::File::open(&path);
-                    let new_sink = rodio::Sink::try_new(&handle);
-                    if let (Ok(file), Ok(s)) = (file, new_sink)
+                    if let Ok(file) = std::fs::File::open(&path)
                         && let Ok(dec) = rodio::Decoder::new(std::io::BufReader::new(file)) {
-                            s.append(dec);
+                            let p = rodio::Player::connect_new(device.mixer());
+                            p.append(dec);
                             speaking.store(true, Relaxed);
-                            sink = Some(s);
+                            player = Some(p);
                         }
                 }
                 Ok(PlayerCmd::Stop) => {
-                    if let Some(s) = &sink {
-                        s.stop();
+                    if let Some(p) = &player {
+                        p.stop();
                     }
                     speaking.store(false, Relaxed);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            if let Some(s) = &sink
-                && s.empty() {
+            if let Some(p) = &player
+                && p.empty() {
                     speaking.store(false, Relaxed);
                 }
         }
@@ -645,8 +646,9 @@ impl Recorder {
 /// cap, then write a mono 16-bit wav into the samples dir.
 #[cfg(feature = "llm")]
 fn record_loopback(stop: &AtomicBool, level: &Arc<AtomicU32>) -> Result<PathBuf, String> {
-    use rodio::cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    use rodio::cpal::{self, SampleFormat};
+    // rodio 0.22 no longer re-exports cpal — it's a direct dependency now.
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::SampleFormat;
     use std::sync::Mutex;
 
     let host = cpal::default_host();
@@ -659,7 +661,8 @@ fn record_loopback(stop: &AtomicBool, level: &Arc<AtomicU32>) -> Result<PathBuf,
     if config.sample_format() != SampleFormat::F32 {
         return Err(format!("Unsupported sample format {:?}", config.sample_format()));
     }
-    let sample_rate = config.sample_rate().0;
+    // cpal 0.17: sample_rate() returns a plain u32 (was a tuple struct).
+    let sample_rate = config.sample_rate();
     let channels = config.channels() as usize;
 
     let buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
