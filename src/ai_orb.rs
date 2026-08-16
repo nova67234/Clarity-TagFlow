@@ -241,15 +241,16 @@ impl AiOrb {
 
         let light = crate::theme::is_light();
         let alpha_scale = if light { 1.7 } else { 1.0 };
-        let tip = if light {
-            Color32::from_rgb(
-                (base.r() as f32 * 0.45) as u8,
-                (base.g() as f32 * 0.45) as u8,
-                (base.b() as f32 * 0.45) as u8,
-            )
-        } else {
-            Color32::WHITE
-        };
+        // Depth/highlight tint: a darker shade of the accent. This used to be
+        // pure white on dark themes, but the near (most visible) particles
+        // blend up to ~85% toward it — the whole orb read as white and its
+        // accent (or a custom orb colour) barely showed. The light themes'
+        // darkened-accent tip shows the colour well, so every theme uses it.
+        let tip = Color32::from_rgb(
+            (base.r() as f32 * 0.45) as u8,
+            (base.g() as f32 * 0.45) as u8,
+            (base.b() as f32 * 0.45) as u8,
+        );
         let mix = |t: f32, a: f32| -> Color32 {
             let t = t.clamp(0.0, 1.0);
             let lerp = |c: u8, to: u8| (c as f32 + (to as f32 - c as f32) * t) as u8;

@@ -222,6 +222,87 @@ static GLASS_LIGHT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// [`set_glass_config`] each frame from the persisted settings.
 static GLASS_CONFIG: AtomicU32 = AtomicU32::new(0);
 
+/// Optional user overrides for the AI chat's colours (Appearance tab), packed
+/// for atomic access: bit 24 = override active, low 24 bits = RGB. Pushed each
+/// frame from the persisted settings, like [`GLASS_CONFIG`]. Some
+/// theme/background combinations (e.g. Aurora's bright pastel glow) can leave
+/// the chat hard to read; these let the user pick their own colours for the
+/// message text, the chat's icons, and the AI orb.
+static CHAT_TEXT: AtomicU32 = AtomicU32::new(0);
+static CHAT_ICON: AtomicU32 = AtomicU32::new(0);
+static ORB: AtomicU32 = AtomicU32::new(0);
+
+/// Pack `over` into an override slot (see above). Cheap atomic store — callers
+/// push these every frame from the persisted settings so the Appearance tab's
+/// pickers update the chat live.
+fn store_override(slot: &AtomicU32, over: Option<[u8; 3]>) {
+    let packed = match over {
+        Some([r, g, b]) => (1 << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32,
+        None => 0,
+    };
+    slot.store(packed, Ordering::Relaxed);
+}
+
+/// The colour in an override slot, if its override is active.
+fn load_override(slot: &AtomicU32) -> Option<Color32> {
+    let p = slot.load(Ordering::Relaxed);
+    (p & (1 << 24) != 0).then(|| Color32::from_rgb((p >> 16) as u8, (p >> 8) as u8, p as u8))
+}
+
+/// Set (or clear, with `None`) the AI-chat text-colour override.
+pub fn set_chat_text(over: Option<[u8; 3]>) {
+    store_override(&CHAT_TEXT, over);
+}
+
+/// Set (or clear) the AI-chat icon-colour override (chat icons only — the rest
+/// of the app keeps [`icon_tint`]).
+pub fn set_chat_icon(over: Option<[u8; 3]>) {
+    store_override(&CHAT_ICON, over);
+}
+
+/// Set (or clear) the AI orb's colour override.
+pub fn set_orb_color(over: Option<[u8; 3]>) {
+    store_override(&ORB, over);
+}
+
+/// The user's AI-chat text-colour override, if enabled.
+pub fn chat_text_override() -> Option<Color32> {
+    load_override(&CHAT_TEXT)
+}
+
+/// Near-black default ink for the chat when the Glass theme runs the bright
+/// Aurora-glow backdrop — bare light text washes out over the pastel glow, so
+/// text and icons default to black there. `None` on every other
+/// theme/backdrop combination (the normal theme colours apply), and a user
+/// override always wins over this.
+pub fn chat_aurora_ink() -> Option<Color32> {
+    let p = palette();
+    if !p.glass {
+        return None;
+    }
+    let (_, backdrop) = glass_config();
+    (backdrop == Backdrop::Aurora).then_some(Color32::from_rgb(12, 13, 16))
+}
+
+/// True while a Glass theme (dark or light panels) is active.
+pub fn is_glass() -> bool {
+    palette().glass
+}
+
+/// The user's AI-chat icon-colour override, if enabled.
+pub fn chat_icon_override() -> Option<Color32> {
+    load_override(&CHAT_ICON)
+}
+
+/// The AI chat's message-text colour: the user's override when set, else the
+/// Aurora-glow black default (see [`chat_aurora_ink`]), else the theme's
+/// normal text colour.
+pub fn chat_text() -> Color32 {
+    chat_text_override()
+        .or_else(chat_aurora_ink)
+        .unwrap_or_else(|| palette().text)
+}
+
 /// Switch the active palette. Call [`apply`] afterwards to push the new visuals.
 pub fn set(theme: Theme) {
     let v = match theme {
@@ -296,9 +377,12 @@ pub fn icon_tint(fallback: Color32) -> Color32 {
 
 /// The AI orb's accent. The orb is a glowing object, not an icon, so it keeps
 /// its "true" dark-theme light blue on every surface — the grey/deep icon
-/// tints of the light themes would wash it out. Aurora keeps its pink.
+/// tints of the light themes would wash it out. Aurora keeps its pink. The
+/// user's Appearance-tab orb colour, when set, wins over both.
 pub fn orb_color() -> Color32 {
-    if palette().aurora {
+    if let Some(c) = load_override(&ORB) {
+        c
+    } else if palette().aurora {
         Color32::from_rgb(235, 130, 175)
     } else {
         DARK.accent1
@@ -376,6 +460,29 @@ pub fn ACCENT2() -> Color32 {
 #[allow(non_snake_case)]
 pub fn EDGE() -> Color32 {
     palette().edge
+}
+
+/// Repaint the Glass background (flat colour + animated backdrop) into `clip`,
+/// generated from the full-window rect so it is pixel-aligned with — and
+/// therefore indistinguishable from — the real backdrop painted by
+/// [`paint_background`]. Floating cards (e.g. the chat's input card) paint
+/// this as an opaque underlay beneath the ordinary translucent [`PANEL`] fill:
+/// the card then matches the other glass panels exactly, while content
+/// scrolled beneath it can't show through. No-op outside the Glass theme.
+pub fn paint_glass_patch(ctx: &egui::Context, painter: &egui::Painter, clip: egui::Rect) {
+    let p = palette();
+    if !p.glass {
+        return;
+    }
+    let painter = painter.with_clip_rect(clip);
+    let (color, backdrop) = glass_config();
+    painter.rect_filled(clip, 0.0, color);
+    let full = ctx.content_rect();
+    match backdrop {
+        Backdrop::Solid => {}
+        Backdrop::Starfield => draw_starfield(ctx, &painter, full),
+        Backdrop::Aurora => draw_aurora_blobs(ctx, &painter, full),
+    }
 }
 
 /// Push the active palette into egui's global visuals. The dark/space branch

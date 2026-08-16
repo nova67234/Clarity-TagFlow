@@ -390,6 +390,9 @@ struct LoraEntry {
     strength: f32,
     /// Which model family this LoRA was trained for (sniffed from its header).
     base: LoraBase,
+    /// The background sniff has resolved `base` (false = still pending, so the
+    /// row shouldn't claim "base?" yet).
+    sniffed: bool,
     /// The ℹ details block under this row is expanded.
     info_open: bool,
     /// Decoded metadata, read lazily the first time ℹ is clicked.
@@ -416,6 +419,8 @@ struct EmbeddingEntry {
     file: String,
     /// Architecture sniffed from the embedding's tensor shapes (reuses [`LoraBase`]).
     base: LoraBase,
+    /// The background sniff has resolved `base` (false = still pending).
+    sniffed: bool,
     /// Included in the next generation.
     selected: bool,
     /// Apply to the negative prompt instead of the positive one.
@@ -885,25 +890,42 @@ fn scan_embeddings() -> Vec<(String, PathBuf)> {
     v
 }
 
-/// Re-scan the embeddings dir, sniffing the architecture of new files and keeping
-/// cached results (incl. selection/weight/thumbnail) for known ones. Kicks off the
-/// background Civitai-thumbnail fetch for any file without a cached preview.
+/// Re-scan the embeddings dir, keeping cached results (incl. selection/weight/
+/// thumbnail) for known files. New files get their architecture sniffed on a
+/// worker thread (like LoRAs) so opening the picker never blocks the UI. Kicks
+/// off the background Civitai-thumbnail fetch for any file without a preview.
 fn refresh_embeddings(state: &mut GenerateState, ctx: &egui::Context) {
-    state.embeddings = scan_embeddings()
-        .into_iter()
-        .map(|(f, path)| {
-            let prev = state.embeddings.iter().find(|e| e.file == f);
-            EmbeddingEntry {
-                base: prev.map(|e| e.base).unwrap_or_else(|| sniff_embedding_base(&path)),
-                selected: prev.map(|e| e.selected).unwrap_or(false),
-                negative: prev.map(|e| e.negative).unwrap_or(false),
-                strength: prev.map(|e| e.strength).unwrap_or(1.0),
-                thumb: prev.and_then(|e| e.thumb.clone()),
-                thumb_missing: prev.map(|e| e.thumb_missing).unwrap_or(false),
-                file: f,
-            }
-        })
-        .collect();
+    let mut to_sniff: Vec<PathBuf> = Vec::new();
+    {
+        let cache = SNIFF_CACHE.lock().unwrap();
+        state.embeddings = scan_embeddings()
+            .into_iter()
+            .map(|(f, path)| {
+                let prev = state.embeddings.iter().find(|e| e.file == f);
+                let (base, sniffed) = match prev {
+                    Some(p) if p.sniffed => (p.base, true),
+                    _ => match cache.get(&path) {
+                        Some(b) => (*b, true),
+                        None => {
+                            to_sniff.push(path);
+                            (LoraBase::Unknown, false)
+                        }
+                    },
+                };
+                EmbeddingEntry {
+                    base,
+                    sniffed,
+                    selected: prev.map(|e| e.selected).unwrap_or(false),
+                    negative: prev.map(|e| e.negative).unwrap_or(false),
+                    strength: prev.map(|e| e.strength).unwrap_or(1.0),
+                    thumb: prev.and_then(|e| e.thumb.clone()),
+                    thumb_missing: prev.map(|e| e.thumb_missing).unwrap_or(false),
+                    file: f,
+                }
+            })
+            .collect();
+    }
+    spawn_base_sniff(to_sniff, sniff_embedding_base, ctx.clone());
     spawn_embedding_thumb_fetch(state.embeddings.iter().map(|e| e.file.clone()).collect(), ctx.clone(), false);
 }
 
@@ -1187,6 +1209,8 @@ pub struct GenerateState {
     show_other_embeddings: bool,
     /// When the embeddings-popup Refresh icon was last clicked (one-shot spin).
     embeddings_refresh_spin: Option<std::time::Instant>,
+    /// Right-click → Delete Embedding… names the file here until confirmed.
+    embedding_delete_confirm: Option<String>,
     show_log: bool,
     /// Brief tint flash on the Copy-log button: (when, was_ok). Green on success,
     /// red on failure; fades out after a short window.
@@ -1291,6 +1315,7 @@ impl GenerateState {
             show_embeddings_popup: false,
             show_other_embeddings: false,
             embeddings_refresh_spin: None,
+            embedding_delete_confirm: None,
             show_log: false,
             copy_flash: None,
             spell: crate::spellcheck::SpellcheckState::default(),
@@ -1337,6 +1362,49 @@ fn comfy_base() -> PathBuf {
 }
 
 /// LoRA `.safetensors` files in ComfyUI's `models/loras/` dir, alphabetical.
+/// Resolved architecture sniffs, keyed by file path — shared by the LoRA and
+/// embedding pickers. Sniffing opens the file and JSON-parses its safetensors
+/// header (megabytes for kohya-trained LoRAs, cold disk on first open), which
+/// froze the UI when done inline for every file — so a worker thread fills this
+/// map and the pickers apply results as they land.
+static SNIFF_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, LoraBase>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Sniff `paths` on a worker thread into [`SNIFF_CACHE`], repainting as each
+/// result lands. Overlapping calls are fine — already-cached paths are skipped.
+fn spawn_base_sniff(paths: Vec<PathBuf>, sniff: fn(&Path) -> LoraBase, ctx: egui::Context) {
+    if paths.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        for p in paths {
+            if SNIFF_CACHE.lock().unwrap().contains_key(&p) {
+                continue;
+            }
+            let base = sniff(&p);
+            SNIFF_CACHE.lock().unwrap().insert(p, base);
+            ctx.request_repaint();
+        }
+    });
+}
+
+/// Per-frame budget of thumbnail decodes across the LoRA/embedding pickers.
+/// Decoding every cached preview JPEG in the first frame froze the popup open;
+/// each picker resets this each frame and rows skip (and request a repaint)
+/// once it's spent, so the list fills over a few fast frames instead.
+static THUMB_DECODE_BUDGET: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Take one unit of this frame's decode budget; when spent, ask for another
+/// frame so the remaining thumbnails load next time round.
+fn take_thumb_decode_budget(ctx: &egui::Context) -> bool {
+    if THUMB_DECODE_BUDGET.fetch_sub(1, Ordering::Relaxed) > 0 {
+        true
+    } else {
+        ctx.request_repaint();
+        false
+    }
+}
+
 fn scan_loras() -> Vec<String> {
     let dir = comfy_base().join("ComfyUI").join("models").join("loras");
     let mut v: Vec<String> = std::fs::read_dir(dir)
@@ -1352,27 +1420,44 @@ fn scan_loras() -> Vec<String> {
 }
 
 /// Re-scan the loras dir, preserving selection + weight of files still present.
-/// New files get their base model sniffed (a cheap header read); known files
-/// keep the cached result. Also kicks off the background Civitai-thumbnail
-/// fetch for any file without a cached preview.
+/// New files get their base model sniffed on a worker thread (header reads
+/// froze the first open when done inline) — until the result lands they list as
+/// compatible with a pending flag. Also kicks off the background
+/// Civitai-thumbnail fetch for any file without a cached preview.
 fn refresh_loras(state: &mut GenerateState, ctx: &egui::Context) {
     let dir = comfy_base().join("ComfyUI").join("models").join("loras");
-    state.loras = scan_loras()
-        .into_iter()
-        .map(|f| {
-            let prev = state.loras.iter().find(|l| l.file == f);
-            LoraEntry {
-                selected: prev.map(|l| l.selected).unwrap_or(false),
-                strength: prev.map(|l| l.strength).unwrap_or(1.0),
-                base: prev.map(|l| l.base).unwrap_or_else(|| sniff_lora_base(&dir.join(&f))),
-                info_open: prev.map(|l| l.info_open).unwrap_or(false),
-                info: prev.and_then(|l| l.info.clone()),
-                thumb: prev.and_then(|l| l.thumb.clone()),
-                thumb_missing: prev.map(|l| l.thumb_missing).unwrap_or(false),
-                file: f,
-            }
-        })
-        .collect();
+    let mut to_sniff: Vec<PathBuf> = Vec::new();
+    {
+        let cache = SNIFF_CACHE.lock().unwrap();
+        state.loras = scan_loras()
+            .into_iter()
+            .map(|f| {
+                let prev = state.loras.iter().find(|l| l.file == f);
+                let (base, sniffed) = match prev {
+                    Some(p) if p.sniffed => (p.base, true),
+                    _ => match cache.get(&dir.join(&f)) {
+                        Some(b) => (*b, true),
+                        None => {
+                            to_sniff.push(dir.join(&f));
+                            (LoraBase::Unknown, false)
+                        }
+                    },
+                };
+                LoraEntry {
+                    selected: prev.map(|l| l.selected).unwrap_or(false),
+                    strength: prev.map(|l| l.strength).unwrap_or(1.0),
+                    base,
+                    sniffed,
+                    info_open: prev.map(|l| l.info_open).unwrap_or(false),
+                    info: prev.and_then(|l| l.info.clone()),
+                    thumb: prev.and_then(|l| l.thumb.clone()),
+                    thumb_missing: prev.map(|l| l.thumb_missing).unwrap_or(false),
+                    file: f,
+                }
+            })
+            .collect();
+    }
+    spawn_base_sniff(to_sniff, sniff_lora_base, ctx.clone());
     spawn_lora_thumb_fetch(state.loras.iter().map(|l| l.file.clone()).collect(), ctx.clone(), false);
 }
 
@@ -1457,6 +1542,23 @@ fn spawn_lora_thumb_fetch(files: Vec<String>, ctx: egui::Context, force: bool) {
 /// A LoRA card frame (the Civitai-card look), highlighted with an accent border +
 /// faint accent wash when selected — selection is shown by the whole card, not
 /// a checkbox.
+/// Fixed height reserved for the "Show for other models" switch row at the
+/// bottom of the LoRA / embeddings pickers — always allocated (even with
+/// nothing to toggle) so both popups keep exactly the same, constant height.
+/// Sized for a one-line title plus the two-line subtitle.
+const SHOW_OTHER_SLOT_H: f32 = 50.0;
+
+/// A hard fixed-height region: children lay out inside but the parent's cursor
+/// advances by exactly `h` no matter what they measure — so wrapped text or a
+/// taller widget can never change the popup's height.
+fn fixed_height_slot(ui: &mut egui::Ui, h: f32, add: impl FnOnce(&mut egui::Ui)) {
+    let r = ui.available_rect_before_wrap();
+    let slot = egui::Rect::from_min_size(r.min, egui::vec2(r.width(), h));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(slot).layout(Layout::top_down(Align::Min)));
+    add(&mut child);
+    ui.allocate_rect(slot, egui::Sense::hover());
+}
+
 fn lora_card(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
     let (fill, stroke) = if selected {
         (
@@ -1504,20 +1606,23 @@ fn lora_row(
     tdir: &Path,
     off_family: bool,
 ) -> bool {
-    // Pick up a freshly downloaded thumbnail from the cache.
+    // Pick up a freshly downloaded thumbnail from the cache — at most a few
+    // decodes per frame across all rows, so the first open never stalls.
     if l.thumb.is_none() && !l.thumb_missing {
         let stem = l.file.trim_end_matches(".safetensors");
         let img = tdir.join(format!("{stem}.img"));
         if img.exists() {
-            match std::fs::read(&img).ok().and_then(|b| crate::civitai::decode_thumb(&b, 200)) {
-                Some(ci) => {
-                    l.thumb = Some(ui.ctx().load_texture(
-                        format!("lora_thumb_{stem}"),
-                        ci,
-                        Default::default(),
-                    ));
+            if take_thumb_decode_budget(ui.ctx()) {
+                match std::fs::read(&img).ok().and_then(|b| crate::civitai::decode_thumb(&b, 200)) {
+                    Some(ci) => {
+                        l.thumb = Some(ui.ctx().load_texture(
+                            format!("lora_thumb_{stem}"),
+                            ci,
+                            Default::default(),
+                        ));
+                    }
+                    None => l.thumb_missing = true, // corrupt download
                 }
-                None => l.thumb_missing = true, // corrupt download
             }
         } else if tdir.join(format!("{stem}.none")).exists() {
             l.thumb_missing = true;
@@ -1596,7 +1701,7 @@ fn lora_row(
                             ));
                             ui.label(RichText::new(l.base.label()).color(l.base.dot_color()).size(10.0));
                         });
-                    } else if l.base == LoraBase::Unknown {
+                    } else if l.base == LoraBase::Unknown && l.sniffed {
                         ui.label(RichText::new("base?").color(MUTED()).size(10.0)).on_hover_text(
                             "Couldn't identify this LoRA's base model from its file — it may not be made for this model.",
                         );
@@ -1718,10 +1823,11 @@ fn lora_row(
     want_delete
 }
 
-/// The LoRA multi-select popup: an accent-highlighted card + weight slider per
 /// Negative-prompt editor popup (opened from the "+" menu). The text edits
 /// `state.negative` live, so closing the popup keeps whatever was typed — there's
 /// no explicit Save. Applied to the workflow's negative encoder at generation.
+/// Styled like the LoRA / Embeddings pickers: icon title row, muted caption, a
+/// rounded input well, and an accent Done button (which is also how it closes).
 fn negative_popup(ctx: &egui::Context, state: &mut GenerateState) {
     use crate::PopupPlacement;
     egui::Window::new("")
@@ -1743,7 +1849,7 @@ fn negative_popup(ctx: &egui::Context, state: &mut GenerateState) {
                 v.widgets.active.corner_radius = radius;
             }
 
-            // Title row: icon + title + close ✕ (auto-saves on close).
+            // Title row (matches the LoRA / Embeddings pickers): icon + title.
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.add(
@@ -1752,47 +1858,45 @@ fn negative_popup(ctx: &egui::Context, state: &mut GenerateState) {
                         .tint(TEXT()),
                 );
                 ui.heading(RichText::new("Negative prompt").color(TEXT()).strong().size(17.0));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .add(egui::Button::image(
-                            egui::Image::new(egui::include_image!("../icons/close.svg"))
-                                .fit_to_exact_size(egui::vec2(24.0, 24.0))
-                                .tint(TEXT()),
-                        ).frame(false).sense(egui::Sense::click_and_drag()))
-                        .on_hover_text("Close (saved automatically)")
-                        .clicked()
-                    {
-                        state.show_negative_popup = false;
-                    }
-                });
             });
-            ui.add_space(10.0);
-
+            ui.add_space(6.0);
             ui.label(
-                RichText::new("What to avoid in the image. Saved automatically — just close when done.")
+                RichText::new("What to avoid in the image. Saved as you type.")
                     .color(MUTED())
-                    .size(12.0),
+                    .size(11.5),
             );
-            ui.add_space(8.0);
+            ui.add_space(12.0);
 
-            // The editor. Edits land straight in state.negative (live save).
-            let out = egui::TextEdit::multiline(&mut state.negative)
-                .desired_width(f32::INFINITY)
-                .desired_rows(6)
-                .hint_text("blurry, low quality, watermark, extra fingers…")
-                .show(ui);
+            // The editor, in an Apple-style rounded input well. Edits land
+            // straight in state.negative (live save).
+            let out = egui::Frame::new()
+                .fill(FIELD())
+                .corner_radius(CornerRadius::same(14))
+                .stroke(egui::Stroke::new(1.0, EDGE()))
+                .inner_margin(Margin::same(10))
+                .show(ui, |ui| {
+                    egui::TextEdit::multiline(&mut state.negative)
+                        .frame(egui::Frame::NONE)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(6)
+                        .hint_text("blurry, low quality, watermark, extra fingers…")
+                        .show(ui)
+                })
+                .inner;
             // Spell-check the negative prompt too (right-click suggestions).
             crate::spellcheck::attach(ui, &out, &mut state.negative, &mut state.neg_spell);
 
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             ui.horizontal(|ui| {
-                if !state.negative.trim().is_empty()
-                    && ui.add(egui::Button::new(RichText::new("Clear").size(12.0))).clicked()
-                {
-                    state.negative.clear();
+                if !state.negative.trim().is_empty() {
+                    let clear = egui::Button::new(RichText::new("Clear").color(TEXT()).size(12.0));
+                    if ui.add_sized(egui::vec2(74.0, 30.0), clear).clicked() {
+                        state.negative.clear();
+                    }
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(egui::Button::new(RichText::new("Done").size(12.0).strong())).clicked() {
+                    let done = egui::Button::new(RichText::new("Done").color(Color32::WHITE).strong()).fill(ACCENT1());
+                    if ui.add_sized(egui::vec2(90.0, 30.0), done).clicked() {
                         state.show_negative_popup = false;
                     }
                 });
@@ -1804,7 +1908,9 @@ fn negative_popup(ctx: &egui::Context, state: &mut GenerateState) {
 fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
     use crate::PopupPlacement;
     egui::Window::new("")
-        .id(egui::Id::new("zimage_lora_popup"))
+        // "…_fixed": fresh id so the stale auto-size remembered under the old
+        // id (from before the constant-height layout) can't keep the window big.
+        .id(egui::Id::new("zimage_lora_popup_fixed"))
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
@@ -1839,21 +1945,6 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
                     fetch_indicator(ui);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // click_and_drag so a click that slips a pixel is swallowed
-                    // by the button instead of dragging the popup.
-                    if ui
-                        .add(egui::Button::image(
-                            egui::Image::new(egui::include_image!("../icons/close.svg"))
-                                .fit_to_exact_size(egui::vec2(24.0, 24.0))
-                                .tint(TEXT()),
-                        ).frame(false).sense(egui::Sense::click_and_drag()))
-                        .on_hover_text("Close")
-                        .clicked()
-                    {
-                        state.show_lora_popup = false;
-                        cancel_lora_thumb_fetch();
-                    }
-                    ui.add_space(2.0);
                     // One-shot spin animation: 0.5s ease-out single turn on click.
                     let spin = match state.lora_refresh_spin {
                         Some(start) => {
@@ -1888,71 +1979,86 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
 
             // LoRAs for this tab's model family are listed first (unknowns are
             // offered too — they may just lack metadata). Those for other models
-            // stay hidden until the "Show LoRAs for other models" checkbox below
-            // is ticked, then appear under a divider, flagged with a coloured
+            // stay hidden until the "Show for other models" switch below is
+            // ticked, then appear under a divider, flagged with a coloured
             // base-family dot.
             let family = state.family;
-            if state.loras.is_empty() {
-                ui.label(
-                    RichText::new("No LoRAs found. Drop .safetensors files into models/loras/.")
-                        .color(MUTED())
-                        .size(12.0),
-                );
-            } else {
-                let loras_dir = comfy_base().join("ComfyUI").join("models").join("loras");
-                let shown = state.loras.iter().filter(|l| l.base.matches(family)).count();
-                let hidden = state.loras.len() - shown;
-                let show_other = state.show_other_loras;
-                let mut delete_req: Option<String> = None;
-                // Push the scrollbar into the popup's margin so it rides the
-                // window edge instead of sitting on the LoRA cards.
-                const SCROLL_GUTTER: f32 = 12.0;
-                let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
-                egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, false]).show(&mut scroll_ui, |ui| {
-                    ui.set_max_width(ui.available_width() - SCROLL_GUTTER);
-                    let tdir = lora_thumbs_dir();
-                    if shown == 0 {
-                        ui.label(
-                            RichText::new(format!("No {} LoRAs found.", family.title()))
-                                .color(MUTED())
-                                .size(12.0),
-                        );
-                        ui.add_space(6.0);
+            let loras_dir = comfy_base().join("ComfyUI").join("models").join("loras");
+            // Apply any bases the background sniffer resolved since last frame,
+            // and re-arm this frame's thumbnail-decode budget.
+            if state.loras.iter().any(|l| !l.sniffed) {
+                let cache = SNIFF_CACHE.lock().unwrap();
+                for l in state.loras.iter_mut().filter(|l| !l.sniffed) {
+                    if let Some(b) = cache.get(&loras_dir.join(&l.file)) {
+                        l.base = *b;
+                        l.sniffed = true;
                     }
-                    for l in state.loras.iter_mut().filter(|l| l.base.matches(family)) {
-                        if lora_row(ui, l, &loras_dir, &tdir, false) {
+                }
+            }
+            THUMB_DECODE_BUDGET.store(3, Ordering::Relaxed);
+            let shown = state.loras.iter().filter(|l| l.base.matches(family)).count();
+            let hidden = state.loras.len() - shown;
+            let show_other = state.show_other_loras;
+            let mut delete_req: Option<String> = None;
+            // Push the scrollbar into the popup's margin so it rides the
+            // window edge instead of sitting on the LoRA cards. The list region
+            // is a fixed 360 tall (auto_shrink off) and the empty-state messages
+            // render INSIDE it, so the popup height never changes.
+            const SCROLL_GUTTER: f32 = 12.0;
+            let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
+            egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, false]).show(&mut scroll_ui, |ui| {
+                ui.set_max_width(ui.available_width() - SCROLL_GUTTER);
+                let tdir = lora_thumbs_dir();
+                if state.loras.is_empty() {
+                    ui.label(
+                        RichText::new("No LoRAs found. Drop .safetensors files into models/loras/.")
+                            .color(MUTED())
+                            .size(12.0),
+                    );
+                } else if shown == 0 {
+                    ui.label(
+                        RichText::new(format!("No {} LoRAs found.", family.title()))
+                            .color(MUTED())
+                            .size(12.0),
+                    );
+                    ui.add_space(6.0);
+                }
+                for l in state.loras.iter_mut().filter(|l| l.base.matches(family)) {
+                    if lora_row(ui, l, &loras_dir, &tdir, false) {
+                        delete_req = Some(l.file.clone());
+                    }
+                }
+                if hidden > 0 && show_other {
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(format!("FOR OTHER MODELS ({hidden})"))
+                            .color(MUTED())
+                            .strong()
+                            .size(11.0),
+                    );
+                    ui.add_space(6.0);
+                    for l in state.loras.iter_mut().filter(|l| !l.base.matches(family)) {
+                        if lora_row(ui, l, &loras_dir, &tdir, true) {
                             delete_req = Some(l.file.clone());
                         }
                     }
-                    if hidden > 0 && show_other {
-                        ui.add_space(2.0);
-                        ui.label(
-                            RichText::new(format!("FOR OTHER MODELS ({hidden})"))
-                                .color(MUTED())
-                                .strong()
-                                .size(11.0),
-                        );
-                        ui.add_space(6.0);
-                        for l in state.loras.iter_mut().filter(|l| !l.base.matches(family)) {
-                            if lora_row(ui, l, &loras_dir, &tdir, true) {
-                                delete_req = Some(l.file.clone());
-                            }
-                        }
-                    }
-                });
-                crate::edge_scroll_done(ui, &scroll_ui, SCROLL_GUTTER);
-                if delete_req.is_some() {
-                    state.lora_delete_confirm = delete_req;
                 }
-                // Reveal/hide the other-model LoRAs (where the "… hidden" note used
-                // to be).
-                if hidden > 0 {
-                    ui.add_space(6.0);
-                    crate::settings::row(
-                        ui,
-                        &format!("Show LoRAs for other models ({hidden})"),
-                        Some("Architecture-bound — they usually have no effect on this model."),
-                        |ui| {
+            });
+            crate::edge_scroll_done(ui, &scroll_ui, SCROLL_GUTTER);
+            if delete_req.is_some() {
+                state.lora_delete_confirm = delete_req;
+            }
+            // Constant-height slot for the "show others" switch row — reserved
+            // even when there's nothing to toggle, so the popup height matches
+            // the embeddings picker exactly and never shifts.
+            ui.add_space(6.0);
+            fixed_height_slot(ui, SHOW_OTHER_SLOT_H, |ui| {
+                    if hidden > 0 {
+                        crate::settings::row(
+                            ui,
+                            &format!("Show for other models ({hidden})"),
+                            Some("Architecture-bound — they usually have no effect on this model."),
+                            |ui| {
                         crate::settings::switch(ui, &mut state.show_other_loras);
                         // Only once the others are revealed: a warning glyph that
                         // pops a disclaimer about cross-architecture LoRAs.
@@ -1991,9 +2097,10 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
                                     );
                                 });
                         }
-                    });
-                }
-            }
+                            },
+                        );
+                    }
+            });
 
             ui.add_space(10.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2073,7 +2180,9 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
 fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
     use crate::PopupPlacement;
     egui::Window::new("")
-        .id(egui::Id::new("embeddings_popup"))
+        // "…_fixed": fresh id so the stale auto-size remembered under the old
+        // id (from before the constant-height layout) can't keep the window big.
+        .id(egui::Id::new("embeddings_popup_fixed"))
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
@@ -2104,19 +2213,6 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
                     fetch_indicator(ui);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .add(egui::Button::image(
-                            egui::Image::new(egui::include_image!("../icons/close.svg"))
-                                .fit_to_exact_size(egui::vec2(24.0, 24.0))
-                                .tint(TEXT()),
-                        ).frame(false).sense(egui::Sense::click_and_drag()))
-                        .on_hover_text("Close")
-                        .clicked()
-                    {
-                        state.show_embeddings_popup = false;
-                        cancel_embedding_thumb_fetch();
-                    }
-                    ui.add_space(2.0);
                     // One-shot 0.5s ease-out spin on click (matches the LoRA popup).
                     let spin = match state.embeddings_refresh_spin {
                         Some(start) => {
@@ -2147,67 +2243,126 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
                     }
                 });
             });
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new("Select embeddings, then set each to Positive or Negative. They're applied at generation — not added to your prompt.")
-                    .color(MUTED())
-                    .size(11.0),
-            );
-            ui.add_space(10.0);
+            ui.add_space(14.0);
 
             let family = state.family;
-            if state.embeddings.is_empty() {
-                ui.label(
-                    RichText::new("No embeddings found. Drop files into models/embeddings/.")
-                        .color(MUTED())
-                        .size(12.0),
-                );
-            } else {
-                let shown = state.embeddings.iter().filter(|e| e.base.matches(family)).count();
-                let hidden = state.embeddings.len() - shown;
-                let show_other = state.show_other_embeddings;
-                // Push the scrollbar into the popup's margin so it rides the
-                // window edge instead of sitting on the embedding cards.
-                const SCROLL_GUTTER: f32 = 12.0;
-                let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
-                egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, false]).show(&mut scroll_ui, |ui| {
-                    ui.set_max_width(ui.available_width() - SCROLL_GUTTER);
-                    if shown == 0 {
-                        ui.label(
-                            RichText::new(format!("No {} embeddings found.", family.title()))
-                                .color(MUTED())
-                                .size(12.0),
-                        );
-                        ui.add_space(6.0);
+            // Apply any bases the background sniffer resolved since last frame,
+            // and re-arm this frame's thumbnail-decode budget.
+            if state.embeddings.iter().any(|e| !e.sniffed) {
+                let dir = comfy_base().join("ComfyUI").join("models").join("embeddings");
+                let cache = SNIFF_CACHE.lock().unwrap();
+                for e in state.embeddings.iter_mut().filter(|e| !e.sniffed) {
+                    if let Some(b) = cache.get(&dir.join(&e.file)) {
+                        e.base = *b;
+                        e.sniffed = true;
                     }
-                    for e in state.embeddings.iter_mut().filter(|e| e.base.matches(family)) {
-                        embedding_row(ui, e, false);
-                    }
-                    if hidden > 0 && show_other {
-                        ui.add_space(2.0);
-                        ui.label(
-                            RichText::new(format!("FOR OTHER MODELS ({hidden})"))
-                                .color(MUTED())
-                                .strong()
-                                .size(11.0),
-                        );
-                        ui.add_space(6.0);
-                        for e in state.embeddings.iter_mut().filter(|e| !e.base.matches(family)) {
-                            embedding_row(ui, e, true);
-                        }
-                    }
-                });
-                crate::edge_scroll_done(ui, &scroll_ui, SCROLL_GUTTER);
-                if hidden > 0 {
-                    ui.add_space(6.0);
-                    ui.checkbox(
-                        &mut state.show_other_embeddings,
-                        RichText::new(format!("Show {hidden} embedding(s) for other models"))
-                            .color(MUTED())
-                            .size(11.5),
-                    );
                 }
             }
+            THUMB_DECODE_BUDGET.store(3, Ordering::Relaxed);
+            let shown = state.embeddings.iter().filter(|e| e.base.matches(family)).count();
+            let hidden = state.embeddings.len() - shown;
+            let show_other = state.show_other_embeddings;
+            let mut delete_req: Option<String> = None;
+            // Push the scrollbar into the popup's margin so it rides the
+            // window edge instead of sitting on the embedding cards. The list
+            // region is a fixed 360 tall (auto_shrink off) and the empty-state
+            // messages render INSIDE it, so the popup height never changes.
+            const SCROLL_GUTTER: f32 = 12.0;
+            let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
+            egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, false]).show(&mut scroll_ui, |ui| {
+                ui.set_max_width(ui.available_width() - SCROLL_GUTTER);
+                let tdir = embedding_thumbs_dir();
+                if state.embeddings.is_empty() {
+                    ui.label(
+                        RichText::new("No embeddings found. Drop files into models/embeddings/.")
+                            .color(MUTED())
+                            .size(12.0),
+                    );
+                } else if shown == 0 {
+                    ui.label(
+                        RichText::new(format!("No {} embeddings found.", family.title()))
+                            .color(MUTED())
+                            .size(12.0),
+                    );
+                    ui.add_space(6.0);
+                }
+                for e in state.embeddings.iter_mut().filter(|e| e.base.matches(family)) {
+                    if embedding_row(ui, e, &tdir, false) {
+                        delete_req = Some(e.file.clone());
+                    }
+                }
+                if hidden > 0 && show_other {
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(format!("FOR OTHER MODELS ({hidden})"))
+                            .color(MUTED())
+                            .strong()
+                            .size(11.0),
+                    );
+                    ui.add_space(6.0);
+                    for e in state.embeddings.iter_mut().filter(|e| !e.base.matches(family)) {
+                        if embedding_row(ui, e, &tdir, true) {
+                            delete_req = Some(e.file.clone());
+                        }
+                    }
+                }
+            });
+            crate::edge_scroll_done(ui, &scroll_ui, SCROLL_GUTTER);
+            if delete_req.is_some() {
+                state.embedding_delete_confirm = delete_req;
+            }
+            // Constant-height slot for the "show others" switch row — reserved
+            // even when there's nothing to toggle, so the popup height matches
+            // the LoRA picker exactly and never shifts.
+            ui.add_space(6.0);
+            fixed_height_slot(ui, SHOW_OTHER_SLOT_H, |ui| {
+                    if hidden > 0 {
+                        crate::settings::row(
+                            ui,
+                            &format!("Show for other models ({hidden})"),
+                            Some("Architecture-bound — they usually have no effect on this model."),
+                            |ui| {
+                                crate::settings::switch(ui, &mut state.show_other_embeddings);
+                                // Only once the others are revealed: a warning glyph that
+                                // pops a disclaimer about cross-architecture embeddings.
+                                if state.show_other_embeddings {
+                                    let warn = ui
+                                        .add(
+                                            egui::Image::new(egui::include_image!("../icons/warning.svg"))
+                                                .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                                                .tint(Color32::from_rgb(235, 150, 45))
+                                                .sense(egui::Sense::click()),
+                                        )
+                                        .on_hover_text("Why these may not work");
+                                    if warn.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    egui::Popup::from_toggle_button_response(&warn)
+                                        .align(egui::RectAlign::TOP_START)
+                                        .width(300.0)
+                                        .gap(6.0)
+                                        .frame(window_frame())
+                                        .show(|ui| {
+                                            ui.label(RichText::new("Heads up").color(TEXT()).strong().size(12.5));
+                                            ui.add_space(4.0);
+                                            ui.label(
+                                                RichText::new(
+                                                    "Embeddings are token vectors sized for a specific \
+                                                     text encoder. One made for another base (SD 1.5, \
+                                                     SDXL, …) doesn't match this model's encoder, so it \
+                                                     has little or no effect on the image.\n\nThey're \
+                                                     shown here only so you can pick one you know is \
+                                                     mislabelled.",
+                                                )
+                                                .color(MUTED())
+                                                .size(11.0),
+                                            );
+                                        });
+                                }
+                            },
+                        );
+                    }
+            });
 
             ui.add_space(10.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2218,25 +2373,89 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
                 }
             });
         });
+
+    // Delete confirmation (right-click → Delete Embedding…): the same compact
+    // centred modal as the LoRA picker's.
+    if let Some(file) = state.embedding_delete_confirm.clone() {
+        egui::Window::new("Delete Embedding")
+            .id(egui::Id::new("embedding_delete_confirm"))
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(window_frame().corner_radius(CornerRadius::same(22)))
+            .show(ctx, |ui| {
+                ui.set_max_width(280.0);
+                ui.vertical_centered(|ui| {
+                    ui.add(
+                        egui::Image::new(egui::include_image!("../icons/warning.svg"))
+                            .fit_to_exact_size(egui::vec2(32.0, 32.0))
+                            .tint(Color32::from_rgb(220, 160, 50)),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Delete this embedding?").size(15.0).strong().color(TEXT()));
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(embed_stem(&file)).color(MUTED()).size(11.5),
+                        )
+                        .truncate(),
+                    );
+                    ui.label(
+                        RichText::new("The file is removed from models/embeddings — this can't be undone.")
+                            .color(MUTED())
+                            .size(11.0),
+                    );
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        let btn_w = 90.0;
+                        let gap = 12.0;
+                        ui.add_space((ui.available_width() - (btn_w * 2.0 + gap)) / 2.0);
+                        ui.spacing_mut().item_spacing.x = gap;
+                        if ui.add_sized(egui::vec2(btn_w, 30.0), egui::Button::new("Cancel")).clicked() {
+                            state.embedding_delete_confirm = None;
+                        }
+                        let del = egui::Button::new(RichText::new("Delete").color(Color32::WHITE).strong())
+                            .fill(Color32::from_rgb(180, 40, 40));
+                        if ui.add_sized(egui::vec2(btn_w, 30.0), del).clicked() {
+                            let dir = comfy_base().join("ComfyUI").join("models").join("embeddings");
+                            let _ = std::fs::remove_file(dir.join(&file));
+                            // Drop its cached thumbnail state too.
+                            let stem = embed_stem(&file);
+                            let tdir = embedding_thumbs_dir();
+                            let _ = std::fs::remove_file(tdir.join(format!("{stem}.img")));
+                            let _ = std::fs::remove_file(tdir.join(format!("{stem}.none")));
+                            state.embedding_delete_confirm = None;
+                            refresh_embeddings(state, ui.ctx());
+                        }
+                    });
+                });
+            });
+    }
 }
 
-/// One embedding row: a LoRA-style card. A click anywhere (de)selects it; when
-/// selected, a Positive / Negative pill pair appears — clicking a pill assigns the
-/// embedding to that encoder. Off-family entries get a coloured base dot + label.
-fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, off_family: bool) {
+/// One embedding row: the same App Store-style card as [`lora_row`] — leading
+/// preview slot, truncated name column, base-family note under the name — with
+/// the embedding-specific Positive / Negative pill pair and Weight slider in the
+/// name column when selected. A click anywhere else (de)selects it. Right-click
+/// offers Set Thumbnail / Delete (delete is confirmed by the caller; returns
+/// true when requested).
+fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, tdir: &Path, off_family: bool) -> bool {
     let name = embed_stem(&e.file).to_string();
 
-    // Pick up a freshly downloaded thumbnail from the cache (lazy, like LoRAs).
+    // Pick up a freshly downloaded thumbnail from the cache — at most a few
+    // decodes per frame across all rows, so the first open never stalls.
     if e.thumb.is_none() && !e.thumb_missing {
-        let tdir = embedding_thumbs_dir();
         let stem = embed_stem(&e.file);
         let img = tdir.join(format!("{stem}.img"));
         if img.exists() {
-            match std::fs::read(&img).ok().and_then(|b| crate::civitai::decode_thumb(&b, 200)) {
-                Some(ci) => {
-                    e.thumb = Some(ui.ctx().load_texture(format!("embed_thumb_{stem}"), ci, Default::default()));
+            if take_thumb_decode_budget(ui.ctx()) {
+                match std::fs::read(&img).ok().and_then(|b| crate::civitai::decode_thumb(&b, 200)) {
+                    Some(ci) => {
+                        e.thumb = Some(ui.ctx().load_texture(format!("embed_thumb_{stem}"), ci, Default::default()));
+                    }
+                    None => e.thumb_missing = true,
                 }
-                None => e.thumb_missing = true,
             }
         } else if tdir.join(format!("{stem}.none")).exists() {
             e.thumb_missing = true;
@@ -2256,38 +2475,74 @@ fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, off_family: bool) {
     let inner = lora_card(ui, selected, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            if let Some(tex) = thumb {
-                ui.add(egui::Image::new(&tex).max_height(64.0).max_width(64.0).corner_radius(8));
-            } else {
-                ui.add(
+            // Leading preview slot — every card gets one (a FIELD well with the
+            // extension glyph while no Civitai preview exists) so the names line
+            // up in a clean App Store-style list, exactly like the LoRA cards.
+            match thumb {
+                Some(tex) => {
+                    ui.add(
+                        egui::Image::new(&tex)
+                            .max_height(80.0)
+                            .max_width(130.0)
+                            .corner_radius(8),
+                    );
+                }
+                None => {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(96.0, 64.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, CornerRadius::same(8), FIELD());
+                    ui.painter().rect_stroke(
+                        rect,
+                        CornerRadius::same(8),
+                        egui::Stroke::new(1.0, EDGE()),
+                        egui::StrokeKind::Inside,
+                    );
                     egui::Image::new(egui::include_image!("../icons/extension.svg"))
-                        .fit_to_exact_size(egui::vec2(14.0, 14.0))
-                        .tint(icon_tint(if selected { TEXT() } else { MUTED() })),
-                );
+                        .tint(icon_tint(MUTED()))
+                        .paint_at(ui, egui::Rect::from_center_size(rect.center(), egui::vec2(22.0, 22.0)));
+                }
             }
-            ui.add(egui::Label::new(RichText::new(&name).color(TEXT()).size(12.5)).truncate());
-            if off_family {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(base.label()).color(base.dot_color()).size(10.5));
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                    ui.painter().circle_filled(rect.center(), 4.0, base.dot_color());
-                });
-            }
+            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                ui.set_width(ui.available_width());
+                // One-line name, ellipsised so long file names can never widen
+                // the card — hover for the full name.
+                let col = if selected { TEXT() } else { MUTED() };
+                ui.add(egui::Label::new(RichText::new(&name).color(col).size(12.0)).truncate())
+                    .on_hover_text(&name);
+                // The base-family note sits UNDER the name (a coloured dot +
+                // family for off-family embeddings; "base?" when unidentified).
+                if off_family {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let (rect, dr) =
+                            ui.allocate_exact_size(egui::vec2(8.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(rect.center(), 3.5, base.dot_color());
+                        dr.on_hover_text(format!(
+                            "Trained for {} — may not work on this model.",
+                            base.label()
+                        ));
+                        ui.label(RichText::new(base.label()).color(base.dot_color()).size(10.0));
+                    });
+                } else if base == LoraBase::Unknown && e.sniffed {
+                    ui.label(RichText::new("base?").color(MUTED()).size(10.0)).on_hover_text(
+                        "Couldn't identify this embedding's base model from its file — it may not be made for this model.",
+                    );
+                }
+                if selected {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        pos_rect = Some(polarity_pill(ui, "Positive", !negative, Color32::from_rgb(70, 160, 90)));
+                        neg_rect = Some(polarity_pill(ui, "Negative", negative, Color32::from_rgb(200, 80, 80)));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Weight").color(MUTED()).size(10.5));
+                        let sr = ui.add(egui::Slider::new(&mut e.strength, 0.0..=2.0));
+                        slider_rect = Some(sr.rect);
+                    });
+                }
+            });
         });
-        if selected {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                pos_rect = Some(polarity_pill(ui, "Positive", !negative, Color32::from_rgb(70, 160, 90)));
-                neg_rect = Some(polarity_pill(ui, "Negative", negative, Color32::from_rgb(200, 80, 80)));
-            });
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("weight").color(MUTED()).size(10.5));
-                let sr = ui.add(egui::Slider::new(&mut e.strength, 0.0..=2.0));
-                slider_rect = Some(sr.rect);
-            });
-        }
     });
 
     let resp = inner.interact(egui::Sense::click());
@@ -2309,6 +2564,45 @@ fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, off_family: bool) {
             e.selected = !e.selected;
         }
     }
+
+    // Right-click menu (same Apple styling as the LoRA cards): pick a custom
+    // preview image, or delete the embedding file (confirmed by the caller).
+    let mut want_thumb = false;
+    let mut want_delete = false;
+    egui::Popup::context_menu(&resp)
+        .frame(crate::zoom::menu_frame())
+        .show(|ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            if crate::zoom::menu_item(ui, egui::include_image!("../icons/image.svg"), "Set Thumbnail…") {
+                want_thumb = true;
+                ui.close();
+            }
+            crate::zoom::menu_sep(ui);
+            if crate::zoom::menu_item(ui, egui::include_image!("../icons/delete.svg"), "Delete Embedding…") {
+                want_delete = true;
+                ui.close();
+            }
+        });
+    if want_thumb
+        && let Some(src) = rfd::FileDialog::new()
+            .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
+            .pick_file()
+    {
+        // The thumb cache stores the raw image bytes ({stem}.img) and decodes
+        // them on load — so the picked file's bytes are stored as-is, after a
+        // decode check so a broken image can't wedge the card in "missing".
+        let stem = embed_stem(&e.file);
+        if let Ok(bytes) = std::fs::read(&src)
+            && crate::civitai::decode_thumb(&bytes, 200).is_some()
+        {
+            let _ = std::fs::create_dir_all(tdir);
+            let _ = std::fs::write(tdir.join(format!("{stem}.img")), &bytes);
+            let _ = std::fs::remove_file(tdir.join(format!("{stem}.none")));
+            e.thumb = None; // reload from the new bytes next frame
+            e.thumb_missing = false;
+        }
+    }
+    want_delete
 }
 
 /// Draw a small rounded "Positive"/"Negative" pill (active = filled with `accent`,

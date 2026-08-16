@@ -192,6 +192,9 @@ fn main() -> eframe::Result {
             // user doesn't see a dark flash on launch. The Glass config (incl.
             // dark/light panels) must be pushed first — the palette reads it.
             set_glass_config(app.settings.glass_bg, app.settings.glass_backdrop, app.settings.glass_light);
+            crate::theme::set_chat_text(app.settings.ai_chat_text_enabled.then_some(app.settings.ai_chat_text));
+            crate::theme::set_chat_icon(app.settings.ai_chat_icon_enabled.then_some(app.settings.ai_chat_icon));
+            crate::theme::set_orb_color(app.settings.ai_orb_color_enabled.then_some(app.settings.ai_orb_color));
             set(app.settings.theme);
             app.last_theme = app.settings.theme;
             app.last_glass_light = app.settings.glass_light;
@@ -1434,8 +1437,11 @@ impl eframe::App for ViewerApp {
 
         // Push the Glass theme's user-configurable background (colour + backdrop)
         // and its dark/light panel mode so the pickers update live; cheap, so
-        // done every frame.
+        // done every frame. Same for the AI chat's optional text-colour override.
         set_glass_config(self.settings.glass_bg, self.settings.glass_backdrop, self.settings.glass_light);
+        crate::theme::set_chat_text(self.settings.ai_chat_text_enabled.then_some(self.settings.ai_chat_text));
+        crate::theme::set_chat_icon(self.settings.ai_chat_icon_enabled.then_some(self.settings.ai_chat_icon));
+        crate::theme::set_orb_color(self.settings.ai_orb_color_enabled.then_some(self.settings.ai_orb_color));
 
         // Paint the theme's full-window background (the Space theme's animated
         // starfield, the Glass theme's configured backdrop) on the bottom layer,

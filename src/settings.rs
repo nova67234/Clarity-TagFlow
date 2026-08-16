@@ -103,6 +103,22 @@ pub struct Settings {
     /// Light-mode Glass: the frosted panels turn translucent white with dark-grey
     /// text/icons. Off keeps the original dark glass.
     pub glass_light: bool,
+    /// Use a custom colour for the AI chat's message text instead of the theme's
+    /// text colour — for theme combinations where the chat is hard to read
+    /// (e.g. light text over Aurora's bright glow). Edited in the Appearance tab.
+    pub ai_chat_text_enabled: bool,
+    /// The custom AI-chat text colour (sRGB), used when the switch above is on.
+    pub ai_chat_text: [u8; 3],
+    /// Custom tint for the icons in the AI chat's conversation area (copy,
+    /// retry, listen, edit, …). The chats side panel, the composer (message
+    /// box), and icons elsewhere in the app keep the theme's tint.
+    pub ai_chat_icon_enabled: bool,
+    /// The custom AI-chat icon colour (sRGB), used when the switch above is on.
+    pub ai_chat_icon: [u8; 3],
+    /// Custom accent for the glowing AI orb (top bar, chat thinking rows).
+    pub ai_orb_color_enabled: bool,
+    /// The custom orb colour (sRGB), used when the switch above is on.
+    pub ai_orb_color: [u8; 3],
     /// Loop videos: restart playback from the beginning when a video reaches its
     /// end. Read by the embedded video player when a clip starts.
     pub loop_video: bool,
@@ -174,6 +190,15 @@ impl Default for Settings {
             glass_bg: [20, 22, 34],
             glass_backdrop: Backdrop::default(),
             glass_light: false,
+            ai_chat_text_enabled: false,
+            // A dark ink — the useful pick for the "light text on a light
+            // theme" case that motivates this setting.
+            ai_chat_text: [35, 37, 42],
+            ai_chat_icon_enabled: false,
+            ai_chat_icon: [35, 37, 42],
+            ai_orb_color_enabled: false,
+            // The orb's classic light blue (its dark-theme accent).
+            ai_orb_color: [64, 140, 255],
             input_folder: String::new(),
             output_folder: String::new(),
             ftp_enabled: false,
@@ -500,6 +525,40 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
         );
     });
 
+    // AI chat: optional custom colours for the chat's text, its icons, and the
+    // AI orb — for theme combinations where the defaults are hard to read
+    // (e.g. Aurora's bright pastel glow). Picking a colour activates the
+    // override; Reset returns to the theme's own colour. Applied live —
+    // pushed into the theme each frame from main.rs.
+    section(ui, "AI chat", |ui| {
+        row(
+            ui,
+            "Text colour",
+            Some("Your messages and the AI's replies. Pick a colour to override the theme."),
+            |ui| {
+                override_pill(ui, &mut settings.ai_chat_text_enabled, &mut settings.ai_chat_text, TEXT());
+            },
+        );
+        row_sep(ui);
+        row(
+            ui,
+            "Icon colour",
+            Some("Conversation icons only — the side panel and message box keep the theme's."),
+            |ui| {
+                override_pill(ui, &mut settings.ai_chat_icon_enabled, &mut settings.ai_chat_icon, crate::theme::icon_tint(TEXT()));
+            },
+        );
+        row_sep(ui);
+        row(
+            ui,
+            "Orb colour",
+            Some("The glowing AI orb's accent, in the chat and the top bar."),
+            |ui| {
+                override_pill(ui, &mut settings.ai_orb_color_enabled, &mut settings.ai_orb_color, crate::theme::orb_color());
+            },
+        );
+    });
+
     // Glass-only controls: panel brightness, background colour, backdrop
     // animation. Hidden for the other themes, which they don't affect.
     if settings.theme == Theme::Glass {
@@ -525,40 +584,7 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
                 "Background colour",
                 Some("Shows through the panels and fills the gutters."),
                 |ui| {
-                    // A pill-shaped colour swatch. egui's own colour button hard-caps
-                    // its corner radius at 2px (the alpha checker grid can't round), so
-                    // we paint our own pill and open the picker in a popup on click.
-                    let mut col = {
-                        let [r, g, b] = settings.glass_bg;
-                        egui::Color32::from_rgb(r, g, b)
-                    };
-                    let (rect, resp) =
-                        ui.allocate_exact_size(egui::vec2(46.0, 18.0), egui::Sense::click());
-                    let radius = rect.height() / 2.0;
-                    ui.painter().rect_filled(rect, radius, col);
-                    ui.painter().rect_stroke(
-                        rect,
-                        radius,
-                        egui::Stroke::new(1.0, EDGE()),
-                        egui::StrokeKind::Inside,
-                    );
-                    if resp.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    egui::Popup::from_toggle_button_response(&resp).show(|ui| {
-                        // The picker's saturation square / hue bar are sized by
-                        // `slider_width`; the default leaves them much narrower than
-                        // the U8/RGB header row, so the popup showed a big empty gap
-                        // on the right. Widen them to fill the popup instead.
-                        ui.spacing_mut().slider_width = 260.0;
-                        if egui::widgets::color_picker::color_picker_color32(
-                            ui,
-                            &mut col,
-                            egui::widgets::color_picker::Alpha::Opaque,
-                        ) {
-                            settings.glass_bg = [col.r(), col.g(), col.b()];
-                        }
-                    });
+                    color_pill(ui, &mut settings.glass_bg);
                 },
             );
             row_sep(ui);
@@ -1053,6 +1079,63 @@ pub(crate) fn row(ui: &mut egui::Ui, label: &str, sub: Option<&str>, control: im
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control);
     });
+}
+
+/// A pill-shaped colour swatch that opens egui's colour picker in a popup on
+/// click — the row-control companion for colour settings. egui's own colour
+/// button hard-caps its corner radius at 2px (the alpha checker grid can't
+/// round), so we paint our own pill. Returns true when the colour was edited.
+fn color_pill(ui: &mut egui::Ui, rgb: &mut [u8; 3]) -> bool {
+    let mut col = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+    let mut changed = false;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(46.0, 18.0), egui::Sense::click());
+    let radius = rect.height() / 2.0;
+    ui.painter().rect_filled(rect, radius, col);
+    ui.painter().rect_stroke(rect, radius, egui::Stroke::new(1.0, EDGE()), egui::StrokeKind::Inside);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    egui::Popup::from_toggle_button_response(&resp).show(|ui| {
+        // The picker's saturation square / hue bar are sized by `slider_width`;
+        // the default leaves them much narrower than the U8/RGB header row, so
+        // the popup showed a big empty gap on the right. Widen them to fill it.
+        ui.spacing_mut().slider_width = 260.0;
+        if egui::widgets::color_picker::color_picker_color32(
+            ui,
+            &mut col,
+            egui::widgets::color_picker::Alpha::Opaque,
+        ) {
+            *rgb = [col.r(), col.g(), col.b()];
+            changed = true;
+        }
+    });
+    changed
+}
+
+/// Control for an optional colour override: the pill picker is always shown —
+/// editing it activates the override — and once active a small Reset button
+/// appears beside it that returns to the theme's own colour. While no override
+/// is active the pill tracks `theme_col` (the theme's current colour), so it
+/// always shows the colour actually in use and the picker starts from it.
+fn override_pill(ui: &mut egui::Ui, enabled: &mut bool, rgb: &mut [u8; 3], theme_col: egui::Color32) {
+    if !*enabled {
+        *rgb = [theme_col.r(), theme_col.g(), theme_col.b()];
+    }
+    // The row control lays out right-to-left: pill first (rightmost), Reset
+    // to its left.
+    if color_pill(ui, rgb) {
+        *enabled = true;
+    }
+    if *enabled {
+        ui.add_space(8.0);
+        if ui
+            .add(egui::Button::new(egui::RichText::new("Reset").size(11.0)))
+            .on_hover_text("Back to the theme's colour")
+            .clicked()
+        {
+            *enabled = false;
+        }
+    }
 }
 
 /// The hairline between two [`row`]s of a card.

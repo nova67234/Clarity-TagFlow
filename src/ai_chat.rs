@@ -4,10 +4,6 @@
 //! Layout (from the design sketches): the chat list lives in a left card
 //! panel built exactly like the image browser's (same `Panel::left` +
 //! `card_frame`), just with conversations instead of thumbnails. The
-//! conversation and the input pill sit in a centred column, Gemini-style —
-//! bubbles hug their text, the tall rounded pill has a `+` (attach image,
-//! add.svg) on the left and the text-to-image send icon (send.svg) on the
-//! right.
 //!
 //! All chat state (conversations, streaming reply, draft) lives on
 //! `LlmState` (src/llm.rs); this module only draws it.
@@ -151,14 +147,18 @@ fn chat_list(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::settin
             let selected = i == llm.active_chat;
             let title = llm.chats[i].title();
             ui.horizontal(|ui| {
-                let text_color = if selected { egui::Color32::WHITE } else { TEXT() };
+                let text_color = TEXT();
+
                 let mut btn = egui::Button::new(
                     egui::RichText::new(title).color(text_color).size(13.0),
                 )
-                .corner_radius(egui::CornerRadius::same(10))
-                .min_size(egui::vec2(ui.available_width() - 26.0, 30.0));
+                    // Increase radius to 18 so it beautifully matches your chat bubbles
+                    .corner_radius(egui::CornerRadius::same(18))
+                    .min_size(egui::vec2(ui.available_width() - 26.0, 30.0));
+
                 btn = if selected {
-                    btn.fill(ACCENT1())
+                    // Use a soft, glassy translucent tint instead of a heavy solid block
+                    btn.fill(ACCENT1().gamma_multiply(0.15))
                 } else {
                     btn.fill(egui::Color32::TRANSPARENT)
                 };
@@ -275,7 +275,7 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                 ui.add_space(msgs_h * 0.42);
                 ui.vertical_centered(|ui| {
                     ui.label(
-                        egui::RichText::new("Ask Gemma anything — attach an image with +")
+                        egui::RichText::new("Ask AI anything — attach an image with +")
                             .color(MUTED())
                             .size(14.5),
                     );
@@ -311,7 +311,6 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
         });
 
     // --- Bottom input card ---
-    // Gemini-style: attached-image thumbnail at the top-left inside the card,
     // the text area beneath it (capped at 8 visible lines, scrolling
     // internally beyond that), and a bottom row with + / send. The card lives
     // on its OWN floating layer, anchored to the panel's bottom and centred
@@ -353,6 +352,15 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(off_x, -14.0))
         .show(ui.ctx(), |ui| {
+        // Glass themes: repaint the window backdrop (pixel-aligned) as an
+        // opaque patch under the card, so the card can share the other
+        // panels' translucent PANEL fill — matching the top bar and chat
+        // list exactly — without messages scrolled beneath showing through.
+        // Uses last frame's rect (stored below); the one-frame lag while the
+        // card grows is invisible. No-op outside Glass.
+        if let Some((r, _)) = llm.input_rect {
+            crate::theme::paint_glass_patch(ui.ctx(), ui.painter(), r);
+        }
         // While a file is dragged over: the expanded blue drop zone replaces
         // the whole card.
         if drag_over_card {
@@ -383,11 +391,21 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
             ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(12.0));
             ui.add_space(2.0);
         }
+        // The same translucent PANEL fill as the top bar / chat list cards —
+        // the glass-patch underlay painted above keeps messages from showing
+        // through it. A soft shadow (same family as card_frame's) lifts the
+        // card visually above the chat.
         egui::Frame::new()
-            .fill(ui.visuals().extreme_bg_color)
+            .fill(PANEL())
             .stroke(egui::Stroke::new(1.0, EDGE()))
             .corner_radius(egui::CornerRadius::same(24))
             .inner_margin(egui::Margin::symmetric(12, 10))
+            .shadow(egui::epaint::Shadow {
+                offset: [0, 4],
+                blur: 14,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(110),
+            })
             .show(ui, |ui| {
                 ui.vertical(|ui| {
                 ui.set_width(col_w - 24.0);
@@ -410,7 +428,7 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                 paint_play_badge(ui, resp.rect);
                             }
                         } else {
-                            media_chip(ui, &path);
+                            media_chip(ui, &path, icon_tint(MUTED()));
                         }
                         if ui
                             .add(egui::Button::new(egui::RichText::new("✕").color(MUTED()).size(11.0)).frame(false))
@@ -586,7 +604,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                         }
                     }
                     None => {
-                        media_chip(ui, path);
+                        media_chip(ui, path, chat_icon_tint(MUTED()));
                     }
                 }
                 if !text.is_empty() {
@@ -619,7 +637,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 let can_send = !llm.running
                                     && (!llm.edit_draft.trim().is_empty() || image.is_some());
-                                let send = icon_button(
+                                let send = msg_icon_button(
                                     ui,
                                     egui::include_image!("../icons/send.svg"),
                                     16.0,
@@ -627,7 +645,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                                     can_send,
                                 )
                                 .clicked();
-                                let cancel = icon_button(
+                                let cancel = msg_icon_button(
                                     ui,
                                     egui::include_image!("../icons/x.svg"),
                                     14.0,
@@ -653,9 +671,14 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
             }
 
             if !text.is_empty() {
+                // iMessage-style bubble: SOLID accent fill with white text.
+                // The old translucent accent (28%) washed out over the Glass
+                // themes' animated backdrops and read as "behind" the chat.
+                // A custom chat text colour (Appearance tab) wins over white.
+                let bubble_text = chat_text_override().unwrap_or(egui::Color32::WHITE);
                 egui::Frame::new()
-                    .fill(ACCENT1().gamma_multiply(0.28))
-                    .corner_radius(egui::CornerRadius::same(22))
+                    .fill(ACCENT1())
+                    .corner_radius(egui::CornerRadius::same(18))
                     .inner_margin(egui::Margin::symmetric(14, 10))
                     .show(ui, |ui| {
                         // Hug short messages: cap the bubble at the text's own
@@ -663,7 +686,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                         // drafts), up to 82% of the column.
                         let est = ui
                             .painter()
-                            .layout_no_wrap(text.clone(), egui::FontId::proportional(14.0), TEXT())
+                            .layout_no_wrap(text.clone(), egui::FontId::proportional(14.0), bubble_text)
                             .size()
                             .x
                             + 12.0;
@@ -671,7 +694,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                             // Emoji-aware label: color Twemoji instead of
                             // monochrome font glyphs.
-                            crate::emoji::label(ui, &text, TEXT(), 14.0, false);
+                            crate::emoji::label(ui, &text, bubble_text, 14.0, false);
                         });
                     });
             }
@@ -679,7 +702,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
             // Edit action under the bubble (mirrors the reply action row).
             ui.add_space(2.0);
             let can_edit = !llm.running;
-            if icon_button(ui, egui::include_image!("../icons/edit.svg"), 14.0, "Edit this message", can_edit)
+            if msg_icon_button(ui, egui::include_image!("../icons/edit.svg"), 14.0, "Edit this message", can_edit)
                 .clicked()
                 && can_edit
             {
@@ -718,16 +741,14 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
     // where the reply will appear.
     if streaming && thinking.is_empty() && body.is_empty() {
         ui.horizontal(|ui| {
-            ui.add(egui::Spinner::new().size(12.0).color(MUTED()));
-            ui.label(egui::RichText::new(&llm.status).color(MUTED()).size(12.5));
+            // Muted like a caption normally; the chat text-colour override
+            // (or the Aurora-glow black default) wins.
+            let col = chat_text_override().or_else(chat_aurora_ink).unwrap_or(MUTED());
+            ui.add(egui::Spinner::new().size(12.0).color(col));
+            ui.label(egui::RichText::new(&llm.status).color(col).size(12.5));
         });
         return;
     }
-    if !thinking.is_empty() {
-        thinking_row(ui, llm, index, &thinking, streaming && body.is_empty());
-        ui.add_space(4.0);
-    }
-
     let mut shown = if streaming && llm.roleplay.enabled {
         // Diary lines are extracted for real when the reply finishes; hide
         // them while it streams so they never flash up.
@@ -738,20 +759,56 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
     if streaming && !body.is_empty() {
         shown.push('▌');
     }
+
+    // Reply text renders bare on the background (no bubble/card) — only the
+    // thoughts well and code blocks get their own surfaces.
+    if !thinking.is_empty() {
+        thinking_row(ui, llm, index, &thinking, streaming && body.is_empty());
+        if !shown.trim().is_empty() {
+            ui.add_space(4.0);
+        }
+    }
     if !shown.trim().is_empty() {
         ui.scope(|ui| {
             // Slightly larger body text for replies than egui's default.
             if let Some(body) = ui.style_mut().text_styles.get_mut(&egui::TextStyle::Body) {
                 body.size = 14.5;
             }
-            // Code blocks: same frosted colour as the top bar's card (PANEL()),
-            // no outline, and rounded to 22 — the viewer takes its fill from
-            // `extreme_bg_color` and the radius/stroke from the noninteractive
-            // widget style.
+            // Code gets SOLID, neutral surfaces (never translucent — over
+            // the animated Glass backdrops code was unreadable): a quiet
+            // near-black editor tone under light text, a soft grey under
+            // dark ink, with a matching chip for inline `code`. Keyed off
+            // the EFFECTIVE chat ink (theme, Aurora-glow default, or the
+            // user's override) so a black-text setup never lands on dark
+            // chips it can't be read on. The viewer takes the block fill
+            // from `extreme_bg_color`, the chip fill from `code_bg_color`,
+            // and the radius/stroke from the noninteractive widget style.
+            let ink = chat_text();
+            let dark_ink = (ink.r() as u16 + ink.g() as u16 + ink.b() as u16) < 384;
+            let use_light_code_bg = crate::theme::is_light() || dark_ink;
+
+            let (code_bg, inline_bg) = if use_light_code_bg {
+                (egui::Color32::from_rgb(238, 240, 245), egui::Color32::from_rgb(228, 231, 238))
+            } else {
+                (egui::Color32::from_rgb(24, 26, 31), egui::Color32::from_rgb(48, 51, 58))
+            };
+
             let v = ui.visuals_mut();
-            v.extreme_bg_color = PANEL();
-            v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(22);
+            v.extreme_bg_color = code_bg;
+            v.code_bg_color = inline_bg;
+            v.selection.bg_fill = ACCENT1().gamma_multiply(0.25);
+            v.selection.stroke.color = TEXT();
+
+            v.extreme_bg_color = code_bg;
+
+            // FIX: Force egui's syntax highlighter to match our background choice
+            v.dark_mode = !use_light_code_bg;
+
+            v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(12);
             v.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+            // Reply text follows the Appearance tab's chat text-colour override
+            // (chat_text() falls back to the theme's normal ink without one).
+            v.override_text_color = Some(chat_text());
             egui_commonmark::CommonMarkViewer::new().show(ui, &mut llm.md_cache, &shown);
         });
     }
@@ -760,13 +817,13 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
     if !streaming {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            if icon_button(ui, egui::include_image!("../icons/copy.svg"), 15.0, "Copy message", true)
+            if msg_icon_button(ui, egui::include_image!("../icons/copy.svg"), 15.0, "Copy message", true)
                 .clicked()
             {
                 ui.ctx().copy_text(text.clone());
             }
             let can_retry = !llm.running;
-            if icon_button(ui, egui::include_image!("../icons/retry.svg"), 15.0, "Regenerate this reply", can_retry)
+            if msg_icon_button(ui, egui::include_image!("../icons/retry.svg"), 15.0, "Regenerate this reply", can_retry)
                 .clicked()
                 && can_retry
             {
@@ -782,7 +839,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
             } else {
                 "Read aloud"
             };
-            if icon_button(ui, egui::include_image!("../icons/listen.svg"), 15.0, tip, true).clicked() {
+            if msg_icon_button(ui, egui::include_image!("../icons/listen.svg"), 15.0, tip, true).clicked() {
                 llm.listen(&text, ui.ctx());
             }
             // First OmniVoice use loads the model — show that it's coming.
@@ -819,10 +876,13 @@ fn thinking_row(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, thinking: &
         }
 
         let label = if live { "Thinking…" } else { "Thoughts" };
+        // Muted like a caption normally; the chat text-colour override
+        // (or the Aurora-glow black default) wins.
+        let col = chat_text_override().or_else(chat_aurora_ink).unwrap_or(MUTED());
         let galley = ui.painter().layout_no_wrap(
             label.to_string(),
             egui::FontId::proportional(12.5),
-            MUTED(),
+            col,
         );
         let size = egui::vec2(galley.size().x + 4.0 + 16.0, 20.0);
         let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -834,13 +894,13 @@ fn thinking_row(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, thinking: &
         }
         if ui.is_rect_visible(rect) {
             let text_pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
-            ui.painter().galley(text_pos, galley, MUTED());
+            ui.painter().galley(text_pos, galley, col);
             let arrow = if open {
                 egui::include_image!("../icons/arrow_drop_down.svg")
             } else {
                 egui::include_image!("../icons/arrow_right.svg")
             };
-            egui::Image::new(arrow).tint(icon_tint(MUTED())).paint_at(
+            egui::Image::new(arrow).tint(chat_icon_tint(MUTED())).paint_at(
                 ui,
                 egui::Rect::from_center_size(
                     egui::pos2(rect.right() - 8.0, rect.center().y),
@@ -856,13 +916,26 @@ fn thinking_row(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, thinking: &
 
     if open {
         ui.add_space(2.0);
+        // Glass: a light, SEE-THROUGH veil — a whisper of white that keeps the
+        // backdrop visible while lifting the thoughts off it (the old dark
+        // panel fill read as a heavy black slab over the bright Aurora glow).
+        // Other themes keep the ordinary panel surface.
+        let fill = if crate::theme::is_glass() {
+            egui::Color32::from_white_alpha(60)
+        } else {
+            PANEL()
+        };
         egui::Frame::new()
-            .fill(PANEL().gamma_multiply(0.55))
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0, EDGE()))
             .corner_radius(egui::CornerRadius::same(14))
             .inner_margin(egui::Margin::symmetric(12, 9))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new(thinking).color(MUTED()).size(12.5));
+                // Muted like a caption normally; the chat text-colour override
+                // (or the Aurora-glow black default) wins.
+                let col = chat_text_override().or_else(chat_aurora_ink).unwrap_or(MUTED());
+                ui.label(egui::RichText::new(thinking).color(col).size(12.5));
             });
     }
 }
@@ -946,7 +1019,7 @@ fn paint_play_badge(ui: &mut egui::Ui, rect: egui::Rect) {
 
 /// Filename chip for an attachment with no thumbnail (an unreadable image, or
 /// a video whose poster is still being captured): a small type icon + name.
-fn media_chip(ui: &mut egui::Ui, path: &std::path::Path) {
+fn media_chip(ui: &mut egui::Ui, path: &std::path::Path, tint: egui::Color32) {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -958,14 +1031,26 @@ fn media_chip(ui: &mut egui::Ui, path: &std::path::Path) {
             egui::Image::new(egui::include_image!("../icons/image.svg"))
         };
         let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-        icon.tint(icon_tint(MUTED())).paint_at(ui, rect);
+        icon.tint(tint).paint_at(ui, rect);
         ui.label(egui::RichText::new(name).color(MUTED()).size(11.5));
     });
 }
 
+/// Tint for icons in the conversation (messages) area: the Appearance tab's
+/// chat icon-colour override when set, otherwise the app-wide [`icon_tint`].
+/// Only the message column uses this — the chats side panel and the composer
+/// (message box) keep the theme's normal tint.
+fn chat_icon_tint(fallback: egui::Color32) -> egui::Color32 {
+    chat_icon_override()
+        .or_else(chat_aurora_ink)
+        .unwrap_or_else(|| icon_tint(fallback))
+}
+
 /// A bare icon button on a 28px click target (same look as the text-to-image
 /// view's send button): the SVG paints dead-centre, tinted to the theme's
-/// text colour, dimmed when disabled.
+/// text colour, dimmed when disabled. Used by the side panel and the composer;
+/// the messages area uses [`msg_icon_button`] so the icon-colour override
+/// applies there only.
 fn icon_button(
     ui: &mut egui::Ui,
     icon: egui::ImageSource<'_>,
@@ -973,11 +1058,33 @@ fn icon_button(
     tip: &str,
     enabled: bool,
 ) -> egui::Response {
+    icon_button_tinted(ui, icon, icon_size, tip, enabled, icon_tint(TEXT()))
+}
+
+/// [`icon_button`] for the conversation area: honours the Appearance tab's
+/// chat icon-colour override.
+fn msg_icon_button(
+    ui: &mut egui::Ui,
+    icon: egui::ImageSource<'_>,
+    icon_size: f32,
+    tip: &str,
+    enabled: bool,
+) -> egui::Response {
+    icon_button_tinted(ui, icon, icon_size, tip, enabled, chat_icon_tint(TEXT()))
+}
+
+fn icon_button_tinted(
+    ui: &mut egui::Ui,
+    icon: egui::ImageSource<'_>,
+    icon_size: f32,
+    tip: &str,
+    enabled: bool,
+    tint: egui::Color32,
+) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
     let resp = resp.on_hover_text(tip);
     let resp = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
     if ui.is_rect_visible(rect) {
-        let tint = icon_tint(TEXT());
         let tint = if enabled { tint } else { tint.gamma_multiply(0.45) };
         egui::Image::new(icon)
             .tint(tint)
