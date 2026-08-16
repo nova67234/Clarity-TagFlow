@@ -294,6 +294,21 @@ const CATALOG: &[ModelInfo] = &[
             ("age.onnx", "https://huggingface.co/public-data/insightface/resolve/main/models/buffalo_l/genderage.onnx"),
         ],
     },
+    ModelInfo {
+        name: "Whisper Base (Speech to Text)",
+        tab: "Whisper",
+        folder: crate::dictate::FOLDER,
+        desc: "OpenAI's Whisper base model — powers the AI chat's mic button. \
+               Multilingual dictation that runs fully locally on the CPU.",
+        note: "Downloads ggml-base.bin (~148 MB). Also fetched automatically \
+               the first time the mic button is used.",
+        repo: "https://huggingface.co/ggerganov/whisper.cpp",
+        kind: None,
+        files: &[(
+            crate::dictate::MODEL_FILE,
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
+        )],
+    },
 ];
 
 /// True when every file for a model is present in any of the searched model

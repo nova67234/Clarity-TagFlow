@@ -775,31 +775,45 @@ fn tag_chip(ui: &mut egui::Ui, text: &str, selected: bool, flash: Option<f32>) -
 /// its text.
 fn edit_chip(ui: &mut egui::Ui, buf: &mut String) -> egui::Response {
     let font = egui::FontId::proportional(13.0);
+    let pad = egui::vec2(10.0, 5.0);
     // Size to the text, but never wider than the panel — a caption-length
     // rename scrolls inside the editor instead of clipping at the edge.
-    let w = (ui
-        .painter()
-        .layout_no_wrap(buf.clone(), font.clone(), Color32::PLACEHOLDER)
-        .size()
-        .x
-        .max(40.0)
-        + 8.0)
-        .min((ui.max_rect().width() - 30.0).max(40.0));
-    egui::Frame::new()
-        .fill(FIELD())
-        .stroke(egui::Stroke::new(1.0, selection_outline()))
-        .corner_radius(CornerRadius::same(13))
-        .inner_margin(Margin::symmetric(10, 5))
-        .show(ui, |ui| {
-            ui.add(
-                egui::TextEdit::singleline(buf)
-                    .frame(egui::Frame::NONE)
-                    .margin(Margin::ZERO)
-                    .font(font)
-                    .desired_width(w),
-            )
-        })
-        .inner
+    let (text_w, row_h) = ui.fonts_mut(|f| {
+        (
+            f.layout_no_wrap(buf.clone(), font.clone(), Color32::PLACEHOLDER).size().x,
+            f.row_height(&font),
+        )
+    });
+    let w = (text_w.max(40.0) + 8.0).min((ui.max_rect().width() - pad.x * 2.0 - 10.0).max(40.0));
+    // Allocate the chip-shaped rect FIRST, like `tag_chip` does — the wrapped
+    // layout then places it (wrapping to a fresh row when it doesn't fit)
+    // before anything paints, so the box can neither run off the panel's
+    // right edge nor balloon past its text.
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, row_h) + pad * 2.0, egui::Sense::hover());
+    let radius = CornerRadius::same((rect.height() / 2.0) as u8);
+    ui.painter().rect_filled(rect, radius, FIELD());
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(1.0, selection_outline()),
+        egui::StrokeKind::Inside,
+    );
+    // A non-allocating child ui for the editor — `ui.put` would allocate the
+    // inner rect in the parent AGAIN, pulling the wrapped cursor back so the
+    // next chip overlapped the box.
+    let inner = egui::Rect::from_min_size(rect.min + pad, egui::vec2(w, row_h));
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.add(
+        egui::TextEdit::singleline(buf)
+            .frame(egui::Frame::NONE)
+            .margin(Margin::ZERO)
+            .font(font)
+            .desired_width(w),
+    )
 }
 
 /// Commit a chip rename: swap `orig` for `new` in place (same position), carry

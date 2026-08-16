@@ -95,6 +95,7 @@ mod bgremove;
 mod civitai;
 mod depth;
 mod detect;
+mod dictate;
 mod emoji;
 mod favorites;
 mod ftp;

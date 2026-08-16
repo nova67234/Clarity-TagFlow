@@ -335,6 +335,8 @@ pub struct LlmState {
     tts: Option<std::process::Child>,
     /// The OmniVoice neural voice (Python sidecar; see src/voice.rs).
     pub voice: crate::voice::VoiceState,
+    /// Whisper mic dictation for the input card's mic button (src/dictate.rs).
+    pub dictate: crate::dictate::DictationState,
     /// Role playing: persona, names and the shared memory diary
     /// (src/roleplay.rs; toggled from the input card's tools menu).
     pub roleplay: crate::roleplay::RoleplayState,
@@ -404,6 +406,7 @@ impl Default for LlmState {
             pending_edit: None,
             tts: None,
             voice: crate::voice::VoiceState::default(),
+            dictate: Default::default(),
             roleplay: crate::roleplay::RoleplayState::load(),
             model: GemmaModel::default(),
             params: GenParams::default(),

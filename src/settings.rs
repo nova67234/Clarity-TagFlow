@@ -1175,7 +1175,7 @@ fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 }
 
 /// A small muted explanatory line, shown under a control.
-fn hint(ui: &mut egui::Ui, text: &str) {
+pub(crate) fn hint(ui: &mut egui::Ui, text: &str) {
     ui.add_space(2.0);
     ui.label(egui::RichText::new(text).color(MUTED()).size(11.0));
 }

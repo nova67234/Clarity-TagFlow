@@ -237,7 +237,9 @@ fn gen_settings_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings) 
 fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::settings::Settings) {
     let avail_w = ui.available_width();
     // The centred content column both the messages and the pill live in.
-    let col_w = (avail_w * 0.58).clamp(420.0, 880.0).min(avail_w - 16.0);
+    // Floor at 0: a squeezed panel can leave avail_w under 16, and a negative
+    // set_width panics.
+    let col_w = (avail_w * 0.58).clamp(420.0, 880.0).min((avail_w - 16.0).max(0.0));
     let pad = ((avail_w - col_w) / 2.0).max(0.0);
 
     // The conversation area under the input card. The reservation is
@@ -494,64 +496,82 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                 let mut open = llm.tools_open;
                                 egui::Popup::from_response(&tools_resp)
                                     .open_bool(&mut open)
+                                    // Toggling a switch shouldn't dismiss the
+                                    // popup — only clicking outside it does.
+                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                                     .align(egui::RectAlign::TOP_START) // opens upward (card sits at the bottom)
-                                    .width(240.0)
+                                    .width(280.0)
                                     .gap(8.0)
                                     .frame(crate::card_frame(14))
                                     .show(|ui| {
-                                        ui.label(egui::RichText::new("TOOLS").color(MUTED()).strong().size(10.5));
-                                        ui.add_space(4.0);
-                                        let mut on = llm.roleplay.enabled;
-                                        let resp = ui.checkbox(&mut on, egui::RichText::new("Role playing").color(TEXT()));
-                                        if resp.changed() {
-                                            llm.roleplay.enabled = on;
-                                            llm.roleplay.save();
-                                        }
-                                        ui.label(
-                                            egui::RichText::new(
+                                        // Apple-style settings card: label + macOS
+                                        // switch per row, muted hint beneath, faint
+                                        // separator between rows (src/settings.rs).
+                                        ui.label(egui::RichText::new("TOOLS").color(MUTED()).strong().size(11.0));
+                                        ui.add_space(5.0);
+                                        crate::settings::card(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("Role playing").color(TEXT()).size(13.0));
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    let mut on = llm.roleplay.enabled;
+                                                    if crate::settings::switch(ui, &mut on).changed() {
+                                                        llm.roleplay.enabled = on;
+                                                        llm.roleplay.save();
+                                                    }
+                                                });
+                                            });
+                                            crate::settings::hint(
+                                                ui,
                                                 "Give the AI a persona and a shared memory \
-                                         diary (left panel). It remembers facts, \
-                                         permissions and the story as it unfolds.",
-                                            )
-                                                .color(MUTED())
-                                                .size(10.5),
-                                        );
-                                        ui.add_space(6.0);
-                                        let mut speak = settings.ai_auto_speak;
-                                        let resp = ui.checkbox(&mut speak, egui::RichText::new("Auto-speak replies").color(TEXT()));
-                                        if resp.changed() {
-                                            settings.ai_auto_speak = speak;
-                                            llm.auto_speak = speak;
-                                        }
-                                        ui.label(
-                                            egui::RichText::new(
+                                                 diary (left panel). It remembers facts, \
+                                                 permissions and the story as it unfolds.",
+                                            );
+                                            crate::settings::row_sep(ui);
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("Auto-speak replies").color(TEXT()).size(13.0));
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    let mut on = settings.ai_auto_speak;
+                                                    if crate::settings::switch(ui, &mut on).changed() {
+                                                        settings.ai_auto_speak = on;
+                                                        llm.auto_speak = on;
+                                                    }
+                                                });
+                                            });
+                                            crate::settings::hint(
+                                                ui,
                                                 "Read every reply aloud the moment it \
-                                         finishes — click any reply's listen \
-                                         icon to stop.",
-                                            )
-                                                .color(MUTED())
-                                                .size(10.5),
-                                        );
+                                                 finishes — click any reply's listen \
+                                                 icon to stop.",
+                                            );
+                                        });
                                     });
                                 llm.tools_open = open;
                             }
                             let can_send = !llm.running
                                 && (!llm.draft.trim().is_empty() || llm.draft_image.is_some());
                             // While a reply streams the send icon becomes a stop
-                            // button, same as the text-to-image view.
+                            // button, same as the text-to-image view. With an
+                            // empty draft only the mic shows; once there's
+                            // something to send the blue send icon takes the
+                            // right edge and the mic slides one slot left.
                             let send_clicked = ui
                                 .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if llm.running {
+                                    let clicked = if llm.running {
                                         if icon_button(ui, egui::include_image!("../icons/stop.svg"), 16.0, "Stop generating", true)
                                             .clicked()
                                         {
                                             llm.stop_generation();
                                         }
                                         false
-                                    } else {
-                                        icon_button(ui, egui::include_image!("../icons/send.svg"), 19.0, "Send", can_send)
+                                    } else if can_send {
+                                        icon_button_tinted(ui, egui::include_image!("../icons/send.svg"), 19.0, "Send", true, DROP_BLUE)
                                             .clicked()
-                                    }
+                                    } else {
+                                        false
+                                    };
+                                    mic_button(ui, llm);
+                                    chat_model_selector(ui, llm, settings);
+                                    clicked
                                 })
                                 .inner;
 
@@ -1145,6 +1165,120 @@ fn msg_icon_button(
     enabled: bool,
 ) -> egui::Response {
     icon_button_tinted(ui, icon, icon_size, tip, enabled, chat_icon_tint(TEXT()))
+}
+
+/// Compact model dropdown next to the mic — same look as the text-to-image
+/// prompt box footer's selector: the active model's name plus a chevron,
+/// opening an upward list of ONLY the installed vision models. Hidden while
+/// nothing is installed yet (Settings → AI Model handles first-time setup).
+fn chat_model_selector(
+    ui: &mut egui::Ui,
+    llm: &mut LlmState,
+    settings: &mut crate::settings::Settings,
+) {
+    let installed: Vec<crate::llm::GemmaModel> =
+        crate::llm::GemmaModel::ALL.into_iter().filter(|m| m.installed()).collect();
+    if installed.is_empty() {
+        return;
+    }
+    let full = llm.model.label().to_string();
+    let menu_id = ui.id().with("chat_model_menu");
+    let open = egui::Popup::is_id_open(ui.ctx(), menu_id);
+
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        full.clone(),
+        egui::FontId::proportional(12.0),
+        TEXT(),
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width(150.0);
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let (arrow, gap) = (14.0, 2.0);
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(galley.size().x + gap + arrow, 28.0), egui::Sense::click());
+    let resp = resp.on_hover_text(full).on_hover_cursor(egui::CursorIcon::PointingHand);
+    if ui.is_rect_visible(rect) {
+        let text_pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
+        ui.painter().galley(text_pos, galley, TEXT());
+        let arrow_src = if open {
+            egui::include_image!("../icons/arrow_up.svg")
+        } else {
+            egui::include_image!("../icons/arrow_down.svg")
+        };
+        let arrow_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - arrow / 2.0, rect.center().y),
+            egui::vec2(arrow, arrow),
+        );
+        egui::Image::new(arrow_src).tint(icon_tint(MUTED())).paint_at(ui, arrow_rect);
+    }
+    egui::Popup::menu(&resp)
+        .id(menu_id)
+        .align(egui::RectAlign::TOP_END)
+        .frame(
+            egui::Frame::new()
+                .fill(PANEL())
+                .corner_radius(egui::CornerRadius::same(22))
+                .inner_margin(egui::Margin::same(12))
+                .stroke(egui::Stroke::new(1.0, EDGE())),
+        )
+        .show(|ui| {
+            ui.set_min_width(200.0);
+            // Round the hover highlight of menu rows (egui's default is square).
+            let radius = egui::CornerRadius::same(6);
+            ui.visuals_mut().widgets.inactive.corner_radius = radius;
+            ui.visuals_mut().widgets.hovered.corner_radius = radius;
+            for m in installed {
+                let resp = ui.selectable_label(llm.model == m, m.label()).on_hover_text(m.hint());
+                if resp.clicked() {
+                    settings.ai_gemma_model = m;
+                    llm.set_model(m);
+                    ui.close();
+                }
+            }
+        });
+}
+
+/// The input card's mic: local Whisper dictation (src/dictate.rs). Idle it's
+/// a plain icon; recording turns it red and pulsing; transcription swaps in a
+/// spinner; the first-ever click downloads the speech model with progress in
+/// the tooltip. Finished transcripts are appended to the draft here too.
+fn mic_button(ui: &mut egui::Ui, llm: &mut LlmState) {
+    if let Some(text) = llm.dictate.poll(ui.ctx()) {
+        if !llm.draft.is_empty() && !llm.draft.ends_with(char::is_whitespace) {
+            llm.draft.push(' ');
+        }
+        llm.draft.push_str(&text);
+    }
+    let mic = egui::include_image!("../icons/mic.svg");
+    match llm.dictate.phase() {
+        crate::dictate::Phase::Downloading(pct) => {
+            icon_button(ui, mic, 18.0, &format!("Downloading the speech model… {pct}%"), false);
+        }
+        crate::dictate::Phase::Transcribing => {
+            ui.add_sized(egui::vec2(28.0, 28.0), egui::Spinner::new().size(16.0))
+                .on_hover_text("Transcribing…");
+        }
+        crate::dictate::Phase::Recording => {
+            let red = egui::Color32::from_rgb(255, 69, 58);
+            let pulse = ((ui.input(|i| i.time) * 3.0).sin() as f32 * 0.5 + 0.5) * 0.5 + 0.5;
+            let secs = llm.dictate.seconds();
+            let tip = format!("Stop dictation ({}:{:02})", secs / 60, secs % 60);
+            if icon_button_tinted(ui, mic, 18.0, &tip, true, red.gamma_multiply(pulse)).clicked() {
+                llm.dictate.toggle(ui.ctx());
+            }
+        }
+        crate::dictate::Phase::Idle => {
+            let tip = match &llm.dictate.err {
+                Some(e) => format!("Dictate — last attempt failed: {e}"),
+                None if !crate::dictate::installed() => {
+                    "Dictate — downloads the speech model on first use (~148 MB)".to_string()
+                }
+                None => "Dictate — speech to text".to_string(),
+            };
+            if icon_button(ui, mic, 18.0, &tip, true).clicked() {
+                llm.dictate.toggle(ui.ctx());
+            }
+        }
+    }
 }
 
 fn icon_button_tinted(
