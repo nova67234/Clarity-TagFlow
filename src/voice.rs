@@ -21,7 +21,7 @@
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 
@@ -576,6 +576,11 @@ pub struct Recorder {
     /// Keeps the "saved!" note visible after main.rs takes `saved`.
     pub just_saved: bool,
     pub err: Option<String>,
+    /// Latest capture peak (f32 bits), written by the audio callback — drives
+    /// the live waveform in the popup.
+    level: Arc<AtomicU32>,
+    /// UI-side waveform history: one bar per frame while recording.
+    wave: Vec<f32>,
 }
 
 impl Recorder {
@@ -592,12 +597,15 @@ impl Recorder {
         self.saved = None;
         self.just_saved = false;
         self.stop = Arc::new(AtomicBool::new(false));
+        self.level.store(0, Relaxed);
+        self.wave.clear();
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         let stop = self.stop.clone();
+        let level = self.level.clone();
         let repaint = ctx.clone();
         std::thread::spawn(move || {
-            let res = record_loopback(&stop);
+            let res = record_loopback(&stop, &level);
             let _ = tx.send(res);
             repaint.request_repaint();
         });
@@ -636,7 +644,7 @@ impl Recorder {
 /// Capture the default output device (loopback) until stopped or the length
 /// cap, then write a mono 16-bit wav into the samples dir.
 #[cfg(feature = "llm")]
-fn record_loopback(stop: &AtomicBool) -> Result<PathBuf, String> {
+fn record_loopback(stop: &AtomicBool, level: &Arc<AtomicU32>) -> Result<PathBuf, String> {
     use rodio::cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use rodio::cpal::{self, SampleFormat};
     use std::sync::Mutex;
@@ -656,12 +664,16 @@ fn record_loopback(stop: &AtomicBool) -> Result<PathBuf, String> {
 
     let buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     let buf2 = buf.clone();
+    let level2 = level.clone();
     // Building an INPUT stream on an OUTPUT device = WASAPI loopback: we get
     // exactly what the speakers are playing.
     let stream = device
         .build_input_stream(
             &config.into(),
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                // Chunk peak → the popup's live waveform.
+                let peak = data.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                level2.store(peak.to_bits(), Relaxed);
                 buf2.lock().unwrap().extend_from_slice(data);
             },
             |e| eprintln!("[recorder] stream error: {e}"),
@@ -705,7 +717,7 @@ fn record_loopback(stop: &AtomicBool) -> Result<PathBuf, String> {
 }
 
 #[cfg(not(feature = "llm"))]
-fn record_loopback(_stop: &AtomicBool) -> Result<PathBuf, String> {
+fn record_loopback(_stop: &AtomicBool, _level: &Arc<AtomicU32>) -> Result<PathBuf, String> {
     Err("This build was compiled without the AI feature.".to_string())
 }
 
@@ -810,7 +822,8 @@ pub fn recorder_window(ctx: &egui::Context, voice: &mut VoiceState) {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
 
-                    ui.horizontal(|ui| {
+                    // Vertically centred so the pill doesn't look top-heavy.
+                    ui.horizontal_centered(|ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
                         // Apple-style record control: a ringed red circle (with a
                         // mic glyph) that morphs into a rounded "stop" square and
@@ -856,8 +869,15 @@ pub fn recorder_window(ctx: &egui::Context, voice: &mut VoiceState) {
                             voice.rec.toggle_recording(ui.ctx());
                         }
 
+                        // Middle column: timer/status on top; while recording a
+                        // live Voice-Memos-style waveform (driven by the real
+                        // capture level) replaces the hint line.
                         ui.vertical(|ui| {
-                            ui.add_space(2.0);
+                            // A nested vertical ui anchors to the row's TOP
+                            // (egui places child uis before their height is
+                            // known) — pad down so the two lines sit centred
+                            // beside the 38px record control.
+                            ui.add_space(12.0);
                             let s = voice.rec.seconds();
                             let (line1, c1, line2): (String, egui::Color32, &str) = if recording {
                                 (
@@ -886,18 +906,60 @@ pub fn recorder_window(ctx: &egui::Context, voice: &mut VoiceState) {
                             };
                             ui.label(egui::RichText::new(line1).color(c1).size(12.5).strong());
                             ui.add_space(1.0);
-                            ui.label(egui::RichText::new(line2).color(MUTED()).size(10.0));
-                        });
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                            if ui
-                                .add(egui::Button::new(egui::RichText::new("✕").color(MUTED())).frame(false))
-                                .on_hover_text("Close")
-                                .clicked()
-                            {
-                                voice.rec.open = false;
+                            if recording {
+                                // Perceptual sqrt so quiet audio still moves the
+                                // bars; newest bar on the right, scrolling left.
+                                let lvl = f32::from_bits(voice.rec.level.load(Relaxed)).sqrt();
+                                voice.rec.wave.push(lvl);
+                                if voice.rec.wave.len() > 2048 {
+                                    voice.rec.wave.drain(..1024);
+                                }
+                                let (wr, _) = ui
+                                    .allocate_exact_size(egui::vec2(118.0, 14.0), egui::Sense::hover());
+                                let (bw, gap) = (2.0, 1.5);
+                                let n = (wr.width() / (bw + gap)) as usize;
+                                let len = voice.rec.wave.len();
+                                let p = ui.painter();
+                                for i in 0..n {
+                                    let v = if len + i >= n { voice.rec.wave[len + i - n] } else { 0.0 };
+                                    let h = (wr.height() * v.clamp(0.06, 1.0)).max(2.0);
+                                    let x = wr.left() + i as f32 * (bw + gap);
+                                    let bar = egui::Rect::from_center_size(
+                                        egui::pos2(x + bw / 2.0, wr.center().y),
+                                        egui::vec2(bw, h),
+                                    );
+                                    p.rect_filled(
+                                        bar,
+                                        egui::CornerRadius::same(1),
+                                        red.gamma_multiply(0.35 + 0.65 * v.min(1.0)),
+                                    );
+                                }
+                            } else {
+                                ui.label(egui::RichText::new(line2).color(MUTED()).size(10.0));
                             }
                         });
+
+                        // Bare ✕ icon pinned to the pill's top-right corner,
+                        // inking up on hover.
+                        let pill = ui.max_rect();
+                        let crect = egui::Rect::from_center_size(
+                            egui::pos2(pill.right() - 7.0, pill.top() + 7.0),
+                            egui::vec2(20.0, 20.0),
+                        );
+                        let cresp = ui
+                            .interact(crect, egui::Id::new("rec_close"), egui::Sense::click())
+                            .on_hover_text("Close")
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        let ink = if cresp.hovered() { TEXT() } else { MUTED() };
+                        egui::Image::new(egui::include_image!("../icons/x.svg"))
+                            .tint(icon_tint(ink))
+                            .paint_at(
+                                ui,
+                                egui::Rect::from_center_size(crect.center(), egui::vec2(15.0, 15.0)),
+                            );
+                        if cresp.clicked() {
+                            voice.rec.open = false;
+                        }
                     });
 
                     if voice.rec.recording {

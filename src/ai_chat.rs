@@ -517,6 +517,11 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                                     if crate::settings::switch(ui, &mut on).changed() {
                                                         llm.roleplay.enabled = on;
                                                         llm.roleplay.save();
+                                                        // Persona + memory change the whole
+                                                        // conversation contract — start fresh
+                                                        // rather than switching mid-chat.
+                                                        // (Reuses the chat if it's empty.)
+                                                        llm.new_chat();
                                                     }
                                                 });
                                             });
@@ -889,15 +894,18 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
 }
 
 /// The collapsible "Thinking" row above a reply: the little AI orb, a muted
-/// label and a drop-down arrow. Clicking anywhere on it (orb included)
-/// reveals the model's thought channel underneath, muted in a soft card. The
-/// orb runs hot while the thought still streams (`live`), then settles to
-/// its idle breathing.
+/// label (pulsing softly while the thought still streams) and a chevron that
+/// rotates as the section opens. Clicking anywhere on it (orb included)
+/// fades in the model's thought channel underneath — an indented quote block
+/// with an orb-accent rule, rather than a boxed card.
 fn thinking_row(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, thinking: &str, live: bool) {
     let chat_id = llm.chats[llm.active_chat].id;
     let open_id = egui::Id::new(("ai_thinking_open", chat_id, index));
     let mut open = ui.data_mut(|d| d.get_temp::<bool>(open_id).unwrap_or(false));
     let mut toggled = false;
+    // Drives both the chevron rotation and the body fade, so open/close
+    // sweeps instead of snapping.
+    let anim = ui.ctx().animate_bool(open_id.with("anim"), open);
 
     ui.horizontal(|ui| {
         let orb = llm.think_orbs.entry((chat_id, index)).or_default();
@@ -906,20 +914,25 @@ fn thinking_row(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, thinking: &
         } else {
             crate::ai_orb::OrbState::Idle
         });
-        if orb.show(ui, 20.0, None).clicked() {
+        if orb.show(ui, 28.0, None).clicked() {
             toggled = true;
         }
 
         let label = if live { "Thinking…" } else { "Thoughts" };
         // Muted like a caption normally; the chat text-colour override
-        // (or the Aurora-glow black default) wins.
-        let col = chat_text_override().or_else(chat_aurora_ink).unwrap_or(MUTED());
+        // (or the Aurora-glow black default) wins. While the thought streams
+        // the label breathes, matching the orb's hot state.
+        let mut col = chat_text_override().or_else(chat_aurora_ink).unwrap_or(MUTED());
+        if live {
+            let pulse = 0.55 + 0.45 * ((ui.input(|i| i.time) * 2.6).sin() as f32 * 0.5 + 0.5);
+            col = col.gamma_multiply(pulse);
+        }
         let galley = ui.painter().layout_no_wrap(
             label.to_string(),
             egui::FontId::proportional(12.5),
             col,
         );
-        let size = egui::vec2(galley.size().x + 4.0 + 16.0, 20.0);
+        let size = egui::vec2(galley.size().x + 8.0 + 16.0, 22.0);
         let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
         let resp = resp
             .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -928,20 +941,28 @@ fn thinking_row(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, thinking: &
             toggled = true;
         }
         if ui.is_rect_visible(rect) {
+            // A soft pill behind the label on hover, so the row reads as a
+            // button without being dressed as one.
+            if resp.hovered() {
+                ui.painter().rect_filled(
+                    rect.expand2(egui::vec2(6.0, 1.0)),
+                    egui::CornerRadius::same(11),
+                    FIELD().gamma_multiply(0.6),
+                );
+            }
             let text_pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
             ui.painter().galley(text_pos, galley, col);
-            let arrow = if open {
-                egui::include_image!("../icons/arrow_drop_down.svg")
-            } else {
-                egui::include_image!("../icons/arrow_right.svg")
-            };
-            egui::Image::new(arrow).tint(chat_icon_tint(MUTED())).paint_at(
-                ui,
-                egui::Rect::from_center_size(
-                    egui::pos2(rect.right() - 8.0, rect.center().y),
-                    egui::vec2(14.0, 14.0),
-                ),
-            );
+            // One chevron, rotated by the open animation (→ swings down to ↓).
+            egui::Image::new(egui::include_image!("../icons/arrow_right.svg"))
+                .tint(chat_icon_tint(MUTED()))
+                .rotate(anim * std::f32::consts::FRAC_PI_2, egui::Vec2::splat(0.5))
+                .paint_at(
+                    ui,
+                    egui::Rect::from_center_size(
+                        egui::pos2(rect.right() - 8.0, rect.center().y),
+                        egui::vec2(14.0, 14.0),
+                    ),
+                );
         }
     });
     if toggled {
@@ -949,29 +970,41 @@ fn thinking_row(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, thinking: &
         ui.data_mut(|d| d.insert_temp(open_id, open));
     }
 
-    if open {
+    if anim > 0.0 {
         ui.add_space(2.0);
-        // Glass: a light, SEE-THROUGH veil — a whisper of white that keeps the
-        // backdrop visible while lifting the thoughts off it (the old dark
-        // panel fill read as a heavy black slab over the bright Aurora glow).
-        // Other themes keep the ordinary panel surface.
-        let fill = if crate::theme::is_glass() {
-            egui::Color32::from_white_alpha(60)
-        } else {
-            PANEL()
-        };
-        egui::Frame::new()
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.0, EDGE()))
-            .corner_radius(egui::CornerRadius::same(14))
-            .inner_margin(egui::Margin::symmetric(12, 9))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                // Muted like a caption normally; the chat text-colour override
-                // (or the Aurora-glow black default) wins.
-                let col = chat_text_override().or_else(chat_aurora_ink).unwrap_or(MUTED());
-                ui.label(egui::RichText::new(thinking).color(col).size(12.5));
-            });
+        ui.scope(|ui| {
+            ui.set_opacity(anim);
+            // Glass keeps a whisper-of-white veil so the thoughts stay
+            // readable over a bright backdrop; every other theme runs the
+            // quote bare — the accent rule alone marks it.
+            let fill = if crate::theme::is_glass() {
+                egui::Color32::from_white_alpha(60)
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            let inner = egui::Frame::new()
+                .fill(fill)
+                .corner_radius(egui::CornerRadius::same(12))
+                .inner_margin(egui::Margin { left: 24, right: 12, top: 6, bottom: 6 })
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    // Muted like a caption normally; the chat text-colour
+                    // override (or the Aurora-glow black default) wins.
+                    let col = chat_text_override().or_else(chat_aurora_ink).unwrap_or(MUTED());
+                    ui.label(egui::RichText::new(thinking).color(col).size(12.5).italics());
+                });
+            // The quote rule: a rounded orb-accent bar down the left edge.
+            let r = inner.response.rect;
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(r.left() + 9.0, r.top() + 5.0),
+                egui::pos2(r.left() + 12.0, r.bottom() - 5.0),
+            );
+            ui.painter().rect_filled(
+                bar,
+                egui::CornerRadius::same(2),
+                crate::theme::orb_color().gamma_multiply(0.55),
+            );
+        });
     }
 }
 

@@ -389,6 +389,13 @@ pub fn orb_color() -> Color32 {
     }
 }
 
+/// True when the Appearance tab's orb colour override is active. The orb
+/// swaps its white particle highlight for a darkened accent then, so the
+/// picked colour actually shows (see src/ai_orb.rs).
+pub fn orb_color_is_custom() -> bool {
+    load_override(&ORB).is_some()
+}
+
 /// Colour for the selected-tile outline in the browser: the theme's accent blue
 /// everywhere (light modes use their deeper accent so it reads on white panels),
 /// except Aurora's pink so it matches that theme's warm glow.

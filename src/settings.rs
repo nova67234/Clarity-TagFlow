@@ -805,6 +805,7 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                         }
                     // The floating always-on-top recorder: capture a voice off
                     // whatever is playing (YouTube, a game) as the sample.
+                    ui.add_space(6.0);
                     let mic = egui::Button::image(
                         egui::Image::new(egui::include_image!("../icons/mic.svg"))
                             .fit_to_exact_size(egui::vec2(15.0, 15.0))

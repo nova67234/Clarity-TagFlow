@@ -240,17 +240,22 @@ impl AiOrb {
         let base = lerp_color(accent, Color32::from_rgb(235, 55, 48), self.error);
 
         let light = crate::theme::is_light();
-        let alpha_scale = if light { 1.7 } else { 1.0 };
-        // Depth/highlight tint: a darker shade of the accent. This used to be
-        // pure white on dark themes, but the near (most visible) particles
-        // blend up to ~85% toward it — the whole orb read as white and its
-        // accent (or a custom orb colour) barely showed. The light themes'
-        // darkened-accent tip shows the colour well, so every theme uses it.
-        let tip = Color32::from_rgb(
-            (base.r() as f32 * 0.45) as u8,
-            (base.g() as f32 * 0.45) as u8,
-            (base.b() as f32 * 0.45) as u8,
-        );
+        let alpha_scale = if light { 2.2 } else { 1.0 };
+        // Depth/highlight tint. The orb's classic dark-theme look is accent
+        // particles blending toward pure WHITE — the light-blue/white glow.
+        // A CUSTOM orb colour instead darkens its own accent, else the white
+        // blend (~85% on the nearest particles) drowns the picked colour.
+        // Light themes always darken: white highlights wash out on white.
+        let custom = color.is_some() || crate::theme::orb_color_is_custom();
+        let tip = if light || custom {
+            Color32::from_rgb(
+                (base.r() as f32 * 0.45) as u8,
+                (base.g() as f32 * 0.45) as u8,
+                (base.b() as f32 * 0.45) as u8,
+            )
+        } else {
+            Color32::WHITE
+        };
         let mix = |t: f32, a: f32| -> Color32 {
             let t = t.clamp(0.0, 1.0);
             let lerp = |c: u8, to: u8| (c as f32 + (to as f32 - c as f32) * t) as u8;
@@ -281,6 +286,17 @@ impl AiOrb {
         let (sy, cy) = self.phase.sin_cos();
         let tilt = 0.45 + (self.breath * 0.5).sin() * 0.08 * (0.3 + self.energy);
         let (st, ct) = tilt.sin_cos();
+
+        // A soft accent halo under the particles so the orb stays visible on
+        // any backdrop — light panels especially washed it out to near-
+        // invisible. Fades out with the error-explosion like the core does.
+        let halo_t = (1.0 - self.error).max(0.0);
+        if halo_t > 0.0 {
+            let halo_a = if light { 30.0 } else { 22.0 } * (0.7 + 0.6 * self.energy) * halo_t;
+            for (k, f) in [(1.25, 0.35), (1.0, 0.65), (0.72, 1.0)] {
+                painter.circle_filled(center, ring_r * k, mix(0.08, halo_a * f));
+            }
+        }
 
         let focal = 2.4;
         let dot_base = (max_r * (0.075 + self.energy * 0.03)).max(0.8) * (1.0 + 0.5 * boost);
@@ -313,8 +329,10 @@ impl AiOrb {
             );
 
             let depth = (z2 + 1.0) * 0.5;
-            let shimmer = 0.55 + 0.45 * (a * 2.0 + self.breath).sin();
-            let depth_fade = 0.35 + 0.65 * depth;
+            // Floor at 0.68 (was 0.55): the deep dips read as the orb fading
+            // out entirely, especially at idle.
+            let shimmer = 0.68 + 0.32 * (a * 2.0 + self.breath).sin();
+            let depth_fade = 0.42 + 0.58 * depth;
             // Per-particle sparkle: each pixel flashes white at a slightly
             // different moment so the finish reads as a shimmering twinkle.
             let spark = if tw > 0.0 {
@@ -324,7 +342,7 @@ impl AiOrb {
                 0.0
             };
             let alpha =
-                (110.0 + 140.0 * self.energy + 120.0 * boost + 60.0 * flash) * shimmer * depth_fade + spark * 165.0;
+                (135.0 + 140.0 * self.energy + 120.0 * boost + 60.0 * flash) * shimmer * depth_fade + spark * 165.0;
             pts.push((z2, pos, dot_base * persp * (1.0 + 0.35 * spark), alpha, spark));
         }
 
