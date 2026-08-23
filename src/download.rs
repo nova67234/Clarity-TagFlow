@@ -82,18 +82,29 @@ pub(crate) struct Item {
 pub(crate) enum Source {
     #[default]
     Pexels,
+    Pixabay,
     Gelbooru,
+    Safebooru,
     Danbooru,
     Wallhaven,
 }
 
 impl Source {
-    const ALL: [Source; 4] = [Source::Pexels, Source::Gelbooru, Source::Danbooru, Source::Wallhaven];
+    const ALL: [Source; 6] = [
+        Source::Pexels,
+        Source::Pixabay,
+        Source::Gelbooru,
+        Source::Safebooru,
+        Source::Danbooru,
+        Source::Wallhaven,
+    ];
 
     fn name(self) -> &'static str {
         match self {
             Source::Pexels => crate::pexels::NAME,
+            Source::Pixabay => crate::pixabay::NAME,
             Source::Gelbooru => "Gelbooru",
+            Source::Safebooru => crate::safebooru::NAME,
             Source::Danbooru => crate::danbooru::NAME,
             Source::Wallhaven => crate::wallhaven::NAME,
         }
@@ -102,7 +113,9 @@ impl Source {
     fn subtitle(self) -> &'static str {
         match self {
             Source::Pexels => crate::pexels::SUBTITLE,
+            Source::Pixabay => crate::pixabay::SUBTITLE,
             Source::Gelbooru => "Tag Downloader",
+            Source::Safebooru => crate::safebooru::SUBTITLE,
             Source::Danbooru => crate::danbooru::SUBTITLE,
             Source::Wallhaven => crate::wallhaven::SUBTITLE,
         }
@@ -111,7 +124,9 @@ impl Source {
     fn home(self) -> &'static str {
         match self {
             Source::Pexels => crate::pexels::HOME,
+            Source::Pixabay => crate::pixabay::HOME,
             Source::Gelbooru => SITE_HOME,
+            Source::Safebooru => crate::safebooru::HOME,
             Source::Danbooru => crate::danbooru::HOME,
             Source::Wallhaven => crate::wallhaven::HOME,
         }
@@ -120,7 +135,10 @@ impl Source {
     fn cred_url(self) -> &'static str {
         match self {
             Source::Pexels => crate::pexels::CRED_URL,
+            Source::Pixabay => crate::pixabay::CRED_URL,
             Source::Gelbooru => "https://gelbooru.com/index.php?page=account&s=options",
+            // No credential system — never shown (the Account card is hidden).
+            Source::Safebooru => crate::safebooru::HOME,
             Source::Danbooru => crate::danbooru::CRED_URL,
             Source::Wallhaven => crate::wallhaven::CRED_URL,
         }
@@ -129,11 +147,13 @@ impl Source {
     fn cred_info(self) -> &'static str {
         match self {
             Source::Pexels => crate::pexels::CRED_INFO,
+            Source::Pixabay => crate::pixabay::CRED_INFO,
             Source::Gelbooru => {
                 "Gelbooru no longer allows anonymous downloads — you must log in with \
                  your account's User ID and API key. Get them from gelbooru.com → \
                  Account → Options → 'API Access Credentials' (free account required)."
             }
+            Source::Safebooru => crate::safebooru::INFO,
             Source::Danbooru => crate::danbooru::CRED_INFO,
             Source::Wallhaven => crate::wallhaven::CRED_INFO,
         }
@@ -142,7 +162,9 @@ impl Source {
     fn tags_hint(self) -> &'static str {
         match self {
             Source::Pexels => crate::pexels::TAGS_HINT,
+            Source::Pixabay => crate::pixabay::TAGS_HINT,
             Source::Gelbooru => "space-separated, e.g. blue_sky 1girl",
+            Source::Safebooru => crate::safebooru::TAGS_HINT,
             Source::Danbooru => crate::danbooru::TAGS_HINT,
             Source::Wallhaven => crate::wallhaven::TAGS_HINT,
         }
@@ -153,19 +175,25 @@ impl Source {
         match self {
             Source::Gelbooru => Some("User ID"),
             Source::Danbooru => Some("Login"),
-            Source::Pexels | Source::Wallhaven => None,
+            Source::Pexels | Source::Pixabay | Source::Safebooru | Source::Wallhaven => None,
         }
     }
 
     /// Whether the API key is mandatory (vs an optional account upgrade).
     fn key_required(self) -> bool {
-        matches!(self, Source::Pexels | Source::Gelbooru)
+        matches!(self, Source::Pexels | Source::Pixabay | Source::Gelbooru)
+    }
+
+    /// Whether the source has any credential system at all — Safebooru's API
+    /// is fully anonymous, so the Account card is skipped for it.
+    fn has_account(self) -> bool {
+        !matches!(self, Source::Safebooru)
     }
 
     /// Booru-style sources: per-post tag strings (comma-formatted sidecars,
     /// tag-search syntax).
     fn is_booru(self) -> bool {
-        matches!(self, Source::Gelbooru | Source::Danbooru)
+        matches!(self, Source::Gelbooru | Source::Safebooru | Source::Danbooru)
     }
 
     /// Whether the Options card shows file-type chips at all (Wallhaven is
@@ -180,9 +208,9 @@ impl Source {
     }
 
     /// Whether the source can return videos — the boorus mix them into posts,
-    /// Pexels serves them from its separate videos endpoint.
+    /// Pexels and Pixabay serve them from their separate videos endpoints.
     fn offers_video(self) -> bool {
-        self.is_booru() || self == Source::Pexels
+        self.is_booru() || matches!(self, Source::Pexels | Source::Pixabay)
     }
 
     /// Per-source blacklist hint — the mechanism differs (tag match, caption
@@ -190,8 +218,11 @@ impl Source {
     fn blacklist_hint(self) -> &'static str {
         match self {
             Source::Pexels => "comma-separated words to skip (matched against the description)",
+            Source::Pixabay => "comma-separated words to skip (matched against the tags)",
             Source::Wallhaven => "comma-separated tags to exclude from the search",
-            Source::Gelbooru | Source::Danbooru => "comma-separated tags to skip",
+            Source::Gelbooru | Source::Safebooru | Source::Danbooru => {
+                "comma-separated tags to skip"
+            }
         }
     }
 
@@ -199,7 +230,9 @@ impl Source {
     fn config_key(self) -> &'static str {
         match self {
             Source::Pexels => "pexels",
+            Source::Pixabay => "pixabay",
             Source::Gelbooru => "gelbooru",
+            Source::Safebooru => "safebooru",
             Source::Danbooru => "danbooru",
             Source::Wallhaven => "wallhaven",
         }
@@ -207,7 +240,9 @@ impl Source {
 
     fn from_config_key(s: &str) -> Source {
         match s {
+            "pixabay" => Source::Pixabay,
             "gelbooru" => Source::Gelbooru,
+            "safebooru" => Source::Safebooru,
             "danbooru" => Source::Danbooru,
             "wallhaven" => Source::Wallhaven,
             _ => Source::Pexels,
@@ -222,7 +257,10 @@ impl Source {
             // lists 80 photos), not downloads — 600/day keeps a full month of
             // daily runs comfortably inside the free tier.
             Source::Pexels => 600,
-            Source::Gelbooru | Source::Danbooru => DAILY_CAP,
+            // Pixabay allows 100 API requests/minute (one lists 200 hits) but
+            // frowns on automated mass-downloading — same order of restraint.
+            Source::Pixabay => 600,
+            Source::Gelbooru | Source::Safebooru | Source::Danbooru => DAILY_CAP,
             // Wallhaven rate-limits the API at 45 requests/minute.
             Source::Wallhaven => 1000,
         }
@@ -236,9 +274,17 @@ impl Source {
                  (200/hour, 20,000/month; one request lists 80 photos). A 600/day allowance \
                  keeps a full month of daily runs comfortably inside the free tier."
             }
+            Source::Pixabay => {
+                "Pixabay allows 100 API requests per minute, but asks that content not be \
+                 mass-downloaded — a 600/day allowance keeps runs to a considerate scale."
+            }
             Source::Gelbooru => {
                 "A courtesy guard-rail so the app can't be used (or accidentally left \
                  running) to mass-pull from Gelbooru."
+            }
+            Source::Safebooru => {
+                "A courtesy guard-rail matching the Gelbooru cap — Safebooru runs the \
+                 same engine and asks automated clients for the same restraint."
             }
             Source::Danbooru => {
                 "A courtesy guard-rail matching the Gelbooru cap — Danbooru asks bots for \
@@ -286,11 +332,16 @@ struct SavedConfig {
     #[serde(default)]
     pexels_key: String,
     #[serde(default)]
+    pixabay_key: String,
+    #[serde(default)]
     danbooru_login: String,
     #[serde(default)]
     danbooru_key: String,
     #[serde(default)]
     wallhaven_key: String,
+    /// Wallhaven's search-filter selections (categories/purity/sorting/…).
+    #[serde(default)]
+    wallhaven_opts: crate::wallhaven::Opts,
 }
 
 /// All UI + runtime state for the downloader view. Lives on `RightPanelState`.
@@ -302,9 +353,12 @@ pub struct DownloaderState {
     user_id: String,
     api_key: String,
     pexels_key: String,
+    pixabay_key: String,
     danbooru_login: String,
     danbooru_key: String,
     wallhaven_key: String,
+    /// Wallhaven's search-filter selections (its Options card).
+    wh: crate::wallhaven::Opts,
     tags: String,
     blacklist: String,
     limit: u32,
@@ -374,9 +428,11 @@ impl Default for DownloaderState {
             user_id: String::new(),
             api_key: String::new(),
             pexels_key: String::new(),
+            pixabay_key: String::new(),
             danbooru_login: String::new(),
             danbooru_key: String::new(),
             wallhaven_key: String::new(),
+            wh: crate::wallhaven::Opts::default(),
             tags: "example_tag".to_string(),
             blacklist: String::new(),
             limit: 100,
@@ -416,9 +472,11 @@ impl DownloaderState {
             show_log: self.log_shown,
             source: self.source.config_key().to_string(),
             pexels_key: self.pexels_key.trim().to_string(),
+            pixabay_key: self.pixabay_key.trim().to_string(),
             danbooru_login: self.danbooru_login.trim().to_string(),
             danbooru_key: self.danbooru_key.trim().to_string(),
             wallhaven_key: self.wallhaven_key.trim().to_string(),
+            wallhaven_opts: self.wh.clone(),
         }
     }
 
@@ -426,7 +484,9 @@ impl DownloaderState {
     fn creds(&self) -> (String, String) {
         match self.source {
             Source::Pexels => (String::new(), self.pexels_key.trim().to_string()),
+            Source::Pixabay => (String::new(), self.pixabay_key.trim().to_string()),
             Source::Gelbooru => (self.user_id.trim().to_string(), self.api_key.trim().to_string()),
+            Source::Safebooru => (String::new(), String::new()),
             Source::Danbooru => (self.danbooru_login.trim().to_string(), self.danbooru_key.trim().to_string()),
             Source::Wallhaven => (String::new(), self.wallhaven_key.trim().to_string()),
         }
@@ -471,9 +531,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
             state.log_shown = cfg.show_log;
             state.source = Source::from_config_key(&cfg.source);
             state.pexels_key = cfg.pexels_key;
+            state.pixabay_key = cfg.pixabay_key;
             state.danbooru_login = cfg.danbooru_login;
             state.danbooru_key = cfg.danbooru_key;
             state.wallhaven_key = cfg.wallhaven_key;
+            state.wh = cfg.wallhaven_opts;
         }
         // Never let a persisted/old value drop below the safety floor.
         if state.delay < MIN_DELAY {
@@ -732,7 +794,9 @@ fn form_sections(ui: &mut egui::Ui, state: &mut DownloaderState, enabled: bool) 
                     // Per-source credentials — which fields show, whether the
                     // key is mandatory, and where to get one all come from the
                     // selected source (info via the ⓘ next to the title).
+                    // Fully anonymous sources (Safebooru) have no card at all.
                     let source = state.source;
+                    if source.has_account() {
                     section_card(ui, egui::include_image!("../icons/encrypted.svg"), purple, "Account",
                         Some(source.cred_info()),
                         |ui| {
@@ -749,9 +813,12 @@ fn form_sections(ui: &mut egui::Ui, state: &mut DownloaderState, enabled: bool) 
                         field_label(ui, "API key");
                         let key = match source {
                             Source::Pexels => &mut state.pexels_key,
+                            Source::Pixabay => &mut state.pixabay_key,
                             Source::Gelbooru => &mut state.api_key,
                             Source::Danbooru => &mut state.danbooru_key,
                             Source::Wallhaven => &mut state.wallhaven_key,
+                            // Card hidden for accountless sources — harmless filler.
+                            Source::Safebooru => &mut state.api_key,
                         };
                         let key_hint = if source.key_required() {
                             format!("Paste your {} API key", source.name())
@@ -810,6 +877,7 @@ fn form_sections(ui: &mut egui::Ui, state: &mut DownloaderState, enabled: bool) 
                             ui.label(egui::RichText::new(msg).color(color).size(10.5));
                         }
                     });
+                    } // if source.has_account()
 
                     section_card(ui, egui::include_image!("../icons/tag.svg"), orange, "Search", None, |ui| {
                         field_label(ui, if source.is_booru() { "Tags" } else { "Search" });
@@ -851,7 +919,8 @@ fn form_sections(ui: &mut egui::Ui, state: &mut DownloaderState, enabled: bool) 
                             });
                             // Chips per capability: boorus mix all three,
                             // Pexels has photos + a separate videos API, and
-                            // Wallhaven is wallpapers-only (nothing to pick).
+                            // Wallhaven (wallpapers-only) gets its own search
+                            // filters instead of file-type chips.
                             if source.has_type_chips() {
                                 ui.add_space(8.0);
                                 field_label(ui, "File types");
@@ -867,6 +936,8 @@ fn form_sections(ui: &mut egui::Ui, state: &mut DownloaderState, enabled: bool) 
                                         }
                                     });
                                 });
+                            } else {
+                                wallhaven_options(ui, enabled, &mut state.wh);
                             }
                         });
                         // Run-status readout — the download glyph (spinner while
@@ -1195,6 +1266,139 @@ fn type_chip(ui: &mut egui::Ui, on: &mut bool, icon: egui::ImageSource<'_>, labe
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// A text-only toggle capsule matching [`type_chip`]'s look, for filter rows
+/// that don't have a natural icon (Wallhaven's categories/purity).
+fn opt_chip(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
+    let font = egui::FontId::proportional(12.0);
+    let (pad_x, pad_y) = (11.0, 6.0);
+    let galley = ui.fonts_mut(|f| f.layout_no_wrap(label.to_string(), font, egui::Color32::PLACEHOLDER));
+    let size = egui::vec2(pad_x * 2.0 + galley.size().x, pad_y * 2.0 + galley.size().y);
+    let (rect, mut resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, label));
+    if ui.is_rect_visible(rect) {
+        let r = egui::CornerRadius::same((rect.height() / 2.0) as u8);
+        let (fill, ink) = if *on {
+            (ACCENT1(), egui::Color32::WHITE)
+        } else if resp.hovered() {
+            (FIELD2(), TEXT())
+        } else {
+            (FIELD(), MUTED())
+        };
+        ui.painter().rect_filled(rect, r, fill);
+        if !*on {
+            ui.painter().rect_stroke(rect, r, egui::Stroke::new(1.0, EDGE()), egui::StrokeKind::Inside);
+        }
+        let text_pos = egui::pos2(rect.left() + pad_x, rect.center().y - galley.size().y / 2.0);
+        ui.painter().galley(text_pos, galley, ink);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Wallhaven's slice of the Options card: category and purity chips, the sort
+/// method (plus toplist range when relevant), and the resolution/ratio
+/// filters — each maps straight onto a search parameter (see `wallhaven.rs`).
+fn wallhaven_options(ui: &mut egui::Ui, enabled: bool, wh: &mut crate::wallhaven::Opts) {
+    ui.add_space(8.0);
+    field_label(ui, "Categories");
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.add_enabled_ui(enabled, |ui| {
+            opt_chip(ui, &mut wh.cat_general, "General");
+            opt_chip(ui, &mut wh.cat_anime, "Anime");
+            opt_chip(ui, &mut wh.cat_people, "People");
+        });
+    });
+    ui.add_space(8.0);
+    field_label(ui, "Purity");
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.add_enabled_ui(enabled, |ui| {
+            opt_chip(ui, &mut wh.pur_sfw, "SFW");
+            opt_chip(ui, &mut wh.pur_sketchy, "Sketchy")
+                .on_hover_text("Borderline content — needs a Wallhaven account's API key to \
+                                actually show up if the account has it disabled.");
+            opt_chip(ui, &mut wh.pur_nsfw, "NSFW")
+                .on_hover_text("NSFW results require a Wallhaven API key (free — see Account).");
+        });
+    });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Sort").color(TEXT()));
+        ui.add_enabled_ui(enabled, |ui| {
+            let label = crate::wallhaven::SORTINGS
+                .iter()
+                .find(|(v, _)| *v == wh.sorting)
+                .map_or("Date added", |(_, l)| *l);
+            egui::ComboBox::from_id_salt("wallhaven_sorting")
+                .width(112.0)
+                .selected_text(label)
+                .show_ui(ui, |ui| {
+                    for (v, l) in crate::wallhaven::SORTINGS {
+                        ui.selectable_value(&mut wh.sorting, v.to_string(), l);
+                    }
+                });
+        });
+        if wh.sorting == "toplist" {
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("Range").color(TEXT()));
+            ui.add_enabled_ui(enabled, |ui| {
+                let label = crate::wallhaven::TOP_RANGES
+                    .iter()
+                    .find(|(v, _)| *v == wh.top_range)
+                    .map_or("Last month", |(_, l)| *l);
+                egui::ComboBox::from_id_salt("wallhaven_toprange")
+                    .width(112.0)
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        for (v, l) in crate::wallhaven::TOP_RANGES {
+                            ui.selectable_value(&mut wh.top_range, v.to_string(), l);
+                        }
+                    });
+            });
+        }
+    });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.scope(|ui| {
+            ui.visuals_mut().extreme_bg_color = FIELD();
+            ui.label(egui::RichText::new("Min res").color(TEXT()))
+                .on_hover_text("Only wallpapers at least this large, e.g. 1920x1080. Blank = any size.");
+            ui.add_enabled(
+                enabled,
+                egui::TextEdit::singleline(&mut wh.atleast)
+                    .hint_text("any")
+                    .desired_width(78.0)
+                    .margin(egui::Margin::symmetric(8, 5)),
+            );
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("Ratios").color(TEXT()))
+                .on_hover_text("Comma-separated aspect ratios, e.g. 16x9,16x10. Blank = any shape.");
+            ui.add_enabled(
+                enabled,
+                egui::TextEdit::singleline(&mut wh.ratios)
+                    .hint_text("any")
+                    .desired_width(90.0)
+                    .margin(egui::Margin::symmetric(8, 5)),
+            );
+        });
+    });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(enabled, |ui| {
+            opt_chip(ui, &mut wh.save_tags, "Save tags").on_hover_text(
+                "Writes each wallpaper's tag list to a matching .txt sidecar, like the \
+                 booru sources. Search results don't include tags, so this makes one \
+                 extra API call per downloaded file (still well inside Wallhaven's \
+                 45 requests/minute limit at the 3-second delay).",
+            );
+        });
+    });
+}
+
 /// Spawn a daemon-style thread that probes the selected source's homepage
 /// every 5s while the view is visible and stores the result in `status`,
 /// repainting the UI when it changes. Polling pauses whenever `visible` stops
@@ -1291,9 +1495,12 @@ fn start_download(state: &mut DownloaderState, ctx: &egui::Context) {
                 return;
             }
         }
-        Source::Pexels => {
+        Source::Pexels | Source::Pixabay => {
             if key.is_empty() {
-                state.push_log("Error: a Pexels API key is required (free — see Account).");
+                state.push_log(format!(
+                    "Error: a {} API key is required (free — see Account).",
+                    source.name()
+                ));
                 state.status = "Idle".to_string();
                 return;
             }
@@ -1307,7 +1514,25 @@ fn start_download(state: &mut DownloaderState, ctx: &egui::Context) {
                 return;
             }
         }
-        Source::Wallhaven => {} // key optional
+        Source::Safebooru => {} // fully anonymous
+        Source::Wallhaven => {
+            // Key optional — but the filter selections must make sense.
+            if !(state.wh.cat_general || state.wh.cat_anime || state.wh.cat_people) {
+                state.push_log("No categories selected. Nothing to download.");
+                state.status = "Idle".to_string();
+                return;
+            }
+            if !(state.wh.pur_sfw || state.wh.pur_sketchy || state.wh.pur_nsfw) {
+                state.push_log("No purity levels selected. Nothing to download.");
+                state.status = "Idle".to_string();
+                return;
+            }
+            if state.wh.pur_nsfw && key.is_empty() {
+                state.push_log("Error: NSFW results require a Wallhaven API key (see Account).");
+                state.status = "Idle".to_string();
+                return;
+            }
+        }
     }
     // At least one of the types the source actually offers must be on.
     if source.has_type_chips() {
@@ -1371,6 +1596,8 @@ fn start_download(state: &mut DownloaderState, ctx: &egui::Context) {
             include_gif: state.include_gif,
             include_vid: state.include_vid,
             output_dir: PathBuf::from(state.output_dir.trim()),
+            wh: state.wh.clone(),
+            seed: random_seed(),
         };
         std::thread::spawn(move || {
             run_download_src(cfg, tx, cancel, ctx);
@@ -1631,6 +1858,27 @@ struct SrcCfg {
     include_gif: bool,
     include_vid: bool,
     output_dir: PathBuf,
+    /// Wallhaven's filter selections (defaulted for the other sources).
+    wh: crate::wallhaven::Opts,
+    /// Per-run seed so Wallhaven's `random` sorting doesn't repeat across pages.
+    seed: String,
+}
+
+/// Six alphanumeric characters derived from the clock — Wallhaven's `seed`
+/// format — so one run's `random` pages never overlap.
+fn random_seed() -> String {
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos() as u64 ^ d.as_secs());
+    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut n = n;
+    (0..6)
+        .map(|_| {
+            let c = CHARS[(n % CHARS.len() as u64) as usize] as char;
+            n /= CHARS.len() as u64;
+            c
+        })
+        .collect()
 }
 
 /// Kick off the one-shot account/key check for the selected source.
@@ -1656,13 +1904,19 @@ fn start_key_check(state: &mut DownloaderState, ctx: &egui::Context) {
 /// can only distinguish accepted vs rejected (invalid / revoked / blocked) vs
 /// rate-limited.
 fn run_key_check(source: Source, user: &str, key: &str) -> (Source, bool, String) {
+    // Accountless sources have no Account card, so the button can't fire.
+    if !source.has_account() {
+        return (source, true, format!("{} has no accounts — nothing to check.", source.name()));
+    }
     let agent = make_agent();
     let (url, headers) = match source {
         Source::Pexels => (crate::pexels::check_url(), crate::pexels::headers(key)),
+        Source::Pixabay => (crate::pixabay::check_url(key), Vec::new()),
         Source::Danbooru => (crate::danbooru::profile_url(user, key), Vec::new()),
         Source::Wallhaven => (crate::wallhaven::settings_url(key), Vec::new()),
         // No profile endpoint on the dapi — a 1-post authed query stands in.
         Source::Gelbooru => (build_api_url("id:>0", 1, 0, user, key), Vec::new()),
+        Source::Safebooru => unreachable!("accountless — handled above"),
     };
 
     let mut req = agent
@@ -1703,6 +1957,12 @@ fn run_key_check(source: Source, user: &str, key: &str) -> (Source, bool, String
                     .unwrap_or_default();
                 (source, true, format!("Key accepted{extra}."))
             }
+            Source::Pixabay => {
+                let extra = quota_left
+                    .map(|n| format!(" — {n} API requests left this minute"))
+                    .unwrap_or_default();
+                (source, true, format!("Key accepted{extra}."))
+            }
             Source::Wallhaven => {
                 if body.contains("\"data\"") {
                     (source, true, "Key accepted — your account's settings apply to searches.".to_string())
@@ -1717,35 +1977,41 @@ fn run_key_check(source: Source, user: &str, key: &str) -> (Source, bool, String
                     (source, false, "Unexpected response — credentials may be rejected.".to_string())
                 }
             }
+            Source::Safebooru => unreachable!("accountless — handled above"),
         },
         401 | 403 => (
             source,
             false,
             format!("Rejected (HTTP {status}) — key invalid, revoked, or the account is blocked."),
         ),
+        // Pixabay reports a bad key as a 400 with a plain-text explanation.
+        400 if source == Source::Pixabay => {
+            (source, false, format!("Rejected — {}.", body.trim().trim_start_matches("[ERROR 400] ")))
+        }
         429 => (source, false, "Rate limited — try again in a minute.".to_string()),
         s => (source, false, format!("Unexpected response (HTTP {s}).")),
     }
 }
 
-/// One paged result stream. Most sources have a single feed; Pexels splits
-/// photos and videos across two endpoints, walked one after the other.
+/// One paged result stream. Most sources have a single feed; Pexels and
+/// Pixabay split photos and videos across two endpoints, walked one after the
+/// other.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Feed {
     Primary,
-    PexelsVideos,
+    Videos,
 }
 
 /// Which feeds this run walks, in order, honouring the type selection.
 fn source_feeds(cfg: &SrcCfg) -> Vec<Feed> {
     match cfg.source {
-        Source::Pexels => {
+        Source::Pexels | Source::Pixabay => {
             let mut feeds = Vec::new();
             if cfg.include_img {
                 feeds.push(Feed::Primary);
             }
             if cfg.include_vid {
-                feeds.push(Feed::PexelsVideos);
+                feeds.push(Feed::Videos);
             }
             feeds
         }
@@ -1756,10 +2022,15 @@ fn source_feeds(cfg: &SrcCfg) -> Vec<Feed> {
 /// The selected feed's search URL for one (1-based) page.
 fn source_page_url(cfg: &SrcCfg, feed: Feed, page: u32) -> String {
     match (cfg.source, feed) {
-        (Source::Pexels, Feed::PexelsVideos) => crate::pexels::video_page_url(&cfg.query, page),
+        (Source::Pexels, Feed::Videos) => crate::pexels::video_page_url(&cfg.query, page),
         (Source::Pexels, Feed::Primary) => crate::pexels::page_url(&cfg.query, page),
+        (Source::Pixabay, Feed::Videos) => crate::pixabay::video_page_url(&cfg.query, page, &cfg.key),
+        (Source::Pixabay, Feed::Primary) => crate::pixabay::page_url(&cfg.query, page, &cfg.key),
+        (Source::Safebooru, _) => crate::safebooru::page_url(&cfg.query, page),
         (Source::Danbooru, _) => crate::danbooru::page_url(&cfg.query, page, &cfg.user, &cfg.key),
-        (Source::Wallhaven, _) => crate::wallhaven::page_url(&cfg.query, page, &cfg.key, &cfg.blacklist),
+        (Source::Wallhaven, _) => {
+            crate::wallhaven::page_url(&cfg.query, page, &cfg.key, &cfg.blacklist, &cfg.wh, &cfg.seed)
+        }
         (Source::Gelbooru, _) => unreachable!("gelbooru uses its own worker"),
     }
 }
@@ -1774,8 +2045,11 @@ fn source_headers(cfg: &SrcCfg) -> Vec<(&'static str, String)> {
 
 fn source_parse(source: Source, feed: Feed, body: &str) -> Result<Vec<Item>, String> {
     match (source, feed) {
-        (Source::Pexels, Feed::PexelsVideos) => crate::pexels::parse_videos(body),
+        (Source::Pexels, Feed::Videos) => crate::pexels::parse_videos(body),
         (Source::Pexels, Feed::Primary) => crate::pexels::parse(body),
+        (Source::Pixabay, Feed::Videos) => crate::pixabay::parse_videos(body),
+        (Source::Pixabay, Feed::Primary) => crate::pixabay::parse(body),
+        (Source::Safebooru, _) => crate::safebooru::parse(body),
         (Source::Danbooru, _) => crate::danbooru::parse(body),
         (Source::Wallhaven, _) => crate::wallhaven::parse(body),
         (Source::Gelbooru, _) => unreachable!("gelbooru uses its own worker"),
@@ -1890,6 +2164,18 @@ fn run_download_src(cfg: SrcCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx
                 }
             }
 
+            // Wallhaven search results carry no tags — with the option on,
+            // one extra call to the per-wallpaper endpoint fills them in
+            // (already comma-joined, so it skips the booru reformatting).
+            let mut item = item;
+            if cfg.source == Source::Wallhaven && cfg.wh.save_tags && item.tags.is_none() {
+                match fetch_wallhaven_tags(&agent, &item, &cfg.key) {
+                    Ok(tags) if !tags.is_empty() => item.tags = Some(tags),
+                    Ok(_) => {}
+                    Err(e) => log(format!("Warning: could not fetch tags for {}: {e}", item.stem)),
+                }
+            }
+
             // Sidecar: booru tag strings get the comma format; captions
             // (e.g. Pexels alt text) are written as-is.
             if let Some(tags) = &item.tags {
@@ -1935,6 +2221,25 @@ fn run_download_src(cfg: SrcCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx
     }
     let _ = tx.send(DlMsg::Done);
     ctx.request_repaint();
+}
+
+/// One call to Wallhaven's per-wallpaper endpoint for the tag sidecar —
+/// search results don't include tags. Best-effort: a failure only costs the
+/// sidecar, never the download.
+fn fetch_wallhaven_tags(agent: &ureq::Agent, item: &Item, key: &str) -> Result<String, String> {
+    let id = item.stem.strip_prefix("wallhaven-").unwrap_or(&item.stem);
+    let mut resp = agent
+        .get(&crate::wallhaven::info_url(id, key))
+        .header("User-Agent", USER_AGENT)
+        .header("Accept", "application/json")
+        .call()
+        .map_err(|e| format!("network error: {e}"))?;
+    let status = resp.status().as_u16();
+    if status != 200 {
+        return Err(format!("HTTP {status}"));
+    }
+    let body = resp.body_mut().read_to_string().map_err(|e| format!("read error: {e}"))?;
+    crate::wallhaven::parse_tags(&body)
 }
 
 /// Fetch one search page for the generic worker, with the same retry/backoff
@@ -2406,6 +2711,7 @@ fn load_config() -> Option<SavedConfig> {
     // The API keys are stored encrypted (DPAPI on Windows); decrypt them back.
     cfg.api_key = crate::secret::unprotect(&cfg.api_key);
     cfg.pexels_key = crate::secret::unprotect(&cfg.pexels_key);
+    cfg.pixabay_key = crate::secret::unprotect(&cfg.pixabay_key);
     cfg.danbooru_key = crate::secret::unprotect(&cfg.danbooru_key);
     cfg.wallhaven_key = crate::secret::unprotect(&cfg.wallhaven_key);
     Some(cfg)
@@ -2425,9 +2731,11 @@ fn save_config(cfg: &SavedConfig) {
         show_log: cfg.show_log,
         source: cfg.source.clone(),
         pexels_key: crate::secret::protect(&cfg.pexels_key),
+        pixabay_key: crate::secret::protect(&cfg.pixabay_key),
         danbooru_login: cfg.danbooru_login.clone(),
         danbooru_key: crate::secret::protect(&cfg.danbooru_key),
         wallhaven_key: crate::secret::protect(&cfg.wallhaven_key),
+        wallhaven_opts: cfg.wallhaven_opts.clone(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&on_disk) {
         let _ = std::fs::write(config_path(), json);

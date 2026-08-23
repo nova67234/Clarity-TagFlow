@@ -104,6 +104,8 @@ mod image_cache;
 mod danbooru;
 mod download;
 mod pexels;
+mod pixabay;
+mod safebooru;
 mod wallhaven;
 mod gallery;
 mod gallery_detail;
