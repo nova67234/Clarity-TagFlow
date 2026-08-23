@@ -12,7 +12,7 @@ pub const STORAGE_KEY: &str = "clarity_tagflow_settings";
 
 /// Which tab of the settings window is shown. Never persisted — resets to
 /// `General` each launch.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SettingsTab {
     #[default]
     General,
@@ -322,13 +322,17 @@ pub fn show(
                         .auto_shrink([false, false])
                         .show(&mut scroll_ui, |ui| {
                             ui.set_width(ui.available_width() - SCROLL_GUTTER);
-                            match settings.tab {
+                            // Scope widget ids by tab: switches at the same
+                            // layout position in two tabs would otherwise share
+                            // an auto-id, and the animation state left behind by
+                            // one tab's toggle plays back on the other's.
+                            ui.push_id(settings.tab, |ui| match settings.tab {
                                 SettingsTab::General => general_tab(ui, settings),
                                 SettingsTab::Appearance => appearance_tab(ui, settings),
                                 SettingsTab::AiModel => ai_model_tab(ui, settings, llm),
                                 SettingsTab::Ftp => ftp_tab(ui, settings, ftp),
                                 SettingsTab::Updates => crate::update::updates_tab(ui, update, settings),
-                            }
+                            });
                         });
                     crate::edge_scroll_done(ui, &scroll_ui, SCROLL_GUTTER);
                 });
@@ -777,7 +781,7 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                         .hint_text(crate::voice::DEFAULT_STYLE),
                 );
                 if resp.changed() {
-                    llm.voice.style = settings.ai_voice_style.clone();
+                    llm.voice.style.clone_from(&settings.ai_voice_style);
                 }
                 hint(
                     ui,
@@ -801,7 +805,7 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                             .pick_file()
                         {
                             settings.ai_voice_ref_audio = p.to_string_lossy().to_string();
-                            llm.voice.ref_audio = settings.ai_voice_ref_audio.clone();
+                            llm.voice.ref_audio.clone_from(&settings.ai_voice_ref_audio);
                         }
                     // The floating always-on-top recorder: capture a voice off
                     // whatever is playing (YouTube, a game) as the sample.
@@ -839,7 +843,7 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                             .hint_text("Type exactly what is said in the recording"),
                     );
                     if resp.changed() {
-                        llm.voice.ref_text = settings.ai_voice_ref_text.clone();
+                        llm.voice.ref_text.clone_from(&settings.ai_voice_ref_text);
                     }
                 }
                 hint(

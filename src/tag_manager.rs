@@ -15,6 +15,9 @@ use crate::theme::*;
 /// existing tag, and the chip flash after trying to re-add one.
 const DUP_TEXT_AMBER: Color32 = Color32::from_rgb(216, 162, 36);
 const DUP_FLASH_AMBER: Color32 = Color32::from_rgb(240, 198, 60);
+/// Chips the AI tagger just added: violet — distinct from the amber
+/// duplicate flash, the green "Saved" status and the theme selection colour.
+const AI_NEW_VIOLET: Color32 = Color32::from_rgb(155, 130, 240);
 /// How long the duplicate chip flash runs (two pulses fading out).
 const DUP_FLASH_SECS: f32 = 1.6;
 
@@ -67,6 +70,15 @@ pub struct TagManagerState {
     /// Chips flashing amber because the user tried to re-add them (already
     /// present), with the flash start time.
     pub dup_flash: Option<(HashSet<String>, Instant)>,
+
+    /// Tags the last AI tagging run added to the current image — tinted violet
+    /// in the list so the user can tell the AI's contribution from what was
+    /// already there. Cleared on image switch or the next run.
+    pub ai_new_tags: HashSet<String>,
+
+    /// When the Copy button was last clicked: tints the icon green and shows
+    /// a "Copied" label beside it until the flash expires.
+    pub copy_flash: Option<Instant>,
 
     /// The tag chip currently being dragged to a new position in the list,
     /// if any.
@@ -122,6 +134,8 @@ impl Default for TagManagerState {
             tag_job: None,
             flash: None,
             dup_flash: None,
+            ai_new_tags: HashSet::new(),
+            copy_flash: None,
             drag_tag: None,
             edit_tag: None,
             edit_focus: false,
@@ -179,6 +193,7 @@ pub fn show(
         state.selected_tags.clear();
         state.drag_tag = None;
         state.edit_tag = None;
+        state.ai_new_tags.clear();
         set_loaded_status(state, current_image, &tags);
     }
 
@@ -231,21 +246,25 @@ pub fn show(
                 // Drop blacklisted tags (comma/newline separated in settings).
                 let blacklist = parse_tags(&state.settings.blacklist);
                 let mut existing = read_sidecar(&done.image);
+                let mut fresh: HashSet<String> = HashSet::new();
                 let mut added = 0;
                 for t in new_tags {
                     let blocked = blacklist.iter().any(|b| b.eq_ignore_ascii_case(&t));
                     let dup = existing.iter().any(|e| e.eq_ignore_ascii_case(&t));
                     if !blocked && !dup {
+                        fresh.insert(t.clone());
                         existing.push(t);
                         added += 1;
                     }
                 }
                 write_sidecar(&done.image, &existing);
                 // If the tagged image is still selected, refresh the live buffer
-                // and this frame's tag list.
+                // and this frame's tag list, and tint the run's additions so the
+                // user can tell them from the tags that were already there.
                 if current_image == Some(done.image.as_path()) {
                     *current_tags = serialize_tags(&existing);
                     tags = existing;
+                    state.ai_new_tags = fresh;
                 }
                 state.status_msg = format!("Added {added} tags");
                 state.status_is_error = false;
@@ -535,13 +554,6 @@ pub fn show(
             // loaded-tag count; this row only carries the right-aligned tools.
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let copy_icon = egui::include_image!("../icons/copy.svg");
-                    if crate::svg_button(ui, copy_icon, "Copy", 16.0, MUTED()).clicked() {
-                        let text = serialize_tags(&tags);
-                        ui.ctx().copy_text(text);
-                        state.status_msg = "Copied to clipboard".to_string();
-                        state.status_is_error = false;
-                    }
                     // While tags are selected: a live count plus a Clear shortcut.
                     if sel_count > 0 {
                         if ui
@@ -563,7 +575,7 @@ pub fn show(
             // Tag list box: 22 rounded corners, fills the remaining vertical
             // space. Tags render as wrapping pill chips; click one to select it.
             let list_h = ui.available_height().max(120.0);
-            egui::Frame::new()
+            let box_resp = egui::Frame::new()
                 .fill(PANEL())
                 .corner_radius(CornerRadius::same(22))
                 .stroke(egui::Stroke::new(1.0, EDGE()))
@@ -632,7 +644,13 @@ pub fn show(
                                         let flash = flash_t.filter(|_| {
                                             state.dup_flash.as_ref().is_some_and(|(set, _)| set.contains(tag))
                                         });
-                                        let resp = tag_chip(ui, tag, selected, flash.map(flash_strength));
+                                        let resp = tag_chip(
+                                            ui,
+                                            tag,
+                                            selected,
+                                            state.ai_new_tags.contains(tag),
+                                            flash.map(flash_strength),
+                                        );
                                         chip_rects.push(resp.rect);
                                         // Bring the already-there chip on screen as
                                         // the flash starts.
@@ -712,6 +730,53 @@ pub fn show(
                             }
                         });
                 });
+
+            // Copy floats in the box's bottom-right corner, on top of the
+            // list (drawn after it, so it wins hover/click over the chips).
+            let btn = 16.0 + 12.0; // svg_button's min hit size for a 16px icon
+            let pad = 6.0;
+            let corner = egui::Rect::from_min_size(
+                box_resp.response.rect.right_bottom() - egui::vec2(btn + pad, btn + pad),
+                egui::vec2(btn, btn),
+            );
+            // While the post-click flash is live the icon turns green and a
+            // "Copied" label sits to its left; both expire together.
+            const COPY_FLASH_SECS: f32 = 1.5;
+            let green = Color32::from_rgb(46, 160, 67);
+            let flashing = match &state.copy_flash {
+                Some(start) if start.elapsed().as_secs_f32() < COPY_FLASH_SECS => {
+                    ui.ctx().request_repaint(); // keep ticking so the flash expires
+                    true
+                }
+                Some(_) => {
+                    state.copy_flash = None;
+                    false
+                }
+                None => false,
+            };
+            let copy_icon = egui::include_image!("../icons/copy.svg");
+            let tint = if flashing { green } else { MUTED() };
+            let copy_resp = ui
+                .scope_builder(egui::UiBuilder::new().max_rect(corner), |ui| {
+                    crate::svg_button(ui, copy_icon, "Copy", 16.0, tint)
+                })
+                .inner;
+            if flashing {
+                let label = egui::WidgetText::from(
+                    egui::RichText::new("Copied").color(green).size(12.0),
+                )
+                .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
+                let pos = egui::pos2(
+                    corner.left() - 4.0 - label.size().x,
+                    corner.center().y - label.size().y / 2.0,
+                );
+                ui.painter().galley(pos, label, green);
+            }
+            if copy_resp.clicked() {
+                let text = serialize_tags(&tags);
+                ui.ctx().copy_text(text);
+                state.copy_flash = Some(Instant::now());
+            }
         });
 }
 
@@ -730,10 +795,11 @@ fn flash_strength(t: f32) -> f32 {
 
 /// A rounded tag pill: FIELD fill (FIELD2 on hover), theme selection colour with
 /// white text while selected. `flash` (0..1) blends the chip toward amber — the
-/// "already added" pulse. Caption-length tags wrap into multi-line chips at the
-/// panel width rather than clipping. Returns the click response; the caller
-/// toggles.
-fn tag_chip(ui: &mut egui::Ui, text: &str, selected: bool, flash: Option<f32>) -> egui::Response {
+/// "already added" pulse. `ai_new` marks a tag the last AI run added: a violet
+/// outline + faint violet wash (selection style still wins while selected).
+/// Caption-length tags wrap into multi-line chips at the panel width rather
+/// than clipping. Returns the click response; the caller toggles.
+fn tag_chip(ui: &mut egui::Ui, text: &str, selected: bool, ai_new: bool, flash: Option<f32>) -> egui::Response {
     let font = egui::FontId::proportional(13.0);
     let pad = egui::vec2(10.0, 5.0);
     let wrap_w = (ui.max_rect().width() - pad.x * 2.0).max(40.0);
@@ -753,6 +819,9 @@ fn tag_chip(ui: &mut egui::Ui, text: &str, selected: bool, flash: Option<f32>) -
         } else {
             (FIELD(), TEXT())
         };
+        if ai_new && !selected {
+            fill = blend(fill, AI_NEW_VIOLET, 0.16);
+        }
         if let Some(k) = flash {
             fill = blend(fill, DUP_FLASH_AMBER, k);
             // Dark ink at peak so the label stays readable on amber.
@@ -763,7 +832,8 @@ fn tag_chip(ui: &mut egui::Ui, text: &str, selected: bool, flash: Option<f32>) -
         let radius = CornerRadius::same((rect.height().min(row_h + pad.y * 2.0) / 2.0) as u8);
         ui.painter().rect_filled(rect, radius, fill);
         if !selected {
-            ui.painter().rect_stroke(rect, radius, egui::Stroke::new(1.0, EDGE()), egui::StrokeKind::Inside);
+            let edge = if ai_new { AI_NEW_VIOLET } else { EDGE() };
+            ui.painter().rect_stroke(rect, radius, egui::Stroke::new(1.0, edge), egui::StrokeKind::Inside);
         }
         ui.painter().galley(rect.min + pad, galley, ink);
     }

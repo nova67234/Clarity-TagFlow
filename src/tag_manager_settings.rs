@@ -83,11 +83,16 @@ pub fn show(
             segmented_control(ui, &mut s.tab);
             ui.add_space(12.0);
 
-            if s.tab == 1 {
-                models.ui(ui);
-            } else {
-                settings_tab(ui, s);
-            }
+            // Scope widget ids by tab so same-position widgets in the two tabs
+            // don't share auto-ids (shared switch animation state replays the
+            // other tab's toggle flip on switch).
+            ui.push_id(s.tab, |ui| {
+                if s.tab == 1 {
+                    models.ui(ui);
+                } else {
+                    settings_tab(ui, s);
+                }
+            });
         });
 
     s.open = open && !esc;
