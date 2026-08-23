@@ -27,10 +27,21 @@ const PREFETCH_PX: f32 = 600.0;
 /// Aspect ratio (h/w) assumed for a tile whose image hasn't decoded yet.
 const DEFAULT_ASPECT: f32 = 1.0;
 
+/// What a thumbnail's right-click menu asked the app to do, with the target's
+/// index into `images`. Handled by the main app, which owns the list and the
+/// delete confirmation flow.
+pub enum TileAction {
+    None,
+    /// Delete this image (and its sidecar), confirming first per the setting.
+    Delete(usize),
+    /// Move this image (and its sidecar) to the Output folder.
+    Move(usize),
+}
+
 /// Render the left browser panel.
 ///
-/// Returns `true` if the search query changed this frame so the main app
-/// knows to re-filter the list.
+/// Returns whether the search query changed this frame (so the main app knows
+/// to re-filter the list) and any action a tile's right-click menu requested.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut egui::Ui,
@@ -44,8 +55,9 @@ pub fn show(
     favorites: &mut crate::favorites::Favorites,
     thumb_max_h: f32,
     media_filter: &mut crate::left_panel_settings::MediaFilter,
-) -> bool {
+) -> (bool, TileAction) {
     let mut search_changed = false;
+    let mut action = TileAction::None;
 
     egui::Panel::left("browser")
         .resizable(false)
@@ -144,14 +156,15 @@ pub fn show(
                     return;
                 }
 
-                thumbnail_list(ui, images, filtered, selected, thumbs, video_thumbs, video_previews, favorites, thumb_max_h);
+                action = thumbnail_list(ui, images, filtered, selected, thumbs, video_thumbs, video_previews, favorites, thumb_max_h);
             });
         });
 
-    search_changed
+    (search_changed, action)
 }
 
-/// The scrollable, hand-virtualized column of bare-image tiles.
+/// The scrollable, hand-virtualized column of bare-image tiles. Returns any
+/// action a tile's right-click menu requested.
 #[allow(clippy::too_many_arguments)]
 fn thumbnail_list(
     ui: &mut egui::Ui,
@@ -163,7 +176,8 @@ fn thumbnail_list(
     video_previews: &mut crate::video::VideoPreviews,
     favorites: &mut crate::favorites::Favorites,
     thumb_max_h: f32,
-) {
+) -> TileAction {
+    let mut action = TileAction::None;
     // When the displayed set changes (a new folder is loaded, or the filter
     // changes) snap the scroll back to the top, instead of keeping the stale
     // offset egui persists from the previous list.
@@ -261,7 +275,8 @@ fn thumbnail_list(
 
                 let id = ui.id().with(("thumb", i));
 
-                // Sense both buttons: left-click selects, right-click toggles favorite.
+                // Sense both buttons: left-click selects, right-click opens the
+                // tile menu below.
                 let resp = ui.interact(rect, id, egui::Sense::click());
 
                 let is_favorite = favorites.is_favorite(&images[i]);
@@ -270,11 +285,39 @@ fn thumbnail_list(
                 if resp.clicked() {
                     *selected = Some(i);
                 }
-                if resp.secondary_clicked() {
-                    favorites.toggle(&images[i]);
-                }
+
+                // Right-click menu: act on THIS tile without having to select
+                // it first — favorite, move to output, delete. Same look as
+                // the viewer's menu, trimmed to list-keeping actions.
+                use crate::zoom::{menu_frame, menu_item, menu_item_danger, menu_sep};
+                egui::Popup::context_menu(&resp).frame(menu_frame()).show(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    let (fav_icon, fav_label) = if is_favorite {
+                        (egui::include_image!("../icons/heart_minus.svg"), "Remove Favorite")
+                    } else {
+                        (egui::include_image!("../icons/heart_plus.svg"), "Favorite")
+                    };
+                    if menu_item(ui, fav_icon, fav_label) {
+                        favorites.toggle(&images[i]);
+                        ui.close();
+                    }
+                    // Zip entries are view-only — nothing ever moves out of or
+                    // is deleted from an archive, so those rows don't appear.
+                    if !crate::archive::is_entry(&images[i]) {
+                        menu_sep(ui);
+                        if menu_item(ui, egui::include_image!("../icons/folderup.svg"), "Move to Output") {
+                            action = TileAction::Move(i);
+                            ui.close();
+                        }
+                        if menu_item_danger(ui, egui::include_image!("../icons/delete.svg"), "Delete") {
+                            action = TileAction::Delete(i);
+                            ui.close();
+                        }
+                    }
+                });
             }
         });
+    action
 }
 
 /// A cheap fingerprint of the currently displayed list. Changes when a new

@@ -190,7 +190,7 @@ fn main() -> eframe::Result {
                 && let Some(saved) = eframe::get_value::<settings::Settings>(storage, settings::STORAGE_KEY) {
                     app.settings = saved;
                     // Restore the last-used AI tagger model into the Tag Manager.
-                    app.tag_manager.ai_model = app.settings.last_ai_model.clone();
+                    app.tag_manager.ai_model.clone_from(&app.settings.last_ai_model);
                     // Restore the Tag Manager's gear-popup preferences.
                     app.tag_manager.settings = app.settings.tag_manager.clone();
                 }
@@ -381,6 +381,14 @@ struct ViewerApp {
     /// when the selection actually changes — and don't retry on failure.
     last_video_path: Option<PathBuf>,
 
+    /// A browser tile's right-click Delete awaiting confirmation: the target's
+    /// path (not index — the list can rescan while the dialog is open).
+    /// Independent of the selection — the user keeps viewing what they're
+    /// viewing.
+    pending_tile_delete: Option<PathBuf>,
+    /// The confirm dialog's "don't ask again" checkbox for the above.
+    tile_delete_skip: bool,
+
     /// Zoom + pan state for the centre image viewer (resets per selection).
     zoom: zoom::ZoomState,
 
@@ -438,6 +446,8 @@ impl Default for ViewerApp {
             video_previews: video::VideoPreviews::new(),
             video_player: None,
             last_video_path: None,
+            pending_tile_delete: None,
+            tile_delete_skip: false,
             zoom: zoom::ZoomState::default(),
             #[cfg(not(target_os = "macos"))]
             scene3d: scene3d::Scene3D::new(),
@@ -923,8 +933,16 @@ impl ViewerApp {
     /// (folder button's popup) — or a folder the user picks when none is set —
     /// then drop it from the list. Shared by the right panel and the gallery popup.
     fn move_selected(&mut self) {
-        let Some(idx) = self.selected else { return };
-        let img_path = self.images[idx].clone();
+        if let Some(idx) = self.selected {
+            self.move_at(idx);
+        }
+    }
+
+    /// Move the image at `idx` (and its sidecar) to the Output folder — or a
+    /// picked folder when none is configured. Any list entry, not just the
+    /// selection: also used by the browser tiles' right-click menu.
+    fn move_at(&mut self, idx: usize) {
+        let Some(img_path) = self.images.get(idx).cloned() else { return };
         // Zip entries are view-only — never move out of an archive (checked
         // before the picker so no dialog pops up either).
         if archive::is_entry(&img_path) {
@@ -1103,7 +1121,15 @@ impl ViewerApp {
         self.selected = if self.images.is_empty() {
             None
         } else {
-            Some(idx.min(self.images.len().saturating_sub(1)))
+            match self.selected {
+                // A different image was selected (e.g. a tile deleted from the
+                // browser's right-click menu): keep viewing it — its index
+                // shifts down when it sat after the removed one.
+                Some(sel) if sel > idx => Some(sel - 1),
+                Some(sel) if sel < idx => Some(sel),
+                // The removed image itself (or none): nearest remaining one.
+                _ => Some(idx.min(self.images.len().saturating_sub(1))),
+            }
         };
     }
 
@@ -1136,17 +1162,28 @@ impl ViewerApp {
     }
 
     fn delete_selected(&mut self) {
-        let Some(idx) = self.selected else { return };
-        let img_path = self.images[idx].clone();
+        if let Some(idx) = self.selected {
+            self.delete_at(idx);
+        }
+    }
+
+    /// Delete the image at `idx` (any list entry, not just the selection) and
+    /// its sidecar. Used by the Details panel's Delete button (via
+    /// [`Self::delete_selected`]) and the browser tiles' right-click menu.
+    fn delete_at(&mut self, idx: usize) {
+        let Some(img_path) = self.images.get(idx).cloned() else { return };
         // Zip entries are view-only — never delete out of an archive.
         if archive::is_entry(&img_path) {
             return;
         }
         let txt_path = right_details::sidecar_txt(&img_path);
 
-        // Stop any embedded player so VLC releases the file before we delete it.
-        self.video_player = None;
-        self.last_video_path = None;
+        // Stop the embedded player when it's this file, so VLC releases it
+        // before the delete (other tiles' deletes leave playback alone).
+        if self.last_video_path.as_deref() == Some(img_path.as_path()) {
+            self.video_player = None;
+            self.last_video_path = None;
+        }
 
         let _ = std::fs::remove_file(&img_path);
         if txt_path.exists() {
@@ -1595,7 +1632,7 @@ impl eframe::App for ViewerApp {
         // its thumbnail. (Reflects last frame's player state; that's fine.)
         let busy_video = self.video_player.as_ref().and(self.last_video_path.as_deref());
         self.video_thumbs.set_busy(busy_video);
-        let search_changed = left_browser::show(
+        let (search_changed, tile_action) = left_browser::show(
             ui,
             &self.images,
             &self.filtered, // Pass the cached list
@@ -1608,6 +1645,47 @@ impl eframe::App for ViewerApp {
             self.settings.thumbnail_size,
             &mut self.settings.media_filter,
         );
+
+        // A tile's right-click menu action — acts on that tile directly, the
+        // current selection stays put.
+        match tile_action {
+            left_browser::TileAction::Delete(i) => {
+                if self.settings.confirm_before_delete {
+                    self.pending_tile_delete = self.images.get(i).cloned();
+                    self.tile_delete_skip = false; // fresh checkbox per prompt
+                } else {
+                    self.delete_at(i);
+                }
+            }
+            left_browser::TileAction::Move(i) => self.move_at(i),
+            left_browser::TileAction::None => {}
+        }
+
+        // The pending tile-delete's confirmation modal (same dialog the
+        // Details panel uses, driven from here so no selection is needed).
+        if self.pending_tile_delete.is_some() {
+            match right_details::delete_confirm_dialog(
+                ui.ctx(),
+                "left_tile_confirm_delete",
+                &mut self.tile_delete_skip,
+            ) {
+                Some(true) => {
+                    // "Don't ask again" disables (and persists) future prompts.
+                    if self.tile_delete_skip {
+                        self.settings.confirm_before_delete = false;
+                    }
+                    // Re-resolve by path — the index may have shifted while
+                    // the dialog was up.
+                    if let Some(path) = self.pending_tile_delete.take()
+                        && let Some(i) = self.images.iter().position(|p| *p == path)
+                    {
+                        self.delete_at(i);
+                    }
+                }
+                Some(false) => self.pending_tile_delete = None,
+                None => {}
+            }
+        }
 
         // Recompute the cached indices list if the user typed in the search box or
         // changed the media-type filter in the Filter Settings panel.

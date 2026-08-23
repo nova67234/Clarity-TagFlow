@@ -1068,15 +1068,31 @@ pub(crate) fn menu_frame() -> egui::Frame {
 /// accent pill (white ink) while hovered. Fixed compact size ([`MENU_W`] × 22).
 /// Returns true when clicked.
 pub(crate) fn menu_item(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, label: &str) -> bool {
+    menu_item_impl(ui, icon, label, false)
+}
+
+/// [`menu_item`]'s destructive twin: red ink and a red hover pill, for rows
+/// like Delete that remove things for good.
+pub(crate) fn menu_item_danger(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, label: &str) -> bool {
+    menu_item_impl(ui, icon, label, true)
+}
+
+fn menu_item_impl(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, label: &str, danger: bool) -> bool {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(MENU_W, 22.0), Sense::click());
     if ui.is_rect_visible(rect) {
         let hovered = resp.hovered();
         if hovered {
-            ui.painter()
-                .rect_filled(rect, CornerRadius::same(7), crate::theme::ACCENT1());
+            let pill = if danger { Color32::from_rgb(180, 40, 40) } else { crate::theme::ACCENT1() };
+            ui.painter().rect_filled(rect, CornerRadius::same(7), pill);
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
-        let ink = if hovered { Color32::WHITE } else { ui.visuals().text_color() };
+        let ink = if hovered {
+            Color32::WHITE
+        } else if danger {
+            Color32::from_rgb(225, 95, 95)
+        } else {
+            ui.visuals().text_color()
+        };
         egui::Image::new(icon)
             .fit_to_exact_size(egui::vec2(14.0, 14.0))
             .tint(ink)
