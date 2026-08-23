@@ -1,11 +1,14 @@
-//! Gelbooru downloader panel — a Rust port of terminus2's `Gelbooru.java`
-//! (without the cookie / Cloudflare-WebView machinery).
+//! The Downloader panel — a multi-source media downloader.
 //!
-//! Shows a form (output folder, User ID + API key, tags, blacklist, limit,
-//! delay, file-type toggles), a live log and a progress bar. The actual fetching
-//! runs on a background thread that talks to the Gelbooru JSON API with `ureq`,
-//! streams matching files to disk, writes a `.txt` tag sidecar next to each, and
-//! keeps a small de-duplication log so re-runs skip files already pulled.
+//! Sources: **Pexels** (default; stock photos, API-key auth), **Gelbooru**
+//! (the original, ported from terminus2's `Gelbooru.java`), **Danbooru** and
+//! **Wallhaven** — each source's API specifics live in its own module
+//! (`pexels.rs` / `danbooru.rs` / `wallhaven.rs`); this module owns the shared
+//! form UI, per-source credentials (encrypted at rest), the background worker
+//! that streams files to disk with `.txt` sidecars where the source provides
+//! tags/captions, and the de-duplication log so re-runs skip files already
+//! pulled. Gelbooru keeps its original specialised worker (daily quota +
+//! artist/character tag-role resolution).
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -57,7 +60,210 @@ enum DlMsg {
     Done,
 }
 
-/// Persisted-across-runs form values (credentials + last inputs).
+/// One downloadable item from any source, in source-neutral form. Produced by
+/// the per-source `parse` functions, consumed by the shared worker.
+pub(crate) struct Item {
+    /// Direct file URL.
+    pub url: String,
+    /// Stable de-duplication key recorded in the download log
+    /// (e.g. `"pexels:12345"`).
+    pub key: String,
+    /// Output file stem; the extension is appended from `ext`.
+    pub stem: String,
+    /// Lower-case file extension (`"jpg"`, …).
+    pub ext: String,
+    /// Booru tag string or a human caption, written to the `.txt` sidecar
+    /// when present.
+    pub tags: Option<String>,
+}
+
+/// The selectable download sources. Pexels is the default.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Source {
+    #[default]
+    Pexels,
+    Gelbooru,
+    Danbooru,
+    Wallhaven,
+}
+
+impl Source {
+    const ALL: [Source; 4] = [Source::Pexels, Source::Gelbooru, Source::Danbooru, Source::Wallhaven];
+
+    fn name(self) -> &'static str {
+        match self {
+            Source::Pexels => crate::pexels::NAME,
+            Source::Gelbooru => "Gelbooru",
+            Source::Danbooru => crate::danbooru::NAME,
+            Source::Wallhaven => crate::wallhaven::NAME,
+        }
+    }
+
+    fn subtitle(self) -> &'static str {
+        match self {
+            Source::Pexels => crate::pexels::SUBTITLE,
+            Source::Gelbooru => "Tag Downloader",
+            Source::Danbooru => crate::danbooru::SUBTITLE,
+            Source::Wallhaven => crate::wallhaven::SUBTITLE,
+        }
+    }
+
+    fn home(self) -> &'static str {
+        match self {
+            Source::Pexels => crate::pexels::HOME,
+            Source::Gelbooru => SITE_HOME,
+            Source::Danbooru => crate::danbooru::HOME,
+            Source::Wallhaven => crate::wallhaven::HOME,
+        }
+    }
+
+    fn cred_url(self) -> &'static str {
+        match self {
+            Source::Pexels => crate::pexels::CRED_URL,
+            Source::Gelbooru => "https://gelbooru.com/index.php?page=account&s=options",
+            Source::Danbooru => crate::danbooru::CRED_URL,
+            Source::Wallhaven => crate::wallhaven::CRED_URL,
+        }
+    }
+
+    fn cred_info(self) -> &'static str {
+        match self {
+            Source::Pexels => crate::pexels::CRED_INFO,
+            Source::Gelbooru => {
+                "Gelbooru no longer allows anonymous downloads — you must log in with \
+                 your account's User ID and API key. Get them from gelbooru.com → \
+                 Account → Options → 'API Access Credentials' (free account required)."
+            }
+            Source::Danbooru => crate::danbooru::CRED_INFO,
+            Source::Wallhaven => crate::wallhaven::CRED_INFO,
+        }
+    }
+
+    fn tags_hint(self) -> &'static str {
+        match self {
+            Source::Pexels => crate::pexels::TAGS_HINT,
+            Source::Gelbooru => "space-separated, e.g. blue_sky 1girl",
+            Source::Danbooru => crate::danbooru::TAGS_HINT,
+            Source::Wallhaven => crate::wallhaven::TAGS_HINT,
+        }
+    }
+
+    /// Label of the username field, for sources that pair one with the key.
+    fn user_field(self) -> Option<&'static str> {
+        match self {
+            Source::Gelbooru => Some("User ID"),
+            Source::Danbooru => Some("Login"),
+            Source::Pexels | Source::Wallhaven => None,
+        }
+    }
+
+    /// Whether the API key is mandatory (vs an optional account upgrade).
+    fn key_required(self) -> bool {
+        matches!(self, Source::Pexels | Source::Gelbooru)
+    }
+
+    /// Booru-style sources: per-post tag strings (comma-formatted sidecars,
+    /// tag-search syntax).
+    fn is_booru(self) -> bool {
+        matches!(self, Source::Gelbooru | Source::Danbooru)
+    }
+
+    /// Whether the Options card shows file-type chips at all (Wallhaven is
+    /// wallpapers-only, so there's nothing to choose).
+    fn has_type_chips(self) -> bool {
+        !matches!(self, Source::Wallhaven)
+    }
+
+    /// Whether the source can return GIFs (booru posts only).
+    fn offers_gif(self) -> bool {
+        self.is_booru()
+    }
+
+    /// Whether the source can return videos — the boorus mix them into posts,
+    /// Pexels serves them from its separate videos endpoint.
+    fn offers_video(self) -> bool {
+        self.is_booru() || self == Source::Pexels
+    }
+
+    /// Per-source blacklist hint — the mechanism differs (tag match, caption
+    /// match, or query-level exclusion) even though the field is shared.
+    fn blacklist_hint(self) -> &'static str {
+        match self {
+            Source::Pexels => "comma-separated words to skip (matched against the description)",
+            Source::Wallhaven => "comma-separated tags to exclude from the search",
+            Source::Gelbooru | Source::Danbooru => "comma-separated tags to skip",
+        }
+    }
+
+    /// Stable key for the saved config.
+    fn config_key(self) -> &'static str {
+        match self {
+            Source::Pexels => "pexels",
+            Source::Gelbooru => "gelbooru",
+            Source::Danbooru => "danbooru",
+            Source::Wallhaven => "wallhaven",
+        }
+    }
+
+    fn from_config_key(s: &str) -> Source {
+        match s {
+            "gelbooru" => Source::Gelbooru,
+            "danbooru" => Source::Danbooru,
+            "wallhaven" => Source::Wallhaven,
+            _ => Source::Pexels,
+        }
+    }
+
+    /// Self-imposed daily download allowance — a courtesy cap in the spirit
+    /// of each service's own limits, tracked in an encrypted per-source file.
+    fn daily_cap(self) -> u32 {
+        match self {
+            // Pexels caps API requests (200/hour, 20 000/month; one request
+            // lists 80 photos), not downloads — 600/day keeps a full month of
+            // daily runs comfortably inside the free tier.
+            Source::Pexels => 600,
+            Source::Gelbooru | Source::Danbooru => DAILY_CAP,
+            // Wallhaven rate-limits the API at 45 requests/minute.
+            Source::Wallhaven => 1000,
+        }
+    }
+
+    /// Hover explanation for the allowance meter.
+    fn cap_note(self) -> &'static str {
+        match self {
+            Source::Pexels => {
+                "Pexels doesn't cap downloads per day — its free tier caps API requests \
+                 (200/hour, 20,000/month; one request lists 80 photos). A 600/day allowance \
+                 keeps a full month of daily runs comfortably inside the free tier."
+            }
+            Source::Gelbooru => {
+                "A courtesy guard-rail so the app can't be used (or accidentally left \
+                 running) to mass-pull from Gelbooru."
+            }
+            Source::Danbooru => {
+                "A courtesy guard-rail matching the Gelbooru cap — Danbooru asks bots for \
+                 restraint (about one request per second, sustained)."
+            }
+            Source::Wallhaven => {
+                "A courtesy guard-rail — Wallhaven rate-limits its API at 45 requests per \
+                 minute and asks for considerate use."
+            }
+        }
+    }
+
+    /// Index into [`Source::ALL`] — how the UI tells the API monitor thread
+    /// which site to ping.
+    fn index(self) -> u8 {
+        Source::ALL.iter().position(|s| *s == self).unwrap_or(0) as u8
+    }
+
+    fn from_index(i: u8) -> Source {
+        Source::ALL.get(i as usize).copied().unwrap_or(Source::Pexels)
+    }
+}
+
+/// Persisted-across-runs form values (credentials + last inputs). The
+/// unprefixed `user_id`/`api_key` are Gelbooru's (pre-multi-source configs).
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct SavedConfig {
     #[serde(default)]
@@ -74,13 +280,31 @@ struct SavedConfig {
     /// by default).
     #[serde(default)]
     show_log: bool,
+    /// The selected source's [`Source::config_key`]; absent/unknown = Pexels.
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    pexels_key: String,
+    #[serde(default)]
+    danbooru_login: String,
+    #[serde(default)]
+    danbooru_key: String,
+    #[serde(default)]
+    wallhaven_key: String,
 }
 
 /// All UI + runtime state for the downloader view. Lives on `RightPanelState`.
 pub struct DownloaderState {
+    /// The selected download source (persisted; Pexels by default).
+    source: Source,
     output_dir: String,
+    /// Gelbooru credentials (the unprefixed pair, matching older configs).
     user_id: String,
     api_key: String,
+    pexels_key: String,
+    danbooru_login: String,
+    danbooru_key: String,
+    wallhaven_key: String,
     tags: String,
     blacklist: String,
     limit: u32,
@@ -113,11 +337,21 @@ pub struct DownloaderState {
     /// while it keeps getting set, so leaving the view pauses the polling
     /// (matching the Civitai panel's monitor).
     api_view_visible: Arc<AtomicBool>,
+    /// [`Source::index`] of the source the monitor should ping (updated each
+    /// frame from the selection).
+    api_source: Arc<AtomicU8>,
 
-    /// Cached (used-today, read-at) for the daily-allowance stat — the count
-    /// lives in an encrypted file, so it's re-read at most once a second
-    /// instead of every frame.
-    quota_cache: Option<(u32, std::time::Instant)>,
+    /// In-flight account/key check (the "Check account" button): a one-shot
+    /// worker that makes a single authenticated call and reports back.
+    key_check_rx: Option<Receiver<(Source, bool, String)>>,
+    /// The last check's (source, ok, message) — shown while that source is
+    /// selected.
+    key_check_result: Option<(Source, bool, String)>,
+
+    /// Cached (source, used-today, read-at) for the daily-allowance meter —
+    /// the count lives in an encrypted file, so it's re-read at most once a
+    /// second instead of every frame (and re-read on source switch).
+    quota_cache: Option<(Source, u32, std::time::Instant)>,
 
     /// The Activity console is shown (toggled by the Activity button). Hidden
     /// by default; the choice persists in the saved config.
@@ -135,9 +369,14 @@ const API_OFFLINE: u8 = 2;
 impl Default for DownloaderState {
     fn default() -> Self {
         Self {
+            source: Source::Pexels,
             output_dir: String::new(),
             user_id: String::new(),
             api_key: String::new(),
+            pexels_key: String::new(),
+            danbooru_login: String::new(),
+            danbooru_key: String::new(),
+            wallhaven_key: String::new(),
             tags: "example_tag".to_string(),
             blacklist: String::new(),
             limit: 100,
@@ -155,6 +394,9 @@ impl Default for DownloaderState {
             api_status: Arc::new(AtomicU8::new(API_CHECKING)),
             monitor_started: false,
             api_view_visible: Arc::new(AtomicBool::new(false)),
+            api_source: Arc::new(AtomicU8::new(0)),
+            key_check_rx: None,
+            key_check_result: None,
             quota_cache: None,
             log_shown: false,
             footer_base: 78.0,
@@ -163,14 +405,44 @@ impl Default for DownloaderState {
 }
 
 impl DownloaderState {
-    /// Today's used download count for the allowance meter, re-read from disk
-    /// at most once a second.
-    fn quota_today(&mut self) -> u32 {
-        let stale = self.quota_cache.is_none_or(|(_, at)| at.elapsed().as_secs_f32() > 1.0);
-        if stale {
-            self.quota_cache = Some((quota_used_today(), std::time::Instant::now()));
+    /// Snapshot the persisted form values (all sources' credentials included).
+    fn saved(&self) -> SavedConfig {
+        SavedConfig {
+            user_id: self.user_id.trim().to_string(),
+            api_key: self.api_key.trim().to_string(),
+            tags: self.tags.clone(),
+            blacklist: self.blacklist.clone(),
+            output_dir: self.output_dir.clone(),
+            show_log: self.log_shown,
+            source: self.source.config_key().to_string(),
+            pexels_key: self.pexels_key.trim().to_string(),
+            danbooru_login: self.danbooru_login.trim().to_string(),
+            danbooru_key: self.danbooru_key.trim().to_string(),
+            wallhaven_key: self.wallhaven_key.trim().to_string(),
         }
-        self.quota_cache.map_or(0, |(n, _)| n)
+    }
+
+    /// The selected source's (user, key) credentials.
+    fn creds(&self) -> (String, String) {
+        match self.source {
+            Source::Pexels => (String::new(), self.pexels_key.trim().to_string()),
+            Source::Gelbooru => (self.user_id.trim().to_string(), self.api_key.trim().to_string()),
+            Source::Danbooru => (self.danbooru_login.trim().to_string(), self.danbooru_key.trim().to_string()),
+            Source::Wallhaven => (String::new(), self.wallhaven_key.trim().to_string()),
+        }
+    }
+
+    /// Today's used download count for the selected source's allowance meter,
+    /// re-read from disk at most once a second (or on source switch).
+    fn quota_today(&mut self) -> u32 {
+        let stale = self
+            .quota_cache
+            .is_none_or(|(src, _, at)| src != self.source || at.elapsed().as_secs_f32() > 1.0);
+        if stale {
+            self.quota_cache =
+                Some((self.source, quota_used_today(self.source), std::time::Instant::now()));
+        }
+        self.quota_cache.map_or(0, |(_, n, _)| n)
     }
 
     fn push_log(&mut self, line: impl Into<String>) {
@@ -197,6 +469,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
             state.blacklist = cfg.blacklist;
             state.output_dir = cfg.output_dir;
             state.log_shown = cfg.show_log;
+            state.source = Source::from_config_key(&cfg.source);
+            state.pexels_key = cfg.pexels_key;
+            state.danbooru_login = cfg.danbooru_login;
+            state.danbooru_key = cfg.danbooru_key;
+            state.wallhaven_key = cfg.wallhaven_key;
         }
         // Never let a persisted/old value drop below the safety floor.
         if state.delay < MIN_DELAY {
@@ -205,15 +482,18 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
     }
 
     // Mark the view visible this frame — the monitor pauses when this stops
-    // getting set (i.e. when another right-panel view is selected).
+    // getting set (i.e. when another right-panel view is selected) — and keep
+    // it pointed at the selected source's site.
     state.api_view_visible.store(true, Ordering::Relaxed);
-    // Spawn the API-status monitor once: it polls gelbooru.com every few seconds
-    // and updates `api_status`, which drives the pill in the Destination header.
+    state.api_source.store(state.source.index(), Ordering::Relaxed);
+    // Spawn the API-status monitor once: it polls the source's homepage every
+    // few seconds and updates `api_status`, which drives the hero's capsule.
     if !state.monitor_started {
         state.monitor_started = true;
         start_api_monitor(
             Arc::clone(&state.api_status),
             Arc::clone(&state.api_view_visible),
+            Arc::clone(&state.api_source),
             ui.ctx().clone(),
         );
     }
@@ -247,6 +527,20 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
             }
         }
         ui.ctx().request_repaint_after(Duration::from_millis(100));
+    }
+
+    // Drain a finished account/key check.
+    if let Some(rx) = &state.key_check_rx {
+        match rx.try_recv() {
+            Ok(res) => {
+                state.key_check_result = Some(res);
+                state.key_check_rx = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => state.key_check_rx = None,
+        }
     }
 
     // Round every widget in this view; text fields get the theme FIELD well
@@ -337,14 +631,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                 .frame(false);
                 if ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     state.log_shown = !state.log_shown;
-                    save_config(&SavedConfig {
-                        user_id: state.user_id.clone(),
-                        api_key: state.api_key.clone(),
-                        tags: state.tags.clone(),
-                        blacklist: state.blacklist.clone(),
-                        output_dir: state.output_dir.clone(),
-                        show_log: state.log_shown,
-                    });
+                    save_config(&state.saved());
                 }
             });
             // The console slides open/closed (`openness`, computed above so
@@ -442,22 +729,38 @@ fn form_sections(ui: &mut egui::Ui, state: &mut DownloaderState, enabled: bool) 
                         });
                     });
 
-                    // Gelbooru disabled anonymous API access (mid-2025 ToS change):
-                    // a User ID + API key are now required — explained via the info
-                    // icon's hover next to the section title.
+                    // Per-source credentials — which fields show, whether the
+                    // key is mandatory, and where to get one all come from the
+                    // selected source (info via the ⓘ next to the title).
+                    let source = state.source;
                     section_card(ui, egui::include_image!("../icons/encrypted.svg"), purple, "Account",
-                        Some("Gelbooru no longer allows anonymous downloads — you must log in with \
-                         your account's User ID and API key. Get them from gelbooru.com → \
-                         Account → Options → 'API Access Credentials' (free account required)."),
+                        Some(source.cred_info()),
                         |ui| {
-                        field_label(ui, "User ID");
-                        field_edit(ui, enabled, egui::TextEdit::singleline(&mut state.user_id)
-                            .hint_text("Required"));
-                        ui.add_space(8.0);
+                        if let Some(user_label) = source.user_field() {
+                            field_label(ui, user_label);
+                            let user = match source {
+                                Source::Danbooru => &mut state.danbooru_login,
+                                _ => &mut state.user_id,
+                            };
+                            field_edit(ui, enabled, egui::TextEdit::singleline(user)
+                                .hint_text(if source.key_required() { "Required" } else { "Optional" }));
+                            ui.add_space(8.0);
+                        }
                         field_label(ui, "API key");
-                        field_edit(ui, enabled, egui::TextEdit::singleline(&mut state.api_key)
+                        let key = match source {
+                            Source::Pexels => &mut state.pexels_key,
+                            Source::Gelbooru => &mut state.api_key,
+                            Source::Danbooru => &mut state.danbooru_key,
+                            Source::Wallhaven => &mut state.wallhaven_key,
+                        };
+                        let key_hint = if source.key_required() {
+                            format!("Paste your {} API key", source.name())
+                        } else {
+                            format!("Optional — {} works without one", source.name())
+                        };
+                        field_edit(ui, enabled, egui::TextEdit::singleline(key)
                             .password(true)
-                            .hint_text("Paste your Gelbooru API key"));
+                            .hint_text(key_hint));
                         ui.add_space(3.0);
                         ui.horizontal(|ui| {
                             ui.label(
@@ -466,24 +769,56 @@ fn form_sections(ui: &mut egui::Ui, state: &mut DownloaderState, enabled: bool) 
                                     .size(10.5),
                             );
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                crate::arrow_link(
-                                    ui,
-                                    "Get credentials",
-                                    "https://gelbooru.com/index.php?page=account&s=options",
-                                    Some(10.5),
-                                );
+                                crate::arrow_link(ui, "Get credentials", source.cred_url(), Some(10.5));
                             });
                         });
+
+                        // Account check: one authenticated call that verifies
+                        // the key — Danbooru's profile even reports ban status.
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let checking = state.key_check_rx.is_some();
+                            let (user, key) = state.creds();
+                            let can_check = !checking
+                                && !key.is_empty()
+                                && (source.user_field().is_none() || !user.is_empty());
+                            let btn = egui::Button::new(egui::RichText::new("Check account").size(11.0));
+                            if ui
+                                .add_enabled(can_check, btn)
+                                .on_hover_text(
+                                    "Makes one authenticated API call to verify the key. \
+                                     Danbooru also reports whether the account is banned; the \
+                                     other sources can only tell accepted vs rejected.",
+                                )
+                                .clicked()
+                            {
+                                start_key_check(state, ui.ctx());
+                            }
+                            if checking {
+                                ui.add(egui::Spinner::new().size(12.0).color(MUTED()));
+                            }
+                        });
+                        if let Some((src, ok, msg)) = &state.key_check_result
+                            && *src == source
+                        {
+                            let color = if *ok {
+                                egui::Color32::from_rgb(46, 160, 67)
+                            } else {
+                                egui::Color32::from_rgb(210, 70, 70)
+                            };
+                            ui.add_space(3.0);
+                            ui.label(egui::RichText::new(msg).color(color).size(10.5));
+                        }
                     });
 
                     section_card(ui, egui::include_image!("../icons/tag.svg"), orange, "Search", None, |ui| {
-                        field_label(ui, "Tags");
+                        field_label(ui, if source.is_booru() { "Tags" } else { "Search" });
                         field_edit(ui, enabled, egui::TextEdit::singleline(&mut state.tags)
-                            .hint_text("space-separated, e.g. blue_sky 1girl"));
+                            .hint_text(source.tags_hint()));
                         ui.add_space(8.0);
                         field_label(ui, "Blacklist");
                         field_edit(ui, enabled, egui::TextEdit::singleline(&mut state.blacklist)
-                            .hint_text("comma-separated tags to skip"));
+                            .hint_text(source.blacklist_hint()));
                     });
 
                     section_card(ui, egui::include_image!("../icons/settings.svg"), slate, "Options", None, |ui| {
@@ -514,16 +849,25 @@ fn form_sections(ui: &mut egui::Ui, state: &mut DownloaderState, enabled: bool) 
                                      delay risks being throttled or temporarily blocked.",
                                 );
                             });
-                            ui.add_space(8.0);
-                            field_label(ui, "File types");
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                ui.add_enabled_ui(enabled, |ui| {
-                                    type_chip(ui, &mut state.include_img, egui::include_image!("../icons/image.svg"), "Image");
-                                    type_chip(ui, &mut state.include_gif, egui::include_image!("../icons/gif.svg"), "Gif");
-                                    type_chip(ui, &mut state.include_vid, egui::include_image!("../icons/video.svg"), "Video");
+                            // Chips per capability: boorus mix all three,
+                            // Pexels has photos + a separate videos API, and
+                            // Wallhaven is wallpapers-only (nothing to pick).
+                            if source.has_type_chips() {
+                                ui.add_space(8.0);
+                                field_label(ui, "File types");
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    ui.add_enabled_ui(enabled, |ui| {
+                                        type_chip(ui, &mut state.include_img, egui::include_image!("../icons/image.svg"), "Image");
+                                        if source.offers_gif() {
+                                            type_chip(ui, &mut state.include_gif, egui::include_image!("../icons/gif.svg"), "Gif");
+                                        }
+                                        if source.offers_video() {
+                                            type_chip(ui, &mut state.include_vid, egui::include_image!("../icons/video.svg"), "Video");
+                                        }
+                                    });
                                 });
-                            });
+                            }
                         });
                         // Run-status readout — the download glyph (spinner while
                         // running, green check when done), the status word, and
@@ -555,10 +899,11 @@ fn info_icon(ui: &mut egui::Ui, tooltip: &str) -> egui::Response {
 }
 
 /// The hero header card: the source selector (title + chevron, like the
-/// generator's model picker), a live Online/Offline capsule, and the
+/// generator's model picker), a live Online/Offline capsule, and the source's
 /// daily-allowance meter.
 fn hero_card(ui: &mut egui::Ui, state: &mut DownloaderState) {
     let api = state.api_status.load(Ordering::Relaxed);
+    let source = state.source;
     let used = state.quota_today();
     egui::Frame::new()
         .fill(PANEL())
@@ -571,8 +916,8 @@ fn hero_card(ui: &mut egui::Ui, state: &mut DownloaderState) {
                 ui.spacing_mut().item_spacing.x = 9.0;
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
-                    source_selector(ui);
-                    ui.label(egui::RichText::new("Tag Downloader").color(MUTED()).size(11.0));
+                    source_selector(ui, state);
+                    ui.label(egui::RichText::new(state.source.subtitle()).color(MUTED()).size(11.0));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     status_capsule(ui, api);
@@ -580,19 +925,22 @@ fn hero_card(ui: &mut egui::Ui, state: &mut DownloaderState) {
             });
 
             ui.add_space(11.0);
-            allowance_meter(ui, used);
+            allowance_meter(ui, used, source);
         });
 }
 
-/// The hero's "N / 2000 today" meter: a hairline bar that shifts green →
-/// amber → red as the day's allowance is spent.
-fn allowance_meter(ui: &mut egui::Ui, used: u32) {
-    let frac = (used as f32 / DAILY_CAP as f32).clamp(0.0, 1.0);
+/// The hero's "N / cap today" meter: a hairline bar that shifts green →
+/// amber → red as the day's allowance is spent. The cap is per source;
+/// hovering the label explains where each number comes from.
+fn allowance_meter(ui: &mut egui::Ui, used: u32, source: Source) {
+    let cap = source.daily_cap();
+    let frac = (used as f32 / cap as f32).clamp(0.0, 1.0);
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Daily allowance").color(MUTED()).size(10.5));
+        ui.label(egui::RichText::new("Daily allowance").color(MUTED()).size(10.5))
+            .on_hover_text(source.cap_note());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
-                egui::RichText::new(format!("{used} / {DAILY_CAP}")).color(MUTED()).size(10.5).strong(),
+                egui::RichText::new(format!("{used} / {cap}")).color(MUTED()).size(10.5).strong(),
             );
         });
     });
@@ -615,13 +963,13 @@ fn allowance_meter(ui: &mut egui::Ui, used: u32) {
 }
 
 /// The hero's source title with an up/down chevron, mirroring the generator's
-/// model selector. Clicking opens the source list — Gelbooru is the only entry
-/// today, so this is the seam where more boorus slot in later.
-fn source_selector(ui: &mut egui::Ui) {
+/// model selector. Clicking opens the source list; picking one switches the
+/// whole form (credentials, hints, sections) to that source.
+fn source_selector(ui: &mut egui::Ui, state: &mut DownloaderState) {
     let menu_id = ui.id().with("dl_source_menu");
     let open = egui::Popup::is_id_open(ui.ctx(), menu_id);
 
-    let galley = egui::WidgetText::from(egui::RichText::new("Gelbooru").color(TEXT()).strong().size(16.0))
+    let galley = egui::WidgetText::from(egui::RichText::new(state.source.name()).color(TEXT()).strong().size(16.0))
         .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
     let (arrow, gap) = (14.0, 3.0);
     let (rect, resp) = ui.allocate_exact_size(
@@ -650,8 +998,16 @@ fn source_selector(ui: &mut egui::Ui) {
         let radius = egui::CornerRadius::same(6);
         ui.visuals_mut().widgets.inactive.corner_radius = radius;
         ui.visuals_mut().widgets.hovered.corner_radius = radius;
-        if ui.selectable_label(true, "Gelbooru").clicked() {
-            ui.close();
+        for s in Source::ALL {
+            if ui.selectable_label(state.source == s, s.name()).clicked() {
+                if state.source != s {
+                    state.source = s;
+                    // The capsule re-checks the new site; remember the choice.
+                    state.api_status.store(API_CHECKING, Ordering::Relaxed);
+                    save_config(&state.saved());
+                }
+                ui.close();
+            }
         }
     });
 }
@@ -839,10 +1195,16 @@ fn type_chip(ui: &mut egui::Ui, on: &mut bool, icon: egui::ImageSource<'_>, labe
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// Spawn a daemon-style thread that probes gelbooru.com every 5s while the view
-/// is visible and stores the result in `status`, repainting the UI when it
-/// changes. Polling pauses whenever `visible` stops being set (view not shown).
-fn start_api_monitor(status: Arc<AtomicU8>, visible: Arc<AtomicBool>, ctx: egui::Context) {
+/// Spawn a daemon-style thread that probes the selected source's homepage
+/// every 5s while the view is visible and stores the result in `status`,
+/// repainting the UI when it changes. Polling pauses whenever `visible` stops
+/// being set (view not shown); `source` (a [`Source::index`]) picks the site.
+fn start_api_monitor(
+    status: Arc<AtomicU8>,
+    visible: Arc<AtomicBool>,
+    source: Arc<AtomicU8>,
+    ctx: egui::Context,
+) {
     std::thread::spawn(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .tls_config(
@@ -867,7 +1229,7 @@ fn start_api_monitor(status: Arc<AtomicU8>, visible: Arc<AtomicBool>, ctx: egui:
                 continue;
             }
             let online = agent
-                .get(SITE_HOME)
+                .get(Source::from_index(source.load(Ordering::Relaxed)).home())
                 .header("User-Agent", USER_AGENT)
                 .call()
                 .map(|r| {
@@ -917,46 +1279,60 @@ fn start_download(state: &mut DownloaderState, ctx: &egui::Context) {
         state.delay = MIN_DELAY;
     }
 
-    let uid = state.user_id.trim().to_string();
-    let key = state.api_key.trim().to_string();
-    if uid.is_empty() || key.is_empty() {
-        state.push_log("Error: User ID and API Key are required.");
-        state.status = "Idle".to_string();
-        return;
+    let source = state.source;
+    let (user, key) = state.creds();
+
+    // Per-source credential rules.
+    match source {
+        Source::Gelbooru => {
+            if user.is_empty() || key.is_empty() {
+                state.push_log("Error: User ID and API Key are required.");
+                state.status = "Idle".to_string();
+                return;
+            }
+        }
+        Source::Pexels => {
+            if key.is_empty() {
+                state.push_log("Error: a Pexels API key is required (free — see Account).");
+                state.status = "Idle".to_string();
+                return;
+            }
+        }
+        Source::Danbooru => {
+            // Anonymous is fine; a half-entered pair silently downgrades to
+            // anonymous, so catch it.
+            if user.is_empty() != key.is_empty() {
+                state.push_log("Error: Danbooru needs BOTH Login and API key (or neither).");
+                state.status = "Idle".to_string();
+                return;
+            }
+        }
+        Source::Wallhaven => {} // key optional
     }
-    if !state.include_img && !state.include_gif && !state.include_vid {
-        state.push_log("No file types selected. Nothing to download.");
-        state.status = "Idle".to_string();
-        return;
+    // At least one of the types the source actually offers must be on.
+    if source.has_type_chips() {
+        let any_type = state.include_img
+            || (source.offers_gif() && state.include_gif)
+            || (source.offers_video() && state.include_vid);
+        if !any_type {
+            state.push_log("No file types selected. Nothing to download.");
+            state.status = "Idle".to_string();
+            return;
+        }
     }
     if state.output_dir.trim().is_empty() {
         state.push_log("Error: Output folder is blank.");
         state.status = "Idle".to_string();
         return;
     }
+    if source != Source::Gelbooru && state.tags.trim().is_empty() {
+        state.push_log("Error: enter a search first.");
+        state.status = "Idle".to_string();
+        return;
+    }
 
     // Persist the inputs for next time.
-    save_config(&SavedConfig {
-        user_id: uid.clone(),
-        api_key: key.clone(),
-        tags: state.tags.clone(),
-        blacklist: state.blacklist.clone(),
-        output_dir: state.output_dir.clone(),
-        show_log: state.log_shown,
-    });
-
-    let cfg = WorkerCfg {
-        user_id: uid,
-        api_key: key,
-        tags: state.tags.clone(),
-        blacklist: state.blacklist.clone(),
-        limit: state.limit,
-        delay: state.delay,
-        include_img: state.include_img,
-        include_gif: state.include_gif,
-        include_vid: state.include_vid,
-        output_dir: PathBuf::from(state.output_dir.trim()),
-    };
+    save_config(&state.saved());
 
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -964,11 +1340,42 @@ fn start_download(state: &mut DownloaderState, ctx: &egui::Context) {
     state.rx = Some(rx);
     state.running = true;
     state.status = "Connecting…".to_string();
-
     let ctx = ctx.clone();
-    std::thread::spawn(move || {
-        run_download(cfg, tx, cancel, ctx);
-    });
+
+    if source == Source::Gelbooru {
+        let cfg = WorkerCfg {
+            user_id: user,
+            api_key: key,
+            tags: state.tags.clone(),
+            blacklist: state.blacklist.clone(),
+            limit: state.limit,
+            delay: state.delay,
+            include_img: state.include_img,
+            include_gif: state.include_gif,
+            include_vid: state.include_vid,
+            output_dir: PathBuf::from(state.output_dir.trim()),
+        };
+        std::thread::spawn(move || {
+            run_download(cfg, tx, cancel, ctx);
+        });
+    } else {
+        let cfg = SrcCfg {
+            source,
+            user,
+            key,
+            query: state.tags.clone(),
+            blacklist: state.blacklist.clone(),
+            limit: state.limit,
+            delay: state.delay,
+            include_img: state.include_img,
+            include_gif: state.include_gif,
+            include_vid: state.include_vid,
+            output_dir: PathBuf::from(state.output_dir.trim()),
+        };
+        std::thread::spawn(move || {
+            run_download_src(cfg, tx, cancel, ctx);
+        });
+    }
 }
 
 /// Immutable settings handed to the worker thread.
@@ -1015,34 +1422,7 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
         return;
     }
 
-    // native-tls => Windows SChannel. ureq 3.x defaults to rustls even with the
-    // native-tls feature on, so the provider must be selected explicitly (rustls
-    // isn't compiled in — see Cargo.toml / ai_models.rs). Without this the agent
-    // fails on every HTTPS call, which on this worker thread looked like a silent
-    // no-op. `http_status_as_error(false)` lets us inspect 4xx/5xx ourselves.
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .provider(ureq::tls::TlsProvider::NativeTls)
-                // Use the OS cert store (with AIA intermediate fetching) rather
-                // than ureq's bundled webpki roots — see civitai.rs.
-                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                .build(),
-        )
-        .max_redirects(10)
-        .http_status_as_error(false)
-        // Bound the request-setup phases (DNS, connect, sending the request, and
-        // waiting for response headers). Those are blocking calls that can't see the
-        // cancel flag, so without a cap a Cancel pressed while one is in flight would
-        // hang until the server replied. We intentionally leave `timeout_global` and
-        // `timeout_recv_body` unset so a large file/video body isn't capped — the
-        // body stream is read in 64 KB chunks that poll the cancel flag themselves.
-        .timeout_resolve(Some(Duration::from_secs(10)))
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_send_request(Some(Duration::from_secs(15)))
-        .timeout_recv_response(Some(Duration::from_secs(20)))
-        .build()
-        .into();
+    let agent = make_agent();
 
     // Session cache of tag name -> Gelbooru type, so common tags are only looked
     // up once across the whole run (most tags repeat across posts).
@@ -1052,7 +1432,7 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
     let mut roles_map = load_tag_roles_map();
 
     // Enforce the daily cap: today's remaining allowance bounds this run.
-    let mut used_today = quota_used_today();
+    let mut used_today = quota_used_today(Source::Gelbooru);
     let remaining_today = DAILY_CAP.saturating_sub(used_today);
     if remaining_today == 0 {
         log(format!(
@@ -1124,7 +1504,7 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
             }
 
             log(format!("Downloading: {file_name}"));
-            match download_file(&agent, &post.file_url, &img_path, &cancel) {
+            match download_file(&agent, &post.file_url, &img_path, SITE_HOME, &cancel) {
                 Ok(true) => {}
                 Ok(false) => {
                     if cancel.load(Ordering::SeqCst) {
@@ -1178,7 +1558,7 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
             // Count it against today's quota and persist immediately, so a crash
             // mid-run can't reset the running total.
             used_today += 1;
-            quota_save(used_today);
+            quota_save(Source::Gelbooru, used_today);
             let _ = tx.send(DlMsg::Progress(total_downloaded, cap));
             ctx.request_repaint();
 
@@ -1205,6 +1585,434 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
     }
     let _ = tx.send(DlMsg::Done);
     ctx.request_repaint();
+}
+
+/// The download workers' HTTP agent.
+///
+/// native-tls => Windows SChannel. ureq 3.x defaults to rustls even with the
+/// native-tls feature on, so the provider must be selected explicitly (rustls
+/// isn't compiled in — see Cargo.toml / ai_models.rs). Without this the agent
+/// fails on every HTTPS call, which on a worker thread looked like a silent
+/// no-op. `http_status_as_error(false)` lets us inspect 4xx/5xx ourselves.
+/// Only the request-setup phases are bounded (DNS, connect, send, response
+/// headers) — those are blocking calls that can't see the cancel flag; the
+/// body is intentionally uncapped since it streams in 64 KB chunks that poll
+/// the cancel flag themselves.
+fn make_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                // Use the OS cert store (with AIA intermediate fetching) rather
+                // than ureq's bundled webpki roots — see civitai.rs.
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .max_redirects(10)
+        .http_status_as_error(false)
+        .timeout_resolve(Some(Duration::from_secs(10)))
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_send_request(Some(Duration::from_secs(15)))
+        .timeout_recv_response(Some(Duration::from_secs(20)))
+        .build()
+        .into()
+}
+
+/// Immutable settings handed to the generic (non-Gelbooru) worker thread.
+struct SrcCfg {
+    source: Source,
+    user: String,
+    key: String,
+    query: String,
+    blacklist: String,
+    limit: u32,
+    delay: f32,
+    include_img: bool,
+    include_gif: bool,
+    include_vid: bool,
+    output_dir: PathBuf,
+}
+
+/// Kick off the one-shot account/key check for the selected source.
+fn start_key_check(state: &mut DownloaderState, ctx: &egui::Context) {
+    if state.key_check_rx.is_some() {
+        return;
+    }
+    let source = state.source;
+    let (user, key) = state.creds();
+    let (tx, rx) = mpsc::channel();
+    state.key_check_rx = Some(rx);
+    state.key_check_result = None;
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let res = run_key_check(source, &user, &key);
+        let _ = tx.send(res);
+        ctx.request_repaint();
+    });
+}
+
+/// One authenticated API call that verifies the stored credentials. Danbooru's
+/// profile endpoint even reports the account's ban flag; the other sources
+/// can only distinguish accepted vs rejected (invalid / revoked / blocked) vs
+/// rate-limited.
+fn run_key_check(source: Source, user: &str, key: &str) -> (Source, bool, String) {
+    let agent = make_agent();
+    let (url, headers) = match source {
+        Source::Pexels => (crate::pexels::check_url(), crate::pexels::headers(key)),
+        Source::Danbooru => (crate::danbooru::profile_url(user, key), Vec::new()),
+        Source::Wallhaven => (crate::wallhaven::settings_url(key), Vec::new()),
+        // No profile endpoint on the dapi — a 1-post authed query stands in.
+        Source::Gelbooru => (build_api_url("id:>0", 1, 0, user, key), Vec::new()),
+    };
+
+    let mut req = agent
+        .get(&url)
+        .header("User-Agent", USER_AGENT)
+        .header("Accept", "application/json,text/plain,*/*");
+    for (k, v) in headers {
+        req = req.header(k, &v);
+    }
+    let mut resp = match req.call() {
+        Ok(r) => r,
+        Err(e) => return (source, false, format!("Network error: {e}")),
+    };
+
+    let status = resp.status().as_u16();
+    // Pexels reports the remaining API-request quota in a response header.
+    let quota_left = resp
+        .headers()
+        .get("X-Ratelimit-Remaining")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+
+    match status {
+        200 => match source {
+            Source::Danbooru => match crate::danbooru::parse_profile(&body) {
+                Ok((name, _, true)) => {
+                    (source, false, format!("Signed in as {name} — this account is BANNED on Danbooru."))
+                }
+                Ok((name, level, false)) => {
+                    (source, true, format!("Signed in as {name} ({level}) — account in good standing."))
+                }
+                Err(e) => (source, false, format!("Unexpected profile response: {e}")),
+            },
+            Source::Pexels => {
+                let extra = quota_left
+                    .map(|n| format!(" — {n} API requests left this period"))
+                    .unwrap_or_default();
+                (source, true, format!("Key accepted{extra}."))
+            }
+            Source::Wallhaven => {
+                if body.contains("\"data\"") {
+                    (source, true, "Key accepted — your account's settings apply to searches.".to_string())
+                } else {
+                    (source, false, "Unexpected response — the key may be rejected.".to_string())
+                }
+            }
+            Source::Gelbooru => {
+                if serde_json::from_str::<serde_json::Value>(&body).is_ok() {
+                    (source, true, "Credentials accepted.".to_string())
+                } else {
+                    (source, false, "Unexpected response — credentials may be rejected.".to_string())
+                }
+            }
+        },
+        401 | 403 => (
+            source,
+            false,
+            format!("Rejected (HTTP {status}) — key invalid, revoked, or the account is blocked."),
+        ),
+        429 => (source, false, "Rate limited — try again in a minute.".to_string()),
+        s => (source, false, format!("Unexpected response (HTTP {s}).")),
+    }
+}
+
+/// One paged result stream. Most sources have a single feed; Pexels splits
+/// photos and videos across two endpoints, walked one after the other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Feed {
+    Primary,
+    PexelsVideos,
+}
+
+/// Which feeds this run walks, in order, honouring the type selection.
+fn source_feeds(cfg: &SrcCfg) -> Vec<Feed> {
+    match cfg.source {
+        Source::Pexels => {
+            let mut feeds = Vec::new();
+            if cfg.include_img {
+                feeds.push(Feed::Primary);
+            }
+            if cfg.include_vid {
+                feeds.push(Feed::PexelsVideos);
+            }
+            feeds
+        }
+        _ => vec![Feed::Primary],
+    }
+}
+
+/// The selected feed's search URL for one (1-based) page.
+fn source_page_url(cfg: &SrcCfg, feed: Feed, page: u32) -> String {
+    match (cfg.source, feed) {
+        (Source::Pexels, Feed::PexelsVideos) => crate::pexels::video_page_url(&cfg.query, page),
+        (Source::Pexels, Feed::Primary) => crate::pexels::page_url(&cfg.query, page),
+        (Source::Danbooru, _) => crate::danbooru::page_url(&cfg.query, page, &cfg.user, &cfg.key),
+        (Source::Wallhaven, _) => crate::wallhaven::page_url(&cfg.query, page, &cfg.key, &cfg.blacklist),
+        (Source::Gelbooru, _) => unreachable!("gelbooru uses its own worker"),
+    }
+}
+
+/// Extra request headers the source needs (Pexels carries its key here).
+fn source_headers(cfg: &SrcCfg) -> Vec<(&'static str, String)> {
+    match cfg.source {
+        Source::Pexels => crate::pexels::headers(&cfg.key),
+        _ => Vec::new(),
+    }
+}
+
+fn source_parse(source: Source, feed: Feed, body: &str) -> Result<Vec<Item>, String> {
+    match (source, feed) {
+        (Source::Pexels, Feed::PexelsVideos) => crate::pexels::parse_videos(body),
+        (Source::Pexels, Feed::Primary) => crate::pexels::parse(body),
+        (Source::Danbooru, _) => crate::danbooru::parse(body),
+        (Source::Wallhaven, _) => crate::wallhaven::parse(body),
+        (Source::Gelbooru, _) => unreachable!("gelbooru uses its own worker"),
+    }
+}
+
+/// The generic multi-source worker: page through search results, de-duplicate
+/// against the shared download log, stream files, and write tag/caption
+/// sidecars where the source provides them. (Gelbooru keeps [`run_download`],
+/// which adds the daily quota and artist/character tag-role resolution.)
+fn run_download_src(cfg: SrcCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx: egui::Context) {
+    let log = |s: String| {
+        let _ = tx.send(DlMsg::Log(s));
+        ctx.request_repaint();
+    };
+
+    let mut downloaded_log = load_download_log();
+    log(format!("Loaded {} previously downloaded file records.", downloaded_log.len()));
+    log(format!("Searching {} for: {}", cfg.source.name(), cfg.query.trim()));
+
+    if let Err(e) = std::fs::create_dir_all(&cfg.output_dir) {
+        log(format!("Error: cannot create output folder: {e}"));
+        let _ = tx.send(DlMsg::Done);
+        return;
+    }
+
+    let agent = make_agent();
+
+    // Enforce the source's daily allowance: today's remainder bounds this run.
+    let daily_cap = cfg.source.daily_cap();
+    let mut used_today = quota_used_today(cfg.source);
+    let remaining_today = daily_cap.saturating_sub(used_today);
+    if remaining_today == 0 {
+        log(format!("Daily limit reached ({daily_cap}/day). Try again tomorrow."));
+        let _ = tx.send(DlMsg::Done);
+        return;
+    }
+    let cap = cfg.limit.min(remaining_today);
+    if cap < cfg.limit {
+        log(format!(
+            "Note: only {remaining_today} of today's {daily_cap} daily allowance remain — \
+             this run is capped at {cap}."
+        ));
+    }
+
+    let _ = tx.send(DlMsg::Progress(0, cap));
+    ctx.request_repaint();
+
+    let mut total_downloaded: u32 = 0;
+
+    // Walk each feed (photos, then videos for Pexels) until the cap is hit.
+    'outer: for feed in source_feeds(&cfg) {
+        let mut page: u32 = 1; // these APIs are all 1-based
+        'feed: while total_downloaded < cap && !cancel.load(Ordering::SeqCst) {
+        let items = match fetch_items(&agent, &cfg, feed, page, &cancel, &log) {
+            Some(i) => i,
+            None => break 'outer,
+        };
+        if items.is_empty() {
+            log("No more results.".into());
+            break 'feed;
+        }
+
+        for item in items {
+            if cancel.load(Ordering::SeqCst) || total_downloaded >= cap {
+                break 'outer;
+            }
+            if item.url.is_empty() {
+                continue;
+            }
+            // Tag strings (boorus) and captions (Pexels alt) both honour the
+            // blacklist; Wallhaven excludes at the query level instead.
+            if let Some(tags) = &item.tags
+                && is_blacklisted(tags, &cfg.blacklist)
+            {
+                log(format!("Skipped (blacklisted): {}", item.stem));
+                continue;
+            }
+            if downloaded_log.contains(&item.key) {
+                log(format!("Skipped (already downloaded): {}", item.stem));
+                continue;
+            }
+            // Boorus mix media; the image-only sources always pass this.
+            if cfg.source.is_booru()
+                && !is_allowed_by_selection(&item.ext, cfg.include_img, cfg.include_gif, cfg.include_vid)
+            {
+                log(format!("Skipped (type not selected): {}.{}", item.stem, item.ext));
+                continue;
+            }
+
+            let file_name = format!("{}.{}", item.stem, item.ext);
+            let dest = cfg.output_dir.join(&file_name);
+            if dest.exists() {
+                log(format!("Skipped (file exists): {file_name}"));
+                append_download_log(&item.key, &mut downloaded_log);
+                continue;
+            }
+
+            log(format!("Downloading: {file_name}"));
+            match download_file(&agent, &item.url, &dest, cfg.source.home(), &cancel) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if cancel.load(Ordering::SeqCst) {
+                        break 'outer;
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    log(format!("Error downloading {}: {e}", item.stem));
+                    let _ = std::fs::remove_file(&dest);
+                    continue;
+                }
+            }
+
+            // Sidecar: booru tag strings get the comma format; captions
+            // (e.g. Pexels alt text) are written as-is.
+            if let Some(tags) = &item.tags {
+                let text = if cfg.source.is_booru() { format_gelbooru_tags(tags) } else { tags.clone() };
+                if !text.is_empty() {
+                    let txt_path = cfg.output_dir.join(format!("{}.txt", item.stem));
+                    if let Err(e) = std::fs::write(&txt_path, text) {
+                        log(format!("Warning: could not write tags for {}: {e}", item.stem));
+                    }
+                }
+            }
+
+            append_download_log(&item.key, &mut downloaded_log);
+            total_downloaded += 1;
+            // Count it against today's allowance and persist immediately, so a
+            // crash mid-run can't reset the running total.
+            used_today += 1;
+            quota_save(cfg.source, used_today);
+            let _ = tx.send(DlMsg::Progress(total_downloaded, cap));
+            ctx.request_repaint();
+
+            if cfg.delay > 0.0 {
+                // Sleep in small slices so Cancel feels responsive.
+                let mut slept = 0.0;
+                while slept < cfg.delay && !cancel.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(100));
+                    slept += 0.1;
+                }
+            }
+        }
+
+        page += 1;
+        std::thread::sleep(Duration::from_millis(500)); // polite pacing
+        }
+    }
+
+    if cancel.load(Ordering::SeqCst) {
+        log("Cancelled.".into());
+    } else {
+        log(format!("Download finished: {total_downloaded} new files this session."));
+        let left = daily_cap.saturating_sub(used_today);
+        log(format!("Daily allowance remaining: {left} of {daily_cap}."));
+    }
+    let _ = tx.send(DlMsg::Done);
+    ctx.request_repaint();
+}
+
+/// Fetch one search page for the generic worker, with the same retry/backoff
+/// policy as the Gelbooru path. `None` means a fatal error (caller stops).
+fn fetch_items(
+    agent: &ureq::Agent,
+    cfg: &SrcCfg,
+    feed: Feed,
+    page: u32,
+    cancel: &AtomicBool,
+    log: &impl Fn(String),
+) -> Option<Vec<Item>> {
+    let mut transient = 0u32;
+    while !cancel.load(Ordering::SeqCst) {
+        let url = source_page_url(cfg, feed, page);
+        let mut req = agent
+            .get(&url)
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "application/json,text/plain,*/*");
+        for (k, v) in source_headers(cfg) {
+            req = req.header(k, &v);
+        }
+
+        let mut resp = match req.call() {
+            Ok(r) => r,
+            Err(e) => {
+                transient += 1;
+                if transient > MAX_TRANSIENT_RETRIES {
+                    log(format!("Error: network failure (max retries): {e}"));
+                    return None;
+                }
+                let wait = backoff_ms(transient);
+                log(format!("Network issue, retrying in {:.1}s…", wait as f64 / 1000.0));
+                sleep_cancellable(wait, cancel);
+                continue;
+            }
+        };
+
+        let status = resp.status().as_u16();
+        if status == 200 {
+            let body = match resp.body_mut().read_to_string() {
+                Ok(b) => b,
+                Err(e) => {
+                    log(format!("Error reading API response: {e}"));
+                    return None;
+                }
+            };
+            return match source_parse(cfg.source, feed, &body) {
+                Ok(items) => Some(items),
+                Err(e) => {
+                    log(format!("Error: {} API: {e}", cfg.source.name()));
+                    None
+                }
+            };
+        }
+        if status == 401 || status == 403 {
+            log(format!(
+                "Error: {} rejected the request (HTTP {status}) — check the API key.",
+                cfg.source.name()
+            ));
+            return None;
+        }
+        if status == 429 || status == 408 || (500..=599).contains(&status) {
+            transient += 1;
+            if transient > MAX_TRANSIENT_RETRIES {
+                log(format!("Error: API returned {status} repeatedly (max retries)."));
+                return None;
+            }
+            let wait = backoff_ms(transient);
+            log(format!("API busy (HTTP {status}), retrying in {:.1}s…", wait as f64 / 1000.0));
+            sleep_cancellable(wait, cancel);
+            continue;
+        }
+
+        log(format!("Error: API returned status {status}."));
+        return None;
+    }
+    None
 }
 
 /// Fetch one API page, with retry/backoff on transient failures. `None` means a
@@ -1273,10 +2081,13 @@ fn fetch_page(
 
 /// Stream a file to `dest`, honouring cancellation. Returns `Ok(true)` on
 /// success, `Ok(false)` on a non-success status (partial file removed).
+/// `referer` is the source's homepage — many CDNs 403 a hotlink without a
+/// matching Referer / Origin.
 fn download_file(
     agent: &ureq::Agent,
     file_url: &str,
     dest: &Path,
+    referer: &str,
     cancel: &AtomicBool,
 ) -> Result<bool, String> {
     let url = normalize_file_url(file_url);
@@ -1284,9 +2095,8 @@ fn download_file(
         .get(&url)
         .header("User-Agent", USER_AGENT)
         .header("Accept", "*/*")
-        // Many CDNs 403 a hotlink without a matching Referer / Origin.
-        .header("Referer", SITE_HOME)
-        .header("Origin", "https://gelbooru.com")
+        .header("Referer", referer)
+        .header("Origin", referer.trim_end_matches('/'))
         .call()
         .map_err(|e| e.to_string())?;
 
@@ -1508,7 +2318,7 @@ fn normalize_file_url(raw: &str) -> String {
 }
 
 /// Percent-encode a query value (RFC 3986 unreserved set kept literal).
-fn percent_encode(s: &str) -> String {
+pub(crate) fn percent_encode(s: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
@@ -1593,16 +2403,19 @@ fn download_log_path() -> PathBuf {
 fn load_config() -> Option<SavedConfig> {
     let json = std::fs::read_to_string(config_path()).ok()?;
     let mut cfg: SavedConfig = serde_json::from_str(&json).ok()?;
-    // The API key is stored encrypted (DPAPI on Windows); decrypt it back for use.
+    // The API keys are stored encrypted (DPAPI on Windows); decrypt them back.
     cfg.api_key = crate::secret::unprotect(&cfg.api_key);
+    cfg.pexels_key = crate::secret::unprotect(&cfg.pexels_key);
+    cfg.danbooru_key = crate::secret::unprotect(&cfg.danbooru_key);
+    cfg.wallhaven_key = crate::secret::unprotect(&cfg.wallhaven_key);
     Some(cfg)
 }
 
 fn save_config(cfg: &SavedConfig) {
     let dir = config_dir();
     let _ = std::fs::create_dir_all(&dir);
-    // Never write the API key as plaintext: encrypt it (DPAPI on Windows, tied to
-    // the current user account) so it can't be read straight out of the JSON.
+    // Never write API keys as plaintext: encrypt them (DPAPI on Windows, tied to
+    // the current user account) so they can't be read straight out of the JSON.
     let on_disk = SavedConfig {
         user_id: cfg.user_id.clone(),
         api_key: crate::secret::protect(&cfg.api_key),
@@ -1610,6 +2423,11 @@ fn save_config(cfg: &SavedConfig) {
         blacklist: cfg.blacklist.clone(),
         output_dir: cfg.output_dir.clone(),
         show_log: cfg.show_log,
+        source: cfg.source.clone(),
+        pexels_key: crate::secret::protect(&cfg.pexels_key),
+        danbooru_login: cfg.danbooru_login.clone(),
+        danbooru_key: crate::secret::protect(&cfg.danbooru_key),
+        wallhaven_key: crate::secret::protect(&cfg.wallhaven_key),
     };
     if let Ok(json) = serde_json::to_string_pretty(&on_disk) {
         let _ = std::fs::write(config_path(), json);
@@ -1643,8 +2461,14 @@ struct QuotaData {
     count: u32,
 }
 
-fn quota_path() -> PathBuf {
-    config_dir().join("gelbooru_quota.dat")
+/// Per-source daily-allowance file. Gelbooru keeps its historical name so
+/// pre-multi-source counts carry over.
+fn quota_path(source: Source) -> PathBuf {
+    let name = match source {
+        Source::Gelbooru => "gelbooru_quota.dat".to_string(),
+        s => format!("{}_quota.dat", s.config_key()),
+    };
+    config_dir().join(name)
 }
 
 /// Local calendar day as `YYYY-MM-DD`.
@@ -1652,10 +2476,10 @@ fn today_str() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
-/// How many files have already been downloaded *today*. Returns 0 if the file is
-/// missing, can't be decrypted, or holds a different (older) date.
-fn quota_used_today() -> u32 {
-    let Ok(stored) = std::fs::read_to_string(quota_path()) else {
+/// How many files have already been downloaded from `source` *today*. Returns
+/// 0 if the file is missing, can't be decrypted, or holds an older date.
+fn quota_used_today(source: Source) -> u32 {
+    let Ok(stored) = std::fs::read_to_string(quota_path(source)) else {
         return 0;
     };
     let json = crate::secret::unprotect(stored.trim());
@@ -1669,14 +2493,14 @@ fn quota_used_today() -> u32 {
     }
 }
 
-/// Persist today's running count, encrypted.
-fn quota_save(count: u32) {
+/// Persist today's running count for `source`, encrypted.
+fn quota_save(source: Source, count: u32) {
     let dir = config_dir();
     let _ = std::fs::create_dir_all(&dir);
     let q = QuotaData { date: today_str(), count };
     if let Ok(json) = serde_json::to_string(&q) {
         let enc = crate::secret::protect(&json);
-        let _ = std::fs::write(quota_path(), enc);
+        let _ = std::fs::write(quota_path(source), enc);
     }
 }
 

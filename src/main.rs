@@ -101,7 +101,10 @@ mod emoji;
 mod favorites;
 mod ftp;
 mod image_cache;
+mod danbooru;
 mod download;
+mod pexels;
+mod wallhaven;
 mod gallery;
 mod gallery_detail;
 // Flux text-to-image generation (ComfyUI backend) — NVIDIA-only, like Pixal3D.
