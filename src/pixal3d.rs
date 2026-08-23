@@ -23,7 +23,7 @@ use std::time::SystemTime;
 use eframe::egui;
 use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText};
 
-use crate::theme::{ACCENT1, EDGE, FIELD, MUTED, PANEL, TEXT};
+use crate::theme::{ACCENT1, EDGE, MUTED, PANEL, TEXT};
 
 const GREEN: Color32 = Color32::from_rgb(46, 160, 67);
 const RED: Color32 = Color32::from_rgb(220, 70, 70);
@@ -380,7 +380,7 @@ fn show_body(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<
         });
     });
     if state.show_log {
-        let log_bg = if crate::theme::is_light() { FIELD() } else { Color32::from_rgb(15, 15, 17) };
+        let log_bg = crate::theme::console_bg();
         egui::Frame::new()
             .fill(log_bg)
             .corner_radius(CornerRadius::same(22))

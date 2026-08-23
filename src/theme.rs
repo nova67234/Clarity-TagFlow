@@ -444,6 +444,13 @@ pub fn FIELD2() -> Color32 {
     palette().field2
 }
 
+/// Background for console/log wells (downloader Activity, generator log,
+/// Pixal3D log, Deep Scan): white in light themes so the well separates
+/// cleanly from the panel, near-black in dark ones.
+pub fn console_bg() -> Color32 {
+    if is_light() { Color32::WHITE } else { Color32::from_rgb(15, 15, 17) }
+}
+
 #[allow(non_snake_case)]
 pub fn TEXT() -> Color32 {
     palette().text

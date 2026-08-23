@@ -397,7 +397,7 @@ fn console_box(ui: &mut egui::Ui, title: &str, lines: &[String], height: f32, sa
         });
     });
     ui.add_space(2.0);
-    let bg = if crate::theme::is_light() { FIELD() } else { egui::Color32::from_rgb(15, 15, 17) };
+    let bg = crate::theme::console_bg();
     egui::Frame::new()
         .fill(bg)
         .corner_radius(egui::CornerRadius::same(12))
@@ -447,7 +447,7 @@ fn corrupt_review(
         );
     });
     ui.add_space(2.0);
-    let bg = if crate::theme::is_light() { FIELD() } else { egui::Color32::from_rgb(15, 15, 17) };
+    let bg = crate::theme::console_bg();
     egui::Frame::new()
         .fill(bg)
         .corner_radius(egui::CornerRadius::same(12))
@@ -957,9 +957,10 @@ impl Sha256 {
         }
         self.update_no_len(&bits.to_be_bytes());
 
+        use std::fmt::Write as _;
         let mut out = String::with_capacity(64);
         for word in self.state.iter() {
-            out.push_str(&format!("{word:08x}"));
+            let _ = write!(out, "{word:08x}");
         }
         out
     }

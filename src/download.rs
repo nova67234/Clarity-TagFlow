@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use crate::theme::{ACCENT1, EDGE, FIELD, MUTED, PANEL, TEXT};
+use crate::theme::{ACCENT1, EDGE, FIELD, FIELD2, MUTED, PANEL, TEXT};
 
 const API_URL: &str = "https://gelbooru.com/index.php?page=dapi&s=post&q=index&json=1";
 /// Tag-info endpoint: returns each tag's `type` (0 general, 1 artist, 3 copyright,
@@ -41,6 +41,9 @@ const MIN_DELAY: f32 = 3.0;
 /// API key) so it can't simply be edited back down — though it's a soft limit:
 /// deleting the file or changing the system clock resets it.
 const DAILY_CAP: u32 = 2000;
+
+/// Full height of the Activity console's scrollable content when open.
+const CONSOLE_H: f32 = 120.0;
 
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "tiff", "webp"];
 const VIDEO_EXTS: &[&str] = &["mp4", "webm", "avi"];
@@ -67,6 +70,10 @@ struct SavedConfig {
     blacklist: String,
     #[serde(default)]
     output_dir: String,
+    /// The Activity console is shown (toggled by the Activity button; hidden
+    /// by default).
+    #[serde(default)]
+    show_log: bool,
 }
 
 /// All UI + runtime state for the downloader view. Lives on `RightPanelState`.
@@ -106,6 +113,18 @@ pub struct DownloaderState {
     /// while it keeps getting set, so leaving the view pauses the polling
     /// (matching the Civitai panel's monitor).
     api_view_visible: Arc<AtomicBool>,
+
+    /// Cached (used-today, read-at) for the daily-allowance stat — the count
+    /// lives in an encrypted file, so it's re-read at most once a second
+    /// instead of every frame.
+    quota_cache: Option<(u32, std::time::Instant)>,
+
+    /// The Activity console is shown (toggled by the Activity button). Hidden
+    /// by default; the choice persists in the saved config.
+    log_shown: bool,
+    /// Measured height of the footer minus the animated console block, so the
+    /// form can reserve exactly the right space same-frame (no nested panels).
+    footer_base: f32,
 }
 
 /// API-status codes shared with the monitor thread.
@@ -136,11 +155,24 @@ impl Default for DownloaderState {
             api_status: Arc::new(AtomicU8::new(API_CHECKING)),
             monitor_started: false,
             api_view_visible: Arc::new(AtomicBool::new(false)),
+            quota_cache: None,
+            log_shown: false,
+            footer_base: 78.0,
         }
     }
 }
 
 impl DownloaderState {
+    /// Today's used download count for the allowance meter, re-read from disk
+    /// at most once a second.
+    fn quota_today(&mut self) -> u32 {
+        let stale = self.quota_cache.is_none_or(|(_, at)| at.elapsed().as_secs_f32() > 1.0);
+        if stale {
+            self.quota_cache = Some((quota_used_today(), std::time::Instant::now()));
+        }
+        self.quota_cache.map_or(0, |(n, _)| n)
+    }
+
     fn push_log(&mut self, line: impl Into<String>) {
         self.log.push(line.into());
         // Cap the in-memory log so a long run can't grow unbounded.
@@ -164,6 +196,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
             }
             state.blacklist = cfg.blacklist;
             state.output_dir = cfg.output_dir;
+            state.log_shown = cfg.show_log;
         }
         // Never let a persisted/old value drop below the safety floor.
         if state.delay < MIN_DELAY {
@@ -228,132 +261,173 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
         v.widgets.open.corner_radius = radius;
     }
 
-    // Header.
+    // Hero header: identity badge + status capsule + daily-allowance meter.
     ui.add_space(2.0);
-    ui.vertical_centered(|ui| {
-        ui.heading(egui::RichText::new("Gelbooru Downloader").color(TEXT()).strong());
-    });
-    ui.add_space(8.0);
+    hero_card(ui, state);
+    ui.add_space(2.0);
 
     let enabled = !state.running;
 
-    // Pin the log + progress + buttons to the bottom (a bottom panel takes only
-    // the height it needs), then let the form scroll in the remaining space. This
-    // guarantees the action area never overflows past the panel's bottom edge.
-    egui::Panel::bottom("dl_footer")
-        .resizable(false)
-        .show_separator_line(false)
-        .frame(egui::Frame::NONE.inner_margin(egui::Margin::ZERO))
-        .show_inside(ui, |ui| {
+    // No nested panels here (the Generate views lay out plainly and never
+    // glitch): a bottom panel's content overflowing its one-frame-stale height
+    // bubbles `expand_to_include_rect` up to the ROOT ui, which briefly
+    // inflated the centre viewer — the flicker on the Activity toggle. Instead
+    // the form scroll area takes exactly the height the footer doesn't need,
+    // computed same-frame (the console's animated height is deterministic and
+    // the rest of the footer is a measured constant).
+    let openness = ui.ctx().animate_bool(ui.id().with("dl_log_open"), state.log_shown);
+    if openness > 0.0 && openness < 1.0 {
+        ui.ctx().request_repaint(); // keep the console slide animating
+    }
+    // Console block: 2 top gap + animated well (content + 2×10 inner margin)
+    // + the item-spacing the extra widget introduces.
+    let console_h = if openness > 0.0 {
+        2.0 + CONSOLE_H * openness + 20.0 + ui.spacing().item_spacing.y
+    } else {
+        0.0
+    };
+    let form_h = (ui.available_height() - state.footer_base - console_h).max(80.0);
+
+    // Form — scrolls if it's too tall. The scrollbar is pushed into the card's
+    // right margin so it rides the panel edge instead of sitting on the
+    // controls (same treatment as the gallery).
+    const SCROLL_GUTTER: f32 = 12.0;
+    let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
+    egui::ScrollArea::vertical()
+        .id_salt("dl_form")
+        .max_height(form_h)
+        .min_scrolled_height(form_h)
+        .auto_shrink([false, false])
+        .show(&mut scroll_ui, |ui| {
+            form_sections(ui, state, enabled);
+        });
+    crate::edge_scroll_done(ui, &scroll_ui, SCROLL_GUTTER);
+
+    // --- Footer: Activity toggle, the sliding console, the action button ---
+    // Rendered into a child pinned to exactly the remaining card space: any
+    // sub-pixel estimate drift clips inside this region instead of expanding
+    // the parent (which would bubble up and nudge the centre viewer).
+    let footer_rect = egui::Rect::from_min_max(ui.cursor().min, ui.max_rect().max);
+    let parent_clip = ui.clip_rect();
+    let ui = &mut ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(footer_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    ui.set_clip_rect(footer_rect.intersect(parent_clip));
+    let footer_top = ui.cursor().min.y;
+    {
             ui.add_space(8.0);
 
-            // Console / log — a dark inset well with a small header. The header
-            // carries the live progress: a percentage (blue while downloading) and
-            // a download glyph wrapped in a spinning ring whenever a run is active.
-            let frac = if state.progress.1 > 0 {
-                (state.progress.0 as f32 / state.progress.1 as f32).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
+            // Console / log — an inset well, hidden by default. The Activity
+            // button reveals it (extending the footer upward) and hides it
+            // again; the choice persists in the saved config.
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Log").color(MUTED()).size(12.0));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if state.running || state.progress.1 > 0 {
-                        let pct = (frac * 100.0).round() as u32;
-                        let pct_color = if state.running { ACCENT1() } else { MUTED() };
-                        ui.label(
-                            egui::RichText::new(format!("{pct}%")).color(pct_color).size(12.0).strong(),
-                        );
-                    }
-                    download_indicator(ui, state.running, state.status == "Done");
-                    if !state.status.is_empty() {
-                        ui.label(egui::RichText::new(&state.status).color(MUTED()).size(11.0));
-                    }
-                });
+                let chev = if state.log_shown {
+                    egui::include_image!("../icons/arrow_down.svg")
+                } else {
+                    egui::include_image!("../icons/arrow_up.svg")
+                };
+                let btn = egui::Button::image_and_text(
+                    egui::Image::new(chev)
+                        .fit_to_exact_size(egui::vec2(12.0, 12.0))
+                        .tint(crate::theme::icon_tint(MUTED())),
+                    egui::RichText::new("Activity").color(MUTED()).size(12.0),
+                )
+                .frame(false);
+                if ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    state.log_shown = !state.log_shown;
+                    save_config(&SavedConfig {
+                        user_id: state.user_id.clone(),
+                        api_key: state.api_key.clone(),
+                        tags: state.tags.clone(),
+                        blacklist: state.blacklist.clone(),
+                        output_dir: state.output_dir.clone(),
+                        show_log: state.log_shown,
+                    });
+                }
             });
-            ui.add_space(2.0);
-            let log_bg = if crate::theme::is_light() {
-                FIELD()
-            } else {
-                egui::Color32::from_rgb(15, 15, 17)
-            };
-            egui::Frame::new()
-                .fill(log_bg)
-                .corner_radius(egui::CornerRadius::same(22))
-                .inner_margin(egui::Margin::same(10))
-                .stroke(egui::Stroke::new(1.0, EDGE()))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    egui::ScrollArea::vertical()
-                        .id_salt("dl_log")
-                        .max_height(120.0)
-                        .auto_shrink([false, false])
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            // Keep scrolling while a text selection is dragged past the edge.
-                            crate::drag_select_autoscroll(ui);
-                            if state.log.is_empty() {
-                                ui.label(
-                                    egui::RichText::new("Log output will appear here.")
-                                        .color(MUTED())
-                                        .monospace()
-                                        .size(12.0),
-                                );
-                            } else {
-                                for line in &state.log {
-                                    ui.label(egui::RichText::new(line).color(TEXT()).monospace().size(12.0));
+            // The console slides open/closed (`openness`, computed above so
+            // the form could reserve space for it this same frame).
+            if openness > 0.0 {
+                let log_h = CONSOLE_H * openness;
+                ui.add_space(2.0);
+                egui::Frame::new()
+                    .fill(crate::theme::console_bg())
+                    .corner_radius(egui::CornerRadius::same(22))
+                    .inner_margin(egui::Margin::same(10))
+                    .stroke(egui::Stroke::new(1.0, EDGE()))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical()
+                            .id_salt("dl_log")
+                            .max_height(log_h)
+                            .min_scrolled_height(log_h)
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                // Keep scrolling while a text selection is dragged past the edge.
+                                crate::drag_select_autoscroll(ui);
+                                if state.log.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("Log output will appear here.")
+                                            .color(MUTED())
+                                            .monospace()
+                                            .size(12.0),
+                                    );
+                                } else {
+                                    for line in &state.log {
+                                        ui.label(egui::RichText::new(line).color(TEXT()).monospace().size(12.0));
+                                    }
                                 }
-                            }
-                        });
-                });
+                            });
+                    });
+            }
 
             ui.add_space(10.0);
 
-            // Start / Cancel buttons.
-            ui.horizontal(|ui| {
-                let gap = 10.0;
-                ui.spacing_mut().item_spacing.x = gap;
-                let btn_w = (ui.available_width() - gap) / 2.0;
-                let size = egui::vec2(btn_w, 38.0);
-
-                let start = egui::Button::new(
-                    egui::RichText::new("Start Download").color(egui::Color32::WHITE).strong(),
-                )
-                .fill(egui::Color32::from_rgb(96, 99, 105));
-                if ui.add_enabled_ui(!state.running, |ui| ui.add_sized(size, start)).inner.clicked() {
-                    start_download(state, ui.ctx());
-                }
-
-                let cancel_bg = egui::Color32::from_rgb(180, 40, 40);
-                let cancel = egui::Button::new(
-                    egui::RichText::new("Cancel").color(egui::Color32::WHITE).strong(),
-                )
-                .fill(cancel_bg);
-                if ui.add_enabled_ui(state.running, |ui| ui.add_sized(size, cancel)).inner.clicked() {
+            // One full-width action button that morphs: accent "Start Download"
+            // while idle, red "Cancel" while a run is active.
+            let size = egui::vec2(ui.available_width(), 40.0);
+            let (label, fill) = if state.running {
+                ("Cancel", egui::Color32::from_rgb(180, 40, 40))
+            } else {
+                ("Start Download", ACCENT1())
+            };
+            let btn = egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE).strong())
+                .fill(fill)
+                .corner_radius(egui::CornerRadius::same(14));
+            if ui.add_sized(size, btn).clicked() {
+                if state.running {
                     state.cancel.store(true, Ordering::SeqCst);
                     state.status = "Cancelling…".to_string();
                     state.push_log("Cancel requested…");
+                } else {
+                    start_download(state, ui.ctx());
                 }
-            });
+            }
             ui.add_space(2.0);
-        });
+    }
 
-    // Form — fills the space above the footer and scrolls if it's too tall.
-    egui::CentralPanel::default()
-        .frame(egui::Frame::NONE.inner_margin(egui::Margin::ZERO))
-        .show_inside(ui, |ui| {
-            // Push the scrollbar into the card's right margin so it rides the
-            // panel edge instead of sitting on the form (same treatment as the
-            // gallery).
-            const SCROLL_GUTTER: f32 = 12.0;
-            let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(&mut scroll_ui, |ui| {
-                    ui.set_max_width(ui.available_width() - SCROLL_GUTTER);
-                    let api = state.api_status.load(Ordering::Relaxed);
-                    section_with_pill(ui, "Destination", api, |ui| {
+    // Remember the footer's constant height (everything except the animated
+    // console block) so next frame's form sizing stays exact — the same
+    // measure-and-repaint trick the Generate views use for their prompt box.
+    let footer_base = (ui.cursor().min.y - footer_top) - console_h;
+    if (footer_base - state.footer_base).abs() > 0.5 {
+        state.footer_base = footer_base;
+        ui.ctx().request_repaint();
+    }
+}
+
+/// The scrollable form: Destination / Account / Search / Options cards.
+fn form_sections(ui: &mut egui::Ui, state: &mut DownloaderState, enabled: bool) {
+                    ui.set_max_width(ui.available_width() - 12.0);
+                    let blue = egui::Color32::from_rgb(90, 150, 230);
+                    let purple = egui::Color32::from_rgb(150, 120, 220);
+                    let orange = egui::Color32::from_rgb(232, 160, 60);
+                    let slate = egui::Color32::from_rgb(130, 140, 160);
+                    section_card(ui, egui::include_image!("../icons/folder.svg"), blue, "Destination", None, |ui| {
                         field_label(ui, "Output folder");
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
@@ -371,10 +445,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                     // Gelbooru disabled anonymous API access (mid-2025 ToS change):
                     // a User ID + API key are now required — explained via the info
                     // icon's hover next to the section title.
-                    section_with_info(ui, "Account",
-                        "Gelbooru no longer allows anonymous downloads — you must log in with \
+                    section_card(ui, egui::include_image!("../icons/encrypted.svg"), purple, "Account",
+                        Some("Gelbooru no longer allows anonymous downloads — you must log in with \
                          your account's User ID and API key. Get them from gelbooru.com → \
-                         Account → Options → 'API Access Credentials' (free account required).",
+                         Account → Options → 'API Access Credentials' (free account required)."),
                         |ui| {
                         field_label(ui, "User ID");
                         field_edit(ui, enabled, egui::TextEdit::singleline(&mut state.user_id)
@@ -402,7 +476,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                         });
                     });
 
-                    section(ui, "Search", |ui| {
+                    section_card(ui, egui::include_image!("../icons/tag.svg"), orange, "Search", None, |ui| {
                         field_label(ui, "Tags");
                         field_edit(ui, enabled, egui::TextEdit::singleline(&mut state.tags)
                             .hint_text("space-separated, e.g. blue_sky 1girl"));
@@ -412,39 +486,61 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                             .hint_text("comma-separated tags to skip"));
                     });
 
-                    section(ui, "Options", |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Limit").color(TEXT()));
-                            ui.add_enabled(
-                                enabled,
-                                egui::DragValue::new(&mut state.limit).range(1..=10000).speed(1.0),
-                            );
-                            ui.add_space(20.0);
-                            ui.label(egui::RichText::new("Delay (s)").color(TEXT()));
-                            ui.add_enabled(
-                                enabled,
-                                egui::DragValue::new(&mut state.delay).range(MIN_DELAY..=60.0).speed(0.1),
-                            );
-                            // Info icon explaining the enforced minimum delay.
-                            info_icon(
-                                ui,
-                                "The delay is the wait between downloads. It can't go below 3 \
-                                 seconds: Gelbooru rate-limits frequent requests, so a shorter \
-                                 delay risks being throttled or temporarily blocked.",
-                            );
+                    section_card(ui, egui::include_image!("../icons/settings.svg"), slate, "Options", None, |ui| {
+                        // The right edge is reserved for the status readout; the
+                        // controls keep to its left.
+                        const STAT_W: f32 = 74.0;
+                        let body_right = ui.max_rect().right();
+                        let top = ui.cursor().min.y;
+                        ui.scope(|ui| {
+                            ui.set_max_width(ui.available_width() - STAT_W - 8.0);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Limit").color(TEXT()));
+                                ui.add_enabled(
+                                    enabled,
+                                    egui::DragValue::new(&mut state.limit).range(1..=10000).speed(1.0),
+                                );
+                                ui.add_space(20.0);
+                                ui.label(egui::RichText::new("Delay (s)").color(TEXT()));
+                                ui.add_enabled(
+                                    enabled,
+                                    egui::DragValue::new(&mut state.delay).range(MIN_DELAY..=60.0).speed(0.1),
+                                );
+                                // Info icon explaining the enforced minimum delay.
+                                info_icon(
+                                    ui,
+                                    "The delay is the wait between downloads. It can't go below 3 \
+                                     seconds: Gelbooru rate-limits frequent requests, so a shorter \
+                                     delay risks being throttled or temporarily blocked.",
+                                );
+                            });
+                            ui.add_space(8.0);
+                            field_label(ui, "File types");
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.add_enabled_ui(enabled, |ui| {
+                                    type_chip(ui, &mut state.include_img, egui::include_image!("../icons/image.svg"), "Image");
+                                    type_chip(ui, &mut state.include_gif, egui::include_image!("../icons/gif.svg"), "Gif");
+                                    type_chip(ui, &mut state.include_vid, egui::include_image!("../icons/video.svg"), "Video");
+                                });
+                            });
                         });
-                        ui.add_space(8.0);
-                        field_label(ui, "File types");
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 14.0;
-                            ui.add_enabled_ui(enabled, |ui| dot_checkbox(ui, &mut state.include_img, "Image"));
-                            ui.add_enabled_ui(enabled, |ui| dot_checkbox(ui, &mut state.include_gif, "Gif"));
-                            ui.add_enabled_ui(enabled, |ui| dot_checkbox(ui, &mut state.include_vid, "Video"));
-                        });
+                        // Run-status readout — the download glyph (spinner while
+                        // running, green check when done), the status word, and
+                        // the live % — anchored flush to the card's right edge
+                        // and centred on the controls' height.
+                        let stat = egui::Rect::from_min_max(
+                            egui::pos2(body_right - STAT_W, top),
+                            egui::pos2(body_right, ui.min_rect().bottom()),
+                        );
+                        let mut child = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(stat)
+                                .layout(egui::Layout::top_down(egui::Align::Center)),
+                        );
+                        status_stat(&mut child, state.running, &state.status, state.progress, stat.height());
                     });
                     ui.add_space(8.0);
-                });
-        });
 }
 
 /// The bundled info SVG at 16 px, tinted with the muted theme colour, with a
@@ -458,85 +554,239 @@ fn info_icon(ui: &mut egui::Ui, tooltip: &str) -> egui::Response {
     .on_hover_text(tooltip)
 }
 
-/// A checkbox that shows a filled **dot** when on, instead of egui's checkmark.
-/// Behaves like `ui.checkbox`: clicking the box or its label toggles `checked`.
-/// egui's `Checkbox` only ever draws a tick, so we paint our own box + dot.
-fn dot_checkbox(ui: &mut egui::Ui, checked: &mut bool, text: &str) -> egui::Response {
-    let icon = ui.spacing().icon_width; // box edge length
-    let gap = ui.spacing().icon_spacing;
-    let galley = egui::WidgetText::from(text).into_galley(
-        ui,
-        Some(egui::TextWrapMode::Extend),
-        f32::INFINITY,
-        egui::TextStyle::Button,
-    );
+/// The hero header card: the source selector (title + chevron, like the
+/// generator's model picker), a live Online/Offline capsule, and the
+/// daily-allowance meter.
+fn hero_card(ui: &mut egui::Ui, state: &mut DownloaderState) {
+    let api = state.api_status.load(Ordering::Relaxed);
+    let used = state.quota_today();
+    egui::Frame::new()
+        .fill(PANEL())
+        .corner_radius(egui::CornerRadius::same(18))
+        .stroke(egui::Stroke::new(1.0, EDGE()))
+        .inner_margin(egui::Margin::symmetric(14, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 9.0;
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    source_selector(ui);
+                    ui.label(egui::RichText::new("Tag Downloader").color(MUTED()).size(11.0));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    status_capsule(ui, api);
+                });
+            });
 
-    let mut desired = egui::vec2(icon + gap + galley.size().x, galley.size().y.max(icon));
-    desired.y = desired.y.max(ui.spacing().interact_size.y);
-    let (rect, mut response) = ui.allocate_exact_size(desired, egui::Sense::click());
-    if response.clicked() {
-        *checked = !*checked;
-        response.mark_changed();
-    }
-    response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *checked, text)
-    });
-
-    if ui.is_rect_visible(rect) {
-        let visuals = ui.style().interact(&response);
-        let center = egui::pos2(rect.left() + icon / 2.0, rect.center().y);
-        let outer = icon / 2.0;
-        // Round indicator: an outline circle, with a filled dot when checked.
-        ui.painter().circle(center, outer, visuals.bg_fill, visuals.bg_stroke);
-        if *checked {
-            ui.painter().circle_filled(center, outer * 0.5, visuals.fg_stroke.color);
-        }
-        let text_pos = egui::pos2(center.x + outer + gap, rect.center().y - galley.size().y / 2.0);
-        ui.painter().galley(text_pos, galley, visuals.text_color());
-    }
-    response
+            ui.add_space(11.0);
+            allowance_meter(ui, used);
+        });
 }
 
-/// A titled, rounded group card holding related controls — mirrors the look of
-/// the Settings window's sections so the downloader feels native to the app.
-fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(8.0);
-    ui.label(egui::RichText::new(title.to_uppercase()).color(MUTED()).strong().size(11.0));
-    ui.add_space(4.0);
-    section_body(ui, add);
-}
-
-/// Like [`section`], but draws an info icon next to the title whose hover tooltip
-/// shows `info`.
-fn section_with_info(ui: &mut egui::Ui, title: &str, info: &str, add: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(8.0);
+/// The hero's "N / 2000 today" meter: a hairline bar that shifts green →
+/// amber → red as the day's allowance is spent.
+fn allowance_meter(ui: &mut egui::Ui, used: u32) {
+    let frac = (used as f32 / DAILY_CAP as f32).clamp(0.0, 1.0);
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        ui.label(egui::RichText::new(title.to_uppercase()).color(MUTED()).strong().size(11.0));
-        info_icon(ui, info);
-    });
-    ui.add_space(4.0);
-    section_body(ui, add);
-}
-
-/// Like [`section`], but draws a right-aligned API-status pill next to the title.
-fn section_with_pill(ui: &mut egui::Ui, title: &str, api: u8, add: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(title.to_uppercase()).color(MUTED()).strong().size(11.0));
+        ui.label(egui::RichText::new("Daily allowance").color(MUTED()).size(10.5));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            api_pill(ui, api);
+            ui.label(
+                egui::RichText::new(format!("{used} / {DAILY_CAP}")).color(MUTED()).size(10.5).strong(),
+            );
         });
     });
     ui.add_space(4.0);
-    section_body(ui, add);
+    let h = 5.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
+    let r = egui::CornerRadius::same((h / 2.0) as u8);
+    ui.painter().rect_filled(rect, r, FIELD());
+    if frac > 0.0 {
+        let color = if frac < 0.7 {
+            egui::Color32::from_rgb(46, 160, 67)
+        } else if frac < 0.95 {
+            egui::Color32::from_rgb(240, 198, 60)
+        } else {
+            egui::Color32::from_rgb(210, 70, 70)
+        };
+        let fill = egui::Rect::from_min_size(rect.min, egui::vec2((rect.width() * frac).max(h), h));
+        ui.painter().rect_filled(fill, r, color);
+    }
 }
 
-/// The rounded card body shared by both section variants.
-fn section_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+/// The hero's source title with an up/down chevron, mirroring the generator's
+/// model selector. Clicking opens the source list — Gelbooru is the only entry
+/// today, so this is the seam where more boorus slot in later.
+fn source_selector(ui: &mut egui::Ui) {
+    let menu_id = ui.id().with("dl_source_menu");
+    let open = egui::Popup::is_id_open(ui.ctx(), menu_id);
+
+    let galley = egui::WidgetText::from(egui::RichText::new("Gelbooru").color(TEXT()).strong().size(16.0))
+        .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
+    let (arrow, gap) = (14.0, 3.0);
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(galley.size().x + gap + arrow, galley.size().y),
+        egui::Sense::click(),
+    );
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if ui.is_rect_visible(rect) {
+        let text_pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
+        ui.painter().galley(text_pos, galley, TEXT());
+        let arrow_src = if open {
+            egui::include_image!("../icons/arrow_up.svg")
+        } else {
+            egui::include_image!("../icons/arrow_down.svg")
+        };
+        let arrow_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - arrow / 2.0, rect.center().y + 1.0),
+            egui::vec2(arrow, arrow),
+        );
+        egui::Image::new(arrow_src)
+            .tint(crate::theme::icon_tint(MUTED()))
+            .paint_at(ui, arrow_rect);
+    }
+    egui::Popup::menu(&resp).id(menu_id).frame(crate::zoom::menu_frame()).show(|ui| {
+        ui.set_min_width(160.0);
+        let radius = egui::CornerRadius::same(6);
+        ui.visuals_mut().widgets.inactive.corner_radius = radius;
+        ui.visuals_mut().widgets.hovered.corner_radius = radius;
+        if ui.selectable_label(true, "Gelbooru").clicked() {
+            ui.close();
+        }
+    });
+}
+
+/// The compact run-status block (Options card, right edge): the download glyph
+/// (spinner ring while running, green check once done), the status word
+/// ("Idle" / "Downloading" / …), and the live percentage during/after a run.
+/// `avail_h` is the reserved region's height, used to centre the stack in it.
+fn status_stat(ui: &mut egui::Ui, running: bool, status: &str, progress: (u32, u32), avail_h: f32) {
+    let frac = if progress.1 > 0 {
+        (progress.0 as f32 / progress.1 as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let show_pct = running || progress.1 > 0;
+    // Estimated stack height (icon + labels + gaps) → top pad that centres it.
+    let mut h = 20.0;
+    if !status.is_empty() {
+        h += 2.0 + 14.0;
+    }
+    if show_pct {
+        h += 2.0 + 16.0;
+    }
+    ui.add_space(((avail_h - h) / 2.0).max(0.0));
+    ui.spacing_mut().item_spacing.y = 2.0;
+    download_indicator(ui, running, status == "Done");
+    if !status.is_empty() {
+        ui.label(egui::RichText::new(status).color(MUTED()).size(10.5));
+    }
+    if show_pct {
+        let pct = (frac * 100.0).round() as u32;
+        let pct_color = if running { ACCENT1() } else { MUTED() };
+        ui.label(egui::RichText::new(format!("{pct}%")).color(pct_color).size(12.0).strong());
+    }
+}
+
+/// The status block's download glyph: the Arrow Downward Alt icon, tinted blue
+/// and wrapped in an animated blue ring while `running`. When idle it's just
+/// the muted arrow; after a successful run it's a green check-circle. The ring
+/// is a rotating arc (a spinner), so it reads as "working" even at 0% — the
+/// exact progress is the percentage label beside it.
+fn download_indicator(ui: &mut egui::Ui, running: bool, done: bool) {
+    let size = 20.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let painter = ui.painter().clone();
+    let center = rect.center();
+
+    // Finished (and not mid-run): a green check-circle in place of the download
+    // glyph, signalling the run completed successfully.
+    if done && !running {
+        let green = egui::Color32::from_rgb(80, 200, 120);
+        egui::Image::new(egui::include_image!("../icons/check_circle.svg"))
+            .tint(green)
+            .paint_at(ui, rect);
+        return;
+    }
+
+    if running {
+        let radius = size * 0.5 - 1.0;
+        let t = ui.input(|i| i.time) as f32;
+        // Faint full ring underneath, then a brighter rotating arc on top.
+        painter.circle_stroke(center, radius, egui::Stroke::new(2.0, ACCENT1().gamma_multiply(0.25)));
+        let start = (t * 3.0) % std::f32::consts::TAU;
+        let sweep = std::f32::consts::PI * 0.6;
+        let pts: Vec<egui::Pos2> = (0..=24)
+            .map(|k| {
+                let a = start + sweep * (k as f32 / 24.0);
+                center + radius * egui::vec2(a.cos(), a.sin())
+            })
+            .collect();
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0, ACCENT1())));
+        ui.ctx().request_repaint(); // keep the spinner animating
+    }
+
+    // Arrow glyph in the centre (blue while downloading, muted otherwise).
+    let tint = if running { ACCENT1() } else { MUTED() };
+    let icon = size * 0.6;
+    let icon_rect = egui::Rect::from_center_size(center, egui::vec2(icon, icon));
+    egui::Image::new(egui::include_image!("../icons/Arrow Downward Alt.svg"))
+        .tint(tint)
+        .paint_at(ui, icon_rect);
+}
+
+/// The API status as a small capsule chip: "● Online" on a FIELD well.
+fn status_capsule(ui: &mut egui::Ui, api: u8) {
+    let (text, dot) = match api {
+        API_ONLINE => ("Online", egui::Color32::from_rgb(46, 160, 67)),
+        API_OFFLINE => ("Offline", egui::Color32::from_rgb(210, 70, 70)),
+        _ => ("Checking…", egui::Color32::from_rgb(150, 150, 150)),
+    };
+    egui::Frame::new()
+        .fill(FIELD())
+        .stroke(egui::Stroke::new(1.0, EDGE()))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                // This sits in a right-to-left layout, so add the label first
+                // (it lands rightmost), then the dot, to read "● Online".
+                ui.label(egui::RichText::new(text).color(MUTED()).size(10.5).strong());
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 3.5, dot);
+            });
+        });
+}
+
+/// A titled, rounded group card holding related controls: a colour-tinted icon
+/// chip + normal-case title over the card body (macOS Settings style). `info`
+/// adds a hover ⓘ after the title.
+fn section_card(
+    ui: &mut egui::Ui,
+    icon: egui::ImageSource<'_>,
+    tint: egui::Color32,
+    title: &str,
+    info: Option<&str>,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 7.0;
+        // The bare icon, colour-tinted — no chip box behind it.
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+        egui::Image::new(icon)
+            .tint(tint)
+            .paint_at(ui, egui::Rect::from_center_size(rect.center(), egui::vec2(15.0, 15.0)));
+        ui.label(egui::RichText::new(title).color(TEXT()).strong().size(12.5));
+        if let Some(info) = info {
+            info_icon(ui, info);
+        }
+    });
+    ui.add_space(5.0);
     egui::Frame::new()
         .fill(PANEL())
-        .corner_radius(egui::CornerRadius::same(12))
+        .corner_radius(egui::CornerRadius::same(14))
         .inner_margin(egui::Margin::symmetric(12, 10))
         .stroke(egui::Stroke::new(1.0, EDGE()))
         .show(ui, |ui| {
@@ -545,24 +795,48 @@ fn section_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
         });
 }
 
-/// Draw the API status as a coloured dot + label (matches the Civitai panel's
-/// "● Online" style).
-fn api_pill(ui: &mut egui::Ui, api: u8) {
-    let (text, dot) = match api {
-        API_ONLINE => ("Online", egui::Color32::from_rgb(46, 160, 67)),
-        API_OFFLINE => ("Offline", egui::Color32::from_rgb(210, 70, 70)),
-        _ => ("Checking…", egui::Color32::from_rgb(150, 150, 150)),
-    };
-    // The section title row is a right-to-left layout and `ui.horizontal` inherits
-    // it, so add the label FIRST (it lands rightmost) and the dot SECOND (to its
-    // left) to read "● Online".
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 5.0;
-        ui.label(egui::RichText::new(text).color(MUTED()).size(11.0).strong());
-        // A small status dot painted to a fixed box so it stays crisp and centred.
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-        ui.painter().circle_filled(rect.center(), 4.0, dot);
-    });
+/// A file-type toggle capsule: icon + label, accent-filled with white ink when
+/// on, a quiet FIELD well when off.
+fn type_chip(ui: &mut egui::Ui, on: &mut bool, icon: egui::ImageSource<'_>, label: &str) -> egui::Response {
+    let font = egui::FontId::proportional(12.0);
+    let icon_s = 13.0;
+    let (pad_x, pad_y, gap) = (10.0, 6.0, 5.0);
+    let galley = ui.fonts_mut(|f| f.layout_no_wrap(label.to_string(), font.clone(), egui::Color32::PLACEHOLDER));
+    let size = egui::vec2(
+        pad_x * 2.0 + icon_s + gap + galley.size().x,
+        pad_y * 2.0 + galley.size().y.max(icon_s),
+    );
+    let (rect, mut resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, label));
+    if ui.is_rect_visible(rect) {
+        let r = egui::CornerRadius::same((rect.height() / 2.0) as u8);
+        let (fill, ink) = if *on {
+            (ACCENT1(), egui::Color32::WHITE)
+        } else if resp.hovered() {
+            (FIELD2(), TEXT())
+        } else {
+            (FIELD(), MUTED())
+        };
+        ui.painter().rect_filled(rect, r, fill);
+        if !*on {
+            ui.painter().rect_stroke(rect, r, egui::Stroke::new(1.0, EDGE()), egui::StrokeKind::Inside);
+        }
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + pad_x + icon_s / 2.0, rect.center().y),
+            egui::vec2(icon_s, icon_s),
+        );
+        egui::Image::new(icon).tint(ink).paint_at(ui, icon_rect);
+        let text_pos = egui::pos2(
+            rect.left() + pad_x + icon_s + gap,
+            rect.center().y - galley.size().y / 2.0,
+        );
+        ui.painter().galley(text_pos, galley, ink);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Spawn a daemon-style thread that probes gelbooru.com every 5s while the view
@@ -617,52 +891,6 @@ fn field_label(ui: &mut egui::Ui, label: &str) {
     ui.add_space(2.0);
 }
 
-/// The Log-header download glyph: the Arrow Downward Alt icon, tinted blue and
-/// wrapped in an animated blue ring while `running`. When idle it's just the muted
-/// arrow. The ring is a rotating arc (a spinner), so it reads as "working" even at
-/// 0% — the exact progress is shown by the percentage label beside it.
-fn download_indicator(ui: &mut egui::Ui, running: bool, done: bool) {
-    let size = 20.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    let painter = ui.painter().clone();
-    let center = rect.center();
-
-    // Finished (and not mid-run): a green check-circle in place of the download
-    // glyph, signalling the run completed successfully.
-    if done && !running {
-        let green = egui::Color32::from_rgb(80, 200, 120);
-        egui::Image::new(egui::include_image!("../icons/check_circle.svg"))
-            .tint(green)
-            .paint_at(ui, rect);
-        return;
-    }
-
-    if running {
-        let radius = size * 0.5 - 1.0;
-        let t = ui.input(|i| i.time) as f32;
-        // Faint full ring underneath, then a brighter rotating arc on top.
-        painter.circle_stroke(center, radius, egui::Stroke::new(2.0, ACCENT1().gamma_multiply(0.25)));
-        let start = (t * 3.0) % std::f32::consts::TAU;
-        let sweep = std::f32::consts::PI * 0.6;
-        let pts: Vec<egui::Pos2> = (0..=24)
-            .map(|k| {
-                let a = start + sweep * (k as f32 / 24.0);
-                center + radius * egui::vec2(a.cos(), a.sin())
-            })
-            .collect();
-        painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0, ACCENT1())));
-        ui.ctx().request_repaint(); // keep the spinner animating
-    }
-
-    // Arrow glyph in the centre (blue while downloading, muted otherwise).
-    let tint = if running { ACCENT1() } else { MUTED() };
-    let icon = size * 0.6;
-    let icon_rect = egui::Rect::from_center_size(center, egui::vec2(icon, icon));
-    egui::Image::new(egui::include_image!("../icons/Arrow Downward Alt.svg"))
-        .tint(tint)
-        .paint_at(ui, icon_rect);
-}
-
 /// A full-width text field with the theme's FIELD well background so it stands
 /// out against the PANEL section card (PANEL-on-PANEL made the box invisible).
 fn field_edit(ui: &mut egui::Ui, enabled: bool, edit: egui::TextEdit<'_>) {
@@ -714,6 +942,7 @@ fn start_download(state: &mut DownloaderState, ctx: &egui::Context) {
         tags: state.tags.clone(),
         blacklist: state.blacklist.clone(),
         output_dir: state.output_dir.clone(),
+        show_log: state.log_shown,
     });
 
     let cfg = WorkerCfg {
@@ -1251,10 +1480,11 @@ fn fetch_tag_types(
 }
 
 fn build_api_url(final_tags: &str, per_page: u32, pid: u32, user_id: &str, api_key: &str) -> String {
+    use std::fmt::Write as _;
     let mut s = String::from(API_URL);
     s.push_str("&tags=");
     s.push_str(&percent_encode(final_tags));
-    s.push_str(&format!("&limit={per_page}&pid={pid}"));
+    let _ = write!(s, "&limit={per_page}&pid={pid}");
     if !user_id.trim().is_empty() {
         s.push_str("&user_id=");
         s.push_str(&percent_encode(user_id.trim()));
@@ -1279,13 +1509,16 @@ fn normalize_file_url(raw: &str) -> String {
 
 /// Percent-encode a query value (RFC 3986 unreserved set kept literal).
 fn percent_encode(s: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out
@@ -1376,6 +1609,7 @@ fn save_config(cfg: &SavedConfig) {
         tags: cfg.tags.clone(),
         blacklist: cfg.blacklist.clone(),
         output_dir: cfg.output_dir.clone(),
+        show_log: cfg.show_log,
     };
     if let Ok(json) = serde_json::to_string_pretty(&on_disk) {
         let _ = std::fs::write(config_path(), json);
