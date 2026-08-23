@@ -37,7 +37,12 @@ const MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 /// Embeddings (textual inversions) are recorded *only* in those blocks, so handing
 /// the panel the formatted text left it unable to list them.
 pub fn read_both(path: &Path) -> (Option<String>, Option<String>) {
-    match metadata_map(path) {
+    // Videos: `metadata_map` refuses them (a full read of a multi-GB file is
+    // not an option), but ComfyUI-generated clips DO carry the `prompt` +
+    // `workflow` graphs as container tags — a bounded head/tail scan finds
+    // them, and they format exactly like an image's PNG-chunk equivalents.
+    let map = if crate::is_video(path) { video_metadata_map(path) } else { metadata_map(path) };
+    match map {
         Some(map) => (format_from_map(&map), raw_from_map(&map)),
         None => (None, None),
     }
@@ -48,9 +53,9 @@ pub fn read_both(path: &Path) -> (Option<String>, Option<String>) {
 /// `None` only when the file can't be read; a readable file with no metadata
 /// yields an empty (or prompt-less) map.
 fn metadata_map(path: &Path) -> Option<BTreeMap<String, String>> {
-    // Never touch videos — they carry no SD generation metadata, and reading a
-    // multi-MB/GB file in full (then scanning it as UTF-8/UTF-16) freezes and can
-    // crash the app. Bail before any read.
+    // Never touch videos here — reading a multi-MB/GB file in full (then
+    // scanning it as UTF-8/UTF-16) freezes and can crash the app. Their
+    // container tags are read by [`video_metadata_map`]'s bounded scan instead.
     if crate::is_video(path) {
         return None;
     }
@@ -466,11 +471,12 @@ fn format_a1111(raw: &str) -> String {
     }
 
     if !kv.is_empty() {
+        use std::fmt::Write as _;
         out.push_str("Parameters:\n");
         let mut used: Vec<String> = Vec::new();
         for key in A1111_ORDER {
             if let Some((actual, val)) = kv.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
-                out.push_str(&format!("  \u{2022} {key}: {val}\n"));
+                let _ = writeln!(out, "  \u{2022} {key}: {val}");
                 used.push(actual.clone());
             }
         }
@@ -478,7 +484,7 @@ fn format_a1111(raw: &str) -> String {
             if used.iter().any(|u| u == k) {
                 continue;
             }
-            out.push_str(&format!("  \u{2022} {k}: {v}\n"));
+            let _ = writeln!(out, "  \u{2022} {k}: {v}");
         }
     }
 
@@ -646,9 +652,10 @@ fn format_comfyui(prompt_json: &str) -> Option<String> {
         out.push_str("\n\n");
     }
     out.push_str("Parameters:\n");
+    use std::fmt::Write as _;
     let mut line = |label: &str, val: &Option<String>| {
         if let Some(v) = val {
-            out.push_str(&format!("  \u{2022} {label}: {v}\n"));
+            let _ = writeln!(out, "  \u{2022} {label}: {v}");
         }
     };
     line("Steps", &steps);
@@ -659,7 +666,7 @@ fn format_comfyui(prompt_json: &str) -> Option<String> {
     line("Size", &size);
     line("Model", &model);
     for lora in &loras {
-        out.push_str(&format!("  \u{2022} LoRA: {lora}\n"));
+        let _ = writeln!(out, "  \u{2022} LoRA: {lora}");
     }
 
     Some(out.trim().to_string())
@@ -667,12 +674,34 @@ fn format_comfyui(prompt_json: &str) -> Option<String> {
 
 /// Follow a ComfyUI input link (`[node_id, slot]`) back to the text that feeds a
 /// CLIP encode node. Mirrors the Java `tracePrompt`.
+/// Resolve a `[node_id, output_slot]` link to the node it points at.
+fn linked_node<'a>(
+    nodes: &'a serde_json::Map<String, serde_json::Value>,
+    link: Option<&serde_json::Value>,
+) -> Option<&'a serde_json::Value> {
+    let arr = link?.as_array()?;
+    let id = arr
+        .first()
+        .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string())))?;
+    nodes.get(&id)
+}
+
 fn trace_prompt(nodes: &serde_json::Map<String, serde_json::Value>, link: Option<&serde_json::Value>) -> String {
+    trace_prompt_at(nodes, link, 0)
+}
+
+fn trace_prompt_at(nodes: &serde_json::Map<String, serde_json::Value>, link: Option<&serde_json::Value>, depth: u32) -> String {
+    if depth > 64 {
+        return String::new(); // cycle / absurd nesting guard
+    }
     let Some(link) = link else { return String::new() };
     let Some(arr) = link.as_array() else { return String::new() };
     let Some(node_id) = arr.first().and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string()))) else {
         return String::new();
     };
+    // Which output slot the link taps — picks the matching side of dual-output
+    // conditioning nodes below.
+    let slot = arr.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
     let Some(node) = nodes.get(&node_id) else { return String::new() };
 
     let class_type = node.get("class_type").and_then(|v| v.as_str()).unwrap_or("");
@@ -684,19 +713,39 @@ fn trace_prompt(nodes: &serde_json::Map<String, serde_json::Value>, link: Option
                 return t.trim().to_string();
             }
             if text.is_array() {
-                return trace_prompt(nodes, Some(text));
+                return trace_prompt_at(nodes, Some(text), depth + 1);
             }
         }
     if class_type == "ConditioningZeroOut" {
         return String::new();
     }
     if let Some(cond) = inputs.get("conditioning") {
-        return trace_prompt(nodes, Some(cond));
+        return trace_prompt_at(nodes, Some(cond), depth + 1);
+    }
+    // Dual-conditioning pass-throughs (e.g. LTXVConditioning: outputs 0 =
+    // positive, 1 = negative): follow the input matching the tapped output.
+    if inputs.get("positive").is_some() || inputs.get("negative").is_some() {
+        let key = if slot == 1 { "negative" } else { "positive" };
+        if let Some(l) = inputs.get(key).filter(|l| l.is_array()) {
+            return trace_prompt_at(nodes, Some(l), depth + 1);
+        }
     }
     if let Some(tg) = inputs.get("text_g")
         && let Some(t) = tg.as_str() {
             return t.trim().to_string();
         }
+    // Text-provider nodes (translate / concat / primitive strings): the text
+    // sits on — or links through — a `text`/`value` input.
+    for key in ["text", "value"] {
+        if let Some(t) = inputs.get(key) {
+            if let Some(s) = t.as_str() {
+                return s.trim().to_string();
+            }
+            if t.is_array() {
+                return trace_prompt_at(nodes, Some(t), depth + 1);
+            }
+        }
+    }
     String::new()
 }
 
@@ -916,10 +965,9 @@ fn read_generation_json(path: &Path) -> Option<DroppedMeta> {
 const VIDEO_HEAD: usize = 24 * 1024 * 1024;
 const VIDEO_TAIL: usize = 8 * 1024 * 1024;
 
-/// Drag-and-drop import for a generated **video**: pull the ComfyUI `workflow`
-/// object out of the container and read its custom nodes + (best-effort) prompt
-/// and settings from the nodes' `widgets_values`.
-fn read_generation_video(path: &Path) -> Option<DroppedMeta> {
+/// The bounded head + tail of a video file as (lossy) text — the shared search
+/// window for both the drop-import reader and the Details metadata view.
+fn video_text_window(path: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let len = std::fs::metadata(path).ok()?.len();
     let mut file = std::fs::File::open(path).ok()?;
@@ -937,18 +985,122 @@ fn read_generation_video(path: &Path) -> Option<DroppedMeta> {
             }
         }
     }
+    Some(text)
+}
 
-    // The workflow object opens with `{"last_node_id": …}` — a key unique to the
-    // top level — so the brace right before it is the object's start.
-    let marker = ci_find(&text, "\"last_node_id\"")?;
-    let open = text[..marker].rfind('{')?;
-    let workflow_json = balanced_object(&text, open)?;
+/// Collect a video's embedded ComfyUI generation metadata into the same
+/// keyword → text map image files produce (`prompt` = the API graph,
+/// `workflow` = the UI graph), so the display/import machinery downstream is
+/// shared. Two container layouts exist in the wild, both found by scanning the
+/// bounded window rather than parsing boxes:
+///
+/// * **SaveVideo / SaveWEBM (ComfyUI core)** — `workflow` and `prompt` are
+///   separate tags, each holding a bare JSON run.
+/// * **VHS / ffmpeg re-mux** — one iTunes comment tag holding
+///   `{"prompt": "<escaped API graph>", "workflow": {…}}`.
+fn video_metadata_map(path: &Path) -> Option<BTreeMap<String, String>> {
+    let text = video_text_window(path)?;
+    let mut map = BTreeMap::new();
 
-    let mut out = DroppedMeta {
-        custom_nodes: comfy_custom_nodes(&workflow_json),
-        ..Default::default()
-    };
-    workflow_widgets_into(&workflow_json, &mut out);
+    // VHS/ffmpeg comment: one JSON object carrying both graphs (the API graph
+    // as an escaped string), parsed with serde so the escaping unwinds. A
+    // node's own inputs can open `{"prompt": "…` too (video nodes take the
+    // prompt text directly), so a candidate only counts as the comment wrapper
+    // when its prompt string is an escaped node graph or a workflow object
+    // rides alongside it.
+    let mut search = 0;
+    while let Some(at) = {
+        let a = text[search..].find("{\"prompt\": \"");
+        let b = text[search..].find("{\"prompt\":\"");
+        a.into_iter().chain(b).min().map(|rel| search + rel)
+    } {
+        search = at + 1;
+        let Some(obj) = balanced_object(&text, at) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&obj) else { continue };
+        let prompt = v.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
+        let workflow = v.get("workflow");
+        if !prompt.contains("class_type") && workflow.is_none() {
+            continue;
+        }
+        if !prompt.trim().is_empty() {
+            map.insert("prompt".to_string(), prompt.to_string());
+        }
+        match workflow {
+            Some(serde_json::Value::String(w)) if !w.trim().is_empty() => {
+                map.insert("workflow".to_string(), w.clone());
+            }
+            Some(w) if w.is_object() => {
+                map.insert("workflow".to_string(), w.to_string());
+            }
+            _ => {}
+        }
+        break;
+    }
+
+    // SaveVideo/SaveWEBM tags: bare JSON runs. The UI workflow opens with
+    // `{"…"last_node_id": …}` — a key unique to its top level — so the brace
+    // right before the marker is the object's start.
+    if !map.contains_key("workflow")
+        && let Some(marker) = ci_find(&text, "\"last_node_id\"")
+            && let Some(open) = text[..marker].rfind('{')
+                && let Some(wf) = balanced_object(&text, open) {
+                    map.insert("workflow".to_string(), wf);
+                }
+    if !map.contains_key("prompt")
+        && let Some(open) = find_api_graph_start(&text)
+            && let Some(pg) = balanced_object(&text, open) {
+                map.insert("prompt".to_string(), pg);
+            }
+
+    if map.is_empty() { None } else { Some(map) }
+}
+
+/// Find the opening `{` of a bare ComfyUI API graph in `text`: the graph is a
+/// map of node id → node, so it opens `{"<digits>": {"inputs"…`. Candidates are
+/// verified by balancing the object and checking it really is a node graph
+/// (has `class_type`), so a stray match inside other JSON is skipped.
+fn find_api_graph_start(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("\": {\"inputs\"") {
+        let quote = search + rel; // the id's closing quote
+        search = quote + 1;
+        let mut j = quote;
+        while j > 0 && bytes[j - 1].is_ascii_digit() {
+            j -= 1;
+        }
+        // Node ids are numeric; require `{"<digits>"` directly before the match.
+        if j == quote || j < 2 || bytes[j - 1] != b'"' || bytes[j - 2] != b'{' {
+            continue;
+        }
+        let open = j - 2;
+        if let Some(obj) = balanced_object(text, open)
+            && obj.contains("\"class_type\"") {
+                return Some(open);
+            }
+    }
+    None
+}
+
+/// Drag-and-drop import for a generated **video** — same shape as the image
+/// path: the API `prompt` graph (when the container carries one) gives the
+/// prompt + settings and is kept as the runnable workflow; the UI `workflow`
+/// graph names the custom nodes and is the widget-heuristics fallback.
+fn read_generation_video(path: &Path) -> Option<DroppedMeta> {
+    let map = video_metadata_map(path)?;
+    let mut out = DroppedMeta::default();
+
+    if let Some(prompt_json) = map.get("prompt").filter(|s| !s.trim().is_empty()) {
+        comfy_prompt_into(prompt_json, &mut out);
+        out.workflow_api = Some(sanitize_json(prompt_json));
+    }
+    if let Some(workflow_json) = map.get("workflow").filter(|s| !s.trim().is_empty()) {
+        out.custom_nodes = comfy_custom_nodes(workflow_json);
+        if out.positive.trim().is_empty() {
+            workflow_widgets_into(workflow_json, &mut out);
+        }
+    }
+
     if out.is_empty() {
         None
     } else {
@@ -1060,11 +1212,11 @@ fn workflow_widgets_into(workflow_json: &str, out: &mut DroppedMeta) {
     prompts.sort_by_key(|s| std::cmp::Reverse(s.len()));
     if out.positive.trim().is_empty()
         && let Some(p) = prompts.first() {
-            out.positive = p.clone();
+            out.positive.clone_from(p);
         }
     if out.negative.trim().is_empty()
         && let Some(n) = prompts.get(1) {
-            out.negative = n.clone();
+            out.negative.clone_from(n);
         }
 }
 
@@ -1116,6 +1268,47 @@ fn comfy_prompt_into(prompt_json: &str, out: &mut DroppedMeta) {
                     }
                 }
             }
+            // Custom-sampling video/DiT graphs split the KSampler's job across
+            // nodes; the seed and step count live here instead.
+            "RandomNoise" if out.seed.is_none() => {
+                out.seed = inputs.get("noise_seed").and_then(&as_i);
+            }
+            "BasicScheduler" if out.steps.is_none() => {
+                out.steps = inputs.get("steps").and_then(&as_i);
+            }
+            "SamplerCustom" | "SamplerCustomAdvanced" => {
+                if out.seed.is_none() {
+                    out.seed = inputs.get("noise_seed").and_then(&as_i);
+                }
+                if out.cfg.is_none() {
+                    out.cfg = inputs.get("cfg").and_then(&as_f);
+                }
+                // The conditioning links sit either directly on the node
+                // (SamplerCustom) or on its guider (CFGGuider / BasicGuider).
+                let mut pos = inputs.get("positive").cloned();
+                let mut neg = inputs.get("negative").cloned();
+                if pos.is_none()
+                    && let Some(g) = linked_node(nodes, inputs.get("guider"))
+                        && let Some(gi) = g.get("inputs") {
+                            pos = gi.get("positive").or_else(|| gi.get("conditioning")).cloned();
+                            neg = gi.get("negative").cloned();
+                            if out.cfg.is_none() {
+                                out.cfg = gi.get("cfg").and_then(&as_f);
+                            }
+                        }
+                if out.positive.trim().is_empty() {
+                    let p = trace_prompt(nodes, pos.as_ref());
+                    if !p.is_empty() {
+                        out.positive = p;
+                    }
+                }
+                if out.negative.trim().is_empty() {
+                    let n = trace_prompt(nodes, neg.as_ref());
+                    if !n.is_empty() {
+                        out.negative = n;
+                    }
+                }
+            }
             ct if ct.contains("LoraLoader") => {
                 if let Some(name) = inputs.get("lora_name").and_then(|v| v.as_str())
                     && !name.is_empty() {
@@ -1141,6 +1334,32 @@ fn comfy_prompt_into(prompt_json: &str, out: &mut DroppedMeta) {
             _ => {}
         }
     }
+
+    // Video DiT graphs (MiniMax H3, some Wan/LTX flows) don't route the prompt
+    // through CLIPTextEncode — the text sits directly on the generator node as
+    // a "prompt"/"positive_prompt" string input. Fallback: the longest such
+    // string (and its negative twin) across the graph.
+    let longest_input = |keys: &[&str]| -> Option<String> {
+        let mut best = String::new();
+        for node in nodes.values() {
+            let Some(ins) = node.get("inputs").and_then(|v| v.as_object()) else { continue };
+            for key in keys {
+                if let Some(s) = ins.get(*key).and_then(|v| v.as_str())
+                    && s.trim().len() > best.len() {
+                        best = s.trim().to_string();
+                    }
+            }
+        }
+        Some(best).filter(|s| !s.is_empty())
+    };
+    if out.positive.trim().is_empty()
+        && let Some(p) = longest_input(&["prompt", "positive_prompt"]) {
+            out.positive = p;
+        }
+    if out.negative.trim().is_empty()
+        && let Some(n) = longest_input(&["negative_prompt"]) {
+            out.negative = n;
+        }
 }
 
 /// Collect the custom nodes a ComfyUI `workflow` (UI) graph depends on, from each
@@ -1332,9 +1551,9 @@ pub(crate) fn sanitize_json(s: &str) -> String {
 pub(crate) mod drop_import_tests {
     use super::*;
 
-    /// The committed sample image under `tests/example/` (whatever it is) must
-    /// parse into a prompt + a runnable API graph for drag-drop import. Found
-    /// dynamically so swapping the sample image doesn't break the test.
+    /// A sample image from the local (gitignored) `tests/example/` folder.
+    /// Found dynamically so swapping samples doesn't break the tests; `None`
+    /// (test skips) when the folder is absent, e.g. in CI.
     pub(crate) fn example_png() -> Option<std::path::PathBuf> {
         std::fs::read_dir("tests/example")
             .ok()?
@@ -1342,14 +1561,88 @@ pub(crate) mod drop_import_tests {
             .find(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("png")))
     }
 
+    /// Like [`example_png`], but only a PNG that embeds a ComfyUI API graph —
+    /// detected by the raw `prompt` text-chunk marker, independent of the
+    /// reader under test. The sample folder holds arbitrary user images
+    /// (A1111 exports included), so graph-dependent tests skip when no
+    /// ComfyUI-saved PNG happens to be present.
+    pub(crate) fn example_comfy_png() -> Option<std::path::PathBuf> {
+        std::fs::read_dir("tests/example")
+            .ok()?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("png")))
+            .find(|p| {
+                std::fs::read(p).is_ok_and(|bytes| {
+                    // A PNG text chunk starts `<type>` then `<keyword>\0`.
+                    [b"tEXtprompt\0".as_slice(), b"iTXtprompt\0".as_slice(), b"zTXtprompt\0".as_slice()]
+                        .iter()
+                        .any(|pat| bytes.windows(pat.len()).any(|w| &w == pat))
+                })
+            })
+    }
+
     #[test]
     fn reads_example_png() {
         let Some(p) = example_png() else { return };
         let meta = read_generation(&p).expect("example png should have metadata");
         assert!(!meta.positive.trim().is_empty(), "a prompt was extracted");
-        assert!(meta.workflow_api.is_some(), "runnable API graph captured");
         // Inline <lora:> tags must never survive in the prompt text.
         assert!(!meta.positive.contains("<lora:"), "lora tags stripped");
+    }
+
+    #[test]
+    fn captures_comfy_api_graph() {
+        let Some(p) = example_comfy_png() else { return };
+        let meta = read_generation(&p).expect("comfy png should have metadata");
+        assert!(meta.workflow_api.is_some(), "runnable API graph captured");
+    }
+
+    /// Sample videos in `tests/example/`, named for what they carry:
+    /// `*_meta.mp4` embeds ComfyUI graphs (`comfy_savevideo_*` = SaveVideo mdta
+    /// tags, `comfy_vhs_*` = the iTunes-comment layout), `*no_meta*` is a plain
+    /// clip. Empty (tests skip) when the local sample folder is absent.
+    fn example_videos() -> Vec<std::path::PathBuf> {
+        std::fs::read_dir("tests/example")
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|x| ["mp4", "webm", "mkv"].iter().any(|v| x.eq_ignore_ascii_case(v)))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn video_metadata_reaches_details_box() {
+        for p in example_videos() {
+            let name = p.file_name().unwrap().to_string_lossy().to_ascii_lowercase();
+            let (disp, raw) = read_both(&p);
+            if name.contains("no_meta") {
+                assert!(disp.is_none(), "{name}: plain video must show no metadata");
+            } else if name.contains("meta") {
+                assert!(disp.is_some(), "{name}: formatted metadata extracted");
+                assert!(raw.is_some(), "{name}: raw metadata extracted");
+            }
+        }
+    }
+
+    #[test]
+    fn video_drop_import_gets_runnable_graph() {
+        for p in example_videos() {
+            let name = p.file_name().unwrap().to_string_lossy().to_ascii_lowercase();
+            if !name.contains("comfy") {
+                continue;
+            }
+            let meta = read_generation(&p).expect("comfy video should import");
+            assert!(!meta.positive.trim().is_empty(), "{name}: a prompt was extracted");
+            assert!(meta.workflow_api.is_some(), "{name}: runnable API graph captured");
+            let graph = meta.workflow_api.unwrap();
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&graph).is_ok(),
+                "{name}: captured graph re-parses as JSON"
+            );
+        }
     }
 
     #[test]
