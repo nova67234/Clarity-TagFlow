@@ -604,7 +604,7 @@ fn resource_card(
                                 .tint(egui::Color32::from_rgb(235, 150, 45)),
                         );
                         warn_rect = Some(r.rect);
-                        warn_msg = d.status.clone();
+                        warn_msg.clone_from(&d.status);
                     }
                     None if installed => {
                         // Already downloaded — green check.
@@ -1475,7 +1475,7 @@ fn load_download_dirs() -> DownloadDirs {
             let mut d = DownloadDirs::default();
             for cat in DlCat::ALL {
                 if let Some(v) = map.get(cat.key()) {
-                    *d.get_mut(cat) = v.clone();
+                    d.get_mut(cat).clone_from(v);
                 }
             }
             return d;
@@ -1488,7 +1488,7 @@ fn load_download_dirs() -> DownloadDirs {
     let mut d = DownloadDirs::default();
     if !legacy.is_empty() {
         for cat in DlCat::ALL {
-            *d.get_mut(cat) = legacy.clone();
+            d.get_mut(cat).clone_from(&legacy);
         }
     }
     d
@@ -2162,11 +2162,14 @@ fn as_text(v: &serde_json::Value) -> Option<String> {
 
 /// Percent-encode a query value (RFC 3986 unreserved set kept literal).
 fn percent_encode(s: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out

@@ -1267,11 +1267,12 @@ mod worker {
                     // model can reason about order and motion.
                     send(Msg::Status("Reading the video…".into()));
                     let frames = video_frames(path)?;
+                    use std::fmt::Write as _;
                     let mut header =
                         format!("This is a video, shown as {} sampled frames:\n", frames.len());
                     for (ms, frame) in &frames {
                         bitmaps.push(load_bitmap(mtmd, frame)?);
-                        header.push_str(&format!("Frame at {}: {marker}\n", fmt_timestamp(*ms)));
+                        let _ = writeln!(header, "Frame at {}: {marker}", fmt_timestamp(*ms));
                     }
                     text = format!("{header}{text}");
                 } else {
@@ -1313,33 +1314,36 @@ mod worker {
             Err(_) => match which {
                 // Gemma 4's wire format.
                 super::GemmaModel::E4B | super::GemmaModel::D31B => {
+                    use std::fmt::Write as _;
                     let mut s = String::new();
                     if think {
                         s.push_str("<|turn>system\n<|think|>\n<turn|>\n");
                     }
                     for (user, text) in &turns {
                         let role = if *user { "user" } else { "model" };
-                        s.push_str(&format!("<|turn>{role}\n{text}<turn|>\n"));
+                        let _ = writeln!(s, "<|turn>{role}\n{text}<turn|>");
                     }
                     s.push_str("<|turn>model\n");
                     s
                 }
                 // Gemma 3's wire format.
                 super::GemmaModel::G27B => {
+                    use std::fmt::Write as _;
                     let mut s = String::new();
                     for (user, text) in &turns {
                         let role = if *user { "user" } else { "model" };
-                        s.push_str(&format!("<start_of_turn>{role}\n{text}<end_of_turn>\n"));
+                        let _ = writeln!(s, "<start_of_turn>{role}\n{text}<end_of_turn>");
                     }
                     s.push_str("<start_of_turn>model\n");
                     s
                 }
                 // ChatML, Qwen's wire format.
                 super::GemmaModel::Qwen8B | super::GemmaModel::Qwen30B => {
+                    use std::fmt::Write as _;
                     let mut s = String::new();
                     for (user, text) in &turns {
                         let role = if *user { "user" } else { "assistant" };
-                        s.push_str(&format!("<|im_start|>{role}\n{text}<|im_end|>\n"));
+                        let _ = writeln!(s, "<|im_start|>{role}\n{text}<|im_end|>");
                     }
                     s.push_str("<|im_start|>assistant\n");
                     s
@@ -1824,7 +1828,7 @@ mod tests {
                         user: true,
                         text: "Mira, I painted this artwork of a cosmic throne — it took me a                                whole year and it is the most precious thing I have ever made.                                I want you to have it. What do you think of it?"
                             .to_string(),
-                        image: Some(img.clone()),
+                        image: Some(img),
                     },
                 ],
             })

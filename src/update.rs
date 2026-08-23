@@ -452,10 +452,10 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
     if do_dismiss
         && let Some(r) = &state.result {
             if let Some(ri) = &r.app_latest {
-                settings.dismissed_app_version = ri.tag.clone();
+                settings.dismissed_app_version.clone_from(&ri.tag);
             }
             if let Some(ri) = &r.comfy_latest {
-                settings.dismissed_comfy_version = ri.tag.clone();
+                settings.dismissed_comfy_version.clone_from(&ri.tag);
             }
         }
 }

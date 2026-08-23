@@ -857,7 +857,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                 && can_edit
             {
                 llm.editing = Some((chat_id, index));
-                llm.edit_draft = text.clone();
+                llm.edit_draft.clone_from(&text);
             }
         });
         return;

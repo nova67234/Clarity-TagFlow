@@ -34,12 +34,13 @@ fn emoji_svg(grapheme: &str) -> Option<&'static [u8]> {
 /// A stable image-cache URI for an emoji grapheme (its codepoints in hex, so the
 /// `.svg` suffix routes it to egui_extras' SVG loader).
 fn emoji_uri(grapheme: &str) -> String {
+    use std::fmt::Write as _;
     let mut s = String::from("twemoji-");
     for (i, c) in grapheme.chars().enumerate() {
         if i > 0 {
             s.push('-');
         }
-        s.push_str(&format!("{:x}", c as u32));
+        let _ = write!(s, "{:x}", c as u32);
     }
     s.push_str(".svg");
     s

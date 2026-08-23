@@ -668,7 +668,7 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
 
     // Apply the deferred actions (borrowck: outside the closure).
     if let Some(dir) = navigate {
-        state.cwd = dir.clone();
+        state.cwd.clone_from(&dir);
         state.saved_note = None;
         let params = state.params(settings);
         state.start_list(params, dir);

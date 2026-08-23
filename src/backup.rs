@@ -395,7 +395,7 @@ impl BackupState {
         let worker_prog = prog.clone();
         let source = self.source.clone();
         let files = self.files.clone();
-        let zip_name_for_worker = zip_name.clone();
+        let zip_name_for_worker = zip_name;
         std::thread::spawn(move || {
             // Catch any panic in the backup so it surfaces as a clean error in the
             // dialog instead of silently killing the worker (which would leave the

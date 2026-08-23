@@ -164,7 +164,8 @@ impl RoleplayState {
         for m in self.memories.iter().skip(skip) {
             diary.push_str("- ");
             if let Some(img) = &m.image {
-                diary.push_str(&format!("[saved picture {img}] "));
+                use std::fmt::Write as _;
+                let _ = write!(diary, "[saved picture {img}] ");
             }
             diary.push_str(&m.text);
             diary.push('\n');
