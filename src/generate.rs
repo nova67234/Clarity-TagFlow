@@ -600,7 +600,12 @@ fn sniff_lora_base(path: &Path) -> LoraBase {
     let Some(obj) = header.as_object() else {
         return LoraBase::Unknown;
     };
+    classify_lora_header(obj)
+}
 
+/// The classification behind [`sniff_lora_base`], split out so tests can feed
+/// it hand-built headers.
+fn classify_lora_header(obj: &serde_json::Map<String, serde_json::Value>) -> LoraBase {
     // 1 — explicit training metadata.
     if let Some(meta) = obj.get("__metadata__").and_then(|m| m.as_object()) {
         for key in ["ss_base_model_version", "modelspec.architecture", "ss_sd_model_name"] {
@@ -624,6 +629,10 @@ fn sniff_lora_base(path: &Path) -> LoraBase {
                 if v.contains("anima") || v.contains("cosmos") {
                     return LoraBase::Anima;
                 }
+                // LTX-Video (Lightricks): "ltxv"/"ltx-video"/"ltx2".
+                if v.contains("ltx") {
+                    return LoraBase::Ltx;
+                }
                 // Wan (Alibaba): "wan2.1"/"wan2.2"/"wanvideo".
                 if v.contains("wan2") || v.contains("wanvideo") || v.contains("wan-video") || v.contains("wan_video") {
                     return LoraBase::Wan;
@@ -640,6 +649,11 @@ fn sniff_lora_base(path: &Path) -> LoraBase {
 
     // 2 — tensor-name fingerprints.
     let mut saw_flat_layers = false;
+    // A plain "blocks" DiT stack with split self/cross attention is shared by
+    // Wan and Anima (Cosmos 2); the feed-forward naming tells them apart (Wan:
+    // ffn, Cosmos: mlp), and those keys may sort after the attention ones — so
+    // collect flags and decide once the whole header has been seen.
+    let (mut saw_blocks_attn, mut saw_blocks_ffn) = (false, false);
     for k in obj.keys() {
         if k == "__metadata__" {
             continue;
@@ -649,19 +663,43 @@ fn sniff_lora_base(path: &Path) -> LoraBase {
         if k.contains("double_blocks") || k.contains("single_blocks") || k.contains("single_transformer_blocks") {
             return LoraBase::Flux;
         }
-        // Anima (Cosmos-2 DiT): flat block stack with split self/cross attention,
-        // e.g. lora_unet_blocks_0_cross_attn_k_proj / _self_attn_q_proj.
-        if k.contains("lora_unet_blocks_") && (k.contains("_cross_attn_") || k.contains("_self_attn_")) {
-            return LoraBase::Anima;
-        }
-        // SD / SDXL UNet naming.
+        // SD / SDXL UNet naming. Checked before the LTX pattern below — SDXL
+        // UNet keys also contain "transformer_blocks" + "attn1".
         if k.contains("input_blocks") || k.contains("down_blocks") || k.contains("lora_te1") || k.contains("mid_block") {
             return LoraBase::Other;
+        }
+        // LTX-Video: a top-level transformer_blocks stack with split self/cross
+        // attention (attn1/attn2) — diffusers "transformer.", Comfy-converted
+        // "diffusion_model.", kohya "lora_unet_" prefixes. SD3-style DiTs use
+        // joint ".attn." and fall through.
+        if (k.starts_with("transformer.transformer_blocks.")
+            || k.starts_with("diffusion_model.transformer_blocks.")
+            || k.starts_with("lora_unet_transformer_blocks_"))
+            && (k.contains("attn1") || k.contains("attn2"))
+        {
+            return LoraBase::Ltx;
+        }
+        // Wan / Anima "blocks" stack, dotted (Comfy: diffusion_model.blocks.N.
+        // cross_attn.k…) or underscored (kohya/musubi: lora_unet_blocks_0_
+        // cross_attn_k…) — flagged, resolved after the loop.
+        let dotted = k.starts_with("diffusion_model.blocks.") || k.starts_with("transformer.blocks.");
+        let underscored = k.contains("lora_unet_blocks_");
+        if dotted || underscored {
+            if k.contains("cross_attn") || k.contains("self_attn") {
+                saw_blocks_attn = true;
+            }
+            if k.contains(".ffn.") || k.contains("_ffn_") {
+                saw_blocks_ffn = true;
+            }
         }
         // Z-Image (S3-DiT): a flat layer stack — diffusion_model.layers.N.attention…
         if k.starts_with("diffusion_model.layers.") || k.contains("lora_unet_layers_") {
             saw_flat_layers = true;
         }
+    }
+    if saw_blocks_attn {
+        // Wan when the feed-forward is "ffn"; Anima (Cosmos 2, "mlp") otherwise.
+        return if saw_blocks_ffn { LoraBase::Wan } else { LoraBase::Anima };
     }
     if saw_flat_layers {
         LoraBase::ZImage
@@ -1130,6 +1168,72 @@ mod lora_sniff_tests {
         let p = fake_safetensors("bare", serde_json::json!({"some.unrecognised.tensor": {"dtype": "F16", "shape": [1], "data_offsets": [0, 0]}}));
         assert!(matches!(sniff_lora_base(&p), LoraBase::Unknown));
         assert!(matches!(sniff_lora_base(Path::new("Z:/does/not/exist.safetensors")), LoraBase::Unknown));
+    }
+
+    /// LTX-Video LoRAs — key shapes taken verbatim from real files: the
+    /// official Lightricks Cakeify LoRA (diffusers "transformer." prefix) and
+    /// a Comfy-converted 13b community LoRA ("diffusion_model." prefix); both
+    /// ship without any `__metadata__`, so only the tensor names identify them.
+    #[test]
+    fn fingerprints_ltx_tensor_names() {
+        let p = fake_safetensors(
+            "ltx_diffusers",
+            serde_json::json!({"transformer.transformer_blocks.0.attn1.to_k.lora_A.weight": {"dtype": "F16", "shape": [1], "data_offsets": [0, 0]}}),
+        );
+        assert!(matches!(sniff_lora_base(&p), LoraBase::Ltx));
+        let p = fake_safetensors(
+            "ltx_comfy",
+            serde_json::json!({"diffusion_model.transformer_blocks.0.attn2.to_out.0.lora_B.weight": {"dtype": "F16", "shape": [1], "data_offsets": [0, 0]}}),
+        );
+        assert!(matches!(sniff_lora_base(&p), LoraBase::Ltx));
+        let p = fake_safetensors(
+            "ltx_meta",
+            serde_json::json!({"__metadata__": {"modelspec.architecture": "ltxv-13b/lora"}}),
+        );
+        assert!(matches!(sniff_lora_base(&p), LoraBase::Ltx));
+    }
+
+    /// SDXL UNet keys also contain "transformer_blocks" + "attn1" — they must
+    /// keep classifying as SD-family, never LTX.
+    #[test]
+    fn sdxl_unet_keys_are_not_ltx() {
+        let p = fake_safetensors(
+            "sdxl_unet",
+            serde_json::json!({"lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_k.lora_down.weight": {"dtype": "F16", "shape": [1], "data_offsets": [0, 0]}}),
+        );
+        assert!(matches!(sniff_lora_base(&p), LoraBase::Other));
+    }
+
+    /// Wan vs Anima: both are a plain "blocks" DiT stack with self/cross
+    /// attention; the feed-forward naming (Wan: ffn, Cosmos: mlp) splits them.
+    /// Wan keys taken verbatim from a real lightx2v Wan 2.2 distill LoRA
+    /// (no `__metadata__` either).
+    #[test]
+    fn fingerprints_wan_and_anima_blocks() {
+        let p = fake_safetensors(
+            "wan_comfy",
+            serde_json::json!({
+                "diffusion_model.blocks.0.cross_attn.k.lora_down.weight": {"dtype": "F16", "shape": [1], "data_offsets": [0, 0]},
+                "diffusion_model.blocks.0.ffn.0.lora_down.weight": {"dtype": "F16", "shape": [1], "data_offsets": [0, 0]}
+            }),
+        );
+        assert!(matches!(sniff_lora_base(&p), LoraBase::Wan));
+        let p = fake_safetensors(
+            "wan_musubi",
+            serde_json::json!({
+                "lora_unet_blocks_0_cross_attn_k.lora_down.weight": {"dtype": "F16", "shape": [1], "data_offsets": [0, 0]},
+                "lora_unet_blocks_0_ffn_0.lora_down.weight": {"dtype": "F16", "shape": [1], "data_offsets": [0, 0]}
+            }),
+        );
+        assert!(matches!(sniff_lora_base(&p), LoraBase::Wan));
+        let p = fake_safetensors(
+            "anima_kohya",
+            serde_json::json!({
+                "lora_unet_blocks_0_cross_attn_k_proj.lora_down.weight": {"dtype": "F16", "shape": [1], "data_offsets": [0, 0]},
+                "lora_unet_blocks_0_mlp_layer1.lora_down.weight": {"dtype": "F16", "shape": [1], "data_offsets": [0, 0]}
+            }),
+        );
+        assert!(matches!(sniff_lora_base(&p), LoraBase::Anima));
     }
 }
 
@@ -3378,7 +3482,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
         });
     });
     if state.show_log {
-        let bg = if is_light() { FIELD() } else { Color32::from_rgb(15, 15, 17) };
+        let bg = crate::theme::console_bg();
         egui::Frame::new()
             .fill(bg)
             .corner_radius(CornerRadius::same(22))
@@ -3469,7 +3573,7 @@ fn model_selector(ui: &mut egui::Ui, state: &mut GenerateState) {
     let (arrow, gap) = (14.0, 2.0);
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(galley.size().x + gap + arrow, 28.0), egui::Sense::click());
-    let resp = resp.on_hover_text(full.clone()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let resp = resp.on_hover_text(full).on_hover_cursor(egui::CursorIcon::PointingHand);
     if ui.is_rect_visible(rect) {
         let text_pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
         ui.painter().galley(text_pos, galley, TEXT());
@@ -4180,14 +4284,14 @@ fn import_dropped_file(state: &mut GenerateState, path: &Path, ctx: &egui::Conte
 
     // Adopt the dropped image's runnable graph so Generate runs *its* workflow
     // (custom nodes and all). Dropping a non-workflow image clears it.
-    state.imported_workflow = meta.workflow_api.clone();
+    state.imported_workflow.clone_from(&meta.workflow_api);
 
     // Fill the prompt + settings (the user opted into both).
     if !meta.positive.trim().is_empty() {
-        state.prompt = meta.positive.clone();
+        state.prompt.clone_from(&meta.positive);
     }
     if !meta.negative.trim().is_empty() {
-        state.negative = meta.negative.clone();
+        state.negative.clone_from(&meta.negative);
     }
     if let Some(s) = meta.steps {
         state.steps = (s as i32).clamp(1, 50);
@@ -4237,7 +4341,7 @@ fn import_dropped_file(state: &mut GenerateState, path: &Path, ctx: &egui::Conte
 
     let nodes = meta.custom_nodes;
     let graph = state.imported_workflow.clone();
-    let civitai = meta.civitai.clone();
+    let civitai = meta.civitai;
     // Nothing to fetch (no custom nodes, no runnable graph) → just report.
     if nodes.is_empty() && graph.is_none() {
         state.nodes_status = Some("Imported — no custom nodes used".into());
@@ -5303,9 +5407,10 @@ fn build_params(job: &GenJob) -> String {
     };
     let mut prompt = job.prompt.clone();
     // Surface selected LoRAs as A1111 tags so they show up too.
+    use std::fmt::Write as _;
     for (file, strength) in &job.loras {
         let name = file.trim_end_matches(".safetensors");
-        prompt.push_str(&format!(" <lora:{name}:{strength}>"));
+        let _ = write!(prompt, " <lora:{name}:{strength}>");
     }
     format!(
         "{prompt}\nNegative prompt: \nSteps: {}, Sampler: Euler, CFG scale: {}, Seed: {}, Size: {}x{}, Model: {}, Version: Clarity TagFlow v{}",
@@ -5404,7 +5509,7 @@ fn anima_workflow(job: &GenJob) -> serde_json::Value {
 
     // A light anime-oriented negative (cfg 4 uses the negative conditioning).
     const ANIMA_NEG: &str = "lowres, worst quality, low quality, bad anatomy, bad hands, text, watermark, jpeg artifacts, signature";
-    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
+    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref}}));
     obj.insert("6".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": neg_with(job, ANIMA_NEG), "clip": clip_ref}}));
     obj.insert("7".into(), json!({"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}));
     obj.insert("8".into(), json!({"class_type": "KSampler", "inputs": {
@@ -5504,7 +5609,7 @@ fn sdxl_workflow(job: &GenJob) -> serde_json::Value {
     let vae_ref = json!(["1", 2]);
     // A standard SDXL quality negative.
     const SDXL_NEG: &str = "ugly, low quality, worst quality, blurry, jpeg artifacts, watermark, text, deformed, bad anatomy";
-    obj.insert("3".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
+    obj.insert("3".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref}}));
     obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": neg_with(job, SDXL_NEG), "clip": clip_ref}}));
     obj.insert("5".into(), json!({"class_type": "EmptyLatentImage", "inputs": {
         "width": width, "height": height, "batch_size": 1
@@ -5617,7 +5722,7 @@ fn ltx_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
     let vae_ref = json!(["1", 2]);
     // A standard video negative (used because LTX runs with a little CFG here).
     const LTX_NEG: &str = "worst quality, inconsistent motion, blurry, jittery, distorted, washed out, overexposed";
-    obj.insert("3".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
+    obj.insert("3".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref}}));
     obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": neg_with(job, LTX_NEG), "clip": clip_ref}}));
 
     // Conditioning + latent: image-to-video seeds the latent from the uploaded
@@ -5627,7 +5732,7 @@ fn ltx_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
         let img = image_name.unwrap_or("");
         obj.insert("5".into(), json!({"class_type": "LoadImage", "inputs": {"image": img}}));
         obj.insert("6".into(), json!({"class_type": "LTXVImgToVideo", "inputs": {
-            "positive": ["3", 0], "negative": ["4", 0], "vae": vae_ref.clone(), "image": ["5", 0],
+            "positive": ["3", 0], "negative": ["4", 0], "vae": vae_ref, "image": ["5", 0],
             "width": width, "height": height, "length": length, "batch_size": 1, "strength": 1.0
         }}));
         (json!(["6", 0]), json!(["6", 1]), json!(["6", 2]))
@@ -5644,11 +5749,11 @@ fn ltx_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
     // Stage 1: sample at the base resolution.
     obj.insert("8".into(), json!({"class_type": "LTXVScheduler", "inputs": {
         "steps": job.steps, "max_shift": 2.05, "base_shift": 0.95, "stretch": true,
-        "terminal": 0.1, "latent": latent_ref.clone()
+        "terminal": 0.1, "latent": latent_ref
     }}));
     obj.insert("9".into(), json!({"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}}));
     obj.insert("11".into(), json!({"class_type": "SamplerCustom", "inputs": {
-        "model": model_ref.clone(), "add_noise": true, "noise_seed": job.seed, "cfg": job.guidance,
+        "model": model_ref, "add_noise": true, "noise_seed": job.seed, "cfg": job.guidance,
         "positive": ["7", 0], "negative": ["7", 1], "sampler": ["9", 0], "sigmas": ["8", 0],
         "latent_image": latent_ref
     }}));
@@ -5661,7 +5766,7 @@ fn ltx_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
         "model_name": "ltxv-spatial-upscaler-0.9.7.safetensors"
     }}));
     obj.insert("21".into(), json!({"class_type": "LTXVLatentUpsampler", "inputs": {
-        "samples": ["11", 0], "upscale_model": ["20", 0], "vae": vae_ref.clone()
+        "samples": ["11", 0], "upscale_model": ["20", 0], "vae": vae_ref
     }}));
     obj.insert("22".into(), json!({"class_type": "LTXVScheduler", "inputs": {
         "steps": job.steps, "max_shift": 2.05, "base_shift": 0.95, "stretch": true,
@@ -5727,7 +5832,7 @@ fn wan_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
 
     let clip_ref = json!(["2", 0]);
     let vae_ref = json!(["3", 0]);
-    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
+    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref}}));
     obj.insert("5".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": neg_with(job, WAN_NEG), "clip": clip_ref}}));
 
     // ModelSamplingSD3 (shift 8) — Wan's sampling-shift node.
@@ -5736,7 +5841,7 @@ fn wan_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
     // Latent: the one node does both modes — image-to-video seeds it from the
     // uploaded frame (start_image), text-to-video omits it.
     let mut latent_inputs = json!({
-        "vae": vae_ref.clone(), "width": width, "height": height, "length": length, "batch_size": 1
+        "vae": vae_ref, "width": width, "height": height, "length": length, "batch_size": 1
     });
     if job.i2v
         && let Some(name) = image_name {
@@ -5798,7 +5903,7 @@ fn wan14b_workflow(
 
     let clip_ref = json!(["2", 0]);
     let vae_ref = json!(["3", 0]);
-    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
+    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref}}));
     obj.insert("5".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": neg_with(job, WAN_NEG), "clip": clip_ref}}));
 
     // ModelSamplingSD3 (shift 8) — Wan's sampling-shift node.
@@ -5808,7 +5913,7 @@ fn wan14b_workflow(
     // bare latent (t2v when start_image is omitted). Outputs [positive, negative,
     // latent]. No clip_vision — Wan 2.2 14B I2V doesn't use it.
     let mut wi2v = json!({
-        "positive": ["4", 0], "negative": ["5", 0], "vae": vae_ref.clone(),
+        "positive": ["4", 0], "negative": ["5", 0], "vae": vae_ref,
         "width": width, "height": height, "length": length, "batch_size": 1
     });
     if job.i2v
@@ -5857,7 +5962,7 @@ fn zimage_workflow(job: &GenJob) -> serde_json::Value {
         clip_ref = json!([node, 1]);
     }
 
-    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
+    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref}}));
     obj.insert("6".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": neg_with(job, ""), "clip": clip_ref}}));
     obj.insert("7".into(), json!({"class_type": "EmptySD3LatentImage", "inputs": {"width": job.width, "height": job.height, "batch_size": 1}}));
     obj.insert("8".into(), json!({"class_type": "KSampler", "inputs": {
@@ -5901,7 +6006,7 @@ fn flux_workflow(job: &GenJob) -> serde_json::Value {
         clip_ref = json!([node, 1]);
     }
 
-    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref.clone()}}));
+    obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref}}));
     obj.insert("5".into(), json!({"class_type": "FluxGuidance", "inputs": {"conditioning": ["4", 0], "guidance": job.guidance}}));
     obj.insert("6".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": neg_with(job, ""), "clip": clip_ref}}));
     obj.insert("7".into(), json!({"class_type": "EmptySD3LatentImage", "inputs": {"width": job.width, "height": job.height, "batch_size": 1}}));
@@ -6020,11 +6125,14 @@ fn parse_progress(s: &str) -> Option<u32> {
 
 /// Minimal percent-encoding for the /view query params.
 fn urlencode(s: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out
@@ -6129,11 +6237,11 @@ mod imported_workflow_tests {
 
     /// The imported-graph prompt substitution must find the right CLIPTextEncode
     /// nodes (the ones feeding the sampler), so Generate can swap the prompt/seed
-    /// into the dropped image's own workflow. Uses whatever sample image is
-    /// committed under tests/example/.
+    /// into the dropped image's own workflow. Uses a ComfyUI-saved sample from
+    /// the local tests/example/ folder; skips when none is present.
     #[test]
     fn traces_sampler_encode_nodes() {
-        let Some(p) = crate::sd_metadata::drop_import_tests::example_png() else { return };
+        let Some(p) = crate::sd_metadata::drop_import_tests::example_comfy_png() else { return };
         let meta = crate::sd_metadata::read_generation(&p).expect("metadata");
         let graph = meta.workflow_api.expect("runnable api graph");
         let v: serde_json::Value = serde_json::from_str(&graph).unwrap();
