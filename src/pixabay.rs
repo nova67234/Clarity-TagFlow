@@ -107,13 +107,23 @@ pub fn parse_videos(body: &str) -> Result<Vec<Item>, String> {
 }
 
 /// The hit's comma-separated `tags` string ("flowers, yellow, blossom"),
-/// already in the sidecar format.
+/// already in the sidecar format — plus an author credit line ("By <user> on
+/// Pixabay — <page>"), per the Pixabay API's show-where-it's-from condition.
 fn hit_tags(hit: &serde_json::Value) -> Option<String> {
-    hit.get("tags")
+    let tags = hit
+        .get("tags")
         .and_then(|t| t.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        .map(str::to_string);
+    let name = hit.get("user").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let Some(name) = name else { return tags };
+    let page = hit.get("pageURL").and_then(|v| v.as_str()).unwrap_or(HOME);
+    let credit = format!("By {name} on Pixabay — {page}");
+    Some(match tags {
+        Some(t) => format!("{t}\n{credit}"),
+        None => credit,
+    })
 }
 
 /// File extension from a CDN URL, ignoring any query string.

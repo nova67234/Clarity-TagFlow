@@ -31,6 +31,20 @@ const SITE_HOME: &str = "https://gelbooru.com/";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+/// Honest client UA. Danbooru's Cloudflare 403s scripts wearing the browser UA
+/// above (API *and* cdn.donmai.us, verified) — its API docs ask clients to
+/// identify themselves instead. Other sources keep the browser UA.
+const CLIENT_USER_AGENT: &str =
+    concat!("ClarityTagFlow/", env!("CARGO_PKG_VERSION"), " (github.com/nova67234/Clarity-TagFlow)");
+
+/// The User-Agent to send a given source.
+fn ua_for(source: Source) -> &'static str {
+    match source {
+        Source::Danbooru => CLIENT_USER_AGENT,
+        _ => USER_AGENT,
+    }
+}
+
 const PAGE_LIMIT: u32 = 100;
 const MAX_TRANSIENT_RETRIES: u32 = 5;
 
@@ -410,6 +424,9 @@ pub struct DownloaderState {
     /// The Activity console is shown (toggled by the Activity button). Hidden
     /// by default; the choice persists in the saved config.
     log_shown: bool,
+    /// An error line landed in the log while the console was closed — shows a
+    /// red dot on the Activity toggle until the console is opened.
+    log_unread_error: bool,
     /// Measured height of the footer minus the animated console block, so the
     /// form can reserve exactly the right space same-frame (no nested panels).
     footer_base: f32,
@@ -444,6 +461,7 @@ impl Default for DownloaderState {
             progress: (0, 0),
             status: "Idle".to_string(),
             running: false,
+            log_unread_error: false,
             cancel: Arc::new(AtomicBool::new(false)),
             rx: None,
             loaded: false,
@@ -506,7 +524,13 @@ impl DownloaderState {
     }
 
     fn push_log(&mut self, line: impl Into<String>) {
-        self.log.push(line.into());
+        let line = line.into();
+        // Flag error lines so the closed console's Activity toggle can show an
+        // unread-error dot (cleared whenever the console is open).
+        if !self.log_shown && line.to_ascii_lowercase().contains("error") {
+            self.log_unread_error = true;
+        }
+        self.log.push(line);
         // Cap the in-memory log so a long run can't grow unbounded.
         if self.log.len() > 1000 {
             let overflow = self.log.len() - 1000;
@@ -715,9 +739,24 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                     egui::RichText::new("Activity").color(MUTED()).size(12.0),
                 )
                 .frame(false);
-                if ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                let resp = ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand);
+                if resp.clicked() {
                     state.log_shown = !state.log_shown;
                     save_config(&state.saved());
+                }
+                // Unread-error badge: a red dot at the top-right corner of the
+                // Activity text while the console is closed and an error line
+                // is waiting in the log. Opening the console clears it.
+                if state.log_shown {
+                    state.log_unread_error = false;
+                } else if state.log_unread_error {
+                    let r = resp.rect;
+                    ui.painter().circle_filled(
+                        egui::pos2(r.right() + 4.0, r.top() + 2.0),
+                        3.0,
+                        egui::Color32::from_rgb(220, 60, 50),
+                    );
+                    resp.on_hover_text("An error was logged — open Activity to read it.");
                 }
             });
             // The console slides open/closed (`openness`, computed above so
@@ -1021,6 +1060,19 @@ fn hero_card(ui: &mut egui::Ui, state: &mut DownloaderState) {
 
             ui.add_space(11.0);
             allowance_meter(ui, used, source);
+
+            // Attribution links the stock-photo APIs' guidelines ask for: a
+            // prominent Pexels link ("Photos provided by Pexels") and showing
+            // where Pixabay content comes from. The boorus don't ask for one.
+            let attrib: Option<(&str, &str)> = match source {
+                Source::Pexels => Some(("Photos provided by Pexels", crate::pexels::HOME)),
+                Source::Pixabay => Some(("Images and videos from Pixabay", crate::pixabay::HOME)),
+                _ => None,
+            };
+            if let Some((label, url)) = attrib {
+                ui.add_space(6.0);
+                ui.hyperlink_to(egui::RichText::new(label).size(10.5), url);
+            }
         });
 }
 
@@ -1763,7 +1815,7 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
             }
 
             log(format!("Downloading: {file_name}"));
-            match download_file(&agent, &post.file_url, &img_path, SITE_HOME, &cancel) {
+            match download_file(&agent, &post.file_url, &img_path, SITE_HOME, USER_AGENT, &cancel) {
                 Ok(true) => {}
                 Ok(false) => {
                     if cancel.load(Ordering::SeqCst) {
@@ -1953,7 +2005,7 @@ fn run_key_check(source: Source, user: &str, key: &str) -> (Source, bool, String
 
     let mut req = agent
         .get(&url)
-        .header("User-Agent", USER_AGENT)
+        .header("User-Agent", ua_for(source))
         .header("Accept", "application/json,text/plain,*/*");
     for (k, v) in headers {
         req = req.header(k, &v);
@@ -2181,7 +2233,7 @@ fn run_download_src(cfg: SrcCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx
             }
 
             log(format!("Downloading: {file_name}"));
-            match download_file(&agent, &item.url, &dest, cfg.source.home(), &cancel) {
+            match download_file(&agent, &item.url, &dest, cfg.source.home(), ua_for(cfg.source), &cancel) {
                 Ok(true) => {}
                 Ok(false) => {
                     if cancel.load(Ordering::SeqCst) {
@@ -2289,7 +2341,7 @@ fn fetch_items(
         let url = source_page_url(cfg, feed, page);
         let mut req = agent
             .get(&url)
-            .header("User-Agent", USER_AGENT)
+            .header("User-Agent", ua_for(cfg.source))
             .header("Accept", "application/json,text/plain,*/*");
         for (k, v) in source_headers(cfg) {
             req = req.header(k, &v);
@@ -2327,11 +2379,39 @@ fn fetch_items(
                 }
             };
         }
-        if status == 401 || status == 403 {
-            log(format!(
-                "Error: {} rejected the request (HTTP {status}) — check the API key.",
-                cfg.source.name()
-            ));
+        if status == 401 || status == 403 || status == 422 {
+            // Surface the API's own explanation when it sends one — Danbooru
+            // returns {"message": "You cannot search for more than 2 tags…"}.
+            let detail = resp
+                .body_mut()
+                .read_to_string()
+                .ok()
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+                .and_then(|v| {
+                    v.get("message")
+                        .or_else(|| v.get("error"))
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.trim().to_string())
+                })
+                .filter(|s| !s.is_empty());
+            let name = cfg.source.name();
+            let msg = if cfg.source == Source::Danbooru && status == 422 {
+                let hint = if cfg.user.trim().is_empty() || cfg.key.trim().is_empty() {
+                    "anonymous searches allow at most 2 tags — remove some, or add a Login + API key (Gold accounts get 6)"
+                } else {
+                    "your account level allows fewer tags than this search uses"
+                };
+                format!(
+                    "Error: {name}: {} ({hint}).",
+                    detail.unwrap_or_else(|| "search rejected".into())
+                )
+            } else {
+                match detail {
+                    Some(d) => format!("Error: {name} rejected the request (HTTP {status}): {d}"),
+                    None => format!("Error: {name} rejected the request (HTTP {status}) — check the API key."),
+                }
+            };
+            log(msg);
             return None;
         }
         if status == 429 || status == 408 || (500..=599).contains(&status) {
@@ -2425,12 +2505,13 @@ fn download_file(
     file_url: &str,
     dest: &Path,
     referer: &str,
+    ua: &str,
     cancel: &AtomicBool,
 ) -> Result<bool, String> {
     let url = normalize_file_url(file_url);
     let mut resp = agent
         .get(&url)
-        .header("User-Agent", USER_AGENT)
+        .header("User-Agent", ua)
         .header("Accept", "*/*")
         .header("Referer", referer)
         .header("Origin", referer.trim_end_matches('/'))

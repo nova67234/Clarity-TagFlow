@@ -79,6 +79,9 @@ pub fn parse(body: &str) -> Result<Vec<Item>, String> {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        // Photographer credit appended to the caption sidecar — the Pexels API
+        // guidelines ask that photographers be credited when possible.
+        let tags = with_credit(p, tags);
         out.push(Item {
             url: url.to_string(),
             key: format!("pexels:{id}"),
@@ -119,8 +122,28 @@ pub fn parse_videos(body: &str) -> Result<Vec<Item>, String> {
             key: format!("pexels:v{id}"),
             stem: format!("pexels-video-{id}"),
             ext,
-            tags: None, // Pexels videos carry no alt text
+            // No alt text on videos — the sidecar is just the videographer credit.
+            tags: with_credit(vid, None),
         });
     }
     Ok(out)
+}
+
+/// Append "Photo by <name> on Pexels — <page>" to the sidecar text. Photos put
+/// the photographer at `photographer`; videos nest the name at `user.name`.
+/// Both carry the media's Pexels page at `url`.
+fn with_credit(media: &serde_json::Value, tags: Option<String>) -> Option<String> {
+    let name = media
+        .get("photographer")
+        .or_else(|| media.pointer("/user/name"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(name) = name else { return tags }; // no credit — keep the caption as-is
+    let page = media.get("url").and_then(|v| v.as_str()).unwrap_or(HOME);
+    let credit = format!("Photo by {name} on Pexels — {page}");
+    Some(match tags {
+        Some(t) => format!("{t}\n{credit}"),
+        None => credit,
+    })
 }
