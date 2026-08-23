@@ -4305,10 +4305,19 @@ fn run_setup(
             return false;
         }
         let _ = std::fs::remove_file(&zip);
-        // The zip extracts as ComfyUI-master; rename to ComfyUI.
+        // The zip extracts as ComfyUI-master; rename to ComfyUI. The rename
+        // fails on Windows when ComfyUI/ already exists (a model download
+        // creates ComfyUI/models before the source lands) — silently ignoring
+        // that left installs with no main.py and a permanently disabled send
+        // button. Fall back to merging the source in around the user dirs.
         let extracted = base.join("ComfyUI-master");
-        if extracted.exists() {
-            let _ = std::fs::rename(&extracted, &comfy);
+        if extracted.exists() && std::fs::rename(&extracted, &comfy).is_err() {
+            const KEEP: &[&str] = &["models", "custom_nodes", "user", "input", "output"];
+            if let Err(e) = copy_tree_skip(&extracted, &comfy, KEEP) {
+                send(format!("ERROR: failed to install ComfyUI source: {e}"));
+                return false;
+            }
+            let _ = std::fs::remove_dir_all(&extracted);
         }
     } else {
         send("== ComfyUI already present".into());
