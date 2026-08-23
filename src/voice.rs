@@ -1020,8 +1020,10 @@ fn run_setup(tx: &Sender<SetupMsg>, ctx: &egui::Context) -> bool {
     let py = py.to_string_lossy().to_string();
 
     // 2 — PyTorch (GPU cu128 first — RTX 50-series included — CPU fallback).
+    // Retries matter especially here: a dropped connection would otherwise
+    // read as "GPU install failed" and silently downgrade to CPU torch.
     send("[2/5] Installing PyTorch (GPU)… this is the big one".to_string());
-    let gpu_ok = run_logged(
+    let gpu_ok = pip_retry(
         &send,
         &base,
         &py,
@@ -1033,7 +1035,7 @@ fn run_setup(tx: &Sender<SetupMsg>, ctx: &egui::Context) -> bool {
     );
     if !gpu_ok {
         send("[2/5] GPU PyTorch failed — installing CPU PyTorch instead".to_string());
-        if !run_logged(&send, &base, &py, &["-m", "pip", "install", "torch", "torchaudio"]) {
+        if !pip_retry(&send, &base, &py, &["-m", "pip", "install", "torch", "torchaudio"]) {
             send("PyTorch install failed".to_string());
             return false;
         }
@@ -1041,7 +1043,7 @@ fn run_setup(tx: &Sender<SetupMsg>, ctx: &egui::Context) -> bool {
 
     // 3 — OmniVoice + the wav writer its examples use.
     send("[3/5] Installing OmniVoice…".to_string());
-    if !run_logged(&send, &base, &py, &["-m", "pip", "install", "omnivoice", "soundfile"]) {
+    if !pip_retry(&send, &base, &py, &["-m", "pip", "install", "omnivoice", "soundfile"]) {
         send("OmniVoice install failed".to_string());
         return false;
     }
@@ -1073,6 +1075,26 @@ fn run_setup(tx: &Sender<SetupMsg>, ctx: &egui::Context) -> bool {
 
 /// Run a command from `dir`, forwarding its merged output line-by-line to the
 /// status label. True on exit code 0.
+/// Run a pip command with retries — PyPI/CDN connections drop mid-download
+/// often enough that one attempt can't be trusted for multi-GB wheels. pip
+/// caches completed downloads, so a retry only re-fetches what was cut off.
+fn pip_retry(send: &dyn Fn(String), dir: &std::path::Path, py: &str, args: &[&str]) -> bool {
+    const ATTEMPTS: u32 = 3;
+    for attempt in 1..=ATTEMPTS {
+        if run_logged(send, dir, py, args) {
+            return true;
+        }
+        if attempt < ATTEMPTS {
+            send(format!(
+                "Install hiccup (usually a dropped connection) — retrying, attempt {}/{ATTEMPTS}…",
+                attempt + 1
+            ));
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    }
+    false
+}
+
 fn run_logged(send: &dyn Fn(String), dir: &std::path::Path, program: &str, args: &[&str]) -> bool {
     let mut cmd = Command::new(program);
     cmd.args(args).current_dir(dir).stdout(Stdio::piped()).stderr(Stdio::piped());

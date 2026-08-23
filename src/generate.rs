@@ -2830,7 +2830,7 @@ pub fn update_comfyui(send: &dyn Fn(String)) -> bool {
     let req = comfy.join("requirements.txt");
     if req.exists() {
         send("== Updating ComfyUI requirements…".into());
-        let _ = run_streamed(&base, &py, &["-m", "pip", "install", "-r", &req.to_string_lossy()], send);
+        let _ = pip_retry(&base, &py, &["-m", "pip", "install", "-r", &req.to_string_lossy()], send);
     }
     match comfyui_installed_version() {
         Some(v) => send(format!("== ComfyUI updated to {v}. It will relaunch on the next generation.")),
@@ -4007,13 +4007,13 @@ fn run_setup(
     // 2 — PyTorch (CUDA 12.8).
     status("Installing PyTorch…");
     send("== [2/6] Installing PyTorch 2.8 (CUDA 12.8)…".into());
-    if !run_streamed(&base, &py, &["-m", "pip", "install", "--upgrade", "pip"], &send) {
+    if !pip_retry(&base, &py, &["-m", "pip", "install", "--upgrade", "pip"], &send) {
         send("WARNING: pip upgrade failed".into());
     }
     // torch + torchvision + torchaudio MUST come from the same cu128 build, or
     // torchaudio's native DLL fails to load on Windows (WinError 127) and crashes
     // ComfyUI at startup (it imports torchaudio).
-    if !run_streamed(
+    if !pip_retry(
         &base,
         &py,
         &["-m", "pip", "install", "torch==2.8.0", "torchvision==0.23.0", "torchaudio==2.8.0", "--index-url", TORCH_INDEX],
@@ -4053,7 +4053,7 @@ fn run_setup(
     let reqs = comfy.join("requirements.txt");
     if reqs.exists() {
         let reqs_s = reqs.to_string_lossy().to_string();
-        if !run_streamed(&base, &py, &["-m", "pip", "install", "-r", &reqs_s], &send) {
+        if !pip_retry(&base, &py, &["-m", "pip", "install", "-r", &reqs_s], &send) {
             send("WARNING: some ComfyUI requirements failed".into());
         }
     }
@@ -4061,7 +4061,7 @@ fn run_setup(
     // than torch 2.8.0 — re-pin it (no-deps so torch/vision aren't disturbed) to
     // fix the Windows DLL-load crash.
     send("== Re-pinning torchaudio to 2.8.0 (cu128) to match torch…".into());
-    run_streamed(
+    pip_retry(
         &base,
         &py,
         &["-m", "pip", "install", "--force-reinstall", "--no-deps", "torchaudio==2.8.0", "--index-url", TORCH_INDEX],
@@ -4082,7 +4082,7 @@ fn run_setup(
             }
         }
     }
-    run_streamed(&base, &py, &["-m", "pip", "install", "gguf"], &send);
+    pip_retry(&base, &py, &["-m", "pip", "install", "gguf"], &send);
 
     // 5/6 — the chosen family's model files.
     let m = |sub: &str| comfy.join("models").join(sub);
@@ -4742,7 +4742,7 @@ fn install_custom_nodes(
                     let reqs = dir.join("requirements.txt");
                     if reqs.exists() {
                         send(format!("   installing {} requirements…", node.name));
-                        let _ = run_streamed(&comfy, &py, &["-m", "pip", "install", "-r", &reqs.to_string_lossy()], &send);
+                        let _ = pip_retry(&comfy, &py, &["-m", "pip", "install", "-r", &reqs.to_string_lossy()], &send);
                     }
                 }
                 ok_count += 1;
@@ -6141,6 +6141,27 @@ fn urlencode(s: &str) -> String {
 // ---------------------------------------------------------------------------
 // Provisioning helpers (self-contained; log via a closure)
 // ---------------------------------------------------------------------------
+
+/// Run a pip command with retries. PyPI/CDN connections drop mid-download
+/// often enough ("Connection broken: IncompleteRead…") that a single attempt
+/// can't be trusted for multi-hundred-MB wheels — and pip keeps completed
+/// downloads in its wheel cache, so a retry only re-fetches what was cut off.
+fn pip_retry(cwd: &Path, py: &str, args: &[&str], send: &dyn Fn(String)) -> bool {
+    const ATTEMPTS: u32 = 3;
+    for attempt in 1..=ATTEMPTS {
+        if run_streamed(cwd, py, args, send) {
+            return true;
+        }
+        if attempt < ATTEMPTS {
+            send(format!(
+                "== Install hiccup (usually a dropped connection) — retrying, attempt {}/{ATTEMPTS}…",
+                attempt + 1
+            ));
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    }
+    false
+}
 
 fn run_streamed(cwd: &Path, program: &str, args: &[&str], send: &dyn Fn(String)) -> bool {
     use std::io::{BufRead, BufReader};

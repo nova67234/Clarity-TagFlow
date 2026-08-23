@@ -813,7 +813,26 @@ fn run_setup(tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context) -> bool {
     let mut core_ok = true;
     let mut step = |label: &str, args: &[&str], env: &[(&str, &str)], required: bool| {
         send(format!("== {label}"));
-        if !run_streamed(tx, ctx, &base, &py, args, env) {
+        // Required steps are plain pip downloads — retry through dropped
+        // connections (pip's wheel cache makes a retry cheap). The optional
+        // GPU-kernel steps compile from source, where failure means a missing
+        // toolchain that retrying can't fix and each attempt takes minutes.
+        let attempts = if required { 3 } else { 1 };
+        let mut ok = false;
+        for attempt in 1..=attempts {
+            if run_streamed(tx, ctx, &base, &py, args, env) {
+                ok = true;
+                break;
+            }
+            if attempt < attempts {
+                send(format!(
+                    "== Install hiccup (usually a dropped connection) — retrying, attempt {}/{attempts}…",
+                    attempt + 1
+                ));
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        }
+        if !ok {
             send(format!("WARNING: step failed: {label}"));
             if required {
                 core_ok = false;
