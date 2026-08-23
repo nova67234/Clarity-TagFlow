@@ -622,7 +622,31 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
     hero_card(ui, state);
     ui.add_space(2.0);
 
-    let enabled = !state.running;
+    // Adult-capable selections (the boorus with NSFW content; Wallhaven only
+    // once Sketchy/NSFW purity is switched on) need the one-time 18+
+    // confirmation. Declining falls back to a safe selection; the form stays
+    // disabled while the dialog is up.
+    let adult = matches!(state.source, Source::Gelbooru | Source::Danbooru)
+        || (state.source == Source::Wallhaven && (state.wh.pur_sketchy || state.wh.pur_nsfw));
+    let mut gated = adult && !crate::age_gate::acknowledged();
+    if gated {
+        match crate::age_gate::modal(ui.ctx(), "downloader_age_gate") {
+            Some(true) => gated = false,
+            Some(false) => {
+                if state.source == Source::Wallhaven {
+                    state.wh.pur_sketchy = false;
+                    state.wh.pur_nsfw = false;
+                } else {
+                    state.source = Source::Pexels;
+                }
+                save_config(&state.saved());
+                gated = false;
+            }
+            None => {}
+        }
+    }
+
+    let enabled = !state.running && !gated;
 
     // No nested panels here (the Generate views lay out plainly and never
     // glitch): a bottom panel's content overflowing its one-frame-stale height
@@ -1472,6 +1496,14 @@ fn field_edit(ui: &mut egui::Ui, enabled: bool, edit: egui::TextEdit<'_>) {
 /// Validate the form and spawn the background worker.
 fn start_download(state: &mut DownloaderState, ctx: &egui::Context) {
     if state.running {
+        return;
+    }
+    // 18+ gate backstop: an adult-capable run never starts unconfirmed, even
+    // if a click races the dialog.
+    let adult = matches!(state.source, Source::Gelbooru | Source::Danbooru)
+        || (state.source == Source::Wallhaven && (state.wh.pur_sketchy || state.wh.pur_nsfw));
+    if adult && !crate::age_gate::acknowledged() {
+        state.push_log("Please confirm the adult-content notice first.");
         return;
     }
     state.log.clear();
@@ -2691,7 +2723,8 @@ fn backoff_ms(retry: u32) -> u64 {
 // Config + download-log persistence
 // ---------------------------------------------------------------------------
 
-fn config_dir() -> PathBuf {
+// pub(crate): the age gate (src/age_gate.rs) keeps its marker file here too.
+pub(crate) fn config_dir() -> PathBuf {
     dirs::config_dir()
         .map(|p| p.join("Clarity TagFlow"))
         .unwrap_or_else(|| PathBuf::from("."))

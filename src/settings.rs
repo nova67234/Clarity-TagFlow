@@ -449,6 +449,35 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
         }
     });
 
+    section(ui, "Content", |ui| {
+        row(
+            ui,
+            "Adult-content confirmation",
+            Some(
+                "The one-time 18+ notice shown before adult-capable download \
+                 sources (Gelbooru, Danbooru, Wallhaven's NSFW purities). \
+                 Reset it on a shared machine to ask again.",
+            ),
+            |ui| {
+                if crate::age_gate::acknowledged() {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if ui.button("Reset").clicked() {
+                            crate::age_gate::reset();
+                        }
+                        ui.label(
+                            egui::RichText::new("Confirmed")
+                                .color(egui::Color32::from_rgb(46, 160, 67))
+                                .size(12.0),
+                        );
+                    });
+                } else {
+                    ui.label(egui::RichText::new("Not confirmed").color(MUTED()).size(12.0));
+                }
+            },
+        );
+    });
+
     section(ui, "Video", |ui| {
         row(
             ui,

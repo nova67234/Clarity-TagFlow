@@ -90,6 +90,7 @@ mod avif {
         None
     }
 }
+mod age_gate;
 mod backup;
 mod bgremove;
 mod civitai;
