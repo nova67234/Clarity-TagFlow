@@ -2077,10 +2077,31 @@ fn poster_image_url(url: &str, width: u32) -> String {
     parts.join("/")
 }
 
-/// First preview image (~200px render) of the Civitai model version matching a
-/// file hash — used by the Generate panels for LoRA thumbnails. Returns the raw
-/// downloaded bytes (a small JPEG), or None when the hash isn't on Civitai.
-pub(crate) fn preview_image_by_hash(sha256: &str) -> Option<Vec<u8>> {
+/// Build a CDN URL for a small transcoded copy of a preview *video* — the same
+/// transform as [`sized_image_url`] plus `transcode=true`, keeping the video
+/// filename so the CDN returns a ~200px mp4 instead of a still.
+fn sized_video_url(url: &str, width: u32) -> String {
+    let mut parts: Vec<String> = url.split('/').map(|s| s.to_string()).collect();
+    if parts.len() < 2 {
+        return url.to_string();
+    }
+    let last = parts.len() - 1;
+    let transform = format!("transcode=true,width={width}");
+    if parts[last - 1].contains('=') {
+        parts[last - 1] = transform;
+    } else {
+        parts.insert(last, transform);
+    }
+    parts.join("/")
+}
+
+/// First preview (~200px render) of the Civitai model version matching a file
+/// hash — used by the Generate panels for LoRA thumbnails. Returns the raw
+/// downloaded still bytes (a small JPEG), or None when the hash isn't on
+/// Civitai. Some LoRAs (video models especially) ship *only* video previews;
+/// those return the first video's poster frame as the still, plus the CDN's
+/// small transcoded mp4 so the caller can build an animated GIF thumbnail.
+pub(crate) fn preview_media_by_hash(sha256: &str) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .tls_config(native_tls_config())
         .timeout_global(Some(Duration::from_secs(20)))
@@ -2089,10 +2110,16 @@ pub(crate) fn preview_image_by_hash(sha256: &str) -> Option<Vec<u8>> {
     let url = format!("https://civitai.com/api/v1/model-versions/by-hash/{sha256}");
     let data = get_json(&agent, &url)?;
     let images = data.get("images")?.as_array()?;
-    // Skip video previews — we want a still image.
-    let img = images.iter().find(|i| i.get("type").and_then(|t| t.as_str()) != Some("video"))?;
-    let img_url = img.get("url")?.as_str()?;
-    get_bytes(&agent, &sized_image_url(img_url, 200))
+    let is_video = |i: &&serde_json::Value| i.get("type").and_then(|t| t.as_str()) == Some("video");
+    if let Some(img) = images.iter().find(|i| !is_video(i)) {
+        let img_url = img.get("url")?.as_str()?;
+        return Some((get_bytes(&agent, &sized_image_url(img_url, 200))?, None));
+    }
+    // Video-only previews: poster still (always) + the small mp4 (best-effort).
+    let vid_url = images.iter().find(is_video)?.get("url")?.as_str()?;
+    let still = get_bytes(&agent, &poster_image_url(vid_url, 200))?;
+    let mp4 = get_bytes(&agent, &sized_video_url(vid_url, 200));
+    Some((still, mp4))
 }
 
 /// Decode downloaded preview bytes into a `ColorImage`, downscaled so its longest

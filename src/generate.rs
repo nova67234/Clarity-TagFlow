@@ -401,6 +401,12 @@ struct LoraEntry {
     thumb: Option<egui::TextureHandle>,
     /// The cache says this file has no Civitai preview — stop checking.
     thumb_missing: bool,
+    /// Animated preview frames (decoded from a cached GIF built out of a
+    /// video-only Civitai preview) with per-frame delay in seconds; shown in
+    /// place of `thumb` when present.
+    anim: Option<AnimFrames>,
+    /// The cached GIF failed to decode — stop asking [`ANIM_CACHE`].
+    anim_missing: bool,
 }
 
 /// One full checkpoint found in ComfyUI's `models/checkpoints/` dir, with its
@@ -533,6 +539,9 @@ enum LoraBase {
     /// Anima — a 2B anime model (CircleStone Labs / Comfy Org, built on NVIDIA
     /// Cosmos 2). Its own DiT architecture; not usable by the current tabs.
     Anima,
+    /// Krea 2 (Krea / Comfy Org) — 12B dense DiT with w-prefixed joint-attention
+    /// projections (blocks.N.attn.wq/wk/wv/wo); loaded via UNETLoader.
+    Krea2,
     /// LTX-Video (Lightricks) — DiT video model loaded via CheckpointLoaderSimple.
     Ltx,
     /// Wan (Alibaba) — DiT video model (5B TI2V / 14B I2V), `model.diffusion_model.
@@ -551,6 +560,7 @@ impl LoraBase {
             LoraBase::ZImage => family == GenFamily::ZImage,
             LoraBase::Sdxl => family == GenFamily::Sdxl,
             LoraBase::Anima => family == GenFamily::Anima,
+            LoraBase::Krea2 => family == GenFamily::Krea2,
             LoraBase::Ltx => family == GenFamily::Ltx,
             LoraBase::Wan => family == GenFamily::Wan,
             LoraBase::Other => false,
@@ -565,6 +575,7 @@ impl LoraBase {
             LoraBase::ZImage => "Z-Image",
             LoraBase::Sdxl => "SDXL",
             LoraBase::Anima => "Anima",
+            LoraBase::Krea2 => "Krea 2",
             LoraBase::Ltx => "LTX",
             LoraBase::Wan => "Wan",
             LoraBase::Other => "SD / other",
@@ -580,6 +591,7 @@ impl LoraBase {
             LoraBase::ZImage => Color32::from_rgb(70, 180, 160),
             LoraBase::Sdxl => Color32::from_rgb(90, 150, 230),
             LoraBase::Anima => Color32::from_rgb(220, 110, 180),
+            LoraBase::Krea2 => Color32::from_rgb(235, 125, 95),
             LoraBase::Ltx => Color32::from_rgb(160, 200, 90),
             LoraBase::Wan => Color32::from_rgb(80, 190, 210),
             LoraBase::Other => Color32::from_rgb(150, 120, 220),
@@ -629,6 +641,10 @@ fn classify_lora_header(obj: &serde_json::Map<String, serde_json::Value>) -> Lor
                 if v.contains("anima") || v.contains("cosmos") {
                     return LoraBase::Anima;
                 }
+                // Krea 2 (Krea / Comfy Org): ai-toolkit stamps "krea2".
+                if v.contains("krea") {
+                    return LoraBase::Krea2;
+                }
                 // LTX-Video (Lightricks): "ltxv"/"ltx-video"/"ltx2".
                 if v.contains("ltx") {
                     return LoraBase::Ltx;
@@ -668,6 +684,12 @@ fn classify_lora_header(obj: &serde_json::Map<String, serde_json::Value>) -> Lor
         if k.contains("input_blocks") || k.contains("down_blocks") || k.contains("lora_te1") || k.contains("mid_block") {
             return LoraBase::Other;
         }
+        // Krea 2, diffusers naming (the official krea/Krea-2-LoRA-* releases,
+        // e.g. sunsetblur, ship metadata-free): a text_fusion module and gated
+        // joint attention (attn.to_gate) — neither appears in any other family.
+        if k.contains("text_fusion.") || (k.contains("transformer_blocks.") && k.contains(".attn.to_gate")) {
+            return LoraBase::Krea2;
+        }
         // LTX-Video: a top-level transformer_blocks stack with split self/cross
         // attention (attn1/attn2) — diffusers "transformer.", Comfy-converted
         // "diffusion_model.", kohya "lora_unet_" prefixes. SD3-style DiTs use
@@ -684,6 +706,16 @@ fn classify_lora_header(obj: &serde_json::Map<String, serde_json::Value>) -> Lor
         // cross_attn_k…) — flagged, resolved after the loop.
         let dotted = k.starts_with("diffusion_model.blocks.") || k.starts_with("transformer.blocks.");
         let underscored = k.contains("lora_unet_blocks_");
+        // Krea 2 (12B dense DiT): the same "blocks" stack but with joint attention
+        // and w-prefixed projections (attn.wq/wk/wv/wo) — unique among the
+        // families here (Wan/Anima use cross_attn/self_attn.q, others to_q).
+        if (dotted || underscored)
+            && [".attn.wq", ".attn.wk", ".attn.wv", ".attn.wo", "_attn_wq", "_attn_wk", "_attn_wv", "_attn_wo"]
+                .iter()
+                .any(|s| k.contains(s))
+        {
+            return LoraBase::Krea2;
+        }
         if dotted || underscored {
             if k.contains("cross_attn") || k.contains("self_attn") {
                 saw_blocks_attn = true;
@@ -743,6 +775,10 @@ fn sniff_checkpoint_base(path: &Path) -> LoraBase {
                 if v.contains("anima") || v.contains("cosmos") {
                     return LoraBase::Anima;
                 }
+                // Krea 2 (Krea / Comfy Org): "krea2".
+                if v.contains("krea") {
+                    return LoraBase::Krea2;
+                }
                 // LTX-Video (Lightricks). Stamped finetunes carry "ltxv"/"ltx-video".
                 if v.contains("ltxv") || v.contains("ltx-video") || v.contains("ltx_video") {
                     return LoraBase::Ltx;
@@ -773,6 +809,12 @@ fn sniff_checkpoint_base(path: &Path) -> LoraBase {
         // among the families offered here. Catches finetunes that lack metadata.
         if k.contains("patchify_proj") {
             return LoraBase::Ltx;
+        }
+        // Krea 2 (12B dense DiT): w-prefixed joint-attention projections
+        // (blocks.N.attn.wq/wk/wv/wo), or the text_fusion module in diffusers
+        // naming — unique to it among the families here.
+        if k.contains(".attn.wq") || k.contains(".attn.wk") || k.contains("text_fusion.") {
+            return LoraBase::Krea2;
         }
         // Wan (Alibaba) DiT: transformer blocks with cross-attention to the umt5
         // text embeddings, e.g. model.diffusion_model.blocks.0.cross_attn.k.weight.
@@ -1030,8 +1072,10 @@ fn spawn_embedding_thumb_fetch(files: Vec<String>, ctx: egui::Context, force: bo
                 break; // picker closed — finish later, when it reopens
             }
             let stem = embed_stem(&f);
+            // Embeddings keep still thumbnails only (the still is a video's
+            // poster frame when a model ships video-only previews).
             let bytes = crate::scan::sha256_file(&dir.join(&f))
-                .and_then(|sha| crate::civitai::preview_image_by_hash(&sha));
+                .and_then(|sha| crate::civitai::preview_media_by_hash(&sha).map(|(still, _)| still));
             let write = match &bytes {
                 Some(b) => std::fs::write(tdir.join(format!("{stem}.img")), b),
                 None => std::fs::write(tdir.join(format!("{stem}.none")), b""),
@@ -1168,6 +1212,42 @@ mod lora_sniff_tests {
         let p = fake_safetensors("bare", serde_json::json!({"some.unrecognised.tensor": {"dtype": "F16", "shape": [1], "data_offsets": [0, 0]}}));
         assert!(matches!(sniff_lora_base(&p), LoraBase::Unknown));
         assert!(matches!(sniff_lora_base(Path::new("Z:/does/not/exist.safetensors")), LoraBase::Unknown));
+    }
+
+    /// Krea 2 LoRAs — ai-toolkit stamps `ss_base_model_version: "krea2"`, and
+    /// its LoKr files carry blocks.N.attn.wq-style keys (both taken verbatim
+    /// from a real aesthetic_photo-v1_krea2.safetensors).
+    #[test]
+    fn fingerprints_krea2() {
+        let p = fake_safetensors(
+            "krea2_meta",
+            serde_json::json!({"__metadata__": {"ss_base_model_version": "krea2"}}),
+        );
+        assert!(matches!(sniff_lora_base(&p), LoraBase::Krea2));
+        let p = fake_safetensors(
+            "krea2_lokr",
+            serde_json::json!({"diffusion_model.blocks.0.attn.wq.lokr_w1": {"dtype": "F16", "shape": [1], "data_offsets": [0, 0]}}),
+        );
+        assert!(matches!(sniff_lora_base(&p), LoraBase::Krea2));
+        // Diffusers naming (official krea/Krea-2-LoRA-sunsetblur, metadata-free):
+        // gated joint attention + text_fusion, keys verbatim from the real file.
+        let p = fake_safetensors(
+            "krea2_diffusers",
+            serde_json::json!({
+                "transformer.transformer_blocks.0.attn.to_gate.lora_A.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 0]},
+                "transformer.text_fusion.layerwise_blocks.0.attn.to_q.lora_A.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 0]}
+            }),
+        );
+        assert!(matches!(sniff_lora_base(&p), LoraBase::Krea2));
+        // Wan's blocks stack (cross_attn.k, no w-prefix) must NOT read as Krea 2.
+        let p = fake_safetensors(
+            "krea2_not_wan",
+            serde_json::json!({
+                "diffusion_model.blocks.0.cross_attn.k.lora_down.weight": {"dtype": "F16", "shape": [1], "data_offsets": [0, 0]},
+                "diffusion_model.blocks.0.ffn.0.lora_down.weight": {"dtype": "F16", "shape": [1], "data_offsets": [0, 0]}
+            }),
+        );
+        assert!(matches!(sniff_lora_base(&p), LoraBase::Wan));
     }
 
     /// LTX-Video LoRAs — key shapes taken verbatim from real files: the
@@ -1556,6 +1636,8 @@ fn refresh_loras(state: &mut GenerateState, ctx: &egui::Context) {
                     info: prev.and_then(|l| l.info.clone()),
                     thumb: prev.and_then(|l| l.thumb.clone()),
                     thumb_missing: prev.map(|l| l.thumb_missing).unwrap_or(false),
+                    anim: prev.and_then(|l| l.anim.clone()),
+                    anim_missing: prev.map(|l| l.anim_missing).unwrap_or(false),
                     file: f,
                 }
             })
@@ -1631,15 +1713,146 @@ fn spawn_lora_thumb_fetch(files: Vec<String>, ctx: egui::Context, force: bool) {
             let stem = f.trim_end_matches(".safetensors");
             // Hashing reads the whole file (LoRAs are ~100-300 MB) — that's why
             // this runs here and the result is cached forever.
-            let bytes = crate::scan::sha256_file(&dir.join(&f))
-                .and_then(|sha| crate::civitai::preview_image_by_hash(&sha));
-            let write = match &bytes {
-                Some(b) => std::fs::write(tdir.join(format!("{stem}.img")), b),
-                None => std::fs::write(tdir.join(format!("{stem}.none")), b""),
-            };
-            let _ = write;
+            let media = crate::scan::sha256_file(&dir.join(&f))
+                .and_then(|sha| crate::civitai::preview_media_by_hash(&sha));
+            match &media {
+                Some((still, mp4)) => {
+                    let _ = std::fs::write(tdir.join(format!("{stem}.img")), still);
+                    // Video-only preview: also build an animated GIF thumbnail
+                    // from the CDN's small mp4 (best-effort — needs ffmpeg).
+                    if let Some(mp4) = mp4 {
+                        video_thumb_to_gif(&tdir, stem, mp4);
+                    }
+                }
+                None => {
+                    let _ = std::fs::write(tdir.join(format!("{stem}.none")), b"");
+                }
+            }
             ctx.request_repaint();
         }
+    });
+}
+
+/// Locate an ffmpeg binary: PATH first, then the copy imageio-ffmpeg ships
+/// inside the Pixal3D tool env (present whenever Pixal3D is installed). None
+/// means animated thumbnails are skipped — the still poster is kept instead.
+fn find_ffmpeg() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for name in ["ffmpeg.exe", "ffmpeg"] {
+                let c = dir.join(name);
+                if c.is_file() {
+                    return Some(c);
+                }
+            }
+        }
+    }
+    let bins = crate::tagger::models_root()
+        .join("pixal3d")
+        .join("python")
+        .join("Lib")
+        .join("site-packages")
+        .join("imageio_ffmpeg")
+        .join("binaries");
+    std::fs::read_dir(bins)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("ffmpeg") && n.ends_with(".exe"))
+        })
+}
+
+/// Convert a small Civitai preview mp4 into a looping `<stem>.gif` in the thumbs
+/// cache (~200px, 10 fps, first 3 s) so video-only LoRAs get an animated
+/// thumbnail. Best-effort: without ffmpeg (or on a failed convert) the poster
+/// still saved alongside is used instead.
+fn video_thumb_to_gif(tdir: &Path, stem: &str, mp4: &[u8]) {
+    let Some(ffmpeg) = find_ffmpeg() else { return };
+    let tmp = tdir.join(format!("{stem}.tmp.mp4"));
+    if std::fs::write(&tmp, mp4).is_err() {
+        return;
+    }
+    // ffmpeg writes its output incrementally and the picker polls `<stem>.gif`
+    // every frame — so convert to a temp name and rename once complete, or the
+    // row can decode (and permanently cache) a half-written animation.
+    let gif = tdir.join(format!("{stem}.gif"));
+    let gif_tmp = tdir.join(format!("{stem}.tmp.gif"));
+    let mut cmd = std::process::Command::new(&ffmpeg);
+    cmd.args(["-y", "-t", "3", "-i"])
+        .arg(&tmp)
+        .args(["-vf", "fps=10,scale=200:-2:flags=lanczos", "-loop", "0"])
+        .arg(&gif_tmp);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let ok = cmd.output().map(|o| o.status.success()).unwrap_or(false);
+    let _ = std::fs::remove_file(&tmp);
+    if ok {
+        let _ = std::fs::remove_file(&gif);
+        let _ = std::fs::rename(&gif_tmp, &gif);
+    } else {
+        let _ = std::fs::remove_file(&gif_tmp);
+    }
+}
+
+/// Decoded animated-thumbnail frames keyed by LoRA stem — `None` marks a GIF
+/// that failed to decode (the row falls back to its still). Filled by
+/// [`spawn_anim_decode`] worker threads so the multi-frame decode never runs on
+/// the UI thread; textures are uploaded there too (egui allows off-thread
+/// `load_texture`).
+type AnimFrames = std::sync::Arc<Vec<(egui::TextureHandle, f32)>>;
+static ANIM_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Option<AnimFrames>>>> =
+    std::sync::LazyLock::new(Default::default);
+/// Stems with a decode in flight (single-flight guard).
+static ANIM_PENDING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Decode a cached animated GIF thumbnail into textures on a worker thread.
+/// Callers only invoke this when [`ANIM_CACHE`] has no entry for `stem` yet.
+fn spawn_anim_decode(stem: String, path: PathBuf, ctx: egui::Context) {
+    if !ANIM_PENDING.lock().unwrap().insert(stem.clone()) {
+        return; // already decoding
+    }
+    std::thread::spawn(move || {
+        // Clear the in-flight marker on every exit path (incl. a panic) so one
+        // bad file can't wedge that row's animation forever.
+        struct Reset(String);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ANIM_PENDING.lock().unwrap().remove(&self.0);
+            }
+        }
+        let _reset = Reset(stem.clone());
+
+        use image::AnimationDecoder;
+        let frames = (|| {
+            let file = std::io::BufReader::new(std::fs::File::open(&path).ok()?);
+            let dec = image::codecs::gif::GifDecoder::new(file).ok()?;
+            let mut out: Vec<(egui::TextureHandle, f32)> = Vec::new();
+            // 3 s at 10 fps is 30 frames; the cap only guards a rogue file.
+            for f in dec.into_frames().take(48) {
+                // Keep what decoded on a bad frame (same as the viewer's
+                // stream_gif) instead of throwing the whole animation away.
+                let Ok(f) = f else { break };
+                let (num, den) = f.delay().numer_denom_ms();
+                // Same 16 ms floor as the viewer's GIF playback (anim.rs).
+                let delay = (num as f32 / den.max(1) as f32 / 1000.0).max(0.016);
+                let buf = f.into_buffer();
+                let size = [buf.width() as usize, buf.height() as usize];
+                let ci = egui::ColorImage::from_rgba_unmultiplied(size, buf.as_raw());
+                let tex = ctx.load_texture(format!("lora_anim_{stem}_{}", out.len()), ci, Default::default());
+                out.push((tex, delay));
+            }
+            // A one-frame "animation" is just a still — use the poster instead.
+            (out.len() >= 2).then(|| std::sync::Arc::new(out))
+        })();
+        ANIM_CACHE.lock().unwrap().insert(stem.clone(), frames);
+        ctx.request_repaint();
     });
 }
 
@@ -1710,6 +1923,25 @@ fn lora_row(
     tdir: &Path,
     off_family: bool,
 ) -> bool {
+    // Pick up an animated GIF thumbnail (video-only Civitai previews). The
+    // multi-frame decode runs on a worker thread; until it lands (or if it
+    // fails) the still poster below shows as usual.
+    if l.anim.is_none() && !l.anim_missing {
+        let stem = l.file.trim_end_matches(".safetensors");
+        let gif = tdir.join(format!("{stem}.gif"));
+        if gif.exists() {
+            // Copy the entry out FIRST — a `match` on the lock guard itself
+            // keeps ANIM_CACHE locked through the arms, and the None arm's
+            // spawn re-locks it: instant self-deadlock (UI freeze).
+            let cached = ANIM_CACHE.lock().unwrap().get(stem).cloned();
+            match cached {
+                Some(Some(frames)) => l.anim = Some(frames),
+                Some(None) => l.anim_missing = true,
+                None => spawn_anim_decode(stem.to_string(), gif, ui.ctx().clone()),
+            }
+        }
+    }
+
     // Pick up a freshly downloaded thumbnail from the cache — at most a few
     // decodes per frame across all rows, so the first open never stalls.
     if l.thumb.is_none() && !l.thumb_missing {
@@ -1741,7 +1973,27 @@ fn lora_row(
             ui.spacing_mut().item_spacing.x = 10.0;
             // Leading preview slot — every card gets one (a FIELD well with the
             // LoRA glyph while no Civitai preview exists) so the names line up
-            // in a clean App Store-style list.
+            // in a clean App Store-style list. An animated GIF preview (video-
+            // only Civitai models) plays in place of the still.
+            if let Some(frames) = l.anim.clone() {
+                let total: f32 = frames.iter().map(|(_, d)| d).sum();
+                let mut t = (ui.input(|i| i.time) as f32) % total.max(0.02);
+                let mut cur = &frames[0];
+                for f in frames.iter() {
+                    if t < f.1 {
+                        cur = f;
+                        break;
+                    }
+                    t -= f.1;
+                }
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f32((cur.1 - t).max(0.01)));
+                ui.add(
+                    egui::Image::new(&cur.0)
+                        .max_height(80.0)
+                        .max_width(130.0)
+                        .corner_radius(8),
+                );
+            } else {
             match l.thumb.clone() {
                 Some(tex) => {
                     ui.add(
@@ -1765,6 +2017,7 @@ fn lora_row(
                         .tint(icon_tint(MUTED()))
                         .paint_at(ui, egui::Rect::from_center_size(rect.center(), egui::vec2(22.0, 22.0)));
                 }
+            }
             }
             // Right slot added FIRST (reserves its width), then the name/weight
             // fill and wrap in what's left — same trick as the Civitai cards.
@@ -1920,6 +2173,18 @@ fn lora_row(
             let _ = std::fs::create_dir_all(tdir);
             let _ = std::fs::write(tdir.join(format!("{stem}.img")), &bytes);
             let _ = std::fs::remove_file(tdir.join(format!("{stem}.none")));
+            // A picked GIF also becomes the animated preview; any other format
+            // replaces (and stops) a previously auto-generated animation.
+            let is_gif = src.extension().is_some_and(|x| x.eq_ignore_ascii_case("gif"));
+            let gif = tdir.join(format!("{stem}.gif"));
+            if is_gif {
+                let _ = std::fs::write(&gif, &bytes);
+            } else {
+                let _ = std::fs::remove_file(&gif);
+            }
+            ANIM_CACHE.lock().unwrap().remove(stem); // decode the new file fresh
+            l.anim = None;
+            l.anim_missing = false;
             l.thumb = None; // reload from the new bytes next frame
             l.thumb_missing = false;
         }
@@ -2268,6 +2533,8 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
                             let tdir = lora_thumbs_dir();
                             let _ = std::fs::remove_file(tdir.join(format!("{stem}.img")));
                             let _ = std::fs::remove_file(tdir.join(format!("{stem}.none")));
+                            let _ = std::fs::remove_file(tdir.join(format!("{stem}.gif")));
+                            ANIM_CACHE.lock().unwrap().remove(stem);
                             state.lora_delete_confirm = None;
                             refresh_loras(state, ui.ctx());
                         }
@@ -5634,6 +5901,7 @@ fn sdxl_workflow(job: &GenJob) -> serde_json::Value {
 /// half resolution and the upscaler ×2 brings it to 1280×704. The graph is a
 /// unified t2v/i2v graph: `LTXVImgToVideoInplace.bypass` controls whether the
 /// LoadImage source is used (t2v bypasses it but still needs *a* valid image).
+/// Selected LoRAs chain in model-only (nodes 600+) ahead of both CFGGuiders.
 fn ltx2_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
     let mut wf: serde_json::Value =
         serde_json::from_str(include_str!("../assets/ltx2_workflow.json")).expect("valid ltx2 template");
@@ -5677,6 +5945,22 @@ fn ltx2_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
     let bypass = !job.i2v;
     set(obj, "290", "bypass", json!(bypass));
     set(obj, "298", "bypass", json!(bypass));
+    // Model-only LoRA chain between the checkpoint (318) and both sampling stages.
+    // Only the CFGGuider model inputs move to the end of the chain — the VAE and
+    // text-encoder taps on 318 stay pointed at the raw checkpoint.
+    let mut model_ref = json!(["318", 0]);
+    for (id, (file, strength)) in (600..).zip(&job.loras) {
+        let node = id.to_string();
+        obj.insert(
+            node.clone(),
+            json!({"class_type": "LoraLoaderModelOnly", "inputs": {
+                "model": model_ref, "lora_name": file, "strength_model": strength
+            }}),
+        );
+        model_ref = json!([node, 0]);
+    }
+    set(obj, "316", "model", model_ref.clone()); // stage 1 (base AV sampling)
+    set(obj, "284", "model", model_ref); // stage 2 (upscaled refine)
     wf
 }
 
