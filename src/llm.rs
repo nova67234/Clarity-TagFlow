@@ -572,7 +572,7 @@ impl LlmState {
                 let img = if crate::is_video(&path) {
                     crate::video::capture_poster(&path, 512)
                 } else {
-                    image::open(&path).ok().map(|img| {
+                    crate::image_cache::open_oriented(&path).ok().map(|img| {
                         let t = img.thumbnail(512, 512).to_rgba8();
                         egui::ColorImage::from_rgba_unmultiplied(
                             [t.width() as usize, t.height() as usize],
@@ -1440,7 +1440,7 @@ mod worker {
                     }
                     text = format!("{header}{text}");
                 } else if let Some(tiles) =
-                    (tile_at == Some(mi)).then(|| image_tiles(path)).transpose()?.flatten()
+                    (tile_at == Some(mi)).then(|| detail_sections(mtmd, path)).flatten()
                 {
                     // The full picture first (the layout), then the labelled
                     // close-ups (the detail) — like a video's frames.
@@ -1448,8 +1448,8 @@ mod worker {
                     use std::fmt::Write as _;
                     bitmaps.push(load_bitmap(mtmd, path)?);
                     let mut header = format!("{marker}\n{DETAIL_GUIDE}\n");
-                    for (label, tile) in &tiles {
-                        bitmaps.push(load_bitmap(mtmd, tile)?);
+                    for (label, tile) in tiles {
+                        bitmaps.push(tile);
                         let _ = writeln!(header, "{label} section: {marker}");
                     }
                     text = format!("{header}{text}");
@@ -1881,7 +1881,9 @@ mod worker {
     /// `video_frames`.
     pub(super) fn image_tiles(path: &Path) -> Result<Option<Vec<(&'static str, PathBuf)>>, String> {
         use std::hash::{Hash, Hasher};
-        let (w, h) = image::image_dimensions(path).map_err(|e| format!("Read image: {e}"))?;
+        // The shape as displayed: a sideways-stored phone portrait must get
+        // the tall grid, and "Top-left" must mean the top-left the user sees.
+        let (w, h) = crate::image_cache::oriented_dimensions(path).ok_or("Read image: unknown size")?;
         if w.max(h) < TILE_MIN_EDGE {
             return Ok(None);
         }
@@ -1916,6 +1918,7 @@ mod worker {
         let meta = std::fs::metadata(path).map_err(|e| format!("Read image: {e}"))?;
         let mut hsh = std::collections::hash_map::DefaultHasher::new();
         (cols, rows, TILE_MAX_EDGE).hash(&mut hsh);
+        format!("{:?}", crate::image_cache::exif_orientation(path)).hash(&mut hsh);
         path.hash(&mut hsh);
         meta.len().hash(&mut hsh);
         if let Ok(t) = meta.modified()
@@ -1932,7 +1935,7 @@ mod worker {
             return Ok(Some(tiles));
         }
 
-        let img = image::open(path).map_err(|e| format!("Read image: {e}"))?;
+        let img = crate::image_cache::open_oriented(path).map_err(|e| format!("Read image: {e}"))?;
         // Section size along one axis: n sections overlapping by TILE_OVERLAP
         // span the whole edge; each starts one (1 - overlap) step further on.
         let span = |edge: u32, n: u32| -> (u32, f32) {
@@ -1955,14 +1958,38 @@ mod worker {
         Ok(Some(tiles))
     }
 
+    /// Detailed Vision's close-ups for `path`, loaded and labelled — or
+    /// `None` (send the plain image) when the picture is small or anything
+    /// about cutting/loading the sections fails: a detail pass must never
+    /// cost the user the whole reply.
+    fn detail_sections(mtmd: &MtmdContext, path: &Path) -> Option<Vec<(&'static str, MtmdBitmap)>> {
+        let tiles = match image_tiles(path) {
+            Ok(t) => t?,
+            Err(e) => {
+                eprintln!("[ai] detailed vision skipped for {}: {e}", path.display());
+                return None;
+            }
+        };
+        tiles
+            .into_iter()
+            .map(|(label, tile)| load_bitmap(mtmd, &tile).map(|b| (label, b)))
+            .collect::<Result<Vec<_>, _>>()
+            .inspect_err(|e| eprintln!("[ai] detailed vision skipped for {}: {e}", path.display()))
+            .ok()
+    }
+
     /// Load an image for the vision pipeline. llama.cpp's own loader (stb)
     /// covers jpg/png/bmp/gif; anything else (webp, tiff, …) is decoded with
     /// the `image` crate and handed over as a temp PNG.
     fn load_bitmap(mtmd: &MtmdContext, path: &Path) -> Result<MtmdBitmap, String> {
-        if let Ok(bmp) = MtmdBitmap::from_file(mtmd, &path.to_string_lossy(), false) {
+        // llama.cpp's loader ignores the EXIF "rotate this" flag phones put
+        // on portraits — only an upright-stored file may take the fast path.
+        let upright = crate::image_cache::exif_orientation(path)
+            == image::metadata::Orientation::NoTransforms;
+        if upright && let Ok(bmp) = MtmdBitmap::from_file(mtmd, &path.to_string_lossy(), false) {
             return Ok(bmp);
         }
-        let img = image::open(path).map_err(|e| format!("Read image: {e}"))?;
+        let img = crate::image_cache::open_oriented(path).map_err(|e| format!("Read image: {e}"))?;
         let tmp = std::env::temp_dir().join("clarity_tagflow_llm_input.png");
         img.to_rgb8()
             .save_with_format(&tmp, image::ImageFormat::Png)
@@ -2723,5 +2750,33 @@ mod tests {
             std::fs::copy(&p, out.join(format!("{label}.png"))).unwrap();
         }
         eprintln!("{}", out.display());
+    }
+
+    /// A phone-style portrait (pixels stored sideways + EXIF "rotate 90°")
+    /// must be tiled as the upright picture: same tall grid and the same
+    /// sections as the upright original. Paths come from
+    /// CLARITY_ROTATED_SAMPLE / CLARITY_UPRIGHT_SAMPLE (one photo saved both
+    /// ways).
+    #[cfg(feature = "llm")]
+    #[test]
+    #[ignore]
+    fn detail_tiles_follow_exif_orientation() {
+        let side = PathBuf::from(std::env::var("CLARITY_ROTATED_SAMPLE").expect("CLARITY_ROTATED_SAMPLE"));
+        let up = PathBuf::from(std::env::var("CLARITY_UPRIGHT_SAMPLE").expect("CLARITY_UPRIGHT_SAMPLE"));
+        let a = worker::image_tiles(&side).unwrap().expect("tiles");
+        let b = worker::image_tiles(&up).unwrap().expect("tiles");
+        let labels = |t: &[(&'static str, PathBuf)]| t.iter().map(|(l, _)| *l).collect::<Vec<&str>>();
+        assert_eq!(labels(&a), labels(&b), "rotated photo got a different grid");
+        for ((label, pa), (_, pb)) in a.iter().zip(&b) {
+            let (ia, ib) = (image::open(pa).unwrap().to_rgb8(), image::open(pb).unwrap().to_rgb8());
+            assert_eq!(ia.dimensions(), ib.dimensions(), "{label}: section shape differs");
+            let diff: f64 = ia.as_raw().iter().zip(ib.as_raw()).map(|(x, y)| (*x as f64 - *y as f64).abs()).sum::<f64>()
+                / ia.as_raw().len() as f64;
+            eprintln!("{label}: mean abs diff {diff:.2}");
+            assert!(diff < 6.0, "{label}: section content differs (sideways?) — diff {diff:.1}");
+        }
+        // The full image the model gets is upright too.
+        let full = crate::image_cache::open_oriented(&side).unwrap();
+        assert!(full.height() > full.width(), "full image still sideways");
     }
 }

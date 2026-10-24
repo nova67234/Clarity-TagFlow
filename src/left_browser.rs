@@ -216,30 +216,51 @@ fn thumbnail_list(
     let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
     let ui = &mut scroll_ui;
 
+    // Size every tile up front (cheap arithmetic) so we know the total
+    // content height and each tile's vertical offset — before showing the
+    // scroll area, so the scroll anchor below can correct this frame.
+    let avail_w = ui.available_width() - SCROLL_GUTTER;
+    let mut sizes: Vec<(f32, f32)> = Vec::with_capacity(filtered.len());
+    let mut offsets: Vec<f32> = Vec::with_capacity(filtered.len());
+    let mut acc = 0.0;
+    for &i in filtered {
+        // Videos carry their aspect in the video-thumb cache (known once
+        // the poster decodes); images carry it in the image cache. Until
+        // either resolves we fall back to a square, then reflow.
+        let aspect = if crate::is_video(&images[i]) {
+            video_thumbs.aspect(&images[i]).unwrap_or(DEFAULT_ASPECT)
+        } else {
+            thumbs.aspect(&images[i]).unwrap_or(DEFAULT_ASPECT)
+        };
+        let size = fit(avail_w, thumb_max_h, aspect);
+        offsets.push(acc);
+        sizes.push(size);
+        acc += size.1 + ROW_GAP;
+    }
+    let total = (acc - ROW_GAP).max(0.0);
+
+    // Scroll anchoring: tiles above the view that finish decoding change
+    // height (square placeholder → real shape) and used to shove the list
+    // around while scrolling up. Remember the top visible tile and its
+    // offset; when its offset moves, move the scroll position with it.
+    let anchor_id = ui.id().with("thumb_scroll_anchor");
+    let prev_anchor: Option<(usize, f32, f32)> = ui.data(|d| d.get_temp(anchor_id));
+    if !list_changed
+        && !selection_changed
+        && let Some((img_idx, old_off, old_scroll)) = prev_anchor
+        && let Some(row) = filtered.iter().position(|&i| i == img_idx)
+        && (offsets[row] - old_off).abs() > 0.5
+    {
+        scroll_area = scroll_area.vertical_scroll_offset((old_scroll + offsets[row] - old_off).max(0.0));
+    }
+
     scroll_area
         .show_viewport(ui, |ui, viewport| {
-            let avail_w = ui.available_width() - SCROLL_GUTTER;
-
-            // Size every tile up front (cheap arithmetic) so we know the total
-            // content height and each tile's vertical offset.
-            let mut sizes: Vec<(f32, f32)> = Vec::with_capacity(filtered.len());
-            let mut offsets: Vec<f32> = Vec::with_capacity(filtered.len());
-            let mut acc = 0.0;
-            for &i in filtered {
-                // Videos carry their aspect in the video-thumb cache (known once
-                // the poster decodes); images carry it in the image cache. Until
-                // either resolves we fall back to a square, then reflow.
-                let aspect = if crate::is_video(&images[i]) {
-                    video_thumbs.aspect(&images[i]).unwrap_or(DEFAULT_ASPECT)
-                } else {
-                    thumbs.aspect(&images[i]).unwrap_or(DEFAULT_ASPECT)
-                };
-                let size = fit(avail_w, thumb_max_h, aspect);
-                offsets.push(acc);
-                sizes.push(size);
-                acc += size.1 + ROW_GAP;
+            // The top visible tile → next frame's scroll anchor.
+            if let Some(row) = (0..filtered.len()).find(|&r| offsets[r] + sizes[r].1 > viewport.min.y) {
+                let anchor = (filtered[row], offsets[row], viewport.min.y);
+                ui.data_mut(|d| d.insert_temp(anchor_id, anchor));
             }
-            let total = (acc - ROW_GAP).max(0.0);
             ui.set_min_height(total); // reserve the full scroll range
 
             let top = ui.min_rect().top();

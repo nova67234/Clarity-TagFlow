@@ -513,7 +513,7 @@ fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::Co
 /// expose it but never apply it; the fast subsample paths skip EXIF entirely, so
 /// we read it here once and apply it to every decoded still. Reads only the
 /// header/metadata, not the pixels.
-fn exif_orientation(path: &Path) -> image::metadata::Orientation {
+pub(crate) fn exif_orientation(path: &Path) -> image::metadata::Orientation {
     use image::ImageDecoder;
     image_reader(path)
         .ok()
@@ -521,6 +521,17 @@ fn exif_orientation(path: &Path) -> image::metadata::Orientation {
         .and_then(|r| r.into_decoder().ok())
         .and_then(|mut d| d.orientation().ok())
         .unwrap_or(image::metadata::Orientation::NoTransforms)
+}
+
+/// `image::open` with the EXIF orientation applied — the picture the way the
+/// viewer shows it. Phones often store portraits sideways with a "rotate
+/// this" flag; anything that decodes stills outside the viewer (the AI
+/// chat's thumbnails, its vision input and Detailed Vision sections) uses
+/// this so it never sees them sideways.
+pub(crate) fn open_oriented(path: &Path) -> image::ImageResult<image::DynamicImage> {
+    let mut img = image::open(path)?;
+    img.apply_orientation(exif_orientation(path));
+    Ok(img)
 }
 
 /// Case-insensitive extension match (`ext` must be given lowercase).

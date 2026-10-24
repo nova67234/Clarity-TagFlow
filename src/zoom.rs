@@ -23,7 +23,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
 // Matches the Java ImageCanvas limits.
-const MIN_SCALE: f32 = 0.05;
+const MIN_SCALE: f32 = 0.01;
 const MAX_SCALE: f32 = 12.0;
 /// Per keystroke zoom factor (Java used 1.10 for Ctrl +/-).
 const KEY_STEP: f32 = 1.10;
@@ -128,8 +128,15 @@ fn idle_sway(now: f64) -> Vec2 {
     Vec2::new((t * 0.45).sin() * 0.35, (t * 0.32).cos() * 0.25)
 }
 
+/// Long edge (px) of the viewer's everyday decode. Views that need more
+/// pixels than this (zoomed in, or fit on a big monitor) ask for a
+/// full-resolution copy — see [`ZoomState::wants_full_res`].
+pub const PREVIEW_EDGE: u32 = 2048;
+
 pub struct ZoomState {
-    /// Pixels per image pixel. 1.0 == 100% (1:1).
+    /// Screen points per *original* image pixel (not texture pixel — the
+    /// texture may be a downscaled preview). 100% is one image pixel per
+    /// physical screen pixel, i.e. `1 / pixels_per_point`.
     scale: f32,
     /// Offset of the image centre from the viewport centre, in screen pixels.
     pan: Vec2,
@@ -150,6 +157,14 @@ pub struct ZoomState {
     crop_rect: Option<Rect>,
     /// Apple-style depth-parallax "Spatial Scene" mode.
     spatial: SpatialScene,
+    /// The current image's real (EXIF-oriented) pixel size, read from its
+    /// header when the selection changes. All zoom math uses this, so 100%
+    /// and the badge are true whatever resolution the texture has.
+    true_size: Option<Vec2>,
+    /// The current view needs more pixels than the preview decode holds.
+    want_full: bool,
+    /// Last seen points-per-pixel (for the zoom badge's true percent).
+    ppp: f32,
 }
 
 /// The scale at which the image exactly fits inside the viewport (the larger of
@@ -177,6 +192,9 @@ impl Default for ZoomState {
             crop_start: None,
             crop_rect: None,
             spatial: SpatialScene::default(),
+            true_size: None,
+            want_full: false,
+            ppp: 1.0,
         }
     }
 }
@@ -203,6 +221,9 @@ impl ZoomState {
             self.crop_mode = false;
             self.crop_start = None;
             self.crop_rect = None;
+            self.want_full = false;
+            self.true_size = crate::image_cache::oriented_dimensions(path)
+                .map(|(w, h)| Vec2::new(w as f32, h as f32));
             // Spatial Scene: drop any in-flight depth job for the previous image
             // and clear its per-image render state. The mode itself persists; the
             // new image's depth is recomputed (or served instantly from cache).
@@ -214,10 +235,23 @@ impl ZoomState {
         }
 
         let viewport = ui.available_rect_before_wrap();
-        let img = tex.size_vec2();
+        // Lay the image out at its real pixel size; the texture (preview or
+        // full-res) just stretches over that rect. The header size is used
+        // only when its shape matches the texture's (formats whose header
+        // disagrees with the decoded image fall back to the texture size).
+        let tex_size = tex.size_vec2();
+        let img = match self.true_size {
+            Some(t) if t.x >= 1.0 && t.y >= 1.0 && ((t.x / t.y) / (tex_size.x / tex_size.y.max(1.0)) - 1.0).abs() < 0.02 => t,
+            _ => tex_size,
+        };
         if img.x < 1.0 || img.y < 1.0 || viewport.width() < 1.0 || viewport.height() < 1.0 {
             return ViewerAction::None;
         }
+        // Points per physical pixel: 100% means one image pixel per physical
+        // screen pixel.
+        let ppp = ui.ctx().pixels_per_point();
+        self.ppp = ppp;
+        let one = 1.0 / ppp;
 
         // In fit mode the scale tracks the viewport (handles window resizes).
         let fit = fit_scale(viewport, img);
@@ -225,6 +259,10 @@ impl ZoomState {
             self.scale = fit;
             self.pan = Vec2::ZERO;
         }
+        // Ask for the full-resolution copy once the view shows the image at
+        // more physical pixels than the preview decode has.
+        self.want_full = img.x.max(img.y) > PREVIEW_EDGE as f32
+            && img.x.max(img.y) * self.scale * ppp > PREVIEW_EDGE as f32 * 1.02;
 
         let resp = ui.interact(viewport, ui.id().with("zoom_viewer"), Sense::click_and_drag());
         let now = ui.input(|i| i.time);
@@ -274,24 +312,25 @@ impl ZoomState {
         }
         if key_fit {
             self.fit_to_view();
-            self.overlay_percent = (fit * 100.0).round() as i32;
             self.flash(now);
+            self.overlay_percent = (fit * ppp * 100.0).round() as i32;
         }
         if key_one {
-            self.zoom_at(viewport, img, 1.0, viewport.center());
+            self.zoom_at(viewport, img, one, viewport.center());
             self.flash(now);
         }
 
         // --- Double-click toggles 100% (at the cursor) and fit ---
         if resp.double_clicked() {
-            if (self.scale - 1.0).abs() < 0.01 {
+            if (self.scale / one - 1.0).abs() < 0.01 {
                 self.fit_to_view();
-                self.overlay_percent = (fit * 100.0).round() as i32;
+                self.flash(now);
+                self.overlay_percent = (fit * ppp * 100.0).round() as i32;
             } else {
                 let anchor = pointer.unwrap_or_else(|| viewport.center());
-                self.zoom_at(viewport, img, 1.0, anchor);
+                self.zoom_at(viewport, img, one, anchor);
+                self.flash(now);
             }
-            self.flash(now);
         }
 
         // --- Drag to pan (only meaningful once the image overflows the viewport) ---
@@ -520,8 +559,11 @@ impl ZoomState {
             return ViewerAction::None;
         }
 
-        // The on-screen image rectangle, clamped to what's actually visible.
-        let irect = self.image_rect(viewport, img).intersect(viewport);
+        // The selection is clamped to what's visible, but measured against
+        // the WHOLE image rect — zoomed in, the visible part is only a window
+        // into the image, and fractions of that window crop the wrong area.
+        let full = self.image_rect(viewport, img);
+        let irect = full.intersect(viewport);
 
         if resp.drag_started()
             && let Some(p) = resp.interact_pointer_pos() {
@@ -539,10 +581,10 @@ impl ZoomState {
                 if cr.width() < 4.0 || cr.height() < 4.0 || irect.width() <= 0.0 || irect.height() <= 0.0 {
                     return None;
                 }
-                let x = ((cr.min.x - irect.min.x) / irect.width()).clamp(0.0, 1.0);
-                let y = ((cr.min.y - irect.min.y) / irect.height()).clamp(0.0, 1.0);
-                let w = (cr.width() / irect.width()).clamp(0.0, 1.0 - x);
-                let h = (cr.height() / irect.height()).clamp(0.0, 1.0 - y);
+                let x = ((cr.min.x - full.min.x) / full.width()).clamp(0.0, 1.0);
+                let y = ((cr.min.y - full.min.y) / full.height()).clamp(0.0, 1.0);
+                let w = (cr.width() / full.width()).clamp(0.0, 1.0 - x);
+                let h = (cr.height() / full.height()).clamp(0.0, 1.0 - y);
                 (w > 0.0 && h > 0.0).then_some(CropFraction { x, y, w, h })
             });
             self.crop_mode = false;
@@ -641,10 +683,17 @@ impl ZoomState {
         }
     }
 
-    /// Capture the current zoom percent and show the badge for a short while.
+    /// Capture the current zoom percent (of the real image pixels, on
+    /// physical screen pixels) and show the badge for a short while.
     fn flash(&mut self, now: f64) {
-        self.overlay_percent = (self.scale * 100.0).round() as i32;
+        self.overlay_percent = (self.scale * self.ppp * 100.0).round() as i32;
         self.overlay_until = now + OVERLAY_SECS;
+    }
+
+    /// Whether the viewer currently needs the full-resolution decode of
+    /// `path` (zoomed in, or fit larger than the preview's pixels).
+    pub fn wants_full_res(&self, path: &Path) -> bool {
+        self.want_full && self.current.as_deref() == Some(path)
     }
 
     fn paint_overlay(&self, ui: &egui::Ui, viewport: Rect) {

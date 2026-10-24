@@ -75,6 +75,8 @@ mod voice;
 mod roleplay;
 // Krea 2 prompt writer for the AI Chat (tools menu).
 mod krea_prompt;
+// Encoding-tolerant, minimal-change .txt tag sidecar reading/writing.
+mod sidecar;
 // The zip viewer only needs the (non-optional) `zip` crate, so it compiles in
 // every build — including the no-default-features release/CI configurations.
 mod archive;
@@ -339,6 +341,12 @@ struct ViewerApp {
     /// Lowercased sidecar-tag text per image, validated by the sidecar's mtime,
     /// so the search can match tags without re-reading every .txt per keystroke.
     tag_search_cache: std::collections::HashMap<PathBuf, (Option<std::time::SystemTime>, String)>,
+    /// Sidecars being (re-)read for tag search on a background thread — the
+    /// first search over a big folder used to read every .txt on the UI
+    /// thread. Results land in `tag_search_cache` and re-run the filter.
+    tag_index_rx: Option<std::sync::mpsc::Receiver<Vec<(PathBuf, Option<std::time::SystemTime>, String)>>>,
+    /// A crop being decoded/saved on a background thread (src, result).
+    crop_rx: Option<std::sync::mpsc::Receiver<(PathBuf, Result<PathBuf, String>)>>,
     /// Favorited ("hearted") files, tracked by content hash so they survive
     /// moves/renames. Shown as a heart badge on the browser thumbnails.
     favorites: favorites::Favorites,
@@ -376,6 +384,10 @@ struct ViewerApp {
     thumbs: image_cache::ImageCache,
     /// Larger images for the centre viewer (few, near-full resolution).
     viewer: image_cache::ImageCache,
+    /// Full-resolution decodes for the centre viewer, loaded only when the
+    /// view needs more pixels than `viewer`'s preview copy has (zoomed in,
+    /// or fit on a big monitor). Capped at the GPU's texture limit (≤ 8192).
+    viewer_full: image_cache::ImageCache,
     /// Poster-frame thumbnails for video files in the left browser.
     video_thumbs: video::VideoThumbs,
     /// Auto-playing muted previews on visible video tiles (the "Video thumbnail
@@ -431,6 +443,8 @@ impl Default for ViewerApp {
             selected: None,
             search: String::new(),
             tag_search_cache: std::collections::HashMap::new(),
+            tag_index_rx: None,
+            crop_rx: None,
             favorites: favorites::Favorites::load(),
             stats: top_bar::SystemStats::default(),
             ftp: ftp::FtpState::default(),
@@ -449,7 +463,8 @@ impl Default for ViewerApp {
             // the clicked image always decodes immediately (priority); the browser
             // gets its own pair so it never blocks — or is blocked by — the viewer.
             thumbs: image_cache::ImageCache::new(THUMB_MAX_EDGE, 400, false, 2),
-            viewer: image_cache::ImageCache::new(2048, 8, true, 1),
+            viewer: image_cache::ImageCache::new(zoom::PREVIEW_EDGE, 8, true, 1),
+            viewer_full: image_cache::ImageCache::new(8192, 2, false, 1),
             video_thumbs: video::VideoThumbs::new(),
             video_previews: video::VideoPreviews::new(),
             video_player: None,
@@ -474,13 +489,15 @@ impl ViewerApp {
         let query = self.search.trim().to_lowercase();
         let filter = self.settings.media_filter;
         let mut filtered = Vec::with_capacity(self.images.len());
+        // Sidecars not read yet (or changed on disk) — indexed in the background.
+        let mut stale: Vec<PathBuf> = Vec::new();
         for i in 0..self.images.len() {
             // Clone the path so the favorite look-up (which needs `&mut favorites`)
             // doesn't clash with borrowing `self.images`.
             let path = self.images[i].clone();
             if !query.is_empty()
                 && !file_name(&path).to_lowercase().contains(&query)
-                && !self.tags_match(&path, &query)
+                && !self.tags_match(&path, &query, &mut stale)
             {
                 continue;
             }
@@ -499,23 +516,66 @@ impl ViewerApp {
             }
         }
         self.filtered = filtered;
+        if !stale.is_empty() && self.tag_index_rx.is_none() {
+            self.start_tag_index(stale);
+        }
     }
 
-    /// Whether `path`'s sidecar tags contain `query` (lowercase). The tag text
-    /// is cached and only re-read when the sidecar's mtime changes, so typing
-    /// in the search box costs one `stat` per image, not a file read.
-    fn tags_match(&mut self, path: &std::path::Path, query: &str) -> bool {
+    /// Read `paths`' sidecars for tag search off the UI thread (through the
+    /// archive layer, so tags inside an opened zip are searchable too).
+    fn start_tag_index(&mut self, paths: Vec<PathBuf>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tag_index_rx = Some(rx);
+        std::thread::spawn(move || {
+            let index = paths
+                .into_iter()
+                .map(|p| {
+                    let txt = right_details::sidecar_txt(&p);
+                    let mtime = std::fs::metadata(&txt).and_then(|m| m.modified()).ok();
+                    let text = sidecar::read_text_lossy(&txt).to_lowercase();
+                    (p, mtime, text)
+                })
+                .collect();
+            let _ = tx.send(index);
+        });
+    }
+
+    /// Fold a finished tag index into the search cache and re-filter.
+    fn poll_tag_index(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.tag_index_rx else { return };
+        match rx.try_recv() {
+            Ok(index) => {
+                self.tag_index_rx = None;
+                for (p, mtime, text) in index {
+                    self.tag_search_cache.insert(p, (mtime, text));
+                }
+                self.update_filtered();
+                ctx.request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(50)),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.tag_index_rx = None,
+        }
+    }
+
+    /// Whether `path`'s sidecar tags contain `query` (lowercase) as whole
+    /// words — "cat" finds "cat" and "black cat", not "catgirl". The tag text
+    /// is cached; a sidecar not read yet (or changed since) is queued in
+    /// `stale` for the background indexer and matches once it lands.
+    fn tags_match(&mut self, path: &std::path::Path, query: &str, stale: &mut Vec<PathBuf>) -> bool {
         let txt = right_details::sidecar_txt(path);
         let mtime = std::fs::metadata(&txt).and_then(|m| m.modified()).ok();
-        let entry = self
-            .tag_search_cache
-            .entry(path.to_path_buf())
-            .or_insert_with(|| (None, String::new()));
-        if entry.0 != mtime {
-            entry.0 = mtime;
-            entry.1 = std::fs::read_to_string(&txt).unwrap_or_default().to_lowercase();
+        match self.tag_search_cache.get(path) {
+            Some((cached, text)) => {
+                if *cached != mtime {
+                    stale.push(path.to_path_buf()); // keep the old text meanwhile
+                }
+                contains_words(text, query)
+            }
+            None => {
+                stale.push(path.to_path_buf());
+                false
+            }
         }
-        entry.1.contains(query)
     }
 
     /// Unload the current folder (the folder popup's "Clear Input"), emptying
@@ -594,44 +654,44 @@ impl ViewerApp {
     /// `frac` is the crop region as fractions (0..1) of the full image. Re-reads the
     /// full-resolution original from disk so the crop isn't limited to the
     /// (possibly downscaled) on-screen texture. A port of ViewerPanel.cropTo().
-    fn crop_current(&mut self, src: &std::path::Path, frac: zoom::CropFraction) {
-        // Zip entries are view-only (cropping writes a new file next to the source).
-        if archive::is_entry(src) {
+    fn crop_current(&mut self, src: &std::path::Path, frac: zoom::CropFraction, ctx: &egui::Context) {
+        // Zip entries are view-only (cropping writes a new file next to the
+        // source); one crop at a time.
+        if archive::is_entry(src) || self.crop_rx.is_some() {
             return;
         }
-        // `decode_full_rgba` covers common formats via `image::open` plus the
-        // extended formats (AVIF/HEIC/RAW) through our own decoder, so cropping
-        // works on everything the viewer can display.
-        let Some(full) = decode_full_rgba(src).map(image::DynamicImage::ImageRgba8) else {
-            return;
-        };
-        let (iw, ih) = (full.width(), full.height());
-        if iw == 0 || ih == 0 {
-            return;
-        }
-        let (iwf, ihf) = (iw as f32, ih as f32);
-        let cx = (frac.x * iwf).round().clamp(0.0, iwf - 1.0) as u32;
-        let cy = (frac.y * ihf).round().clamp(0.0, ihf - 1.0) as u32;
-        let cw = (frac.w * iwf).round().clamp(1.0, iwf - cx as f32) as u32;
-        let ch = (frac.h * ihf).round().clamp(1.0, ihf - cy as f32) as u32;
+        // Decoding a big photo or RAW takes seconds — off the UI thread, with
+        // a toast meanwhile; `drive_crop_job` adds the result to the browser.
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.crop_rx = Some(rx);
+        self.bg_toast = Some(("Cropping…".to_string(), f64::INFINITY));
+        let src = src.to_path_buf();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = crop_to_file(&src, frac);
+            let _ = tx.send((src, result));
+            ctx.request_repaint();
+        });
+    }
 
-        let cropped = full.crop_imm(cx, cy, cw, ch);
-        let dest = crop_destination(src);
-        if cropped.save(&dest).is_ok() {
-            // Place the crop directly beneath the image it came from in the
-            // browser (rather than at the end of the list), then select it.
-            if self.images.contains(&dest) {
-                return;
+    /// Finish a background crop: place it beneath its source and select it.
+    fn drive_crop_job(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.crop_rx else { return };
+        let (src, result) = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                (PathBuf::new(), Err("Crop worker stopped".to_string()))
             }
-            let insert_at = self
-                .images
-                .iter()
-                .position(|p| p == src)
-                .map(|i| i + 1)
-                .unwrap_or(self.images.len());
-            self.images.insert(insert_at, dest);
-            self.selected = Some(insert_at);
-            self.update_filtered();
+        };
+        self.crop_rx = None;
+        let now = ctx.input(|i| i.time);
+        match result {
+            Ok(dest) => {
+                self.bg_toast = None;
+                self.insert_derived(&src, dest);
+            }
+            Err(e) => self.bg_toast = Some((format!("Crop failed — {e}"), now + 5.0)),
         }
     }
 
@@ -731,6 +791,8 @@ impl ViewerApp {
     /// kick inference once it's ready, and handle the result. Also expires the
     /// transient toast.
     fn drive_bg_job(&mut self, ctx: &egui::Context) {
+        self.drive_crop_job(ctx);
+        self.poll_tag_index(ctx);
         let now = ctx.input(|i| i.time);
         if let Some((_, until)) = &self.bg_toast
             && now >= *until {
@@ -834,13 +896,27 @@ impl ViewerApp {
             });
     }
 
+    /// Arrow-key navigation through what the browser actually shows — the
+    /// filtered list (search / media filters), wrapping at the ends.
     fn step_selection(&mut self, delta: i32) {
-        if self.images.is_empty() {
+        if self.filtered.is_empty() {
             return;
         }
-        let current = self.selected.unwrap_or(0) as i32;
-        let next = (current + delta).rem_euclid(self.images.len() as i32);
-        self.selected = Some(next as usize);
+        let n = self.filtered.len() as i32;
+        let pos = match self.selected.and_then(|s| self.filtered.iter().position(|&i| i == s)) {
+            Some(pos) => (pos as i32 + delta).rem_euclid(n),
+            // The selection is hidden by the filter: step to the nearest
+            // visible image in the direction pressed.
+            None => {
+                let cur = self.selected.unwrap_or(0);
+                if delta > 0 {
+                    self.filtered.iter().position(|&i| i > cur).unwrap_or(0) as i32
+                } else {
+                    self.filtered.iter().rposition(|&i| i < cur).unwrap_or(n as usize - 1) as i32
+                }
+            }
+        };
+        self.selected = Some(self.filtered[pos as usize]);
     }
 
     /// Delete the selected image and its `.txt` sidecar, then fix up the list.
@@ -1135,8 +1211,15 @@ impl ViewerApp {
                 // shifts down when it sat after the removed one.
                 Some(sel) if sel > idx => Some(sel - 1),
                 Some(sel) if sel < idx => Some(sel),
-                // The removed image itself (or none): nearest remaining one.
-                _ => Some(idx.min(self.images.len().saturating_sub(1))),
+                // The removed image itself (or none): the nearest one the
+                // browser still shows (search / filters), else any.
+                _ => self
+                    .filtered
+                    .iter()
+                    .copied()
+                    .find(|&i| i >= idx)
+                    .or_else(|| self.filtered.last().copied())
+                    .or(Some(idx.min(self.images.len().saturating_sub(1)))),
             }
         };
     }
@@ -1148,7 +1231,7 @@ impl ViewerApp {
             zoom::ViewerAction::ToggleFavorite => {
                 self.favorites.toggle(path);
             }
-            zoom::ViewerAction::Crop(frac) => self.crop_current(path, frac),
+            zoom::ViewerAction::Crop(frac) => self.crop_current(path, frac, ctx),
             zoom::ViewerAction::CopyImage => self.copy_current(path),
             zoom::ViewerAction::RemoveBackground => self.start_bgremove(path, ctx),
             zoom::ViewerAction::None => {}
@@ -1394,6 +1477,22 @@ impl ViewerApp {
                 match self.viewer.request(&path, now) {
                     image_cache::Cached::Ready(tex) => {
                         let is_fav = self.favorites.is_favorite(&path);
+                        // Swap in the full-resolution decode when the view needs
+                        // more pixels than the preview has; until it lands the
+                        // preview keeps showing (the zoom maths uses the real
+                        // pixel size either way).
+                        let tex = if self.zoom.wants_full_res(&path) {
+                            match self.viewer_full.request(&path, now) {
+                                image_cache::Cached::Ready(full) => full,
+                                image_cache::Cached::Loading => {
+                                    ui.ctx().request_repaint_after(Duration::from_millis(60));
+                                    tex
+                                }
+                                _ => tex,
+                            }
+                        } else {
+                            tex
+                        };
                         let action = self.zoom.show(ui, &tex, &path, is_fav);
                         self.handle_viewer_action(action, &path, ui.ctx());
                     }
@@ -1447,6 +1546,15 @@ impl ViewerApp {
 
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Interface size (Settings > Appearance). Applied before anything is laid
+        // out so the whole UI, including fixed point sizes, scales together.
+        {
+            let ctx = ui.ctx().clone();
+            let target = settings::effective_ui_scale(&ctx, &self.settings);
+            if (ctx.zoom_factor() - target).abs() > 0.001 {
+                ctx.set_zoom_factor(target);
+            }
+        }
         // While the splash is writing its wordmark, render ONLY the splash —
         // the panels (and the folder/thumbnail work they kick off) build after
         // it, so launch shows the text before the app UI exists. The fade-out
@@ -1485,6 +1593,10 @@ impl eframe::App for ViewerApp {
 
         self.thumbs.begin_frame(ui.ctx());
         self.viewer.begin_frame(ui.ctx());
+        // Full-res copies: as big as the GPU allows, at most 8192 px.
+        let max_tex = ui.ctx().input(|i| i.max_texture_side).min(8192) as u32;
+        self.viewer_full.set_max_edge(max_tex);
+        self.viewer_full.begin_frame(ui.ctx());
 
         // Push the Glass theme's user-configurable background (colour + backdrop)
         // and its dark/light panel mode so the pickers update live; cheap, so
@@ -2378,7 +2490,44 @@ fn decode_full_rgba(src: &std::path::Path) -> Option<image::RgbaImage> {
             return avif::decode_avif(src);
         }
     }
-    image::open(src).ok().map(|img| img.to_rgba8())
+    image_cache::open_oriented(src).ok().map(|img| img.to_rgba8())
+}
+
+/// Crop `src` by `frac` (fractions of the upright full image) and save it as
+/// `<name>_crop.png` beside the original. Runs on a worker thread.
+fn crop_to_file(src: &std::path::Path, frac: zoom::CropFraction) -> Result<PathBuf, String> {
+    // `decode_full_rgba` covers common formats via `image` plus the extended
+    // formats (AVIF/HEIC/RAW) through our own decoder, so cropping works on
+    // everything the viewer can display.
+    let full = decode_full_rgba(src)
+        .map(image::DynamicImage::ImageRgba8)
+        .ok_or("couldn't read the image")?;
+    let (iw, ih) = (full.width(), full.height());
+    if iw == 0 || ih == 0 {
+        return Err("empty image".to_string());
+    }
+    let (iwf, ihf) = (iw as f32, ih as f32);
+    let cx = (frac.x * iwf).round().clamp(0.0, iwf - 1.0) as u32;
+    let cy = (frac.y * ihf).round().clamp(0.0, ihf - 1.0) as u32;
+    let cw = (frac.w * iwf).round().clamp(1.0, iwf - cx as f32) as u32;
+    let ch = (frac.h * ihf).round().clamp(1.0, ihf - cy as f32) as u32;
+    let dest = crop_destination(src);
+    full.crop_imm(cx, cy, cw, ch).save(&dest).map_err(|e| e.to_string())?;
+    Ok(dest)
+}
+
+/// `haystack` contains `needle` as whole words: the match isn't glued to a
+/// letter or digit on either side ("cat" ≠ "catgirl", "scattered"; = "black
+/// cat", "cat_ears"). Both lowercase.
+fn contains_words(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.match_indices(needle).any(|(i, _)| {
+        let before = haystack[..i].chars().next_back();
+        let after = haystack[i + needle.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
 }
 
 /// Where a crop of `src` is saved: `<name>_crop.png` next to the original, with a
@@ -2426,5 +2575,22 @@ mod cf_dib_tests {
         // Top row: red -> BGRX(0,0,255); half-green on white -> (127,255,127).
         assert_eq!(&dib[48..52], &[0, 0, 255, 255]);
         assert_eq!(&dib[52..56], &[127, 255, 127, 255]);
+    }
+}
+
+
+#[cfg(test)]
+mod viewer_review_tests {
+    use super::contains_words;
+
+    #[test]
+    fn tag_search_matches_whole_words() {
+        let tags = "1girl, black cat, cat_ears, scattered petals";
+        assert!(contains_words(tags, "cat"));
+        assert!(contains_words(tags, "black cat"));
+        assert!(contains_words(tags, "ears"));
+        assert!(!contains_words("catgirl, scattered", "cat"));
+        assert!(!contains_words("1girl", "girl"));
+        assert!(contains_words(tags, ""));
     }
 }

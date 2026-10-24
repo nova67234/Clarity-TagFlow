@@ -141,6 +141,15 @@ pub(crate) struct TagRoles {
 /// and whether the user is currently in edit mode.
 pub struct RightPanelState {
     pub current_tags: String,
+    /// `current_tags` as last read from / written to disk — an edit is unsaved
+    /// while the two differ (auto-saved when the selection moves on).
+    loaded_tags: String,
+    /// How the sidecar was encoded (ANSI / UTF-16 files are read too, and
+    /// UTF-16 is written back as UTF-16).
+    tags_encoding: crate::sidecar::Encoding,
+    /// The sidecar exists but couldn't be read. Editing is blocked so the
+    /// empty box can never be saved over the real tags.
+    tags_error: Option<String>,
     /// Artist/character tags for the current image (looked up by md5 from the
     /// shared tag_roles.json), so the tag box can colour artist orange / char green.
     tag_roles: TagRoles,
@@ -218,6 +227,9 @@ impl Default for RightPanelState {
     fn default() -> Self {
         Self {
             current_tags: String::new(),
+            loaded_tags: String::new(),
+            tags_encoding: crate::sidecar::Encoding::Utf8,
+            tags_error: None,
             tag_roles: TagRoles::default(),
             roles_cache: None,
             sd_metadata: None,
@@ -266,6 +278,25 @@ pub enum RightPanelAction {
     MoveCurrent,
 }
 
+/// Write the edited tags of `image` to its sidecar, in the encoding it was
+/// read with. An empty edit on an image with no sidecar writes nothing (no
+/// stray empty `.txt` files). True on success.
+fn save_tags(state: &mut RightPanelState, image: &Path) -> bool {
+    if state.tags_error.is_some() {
+        return false;
+    }
+    let txt_path = sidecar_txt(image);
+    if !txt_path.exists() && state.current_tags.trim().is_empty() {
+        state.loaded_tags.clone_from(&state.current_tags);
+        return true;
+    }
+    let ok = crate::sidecar::write(&txt_path, &state.current_tags, state.tags_encoding).is_ok();
+    if ok {
+        state.loaded_tags.clone_from(&state.current_tags);
+    }
+    ok
+}
+
 /// Render the right details panel.
 pub fn show(
     ui: &mut egui::Ui,
@@ -284,6 +315,16 @@ pub fn show(
 
     // 1. Sync the text box state when the selected image changes.
     if state.last_path.as_deref() != current_image {
+        // Leaving an image mid-edit (clicking another thumbnail, arrow keys)
+        // saves the edit instead of silently dropping it.
+        if state.is_editing
+            && state.current_tags != state.loaded_tags
+            && let Some(prev) = state.last_path.clone()
+            && !crate::archive::is_entry(&prev)
+            && !save_tags(state, &prev)
+        {
+            eprintln!("[tags] couldn't save the edit to {}", sidecar_txt(&prev).display());
+        }
         state.last_path = current_image.map(|p| p.to_path_buf());
         state.is_editing = false;
         state.show_delete_confirm = false; // Reset delete prompt when navigating away
@@ -294,8 +335,21 @@ pub fn show(
 
         if let Some(path) = current_image {
             let txt_path = sidecar_txt(path);
-            // Through `archive` so sidecars inside a mounted zip backup load too.
-            state.current_tags = crate::archive::read_to_string(&txt_path).unwrap_or_default();
+            // Through `archive` so sidecars inside a mounted zip backup load
+            // too; ANSI / UTF-16 sidecars decode instead of reading as empty.
+            match crate::sidecar::read(&txt_path) {
+                Ok(sc) => {
+                    state.current_tags = sc.text;
+                    state.tags_encoding = sc.encoding;
+                    state.tags_error = None;
+                }
+                Err(e) => {
+                    state.current_tags.clear();
+                    state.tags_encoding = crate::sidecar::Encoding::Utf8;
+                    state.tags_error = Some(e);
+                }
+            }
+            state.loaded_tags.clone_from(&state.current_tags);
             // Look up this image's artist/character roles (by md5) from the shared
             // tag_roles.json, so the tag box can colour those tags.
             state.tag_roles = lookup_tag_roles(&mut state.roles_cache, path);
@@ -340,6 +394,8 @@ pub fn show(
 
         } else {
             state.current_tags.clear();
+            state.loaded_tags.clear();
+            state.tags_error = None;
             state.tag_roles = TagRoles::default();
             state.sd_metadata = None;
             state.sd_metadata_raw = None;
@@ -646,7 +702,10 @@ pub fn show(
                                     // Images inside a mounted zip are view-only: no tag
                                     // edits, moves or deletes (nothing is ever written
                                     // into — or extracted from — the archive).
-                                    let read_only = crate::archive::is_entry(img_path);
+                                    // An unreadable sidecar is view-only too, so the
+                                    // empty box can't be saved over it.
+                                    let read_only =
+                                        crate::archive::is_entry(img_path) || state.tags_error.is_some();
 
                                     // Edit/Save slot: flashes green when a save succeeds,
                                     // red when the write fails (stays in edit mode to retry).
@@ -660,21 +719,16 @@ pub fn show(
                                     if ui.add_enabled(!read_only, edit_btn).clicked() {
                                         if state.showing_meta {
                                             // The metadata view is read-only. Clicking
-                                            // Edit Text here drops to the .txt tags view,
-                                            // creating the sidecar file if it doesn't
-                                            // exist yet, and enters edit mode so tags can
-                                            // be added to a metadata-only image.
-                                            let txt_path = sidecar_txt(img_path);
-                                            if !txt_path.exists() {
-                                                let _ = std::fs::write(&txt_path, &state.current_tags);
-                                            }
+                                            // Edit Text here drops to the .txt tags view
+                                            // in edit mode so tags can be added to a
+                                            // metadata-only image. The sidecar is only
+                                            // created when something is actually saved.
                                             state.showing_meta = false;
                                             state.is_editing = true;
                                             state.edit_flash_start = Some(Instant::now());
                                             state.save_flash = None;
                                         } else if state.is_editing {
-                                            let txt_path = sidecar_txt(img_path);
-                                            let ok = std::fs::write(&txt_path, &state.current_tags).is_ok();
+                                            let ok = save_tags(state, img_path);
                                             if ok {
                                                 state.is_editing = false; // saved — back to view mode
                                             }
@@ -786,6 +840,16 @@ pub fn show(
                                 //    always read-only (no editing, no save-back).
                                 let showing_meta = state.showing_meta && state.sd_metadata.is_some();
                                 let editable = state.is_editing && !showing_meta;
+                                if let Some(e) = state.tags_error.as_ref().filter(|_| !showing_meta) {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{e} — editing is off so the file isn't overwritten."
+                                        ))
+                                        .color(egui::Color32::from_rgb(210, 70, 70))
+                                        .size(12.0),
+                                    );
+                                    ui.add_space(4.0);
+                                }
                                 let mut display_text = if showing_meta {
                                     state.sd_metadata.clone().unwrap_or_default()
                                 } else {

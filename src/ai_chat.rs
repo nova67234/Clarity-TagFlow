@@ -130,7 +130,7 @@ impl Lightbox {
             let p = path.to_path_buf();
             let repaint = ctx.clone();
             std::thread::spawn(move || {
-                let img = image::open(&p).ok().map(|img| {
+                let img = crate::image_cache::open_oriented(&p).ok().map(|img| {
                     let t = img.thumbnail(2048, 2048).to_rgba8();
                     egui::ColorImage::from_rgba_unmultiplied(
                         [t.width() as usize, t.height() as usize],

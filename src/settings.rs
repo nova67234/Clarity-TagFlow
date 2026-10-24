@@ -168,6 +168,48 @@ pub struct Settings {
     pub dismissed_app_version: String,
     /// Same, for the dismissed ComfyUI release tag.
     pub dismissed_comfy_version: String,
+    /// Interface size multiplier (1.0 = 100%). Ignored while `ui_scale_auto` is on.
+    pub ui_scale: f32,
+    /// Pick the interface size from the monitor's resolution, so the app isn't
+    /// tiny on large desktop screens running at 100% OS scaling.
+    pub ui_scale_auto: bool,
+}
+
+/// The interface size steps offered in Settings > Appearance.
+pub const UI_SCALE_STEPS: [f32; 8] = [0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5];
+
+/// Interface size picked for the current monitor when "Auto" is on.
+///
+/// The OS's own display scaling is already applied by egui, so this only adds
+/// extra size when the screen is large in *OS logical* pixels, i.e. a 1440p or
+/// 4K desktop monitor left at 100-125% scaling. A laptop at its usual 125-150%
+/// scaling stays at 100%, so the layout you designed there is unchanged.
+pub fn auto_ui_scale(ctx: &egui::Context) -> f32 {
+    let (monitor, native) = ctx.input(|i| {
+        let vp = i.viewport();
+        (vp.monitor_size, vp.native_pixels_per_point)
+    });
+    let (Some(monitor), Some(native)) = (monitor, native) else {
+        return 1.0;
+    };
+    // `monitor_size` is in points *including* our current zoom, so convert back
+    // to physical pixels and then to OS logical pixels. This keeps the result
+    // stable no matter what zoom is currently applied (no feedback loop).
+    // Use the short side so ultrawide monitors are judged by their height.
+    let physical_h = monitor.x.min(monitor.y) * ctx.pixels_per_point();
+    let logical_h = physical_h / native.max(0.5);
+    match logical_h {
+        h if h >= 2000.0 => 1.5,  // 4K at 100%
+        h if h >= 1700.0 => 1.25, // 4K at 125%
+        h if h >= 1400.0 => 1.1,  // 1440p at 100%, 4K at 150%
+        _ => 1.0,
+    }
+}
+
+/// The interface size that should be applied right now.
+pub fn effective_ui_scale(ctx: &egui::Context, settings: &Settings) -> f32 {
+    let s = if settings.ui_scale_auto { auto_ui_scale(ctx) } else { settings.ui_scale };
+    s.clamp(0.75, 3.0)
 }
 
 impl Default for Settings {
@@ -221,6 +263,8 @@ impl Default for Settings {
             media_filter: MediaFilter::default(),
             dismissed_app_version: String::new(),
             dismissed_comfy_version: String::new(),
+            ui_scale: 1.0,
+            ui_scale_auto: true,
         }
     }
 }
@@ -536,6 +580,38 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut settings.layout, Layout::Panels, "Panels");
                         ui.selectable_value(&mut settings.layout, Layout::Gallery, "Gallery");
+                    });
+            },
+        );
+        row_sep(ui);
+        row(
+            ui,
+            "Interface size",
+            Some("Makes text, icons and panels bigger. Auto picks a size from your monitor's resolution."),
+            |ui| {
+                let pct = |v: f32| format!("{}%", (v * 100.0).round() as i32);
+                let label = if settings.ui_scale_auto {
+                    format!("Auto ({})", pct(auto_ui_scale(ui.ctx())))
+                } else {
+                    pct(settings.ui_scale)
+                };
+                egui::ComboBox::from_id_salt("ui_scale_combo")
+                    .width(130.0)
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(settings.ui_scale_auto, format!("Auto ({})", pct(auto_ui_scale(ui.ctx()))))
+                            .clicked()
+                        {
+                            settings.ui_scale_auto = true;
+                        }
+                        for step in UI_SCALE_STEPS {
+                            let selected = !settings.ui_scale_auto && (settings.ui_scale - step).abs() < 0.001;
+                            if ui.selectable_label(selected, pct(step)).clicked() {
+                                settings.ui_scale_auto = false;
+                                settings.ui_scale = step;
+                            }
+                        }
                     });
             },
         );

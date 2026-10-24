@@ -245,29 +245,42 @@ pub fn show(
             Ok(new_tags) => {
                 // Drop blacklisted tags (comma/newline separated in settings).
                 let blacklist = parse_tags(&state.settings.blacklist);
-                let mut existing = read_sidecar(&done.image);
-                let mut fresh: HashSet<String> = HashSet::new();
-                let mut added = 0;
-                for t in new_tags {
-                    let blocked = blacklist.iter().any(|b| b.eq_ignore_ascii_case(&t));
-                    let dup = existing.iter().any(|e| e.eq_ignore_ascii_case(&t));
-                    if !blocked && !dup {
-                        fresh.insert(t.clone());
-                        existing.push(t);
-                        added += 1;
+                // An unreadable sidecar is left alone rather than overwritten.
+                if let Some(mut existing) = read_sidecar(&done.image) {
+                    let mut fresh: HashSet<String> = HashSet::new();
+                    let mut added = 0;
+                    for t in new_tags {
+                        let blocked = blacklist.iter().any(|b| b.eq_ignore_ascii_case(&t));
+                        let dup = existing.iter().any(|e| e.eq_ignore_ascii_case(&t));
+                        if !blocked && !dup {
+                            fresh.insert(t.clone());
+                            existing.push(t);
+                            added += 1;
+                        }
                     }
+                    match write_sidecar(&done.image, &existing) {
+                        Some(text) => {
+                            // If the tagged image is still selected, refresh the live
+                            // buffer and this frame's tag list, and tint the run's
+                            // additions so the user can tell them from the tags that
+                            // were already there.
+                            if current_image == Some(done.image.as_path()) {
+                                *current_tags = text;
+                                tags = existing;
+                                state.ai_new_tags = fresh;
+                            }
+                            state.status_msg = format!("Added {added} tags");
+                            state.status_is_error = false;
+                        }
+                        None => {
+                            state.status_msg = "Couldn't save this image's .txt".to_string();
+                            state.status_is_error = true;
+                        }
+                    }
+                } else {
+                    state.status_msg = "Couldn't read this image's .txt — left it untouched".to_string();
+                    state.status_is_error = true;
                 }
-                write_sidecar(&done.image, &existing);
-                // If the tagged image is still selected, refresh the live buffer
-                // and this frame's tag list, and tint the run's additions so the
-                // user can tell them from the tags that were already there.
-                if current_image == Some(done.image.as_path()) {
-                    *current_tags = serialize_tags(&existing);
-                    tags = existing;
-                    state.ai_new_tags = fresh;
-                }
-                state.status_msg = format!("Added {added} tags");
-                state.status_is_error = false;
             }
             Err(e) => {
                 state.status_msg = e;
@@ -509,9 +522,10 @@ pub fn show(
                     let before = tags.len();
                     tags.retain(|t| !state.selected_tags.contains(t));
                     let removed = before - tags.len();
-                    save(img, &tags, current_tags);
-                    state.selected_tags.clear();
-                    set_change_status(state, "Removed", removed, tags.len());
+                    if save(state, img, &tags, current_tags) {
+                        state.selected_tags.clear();
+                        set_change_status(state, "Removed", removed, tags.len());
+                    }
                 }
             });
 
@@ -527,15 +541,21 @@ pub fn show(
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Confirm").clicked() {
                             let new_tags = parse_tags(&state.draft);
-                            let n = add_to_all(all_images, &new_tags);
+                            let (n, skipped) = add_to_all(all_images, &new_tags);
                             state.draft.clear();
                             state.confirm_add_all = false;
                             // Refresh the current file's buffer so the list reflects the write.
-                            if let Some(path) = current_image {
-                                *current_tags = serialize_tags(&read_sidecar(path));
+                            if let Some(path) = current_image
+                                && let Ok(sc) = crate::sidecar::read(&crate::right_details::sidecar_txt(path))
+                            {
+                                *current_tags = sc.text;
                             }
-                            state.status_msg = format!("Added to {n} images");
-                            state.status_is_error = false;
+                            state.status_msg = if skipped == 0 {
+                                format!("Added to {n} images")
+                            } else {
+                                format!("Added to {n} images — {skipped} unreadable .txt files left untouched")
+                            };
+                            state.status_is_error = skipped > 0;
                         }
                         if ui.button("Cancel").clicked() {
                             state.confirm_add_all = false;
@@ -717,8 +737,9 @@ pub fn show(
                                                     {
                                                         let t = tags.remove(from);
                                                         tags.insert(to, t);
-                                                        save(img, &tags, current_tags);
-                                                        set_change_status(state, "Moved", 1, tags.len());
+                                                        if save(state, img, &tags, current_tags) {
+                                                            set_change_status(state, "Moved", 1, tags.len());
+                                                        }
                                                     }
                                                 }
                                             } else if released {
@@ -913,8 +934,9 @@ fn rename_tag(
     if state.selected_tags.remove(orig) {
         state.selected_tags.insert(new.to_string());
     }
-    if let Some(img) = current_image {
-        save(img, tags, current_tags);
+    if let Some(img) = current_image
+        && save(state, img, tags, current_tags)
+    {
         set_change_status(state, "Renamed", 1, tags.len());
     }
 }
@@ -1120,8 +1142,9 @@ fn commit_draft(
     let (changed, dups) = add_tags_reporting_dups(tags, &state.draft);
     if changed {
         let added = tags.len() - before;
-        save(path, tags, current_tags);
-        set_change_status(state, "Added", added, tags.len());
+        if save(state, path, tags, current_tags) {
+            set_change_status(state, "Added", added, tags.len());
+        }
     }
     let had_dups = !dups.is_empty();
     if had_dups {
@@ -1139,30 +1162,57 @@ fn serialize_tags(tags: &[String]) -> String {
     tags.join(", ")
 }
 
-/// Apply the working tag list to the selected file: update the shared buffer and
-/// write the `.txt` sidecar.
-fn save(path: &Path, tags: &[String], current_tags: &mut String) {
-    *current_tags = serialize_tags(tags);
-    let _ = std::fs::write(crate::right_details::sidecar_txt(path), current_tags.as_bytes());
+/// Apply the working tag list to the selected file's sidecar and update the
+/// shared buffer with the result. Only what changed is edited in the file
+/// (see `sidecar::apply_tags`), so captions keep their sentences. False —
+/// with an error status, nothing written — when the existing sidecar can't
+/// be read.
+fn save(state: &mut TagManagerState, path: &Path, tags: &[String], current_tags: &mut String) -> bool {
+    match write_sidecar(path, tags) {
+        Some(text) => {
+            *current_tags = text;
+            true
+        }
+        None => {
+            state.status_msg = "Couldn't read this image's .txt — left it untouched".to_string();
+            state.status_is_error = true;
+            false
+        }
+    }
 }
 
-/// Read and parse a file's sidecar tags from disk.
-fn read_sidecar(path: &Path) -> Vec<String> {
+/// Read and parse a file's sidecar tags from disk (`None` when the sidecar
+/// exists but can't be read — callers must not write over it).
+fn read_sidecar(path: &Path) -> Option<Vec<String>> {
     let txt = crate::right_details::sidecar_txt(path);
-    parse_tags(&std::fs::read_to_string(txt).unwrap_or_default())
+    crate::sidecar::read(&txt).ok().map(|sc| parse_tags(&sc.text))
 }
 
-/// Write a tag list to a file's sidecar.
-fn write_sidecar(path: &Path, tags: &[String]) {
-    let _ = std::fs::write(crate::right_details::sidecar_txt(path), serialize_tags(tags));
+/// Make a file's sidecar hold `tags`, editing only what changed and keeping
+/// its encoding. Returns the new file text, or `None` (nothing written) when
+/// the existing sidecar can't be read. An empty list never creates a file.
+fn write_sidecar(path: &Path, tags: &[String]) -> Option<String> {
+    let txt = crate::right_details::sidecar_txt(path);
+    let sc = crate::sidecar::read(&txt).ok()?;
+    let text = crate::sidecar::apply_tags(&sc.text, tags);
+    let unchanged = text == sc.text && (sc.existed || text.is_empty());
+    if !unchanged && crate::sidecar::write(&txt, &text, sc.encoding).is_err() {
+        return None;
+    }
+    Some(text)
 }
 
 /// Add `new_tags` to every loaded file's sidecar, skipping files that already
-/// have them all (case-insensitive). Returns the number of files changed.
-fn add_to_all(all_images: &[PathBuf], new_tags: &[String]) -> usize {
+/// have them all (case-insensitive). Returns the number of files changed and
+/// the number skipped because their sidecar couldn't be read.
+fn add_to_all(all_images: &[PathBuf], new_tags: &[String]) -> (usize, usize) {
     let mut count = 0;
+    let mut skipped = 0;
     for img in all_images {
-        let mut existing = read_sidecar(img);
+        let Some(mut existing) = read_sidecar(img) else {
+            skipped += 1;
+            continue;
+        };
         let mut changed = false;
         for t in new_tags {
             if !existing.iter().any(|e| e.eq_ignore_ascii_case(t)) {
@@ -1171,9 +1221,11 @@ fn add_to_all(all_images: &[PathBuf], new_tags: &[String]) -> usize {
             }
         }
         if changed {
-            write_sidecar(img, &existing);
-            count += 1;
+            match write_sidecar(img, &existing) {
+                Some(_) => count += 1,
+                None => skipped += 1,
+            }
         }
     }
-    count
+    (count, skipped)
 }

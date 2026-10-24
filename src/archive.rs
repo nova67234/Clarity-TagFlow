@@ -157,15 +157,6 @@ pub fn read(path: &Path) -> io::Result<Vec<u8>> {
     }
 }
 
-/// `std::fs::read_to_string`, but virtual archive paths read from the zip.
-pub fn read_to_string(path: &Path) -> io::Result<String> {
-    match entry_of(path) {
-        Some((a, name)) => String::from_utf8(a.read_entry(&name)?)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
-        None => std::fs::read_to_string(path),
-    }
-}
-
 /// A seekable reader over a plain file or an in-memory zip entry — what the
 /// streaming decoders (jpeg/png/tiff subsampling, GIF/MP4 probes, animation
 /// player) use in place of `File::open`.
@@ -248,7 +239,7 @@ mod tests {
 
         // Bytes come back decrypted, entirely in memory.
         assert_eq!(read(&img).unwrap(), b"not really a png");
-        assert_eq!(read_to_string(&zip_path.join("photos/a.txt")).unwrap(), "tag1, tag2");
+        assert_eq!(read(&zip_path.join("photos/a.txt")).unwrap(), b"tag1, tag2");
 
         // Real files still route to the filesystem.
         close();
