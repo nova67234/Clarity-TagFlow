@@ -49,6 +49,7 @@ jobs:
           cp target/release/Clarity_TagFlow "$PKG/Clarity_TagFlow"
           chmod +x "$PKG/Clarity_TagFlow"
           cp icons/app-icon.PNG "$PKG/app-icon.png"
+          cp assets/fonts/UFL.txt "$PKG/UFL.txt"  # embedded font's licence
           cat > "$PKG/Clarity_TagFlow.desktop" <<'EOF'
           [Desktop Entry]
           Type=Application

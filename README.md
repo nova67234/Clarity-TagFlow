@@ -82,4 +82,6 @@ Clarity TagFlow is a ground-up Rust rewrite of the Java app **terminus2** — sa
 
 Licensed under the [MIT License](LICENSE).
 
+Bold text in the AI chat uses **Ubuntu Medium** (© Canonical Ltd.), embedded under the [Ubuntu Font Licence 1.0](assets/fonts/UFL.txt), which ships with every download.
+
 *Same workflow. Native speed. More AI.* 🦀✨

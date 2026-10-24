@@ -58,6 +58,7 @@ jobs:
           cp build/Clarity_TagFlow "$APP/Contents/MacOS/Clarity_TagFlow"
           chmod +x "$APP/Contents/MacOS/Clarity_TagFlow"
           cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+          cp assets/fonts/UFL.txt "$APP/Contents/Resources/UFL.txt"  # embedded font's licence
           cp installer/Info.plist "$APP/Contents/Info.plist"
           # Ad-hoc sign so it launches on Apple Silicon without a Gatekeeper block.
           codesign --force --deep --sign - "$APP"

@@ -170,6 +170,18 @@ impl Style {
             text = text.strong();
         }
 
+        // PATCH(Clarity TagFlow): real bold weight. egui has no synthetic
+        // bold (`strong()` only changes the colour, and the chat pins that
+        // colour to its ink), so bold text and the strong heading levels use
+        // the app's "bold" font family (Ubuntu Medium) when it's registered.
+        // Inline code below switches back to monospace.
+        if self.strong || self.heading.is_some_and(|level| level <= 3) {
+            let bold = egui::FontFamily::Name("bold".into());
+            if ui.ctx().fonts(|f| f.definitions().families.contains_key(&bold)) {
+                text = text.family(bold);
+            }
+        }
+
         if self.emphasis {
             // FIXME: Might want to add some space between the next text
             text = text.italics();

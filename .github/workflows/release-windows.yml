@@ -138,6 +138,9 @@ jobs:
           foreach ($dll in 'vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll') {
             Copy-Item "$env:SystemRoot\System32\$dll" ClarityTagFlow-windows/ -ErrorAction Stop
           }
+          # The embedded Ubuntu Medium font's licence must travel with every copy
+          # (the installer picks it up from this folder too).
+          Copy-Item assets/fonts/UFL.txt ClarityTagFlow-windows/UFL.txt -ErrorAction Stop
           Compress-Archive -Path ClarityTagFlow-windows/* -DestinationPath ClarityTagFlow-windows.zip -Force
 
       # Build a per-user installer (Inno Setup ships on the GitHub Windows image)

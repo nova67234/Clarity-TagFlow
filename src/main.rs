@@ -2521,6 +2521,22 @@ fn install_fallback_fonts(ctx: &egui::Context) {
         }
     }
 
+    // Bold weight for Markdown **bold** and headings in the AI chat (replies
+    // and thoughts). egui has no synthetic bold (`strong()` only changes the
+    // colour), so ship Ubuntu Medium: the same family and version (0.83) as
+    // egui's built-in Ubuntu Light, under the same licence (assets/fonts/UFL.txt).
+    // ALWAYS registered (laying out with an unknown family panics), with the
+    // proportional list behind it so CJK / math / emoji still resolve.
+    fonts.font_data.insert(
+        "ubuntu_medium".into(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/Ubuntu-Medium.ttf")).into(),
+    );
+    let mut bold_list: Vec<String> = vec!["ubuntu_medium".into()];
+    if let Some(prop) = fonts.families.get(&egui::FontFamily::Proportional) {
+        bold_list.extend(prop.iter().cloned());
+    }
+    fonts.families.insert(egui::FontFamily::Name("bold".into()), bold_list);
+
     // Cursive script font for the startup splash ("Clarity TagFlow" write-on).
     // The family is ALWAYS registered — laying out with an unknown family
     // panics — and just maps to the proportional list when no script font is

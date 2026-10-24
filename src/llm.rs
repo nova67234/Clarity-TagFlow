@@ -2199,7 +2199,9 @@ mod worker {
         }
         context.decode(batch).map_err(|e| format!("Decode: {e}"))?;
         raw.push_str(&close);
-        send(Msg::Token(close));
+        // The wrap-up is for the model only: the chat gets just the closing
+        // marker, so the Thoughts box doesn't end with the hidden nudge.
+        send(Msg::Token(format!("\n{close_marker}\n")));
         Ok(())
     }
 
@@ -3503,10 +3505,10 @@ mod tests {
                     wrong.push(format!("{res:?} cut_off={cut_off}"));
                 } else if edits.is_empty() == *should_change {
                     wrong.push(if *should_change { "no edit".into() } else { format!("edited: {edits:?}") });
-                } else if *should_change {
-                    if let Err(why) = check(&before, &after) {
-                        wrong.push(why);
-                    }
+                } else if *should_change
+                    && let Err(why) = check(&before, &after)
+                {
+                    wrong.push(why);
                 }
                 for line in visible.lines() {
                     let l = line.trim_start();

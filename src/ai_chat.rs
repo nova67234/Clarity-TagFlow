@@ -1044,65 +1044,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         }
     }
     if !shown.trim().is_empty() {
-        ui.scope(|ui| {
-            // Slightly larger body text for replies than egui's default.
-            if let Some(body) = ui.style_mut().text_styles.get_mut(&egui::TextStyle::Body) {
-                body.size = 14.5;
-            }
-            // Code gets SOLID, neutral surfaces (never translucent — over
-            // the animated Glass backdrops code was unreadable): a quiet
-            // near-black editor tone under light text, a soft grey under
-            // dark ink, with a matching chip for inline `code`. Keyed off
-            // the EFFECTIVE chat ink (theme, Aurora-glow default, or the
-            // user's override) so a black-text setup never lands on dark
-            // chips it can't be read on. The viewer takes the block fill
-            // from `extreme_bg_color`, the chip fill from `code_bg_color`,
-            // and the radius/stroke from the noninteractive widget style.
-            let ink = chat_text();
-            let dark_ink = (ink.r() as u16 + ink.g() as u16 + ink.b() as u16) < 384;
-            let use_light_code_bg = crate::theme::is_light() || dark_ink;
-
-            // Multi-line code blocks keep their solid background (these DO get rounded corners)
-            let code_bg = if use_light_code_bg {
-                egui::Color32::from_rgb(238, 240, 245)
-            } else {
-                egui::Color32::from_rgb(24, 26, 31)
-            };
-
-            // Inline `code` chips: a see-through grey veil — the backdrop
-            // stays visible through the rounded chip. The vendored viewer
-            // pairs it with light-grey text (it keys the code text colour
-            // off the chip's brightness, see misc.rs).
-            let inline_bg = egui::Color32::from_rgba_unmultiplied(128, 132, 140, 90);
-
-            let v = ui.visuals_mut();
-            v.extreme_bg_color = code_bg;
-            v.code_bg_color = inline_bg;
-
-            v.dark_mode = !use_light_code_bg;
-
-            // Keep the mouse text selection highlight soft as well
-            v.selection.bg_fill = ACCENT1().gamma_multiply(0.20);
-            v.selection.stroke.color = TEXT();
-
-            v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(12);
-            v.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-            // Reply text follows the Appearance tab's chat text-colour override
-            // (chat_text() falls back to the theme's normal ink without one).
-            v.override_text_color = Some(chat_text());
-            // Bold/heading text resolves through strong_text_color() — the
-            // widgets.active colour — which BYPASSES override_text_color
-            // (egui RichText::get_text_color), so under a dark ink it stayed
-            // near-white and washed out over the bright backdrop. Pin it to
-            // the ink. Links get a deep readable blue when the ink is dark.
-            v.widgets.active.fg_stroke.color = chat_text();
-            if dark_ink {
-                v.hyperlink_color = egui::Color32::from_rgb(28, 110, 235);
-            }
-            egui_commonmark::CommonMarkViewer::new()
-                .render_math_fn(Some(&render_math))
-                .show(ui, &mut llm.md_cache, &shown);
-        });
+        chat_markdown(ui, &mut llm.md_cache, &shown, false);
     }
 
     // Tag images: what this reply changed in the image's tags, with Undo.
@@ -1249,6 +1191,93 @@ fn tag_change_note(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, change: 
         });
 }
 
+/// Markdown in the conversation: model replies, and (with `thought`) the
+/// model's thoughts in the "Thoughts" box. Both share the code-surface and ink
+/// rules; thoughts use smaller, muted body text so they stay quieter than the
+/// answer, while bold and headings keep the normal chat ink (and the bold
+/// font weight) so they still stand out.
+fn chat_markdown(
+    ui: &mut egui::Ui,
+    cache: &mut egui_commonmark::CommonMarkCache,
+    text: &str,
+    thought: bool,
+) {
+    ui.scope(|ui| {
+        let s = ui.style_mut();
+        // Slightly larger body text for replies than egui's default; thoughts
+        // keep the old 12.5 caption size, with headings and code scaled down
+        // to match.
+        if let Some(body) = s.text_styles.get_mut(&egui::TextStyle::Body) {
+            body.size = if thought { 12.5 } else { 14.5 };
+        }
+        if thought {
+            if let Some(h) = s.text_styles.get_mut(&egui::TextStyle::Heading) {
+                h.size = 14.5;
+            }
+            if let Some(m) = s.text_styles.get_mut(&egui::TextStyle::Monospace) {
+                m.size = 11.5;
+            }
+        }
+        // Code gets SOLID, neutral surfaces (never translucent — over
+        // the animated Glass backdrops code was unreadable): a quiet
+        // near-black editor tone under light text, a soft grey under
+        // dark ink, with a matching chip for inline `code`. Keyed off
+        // the EFFECTIVE chat ink (theme, Aurora-glow default, or the
+        // user's override) so a black-text setup never lands on dark
+        // chips it can't be read on. The viewer takes the block fill
+        // from `extreme_bg_color`, the chip fill from `code_bg_color`,
+        // and the radius/stroke from the noninteractive widget style.
+        let ink = chat_text();
+        let dark_ink = (ink.r() as u16 + ink.g() as u16 + ink.b() as u16) < 384;
+        let use_light_code_bg = crate::theme::is_light() || dark_ink;
+
+        // Multi-line code blocks keep their solid background (these DO get rounded corners)
+        let code_bg = if use_light_code_bg {
+            egui::Color32::from_rgb(238, 240, 245)
+        } else {
+            egui::Color32::from_rgb(24, 26, 31)
+        };
+
+        // Inline `code` chips: a see-through grey veil — the backdrop
+        // stays visible through the rounded chip. The vendored viewer
+        // pairs it with light-grey text (it keys the code text colour
+        // off the chip's brightness, see misc.rs).
+        let inline_bg = egui::Color32::from_rgba_unmultiplied(128, 132, 140, 90);
+
+        let v = ui.visuals_mut();
+        v.extreme_bg_color = code_bg;
+        v.code_bg_color = inline_bg;
+
+        v.dark_mode = !use_light_code_bg;
+
+        // Keep the mouse text selection highlight soft as well
+        v.selection.bg_fill = ACCENT1().gamma_multiply(0.20);
+        v.selection.stroke.color = TEXT();
+
+        v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(12);
+        v.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+        // Reply text follows the Appearance tab's chat text-colour override
+        // (chat_text() falls back to the theme's normal ink without one).
+        v.override_text_color = Some(if thought {
+            chat_text_override().or_else(chat_aurora_ink).unwrap_or(MUTED())
+        } else {
+            chat_text()
+        });
+        // Bold/heading text resolves through strong_text_color() — the
+        // widgets.active colour — which BYPASSES override_text_color
+        // (egui RichText::get_text_color), so under a dark ink it stayed
+        // near-white and washed out over the bright backdrop. Pin it to
+        // the ink. Links get a deep readable blue when the ink is dark.
+        v.widgets.active.fg_stroke.color = chat_text();
+        if dark_ink {
+            v.hyperlink_color = egui::Color32::from_rgb(28, 110, 235);
+        }
+        egui_commonmark::CommonMarkViewer::new()
+            .render_math_fn(Some(&render_math))
+            .show(ui, cache, text);
+    });
+}
+
 /// The collapsible "Thinking" row above a reply: the little AI orb, a muted
 /// label (pulsing softly while the thought still streams) and a chevron that
 /// rotates as the section opens. Clicking anywhere on it (orb included)
@@ -1350,10 +1379,12 @@ fn thinking_row(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, thinking: &
                 .inner_margin(egui::Margin { left: 24, right: 12, top: 6, bottom: 6 })
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    // Muted like a caption normally; the chat text-colour
-                    // override (or the Aurora-glow black default) wins.
-                    let col = chat_text_override().or_else(chat_aurora_ink).unwrap_or(MUTED());
-                    ui.label(egui::RichText::new(thinking).color(col).size(12.5).italics());
+                    // Markdown like the replies (lists, bold, code blocks with
+                    // highlighting), in the quieter thought style. Its own id
+                    // so it never clashes with the reply's viewer below.
+                    ui.push_id(("thought_md", chat_id, index), |ui| {
+                        chat_markdown(ui, &mut llm.md_cache, thinking, true);
+                    });
                 });
             // The quote rule: a rounded orb-accent bar down the left edge.
             let r = inner.response.rect;
