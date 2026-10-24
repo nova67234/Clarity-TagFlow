@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::backup::{FLASH, FLASH_GREEN, FLASH_RED};
 
 use eframe::egui;
 
@@ -77,6 +79,10 @@ pub struct ScanState {
     /// True on the frame the window was opened, so the Find Issues button click
     /// that spawned it isn't counted as a click outside (instant hide).
     just_opened: bool,
+    /// Footer button click-flash (Create Backup style): the button fills
+    /// green/red for `FLASH`, then the action fires.
+    start_flash: Option<Instant>,
+    cancel_flash: Option<Instant>,
 }
 
 impl Default for ScanState {
@@ -95,6 +101,8 @@ impl Default for ScanState {
             finished_tick: false,
             anchor_pos: None,
             just_opened: false,
+            start_flash: None,
+            cancel_flash: None,
         }
     }
 }
@@ -328,13 +336,34 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
             // Right-aligned footer: the primary Start Scan / Cancel button.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
+                // Plain at rest; flash green/red on click, then fire once the
+                // flash has lingered for `FLASH` — same as Create Backup.
                 if state.running {
-                    if footer_button(ui, "Cancel", Some(egui::Color32::from_rgb(180, 40, 40))).clicked() {
+                    let flashing = state.cancel_flash.is_some();
+                    if footer_button(ui, "Cancel", flashing.then_some(FLASH_RED)).clicked()
+                        && !flashing
+                    {
+                        state.cancel_flash = Some(Instant::now());
+                    }
+                    if state.cancel_flash.is_some_and(|t| t.elapsed() >= FLASH) {
+                        state.cancel_flash = None;
                         state.cancel.store(true, Ordering::SeqCst);
                         state.status = "Cancelling…".to_string();
                     }
-                } else if footer_button(ui, "Start Scan", Some(ACCENT1())).clicked() {
-                    start_scan(state, ctx);
+                } else {
+                    let flashing = state.start_flash.is_some();
+                    if footer_button(ui, "Start Scan", flashing.then_some(FLASH_GREEN)).clicked()
+                        && !flashing
+                    {
+                        state.start_flash = Some(Instant::now());
+                    }
+                    if state.start_flash.is_some_and(|t| t.elapsed() >= FLASH) {
+                        state.start_flash = None;
+                        start_scan(state, ctx);
+                    }
+                }
+                if state.start_flash.is_some() || state.cancel_flash.is_some() {
+                    ctx.request_repaint();
                 }
             });
         });

@@ -23,11 +23,11 @@ use zip::{AesMode, CompressionMethod};
 use crate::theme::*;
 
 /// Green flash on the Create button on click (matches Tag Manager settings Save).
-const FLASH_GREEN: Color32 = Color32::from_rgb(46, 160, 67);
+pub const FLASH_GREEN: Color32 = Color32::from_rgb(46, 160, 67);
 /// Red flash on the Cancel button on click (matches Tag Manager settings Cancel).
-const FLASH_RED: Color32 = Color32::from_rgb(200, 55, 55);
+pub const FLASH_RED: Color32 = Color32::from_rgb(200, 55, 55);
 /// How long a button flash lingers before its action fires.
-const FLASH: Duration = Duration::from_millis(450);
+pub const FLASH: Duration = Duration::from_millis(450);
 
 /// Shortest password Create accepts for an encrypted archive. Zip AES derives
 /// its key with low-iteration PBKDF2, so very short passwords give AES-256 in

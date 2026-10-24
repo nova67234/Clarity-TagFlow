@@ -17,6 +17,9 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
+use std::time::Instant;
+
+use crate::backup::{FLASH, FLASH_GREEN};
 
 use eframe::egui;
 use suppaftp::native_tls::TlsConnector;
@@ -88,6 +91,11 @@ pub struct FtpState {
     /// "Test connection" result for the settings tab.
     test_rx: Option<Receiver<Result<usize, String>>>,
     pub test_status: Option<Result<String, String>>,
+
+    /// Footer button click-flash (Create Backup style): green for `FLASH`,
+    /// then the action fires.
+    load_flash: Option<Instant>,
+    dl_flash: Option<Instant>,
 }
 
 impl FtpState {
@@ -437,7 +445,7 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
                 let title = if settings.ftp_host.trim().is_empty() {
                     "FTP Browser".to_string()
                 } else {
-                    format!("FTP — {}", settings.ftp_host.trim())
+                    format!("FTP {}", settings.ftp_host.trim())
                 };
                 ui.heading(egui::RichText::new(title).color(TEXT()).strong().size(17.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -632,14 +640,25 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
                             .size(12.0),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let btn = egui::Button::new(
-                            egui::RichText::new(format!("Load {} images", media.len()))
-                                .color(egui::Color32::WHITE)
-                                .strong(),
-                        )
-                        .fill(ACCENT1())
-                        .corner_radius(egui::CornerRadius::same(10));
-                        if ui.add_enabled(!media.is_empty(), btn).clicked() {
+                        // Both footer buttons share the Create Backup popup's
+                        // footer-button size (14pt, corner-10, 32px tall).
+                        let btn_size = egui::vec2(110.0, 32.0);
+                        // Plain at rest; flash green on click, then fire once the
+                        // flash has lingered for `FLASH` — same as Create Backup.
+                        let load_flashing = state.load_flash.is_some();
+                        let dl_flashing = state.dl_flash.is_some();
+                        let btn = footer_button("Load images", load_flashing.then_some(FLASH_GREEN));
+                        if ui
+                            .add_enabled_ui(!media.is_empty(), |ui| ui.add_sized(btn_size, btn))
+                            .inner
+                            .clicked()
+                            && !load_flashing
+                            && !dl_flashing
+                        {
+                            state.load_flash = Some(Instant::now());
+                        }
+                        if state.load_flash.is_some_and(|t| t.elapsed() >= FLASH) {
+                            state.load_flash = None;
                             load_files = Some(media.clone());
                         }
 
@@ -654,12 +673,23 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
                         } else {
                             format!("Save all media in this folder to {out}")
                         };
-                        let dl_btn = egui::Button::new(
-                            egui::RichText::new("Download All").color(TEXT()),
-                        )
-                        .corner_radius(egui::CornerRadius::same(10));
-                        if ui.add_enabled(!media.is_empty(), dl_btn).on_hover_text(tip).clicked() {
+                        let dl_btn = footer_button("Download All", dl_flashing.then_some(FLASH_GREEN));
+                        if ui
+                            .add_enabled_ui(!media.is_empty(), |ui| ui.add_sized(btn_size, dl_btn))
+                            .inner
+                            .on_hover_text(tip)
+                            .clicked()
+                            && !dl_flashing
+                            && !load_flashing
+                        {
+                            state.dl_flash = Some(Instant::now());
+                        }
+                        if state.dl_flash.is_some_and(|t| t.elapsed() >= FLASH) {
+                            state.dl_flash = None;
                             save_files = Some(media);
+                        }
+                        if state.load_flash.is_some() || state.dl_flash.is_some() {
+                            ui.ctx().request_repaint();
                         }
                     });
                 });
@@ -725,6 +755,18 @@ fn human_size(bytes: usize) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// A footer button matching the Create Backup popup (corner-10, 14pt).
+/// `fill` Some → filled with white text (click flash); None → plain TEXT label.
+fn footer_button(label: &str, fill: Option<egui::Color32>) -> egui::Button<'static> {
+    let text = if fill.is_some() { egui::Color32::WHITE } else { TEXT() };
+    let mut btn = egui::Button::new(egui::RichText::new(label).color(text).size(14.0))
+        .corner_radius(egui::CornerRadius::same(10));
+    if let Some(c) = fill {
+        btn = btn.fill(c);
+    }
+    btn
 }
 
 #[cfg(test)]

@@ -765,7 +765,7 @@ pub fn folder_popup(
             let input_path = current_folder.map(|p| p.display().to_string());
             let mut sel_in = menu_row_value(
                 ui,
-                "Select Input...",
+                "Select Input",
                 input_path.as_deref().unwrap_or("No folder selected"),
                 true,
             );
@@ -784,7 +784,7 @@ pub fn folder_popup(
             }
             let sel_out = menu_row_value(
                 ui,
-                "Select Output...",
+                "Select Output",
                 if output_folder.trim().is_empty() { "No folder selected" } else { output_folder },
                 true,
             );
@@ -794,7 +794,7 @@ pub fn folder_popup(
                 }
                 close = true;
             }
-            if menu_row(ui, "Open Zip (.zip)...", true)
+            if menu_row(ui, "Open .Zip", true)
                 .on_hover_text(
                     "Browse a zip archive — password-protected too — straight from \
                      the file, without extracting anything",

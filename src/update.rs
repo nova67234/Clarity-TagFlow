@@ -7,7 +7,9 @@
 //! [`crate::generate::update_comfyui`].
 
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::backup::{FLASH, FLASH_GREEN, FLASH_RED};
 
 use eframe::egui;
 use egui::{Color32, CornerRadius, Margin, RichText, Stroke};
@@ -87,6 +89,12 @@ pub struct UpdateState {
     comfy_rx: Option<Receiver<ComfyMsg>>,
     comfy_log: Vec<String>,
     comfy_done: Option<bool>,
+
+    // Button click-flash timers (Create Backup style: plain at rest, the
+    // button fills green/red for `FLASH`, then the action fires).
+    flash_download: Option<Instant>,
+    flash_check: Option<Instant>,
+    flash_dismiss: Option<Instant>,
 }
 
 impl UpdateState {
@@ -351,8 +359,10 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
                 if let Some(ri) = &r.app_latest {
                     if is_newer(&ri.tag, CURRENT) {
                         ui.label(RichText::new(format!("Update available — {}", ri.tag)).color(GREEN).strong());
-                        ui.add_space(2.0);
-                        crate::arrow_link(ui, "Download from GitHub", &ri.url, None);
+                        ui.add_space(4.0);
+                        if flash_button(ui, "Download from GitHub", 170.0, &mut state.flash_download, FLASH_GREEN) {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(&ri.url));
+                        }
                         ui.add_space(6.0);
                         ui.label(RichText::new("What's new").color(TEXT()).strong().size(12.0));
                         ui.add_space(2.0);
@@ -384,22 +394,39 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
             && let (Some(inst), Some(latest)) = (&r.comfy_installed, &r.comfy_latest) {
                 if is_newer(&latest.tag, inst) {
                     ui.add_space(2.0);
-                    ui.label(RichText::new(format!("Update available — {}", latest.tag)).color(GREEN).strong());
+                    // "Update available" line with a blue download arrow at the
+                    // right end (same icon as the Civitai panel's download) —
+                    // clicking it runs the in-place update; a spinner replaces
+                    // it while the update is running.
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("Update available — {}", latest.tag)).color(GREEN).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if comfy_updating {
+                                ui.add(egui::Spinner::new().size(18.0).color(ACCENT1()));
+                            } else {
+                                let arrow = egui::include_image!("../icons/arrow_circle_down.svg");
+                                let r = ui
+                                    .add(
+                                        egui::Image::new(arrow)
+                                            .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                                            .tint(ACCENT1())
+                                            .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_text("Update ComfyUI in place (keeps your models)");
+                                if r.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if r.clicked() {
+                                    do_comfy_update = true;
+                                }
+                            }
+                        });
+                    });
                     ui.add_space(6.0);
                     if !latest.notes.trim().is_empty() {
                         ui.label(RichText::new("What's new").color(TEXT()).strong().size(12.0));
                         ui.add_space(2.0);
                         notes_box(ui, "comfy_notes", &latest.notes);
-                        ui.add_space(6.0);
-                    }
-                    let btn = egui::Button::new(
-                        RichText::new(if comfy_updating { "Updating…" } else { "Update ComfyUI" })
-                            .color(Color32::WHITE)
-                            .strong(),
-                    )
-                    .fill(ACCENT1());
-                    if ui.add_enabled(!comfy_updating, btn).clicked() {
-                        do_comfy_update = true;
                     }
                 } else {
                     ui.add_space(2.0);
@@ -426,13 +453,18 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
     // --- Footer: re-check + dismiss ---
     ui.add_space(2.0);
     ui.horizontal(|ui| {
-        if ui.add_enabled(!checking, egui::Button::new(RichText::new("Check now").size(12.0))).clicked() {
+        let fired = ui
+            .add_enabled_ui(!checking, |ui| {
+                flash_button_rounded(ui, "Check now", 90.0, &mut state.flash_check, FLASH_GREEN, 16)
+            })
+            .inner;
+        if fired {
             do_check = true;
         }
         let can_dismiss = state.result.as_ref().map(|r| r.app_update() || r.comfy_update()).unwrap_or(false);
         if can_dismiss {
-            ui.add_space(6.0);
-            if ui.add(egui::Button::new(RichText::new("Dismiss").size(12.0)).frame(false)).clicked() {
+            ui.add_space(8.0);
+            if flash_button(ui, "Dismiss", 90.0, &mut state.flash_dismiss, FLASH_RED) {
                 do_dismiss = true;
             }
         }
@@ -485,6 +517,48 @@ fn notes_box(ui: &mut egui::Ui, id: &str, text: &str) {
 fn hint(ui: &mut egui::Ui, text: &str) {
     ui.add_space(4.0);
     ui.label(RichText::new(text).color(MUTED()).size(11.0));
+}
+
+/// A Create Backup–style button: plain TEXT label at rest (corner-10, 14pt,
+/// 32px tall); on click it fills `flash_color` with white text for `FLASH`,
+/// then returns `true` once so the caller fires the action.
+fn flash_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    width: f32,
+    flash: &mut Option<Instant>,
+    flash_color: Color32,
+) -> bool {
+    flash_button_rounded(ui, label, width, flash, flash_color, 10)
+}
+
+/// `flash_button` with a custom corner radius (16 = full pill at 32px tall).
+fn flash_button_rounded(
+    ui: &mut egui::Ui,
+    label: &str,
+    width: f32,
+    flash: &mut Option<Instant>,
+    flash_color: Color32,
+    radius: u8,
+) -> bool {
+    let flashing = flash.is_some();
+    let text = if flashing { Color32::WHITE } else { TEXT() };
+    let mut btn = egui::Button::new(RichText::new(label).color(text).size(14.0))
+        .corner_radius(CornerRadius::same(radius));
+    if flashing {
+        btn = btn.fill(flash_color);
+    }
+    if ui.add_sized([width, 32.0], btn).clicked() && !flashing {
+        *flash = Some(Instant::now());
+    }
+    if flash.is_some_and(|t| t.elapsed() >= FLASH) {
+        *flash = None;
+        return true;
+    }
+    if flash.is_some() {
+        ui.ctx().request_repaint();
+    }
+    false
 }
 
 #[cfg(test)]

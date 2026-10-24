@@ -819,7 +819,8 @@ pub fn show(
                                                         .fit_to_exact_size(egui::vec2(16.0, 16.0))
                                                         .tint(TEXT()),
                                                     egui::RichText::new(to).size(13.0),
-                                                );
+                                                )
+                                                .frame(false);
                                                 if ui
                                                     .add(btn)
                                                     .on_hover_text(
