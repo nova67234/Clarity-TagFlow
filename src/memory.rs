@@ -1,4 +1,4 @@
-//! The AI's long-term memory across chats (the chat list's gear → AI Settings
+//! The AI's long-term memory across chats (the Tools menu's gear → AI Settings
 //! → Memory, and the 3D memory map in src/memory_map.rs).
 //!
 //! The layout follows the design from the "Creating 3D visualizations in chat"

@@ -1,9 +1,11 @@
 //! AI Chat — the full-window view shown instead of the three panels while
 //! Settings → AI Model → "Activate AI Chat" is on (the top bar stays).
 //!
-//! Layout (from the design sketches): the chat list lives in a left card
-//! panel built exactly like the image browser's (same `Panel::left` +
-//! `card_frame`), just with conversations instead of thumbnails. The
+//! Layout: just the conversation, centred, with the input card at the bottom
+//! — no side panels. A workflow from the input card's Tools menu brings its
+//! own: Tag images puts the image on the left and the Tag Manager on the
+//! right (src/main.rs). The session's chats are behind the input card's
+//! chats button, and AI Settings behind the Tools menu's gear.
 //!
 //! All chat state (conversations, streaming reply, draft) lives on
 //! `LlmState` (src/llm.rs); this module only draws it.
@@ -11,12 +13,8 @@
 use eframe::egui;
 use egui::Margin;
 
-use crate::card_frame;
 use crate::llm::{ChatRole, LlmState};
 use crate::theme::*;
-
-/// Width of the chats side panel — same as the Details & Actions panel's.
-const PANEL_W: f32 = crate::right_details::PANEL_WIDTH;
 
 /// Drag-and-drop accent — the blue the input card turns while a file is
 /// dragged over it (matches the generator prompt box's import blue).
@@ -68,27 +66,12 @@ pub fn show(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::setting
         return;
     }
 
-    // --- Left: the chat list, in the image browser's card panel style. ---
-    // Tag images mode has no chat list: main.rs puts the image there (and the
-    // Tag Manager on the right) — or, with no image selected, only the chat
-    // shows. Role play's character and memories live in AI Settings.
-    if !llm.tag_images {
-        egui::Panel::left("ai_chat_list")
-            .resizable(false)
-            .exact_size(PANEL_W)
-            .show_separator_line(false)
-            .frame(egui::Frame::new().fill(BG()).inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 10 }))
-            .show_inside(ui, |ui| {
-                card_frame(22).show(ui, |ui| {
-                    // Fill the panel's full height, like the browser card.
-                    ui.set_min_height(ui.available_height());
-                    ui.set_width(ui.available_width());
-                    chat_list(ui, llm);
-                });
-            });
-    }
+    // No side panels of its own: with no workflow on in the Tools menu it's
+    // only the chat. Tag images brings the image and the Tag Manager
+    // (main.rs draws those around this view); role play's character and
+    // memories live in AI Settings; the chats are behind the chats button.
 
-    // --- Centre: the conversation + input pill, in a centred column. ---
+    // --- The conversation + input pill, in a centred column. ---
     egui::CentralPanel::default()
         .frame(egui::Frame::new().fill(BG()).inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 10 }))
         .show_inside(ui, |ui| {
@@ -216,63 +199,49 @@ fn lightbox_ui(ctx: &egui::Context, llm: &mut LlmState) {
     }
 }
 
-/// The chat list card: a "Chats" header with a new-chat button and the
-/// AI-settings gear (sampling knobs), then one row per conversation ("tabs
-/// like switch between chats").
+/// The chats popup (the input card's chats button): a "CHATS" header with a
+/// new-chat button, then one row per conversation this session — click one
+/// to switch to it, ✕ to delete it.
 fn chat_list(ui: &mut egui::Ui, llm: &mut LlmState) {
-    ui.add_space(4.0);
+    // The popup's width: the rows' left-aligned titles would otherwise grow
+    // it to the whole window.
+    ui.set_max_width(260.0);
     ui.horizontal(|ui| {
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new("Chats").color(TEXT()).strong().size(14.5));
+        ui.label(egui::RichText::new("CHATS").color(MUTED()).strong().size(11.0));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_space(2.0);
             if icon_button(ui, egui::include_image!("../icons/add.svg"), 18.0, "New chat", true)
                 .clicked()
             {
                 llm.new_chat();
-            }
-            // Opens the AI Settings window (src/ai_settings.rs): replies,
-            // and memory with its 3D memory map.
-            let gear = icon_button(
-                ui,
-                egui::include_image!("../icons/settings.svg"),
-                16.0,
-                "AI settings and memory",
-                true,
-            );
-            if gear.clicked() {
-                llm.gen_settings_open = !llm.gen_settings_open;
+                llm.chats_open = false;
             }
         });
     });
-    ui.add_space(8.0);
+    ui.add_space(5.0);
 
-    egui::ScrollArea::vertical().id_salt("ai_chat_list").show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("ai_chat_list").max_height(340.0).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 3.0;
+        // Title buttons all the same width, the delete icons in a column.
+        let title_w = ui.available_width() - 30.0;
         let mut delete: Option<usize> = None;
         for i in 0..llm.chats.len() {
             let selected = i == llm.active_chat;
             let title = llm.chats[i].title();
             ui.horizontal(|ui| {
-                let text_color = TEXT();
-
-                let mut btn = egui::Button::new(
-                    egui::RichText::new(title).color(text_color).size(13.0),
-                )
-                    .corner_radius(egui::CornerRadius::same(18))
-                    .min_size(egui::vec2(ui.available_width() - 26.0, 30.0));
-
+                // The title on the left (the empty right text takes the rest).
+                let mut btn = egui::Button::new(egui::RichText::new(title).color(TEXT()).size(13.0))
+                    .right_text("")
+                    .corner_radius(egui::CornerRadius::same(18));
                 btn = if selected {
                     btn.fill(ACCENT1().gamma_multiply(0.15))
                 } else {
                     btn.fill(egui::Color32::TRANSPARENT)
                 };
-                if ui.add(btn).clicked() {
+                if ui.add_sized(egui::vec2(title_w, 30.0), btn).clicked() {
                     llm.active_chat = i;
+                    llm.chats_open = false;
                 }
-                if ui
-                    .add(egui::Button::new(egui::RichText::new("✕").color(MUTED()).size(11.0)).frame(false))
-                    .on_hover_text("Delete this chat")
+                if icon_button_tinted(ui, egui::include_image!("../icons/x.svg"), 14.0, "Delete this chat", true, icon_tint(MUTED()))
                     .clicked()
                 {
                     delete = Some(i);
@@ -412,7 +381,7 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                 } else if llm.krea_prompts {
                     "Attach a picture with + or describe an idea — get a Krea 2 prompt"
                 } else {
-                    "Ask AI anything — attach an image with +"
+                    "Ask AI anything — attach an image with +, or pick a workflow in Tools"
                 };
                 ui.vertical_centered(|ui| {
                     ui.set_max_width(col_w);
@@ -543,7 +512,7 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                 });
                 ui.add_space(2.0);
             }
-            // The same translucent PANEL fill as the top bar / chat list cards —
+            // The same translucent PANEL fill as the top bar and the side cards —
             // the glass-patch underlay painted above keeps messages from showing
             // through it. A soft shadow (same family as card_frame's) lifts the
             // card visually above the chat.
@@ -652,6 +621,27 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                             let tools_resp = icon_button(ui, egui::include_image!("../icons/tools.svg"), 18.0, "Tools", true);
                             if tools_resp.clicked() {
                                 llm.tools_open = !llm.tools_open;
+                                llm.chats_open = false;
+                            }
+                            // Chats: this session's conversations, and a new one
+                            // (the view has no chat list panel).
+                            let chats_resp = icon_button(ui, egui::include_image!("../icons/chats.svg"), 17.0, "Chats", true);
+                            if chats_resp.clicked() {
+                                llm.chats_open = !llm.chats_open;
+                                llm.tools_open = false;
+                            }
+                            if llm.chats_open {
+                                let mut open = true;
+                                egui::Popup::from_response(&chats_resp)
+                                    .open_bool(&mut open)
+                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                                    .align(egui::RectAlign::TOP_START) // opens upward, like Tools
+                                    .width(260.0)
+                                    .gap(8.0)
+                                    .frame(crate::card_frame(14))
+                                    .show(|ui| chat_list(ui, llm));
+                                // Closed by a click outside, or by picking a chat.
+                                llm.chats_open &= open;
                             }
                             if llm.tools_open {
                                 let mut open = llm.tools_open;

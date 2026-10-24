@@ -97,7 +97,7 @@ pub struct Settings {
     /// AI runs the highest level the GPU can safely handle.
     pub ai_image_detail: crate::llm::ImageDetail,
     /// AI chat sampling knobs (temperature, top-k/p, reply length) — edited
-    /// from the gear in the chat list panel.
+    /// from the gear in the AI Chat's Tools menu.
     pub ai_gen: crate::llm::GenParams,
     /// Voice cloning: path to a short reference recording (empty = none —
     /// the description above is used instead).

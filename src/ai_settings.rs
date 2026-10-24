@@ -1,4 +1,4 @@
-//! AI Settings: the window behind the gear in the AI Chat's chat list. Built
+//! AI Settings: the window behind the gear in the AI Chat's Tools menu. Built
 //! from the main Settings window's parts (src/settings.rs) so the two look the
 //! same: a sidebar with the title and tabs, sections of rounded cards with
 //! label/description rows and macOS-style switches on the right.

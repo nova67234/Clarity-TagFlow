@@ -69,7 +69,7 @@ mod ai_models;
 mod ai_orb;
 // The full-window AI Chat view (Settings → AI Model → Activate AI Chat).
 mod ai_chat;
-// AI Settings window (the chat list's or Tools menu's gear): replies, memory
+// AI Settings window (the Tools menu's gear): replies, memory
 // and role play tabs.
 mod ai_settings;
 // The AI's long-term memory across chats (and role play's own, kept apart),

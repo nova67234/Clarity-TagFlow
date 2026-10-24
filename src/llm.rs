@@ -148,8 +148,8 @@ impl GemmaModel {
 /// True when this binary was compiled with local-AI support.
 pub const BUILT_WITH_LLM: bool = cfg!(feature = "llm");
 
-/// Sampling knobs for the AI chat, edited from the gear in the chat-list
-/// panel and persisted in Settings (`ai_gen`). The defaults are Gemma's
+/// Sampling knobs for the AI chat, edited in AI Settings (the Tools menu's
+/// gear) and persisted in Settings (`ai_gen`). The defaults are Gemma's
 /// recommended sampling.
 #[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -539,7 +539,7 @@ pub struct LlmState {
     /// Sampling knobs (mirrors the persisted setting; sent with every ask, so
     /// edits apply from the next reply — no model reload).
     pub params: GenParams,
-    /// The AI Settings window (the chat list's gear) is open.
+    /// The AI Settings window (the Tools menu's gear) is open.
     pub gen_settings_open: bool,
     /// Which AI Settings tab is shown.
     pub ai_settings_tab: crate::ai_settings::AiTab,
@@ -577,6 +577,8 @@ pub struct LlmState {
     pub krea_prompts: bool,
     /// The input card's tools popup is open.
     pub tools_open: bool,
+    /// The input card's chats popup (switch / new / delete chat) is open.
+    pub chats_open: bool,
     /// Spell-check state for the input card (right-click suggestion menu),
     /// same checker as the generator prompt boxes.
     pub spell: crate::spellcheck::SpellcheckState,
@@ -656,6 +658,7 @@ impl Default for LlmState {
             detailed_vision: false,
             krea_prompts: false,
             tools_open: false,
+            chats_open: false,
             spell: crate::spellcheck::SpellcheckState::default(),
             worker: None,
         }
