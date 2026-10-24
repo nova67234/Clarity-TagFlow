@@ -69,6 +69,11 @@ mod ai_models;
 mod ai_orb;
 // The full-window AI Chat view (Settings → AI Model → Activate AI Chat).
 mod ai_chat;
+// AI Settings window (the chat list's gear): replies + memory tabs.
+mod ai_settings;
+// The AI's long-term memory across chats, and its 3D memory map.
+mod memory;
+mod memory_map;
 // The OmniVoice neural voice for the chat's Listen buttons (Python sidecar).
 mod voice;
 // Role playing for the AI Chat: persona, names, shared memory diary.

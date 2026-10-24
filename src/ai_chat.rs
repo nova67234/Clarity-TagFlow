@@ -82,12 +82,12 @@ pub fn show(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::setting
                         .id_salt("ai_chat_list_outer")
                         .max_height(h * 0.32)
                         .auto_shrink([false, true])
-                        .show(ui, |ui| chat_list(ui, llm, settings));
+                        .show(ui, |ui| chat_list(ui, llm));
                     ui.add_space(6.0);
                     ui.separator();
                     crate::roleplay::panel_ui(ui, &mut llm.roleplay);
                 } else {
-                    chat_list(ui, llm, settings);
+                    chat_list(ui, llm);
                 }
             });
         });
@@ -98,6 +98,10 @@ pub fn show(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::setting
         .show_inside(ui, |ui| {
             conversation(ui, llm, settings);
         });
+
+    // The gear's AI Settings window and the memory map it opens.
+    crate::ai_settings::window(ui.ctx(), llm, settings);
+    crate::memory_map::window(ui.ctx(), llm);
 
     // Click-to-enlarge overlay for message attachments, above everything.
     lightbox_ui(ui.ctx(), llm);
@@ -219,7 +223,7 @@ fn lightbox_ui(ctx: &egui::Context, llm: &mut LlmState) {
 /// The chat list card: a "Chats" header with a new-chat button and the
 /// AI-settings gear (sampling knobs), then one row per conversation ("tabs
 /// like switch between chats").
-fn chat_list(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::settings::Settings) {
+fn chat_list(ui: &mut egui::Ui, llm: &mut LlmState) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(4.0);
@@ -231,26 +235,17 @@ fn chat_list(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::settin
             {
                 llm.new_chat();
             }
+            // Opens the AI Settings window (src/ai_settings.rs): replies,
+            // and memory with its 3D memory map.
             let gear = icon_button(
                 ui,
                 egui::include_image!("../icons/settings.svg"),
                 16.0,
-                "AI settings (temperature, reply length…)",
+                "AI settings and memory",
                 true,
             );
             if gear.clicked() {
                 llm.gen_settings_open = !llm.gen_settings_open;
-            }
-            if llm.gen_settings_open {
-                let mut open = llm.gen_settings_open;
-                egui::Popup::from_response(&gear)
-                    .open_bool(&mut open)
-                    .align(egui::RectAlign::BOTTOM_START)
-                    .width(250.0)
-                    .gap(8.0)
-                    .frame(crate::card_frame(14))
-                    .show(|ui| gen_settings_ui(ui, settings));
-                llm.gen_settings_open = open;
             }
         });
     });
@@ -292,63 +287,6 @@ fn chat_list(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::settin
             llm.delete_chat(i);
         }
     });
-}
-
-/// The gear popup: sampling knobs for how the AI replies. Edits land in the
-/// persisted settings (main.rs mirrors them onto `LlmState` each frame) and
-/// apply from the next message — no model reload.
-fn gen_settings_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings) {
-    let p = &mut settings.ai_gen;
-    ui.label(egui::RichText::new("AI SETTINGS").color(MUTED()).strong().size(10.5));
-    ui.add_space(6.0);
-
-    let knob = |ui: &mut egui::Ui, name: &str, hint: &str, slider: egui::Slider<'_>| {
-        ui.label(egui::RichText::new(name).color(TEXT()).size(12.5));
-        ui.spacing_mut().slider_width = 170.0;
-        ui.add(slider);
-        ui.label(egui::RichText::new(hint).color(MUTED()).size(10.5));
-        ui.add_space(8.0);
-    };
-
-    knob(
-        ui,
-        "Temperature",
-        "Randomness of the replies: 0 is focused and repeatable, \
-         1 is Gemma's recommended default, 2 gets wild.",
-        egui::Slider::new(&mut p.temperature, 0.0..=2.0).step_by(0.05).fixed_decimals(2),
-    );
-    knob(
-        ui,
-        "Top-K",
-        "Pick each word from only the K most likely candidates. \
-         Lower is safer, higher is more varied. Default 64.",
-        egui::Slider::new(&mut p.top_k, 1..=128),
-    );
-    knob(
-        ui,
-        "Top-P",
-        "Or by probability: drop unlikely words past this cumulative \
-         share. Lower is safer. Default 0.95.",
-        egui::Slider::new(&mut p.top_p, 0.05..=1.0).step_by(0.01).fixed_decimals(2),
-    );
-    knob(
-        ui,
-        "Max reply length",
-        "The longest answer the AI may write, in tokens (≈ ¾ of a \
-         word each). Default 3072.",
-        egui::Slider::new(&mut p.max_tokens, 256..=8192).step_by(64.0),
-    );
-
-    // The thinking level lives in GenParams too, but it has its own control
-    // (tools menu) — resetting the sampling knobs leaves it alone.
-    let defaults = crate::llm::GenParams { thinking: p.thinking, ..Default::default() };
-    if *p != defaults
-        && ui
-        .button(egui::RichText::new("Reset to defaults").size(11.5))
-        .clicked()
-    {
-        *p = defaults;
-    }
 }
 
 /// The conversation column: scrollable bubbles + the bottom input pill, both
@@ -740,38 +678,6 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                                  Replies start slower. Always on with Krea 2 \
                                                  prompts.",
                                             );
-                                        });
-
-                                        // Thinking mode: its own card under the
-                                        // switches — a slider, not a toggle.
-                                        ui.add_space(10.0);
-                                        ui.label(egui::RichText::new("THINKING").color(MUTED()).strong().size(11.0));
-                                        ui.add_space(5.0);
-                                        crate::settings::card(ui, |ui| {
-                                            let thinks = llm.model.thinks();
-                                            let mut level = settings.ai_gen.thinking;
-                                            ui.add_enabled_ui(thinks, |ui| thinking_slider(ui, &mut level));
-                                            if level != settings.ai_gen.thinking {
-                                                settings.ai_gen.thinking = level;
-                                                llm.params.thinking = level;
-                                            }
-                                            let hint = if thinks {
-                                                match level {
-                                                    crate::llm::ThinkLevel::Off => {
-                                                        "Answers right away — fastest, but weaker on tricky questions."
-                                                    }
-                                                    crate::llm::ThinkLevel::Low => "A quick think before answering.",
-                                                    crate::llm::ThinkLevel::Medium => "Balanced — the default.",
-                                                    crate::llm::ThinkLevel::High => "Thinks it through. Slower replies.",
-                                                    crate::llm::ThinkLevel::Max => {
-                                                        "Thinks the longest before answering: the slowest replies,                                                          and long chats keep fewer old messages in memory."
-                                                    }
-                                                }
-                                            } else {
-                                                "This model answers directly — thinking applies to \
-                                                 Gemma 4 31B and Qwen3-VL 30B Thinking."
-                                            };
-                                            crate::settings::hint(ui, hint);
                                         });
                                     });
                                 llm.tools_open = open;
@@ -1424,10 +1330,12 @@ fn msg_icon_button(
     icon_button_tinted(ui, icon, icon_size, tip, enabled, chat_icon_tint(TEXT()))
 }
 
-/// Compact model dropdown next to the mic — same look as the text-to-image
-/// prompt box footer's selector: the active model's name plus a chevron,
-/// opening an upward list of ONLY the installed vision models. Hidden while
-/// nothing is installed yet (Settings → AI Model handles first-time setup).
+/// The model picker next to the mic, Gemini-style: the button reads the
+/// model and (for the models that think) its thinking level, e.g. "Gemma 4
+/// 31B Medium". It opens an upward list of ONLY the installed models — each
+/// with a short tagline and a check on the active one — then a divider and a
+/// "Thinking level ▸" submenu holding the cube slider. Hidden while nothing
+/// is installed yet (Settings → AI Model handles first-time setup).
 fn chat_model_selector(
     ui: &mut egui::Ui,
     llm: &mut LlmState,
@@ -1438,21 +1346,26 @@ fn chat_model_selector(
     if installed.is_empty() {
         return;
     }
-    let full = llm.model.label().to_string();
+    let thinks = llm.model.thinks();
     let menu_id = ui.id().with("chat_model_menu");
     let open = egui::Popup::is_id_open(ui.ctx(), menu_id);
 
-    let mut job = egui::text::LayoutJob::simple_singleline(
-        full.clone(),
-        egui::FontId::proportional(12.0),
-        TEXT(),
-    );
-    job.wrap = egui::text::TextWrapping::truncate_at_width(150.0);
+    // "Gemma 4 31B" + a muted " Medium" when the model thinks.
+    let mut job = egui::text::LayoutJob::default();
+    job.append(llm.model.label(), 0.0, egui::TextFormat::simple(egui::FontId::proportional(12.0), TEXT()));
+    if thinks {
+        job.append(
+            settings.ai_gen.thinking.label(),
+            5.0,
+            egui::TextFormat::simple(egui::FontId::proportional(12.0), MUTED()),
+        );
+    }
+    job.wrap = egui::text::TextWrapping::truncate_at_width(190.0);
     let galley = ui.fonts_mut(|f| f.layout_job(job));
     let (arrow, gap) = (14.0, 2.0);
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(galley.size().x + gap + arrow, 28.0), egui::Sense::click());
-    let resp = resp.on_hover_text(full).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let resp = resp.on_hover_text("Model and thinking level").on_hover_cursor(egui::CursorIcon::PointingHand);
     if ui.is_rect_visible(rect) {
         let text_pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
         ui.painter().galley(text_pos, galley, TEXT());
@@ -1470,28 +1383,137 @@ fn chat_model_selector(
     egui::Popup::menu(&resp)
         .id(menu_id)
         .align(egui::RectAlign::TOP_END)
+        // Dragging the thinking slider mustn't close the menu; picking a
+        // model closes it explicitly.
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .frame(
             egui::Frame::new()
                 .fill(PANEL())
                 .corner_radius(egui::CornerRadius::same(22))
-                .inner_margin(egui::Margin::same(12))
+                .inner_margin(egui::Margin::same(10))
                 .stroke(egui::Stroke::new(1.0, EDGE())),
         )
         .show(|ui| {
-            ui.set_min_width(200.0);
-            // Round the hover highlight of menu rows (egui's default is square).
-            let radius = egui::CornerRadius::same(6);
-            ui.visuals_mut().widgets.inactive.corner_radius = radius;
-            ui.visuals_mut().widgets.hovered.corner_radius = radius;
+            ui.set_width(250.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
             for m in installed {
-                let resp = ui.selectable_label(llm.model == m, m.label()).on_hover_text(m.hint());
-                if resp.clicked() {
+                if model_row(ui, m, llm.model == m) {
                     settings.ai_gemma_model = m;
                     llm.set_model(m);
                     ui.close();
                 }
             }
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(2.0);
+            // Thinking level — expands in place (no second popup): a row with
+            // the current level and a chevron that turns down to reveal the
+            // cube slider underneath.
+            let open_id = ui.id().with("thinking_expanded");
+            let mut expanded = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
+            if thinking_row_header(ui, thinks, settings.ai_gen.thinking, expanded) {
+                expanded = !expanded;
+                ui.data_mut(|d| d.insert_temp(open_id, expanded));
+            }
+            let anim = ui.ctx().animate_bool(open_id.with("anim"), expanded);
+            if anim > 0.0 {
+                ui.scope(|ui| {
+                    ui.set_opacity(anim);
+                    ui.add_space(4.0 * anim);
+                    ui.add_enabled_ui(thinks, |ui| {
+                        let mut level = settings.ai_gen.thinking;
+                        thinking_slider(ui, &mut level);
+                        if level != settings.ai_gen.thinking {
+                            settings.ai_gen.thinking = level;
+                            llm.params.thinking = level;
+                        }
+                    });
+                    ui.add_space(2.0);
+                    crate::settings::hint(ui, &thinking_hint(thinks, settings.ai_gen.thinking));
+                });
+            }
         });
+}
+
+/// The picker's "Thinking level" row: label, the current level (muted) and
+/// a chevron that points right when folded and down when open. True when
+/// clicked.
+fn thinking_row_header(ui: &mut egui::Ui, thinks: bool, level: crate::llm::ThinkLevel, expanded: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        if resp.hovered() {
+            p.rect_stroke(
+                rect.shrink(1.0),
+                egui::CornerRadius::same(14),
+                egui::Stroke::new(1.5, TEXT().gamma_multiply(0.85)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let x = rect.left() + 34.0;
+        p.text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, "Thinking level", egui::FontId::proportional(13.5), TEXT());
+        let value = if thinks { level.label() } else { "Off" };
+        p.text(
+            egui::pos2(rect.right() - 30.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            value,
+            egui::FontId::proportional(12.5),
+            MUTED(),
+        );
+        let turn = ui.ctx().animate_bool(ui.id().with("thinking_chevron"), expanded);
+        egui::Image::new(egui::include_image!("../icons/arrow_right.svg"))
+            .tint(icon_tint(MUTED()))
+            .rotate(turn * std::f32::consts::FRAC_PI_2, egui::Vec2::splat(0.5))
+            .paint_at(ui, egui::Rect::from_center_size(egui::pos2(rect.right() - 16.0, rect.center().y), egui::vec2(14.0, 14.0)));
+    }
+    resp.clicked()
+}
+
+/// What the thinking level means, under the slider.
+fn thinking_hint(thinks: bool, level: crate::llm::ThinkLevel) -> String {
+    use crate::llm::ThinkLevel as L;
+    if !thinks {
+        return "This model answers directly — thinking applies to Gemma 4 31B and \
+                Qwen3-VL 30B Thinking."
+            .to_string();
+    }
+    match level {
+        L::Off => "Answers right away — fastest, but weaker on tricky questions.",
+        L::Low => "A quick think before answering.",
+        L::Medium => "Balanced — the default.",
+        L::High => "Thinks it through. Slower replies.",
+        L::Max => "Thinks the longest before answering: the slowest replies, and long chats \
+                   keep fewer old messages in memory.",
+    }
+    .to_string()
+}
+
+/// One model in the picker: a check for the active one, the name with its
+/// tagline beneath, and a rounded outline on hover. True when clicked.
+fn model_row(ui: &mut egui::Ui, m: crate::llm::GemmaModel, active: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::click());
+    let resp = resp.on_hover_text(m.hint()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        if resp.hovered() {
+            p.rect_stroke(
+                rect.shrink(1.0),
+                egui::CornerRadius::same(14),
+                egui::Stroke::new(1.5, TEXT().gamma_multiply(0.85)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if active {
+            egui::Image::new(egui::include_image!("../icons/check.svg"))
+                .tint(TEXT())
+                .paint_at(ui, egui::Rect::from_center_size(egui::pos2(rect.left() + 16.0, rect.center().y), egui::vec2(16.0, 16.0)));
+        }
+        let x = rect.left() + 34.0;
+        p.text(egui::pos2(x, rect.top() + 14.0), egui::Align2::LEFT_CENTER, m.label(), egui::FontId::proportional(13.5), TEXT());
+        p.text(egui::pos2(x, rect.top() + 31.0), egui::Align2::LEFT_CENTER, m.tagline(), egui::FontId::proportional(11.5), MUTED());
+    }
+    resp.clicked()
 }
 
 /// The input card's mic: local Whisper dictation (src/dictate.rs). Idle it's
@@ -1714,7 +1736,61 @@ fn thinking_slider(ui: &mut egui::Ui, level: &mut crate::llm::ThinkLevel) -> egu
         col,
         egui::Stroke::new(2.0, egui::Color32::WHITE.gamma_multiply(0.9 * dim)),
     );
+    // Sparkles: four at Max, two at High. They animate, so keep the
+    // slider redrawing (~30 fps) while they show.
+    let sparkles = match *level {
+        ThinkLevel::Max => 4,
+        ThinkLevel::High => 2,
+        _ => 0,
+    };
+    if sparkles > 0 && enabled {
+        knob_sparkles(ui.painter(), egui::pos2(kx, cy), time, sparkles);
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+    }
     resp
+}
+
+/// Little four-point stars twinkling slowly around the knob (`count` of
+/// them: 4 at Max, 2 at High), each on its own phase so they never flash
+/// together.
+fn knob_sparkles(painter: &egui::Painter, c: egui::Pos2, time: f64, count: usize) {
+    let t = time as f32;
+    // (angle around the knob, distance, phase, peak size)
+    const SPARKS: [(f32, f32, f32, f32); 4] =
+        [(-2.2, 13.0, 0.0, 4.2), (-0.6, 14.0, 1.7, 3.4), (0.9, 12.0, 3.3, 3.8), (2.6, 13.5, 4.8, 3.0)];
+    let tint = egui::Color32::from_rgb(236, 222, 255); // purple-white
+    // High keeps the two that sit apart (first and third), so it reads as
+    // a lighter version of Max.
+    let picked: &[usize] = if count >= 4 { &[0, 1, 2, 3] } else { &[0, 2] };
+    for &(angle, dist, phase, size) in picked.iter().map(|&i| &SPARKS[i]) {
+        // Mostly dark, briefly bright: a slow ~4 s twinkle per sparkle.
+        let s = ((t * 1.5 + phase).sin() * 0.5 + 0.5).powi(4);
+        if s < 0.02 {
+            continue;
+        }
+        // A gentle drift around the knob so they don't sit perfectly still.
+        let a = angle + t * 0.12;
+        let p = c + egui::vec2(a.cos(), a.sin()) * dist;
+        let r = size * (0.55 + 0.45 * s);
+        let w = r * 0.24;
+        let col = tint.gamma_multiply(s);
+        // A four-point star as two thin diamonds (each convex).
+        for (dx, dy) in [(0.0, 1.0), (1.0, 0.0)] {
+            let (ax, ay) = (dx * r, dy * r);
+            let (bx, by) = (dy * w, dx * w);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    p + egui::vec2(-ax, -ay),
+                    p + egui::vec2(bx, by),
+                    p + egui::vec2(ax, ay),
+                    p + egui::vec2(-bx, -by),
+                ],
+                col,
+                egui::Stroke::NONE,
+            ));
+        }
+        painter.circle_filled(p, w * 0.9, egui::Color32::WHITE.gamma_multiply(s));
+    }
 }
 
 /// A radial glow: `col` at the centre, half strength at 45% of the radius,

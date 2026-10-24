@@ -83,6 +83,9 @@ pub struct Settings {
     /// Krea 2 prompts: the chat turns pictures and ideas into Krea 2
     /// text-to-image prompts (tools menu toggle; implies detailed vision).
     pub ai_krea_prompts: bool,
+    /// Remember across chats (AI Settings → Memory): the AI keeps long-term
+    /// memories (src/memory.rs) and looks them up when they're useful.
+    pub ai_memory_enabled: bool,
     /// Which local model the AI chat runs (Gemma E4B / 27B / 31B, Qwen3-VL
     /// 8B / 30B Thinking).
     pub ai_gemma_model: crate::llm::GemmaModel,
@@ -233,6 +236,7 @@ impl Default for Settings {
             ai_auto_speak: false,
             ai_detailed_vision: false,
             ai_krea_prompts: false,
+            ai_memory_enabled: false,
             ai_gemma_model: crate::llm::GemmaModel::default(),
             ai_image_detail: crate::llm::ImageDetail::default(),
             ai_gen: crate::llm::GenParams::default(),
@@ -1161,7 +1165,15 @@ fn ftp_tab(ui: &mut egui::Ui, settings: &mut Settings, ftp: &mut crate::ftp::Ftp
 /// When `badge` is set, a small red dot sits at the row's right edge —
 /// the "update waiting" mark.
 fn tab_button(ui: &mut egui::Ui, settings: &mut Settings, tab: SettingsTab, label: &str, badge: bool) {
-    let selected = settings.tab == tab;
+    if side_tab(ui, settings.tab == tab, label, badge) {
+        settings.tab = tab;
+    }
+}
+
+/// One sidebar tab row of a settings-style window (this window and AI
+/// Settings): accent-filled when selected, flat otherwise, with an optional
+/// red dot. True when clicked.
+pub(crate) fn side_tab(ui: &mut egui::Ui, selected: bool, label: &str, badge: bool) -> bool {
     let text_color = if selected { egui::Color32::WHITE } else { TEXT() };
     let resp = ui
         .scope(|ui| {
@@ -1182,9 +1194,6 @@ fn tab_button(ui: &mut egui::Ui, settings: &mut Settings, tab: SettingsTab, labe
             ui.add(btn)
         })
         .inner;
-    if resp.clicked() {
-        settings.tab = tab;
-    }
     if badge {
         // Paint the dot inside the row's right edge, on the label's vertical
         // midline. Matches the red of the top-bar gear's update badge.
@@ -1194,6 +1203,7 @@ fn tab_button(ui: &mut egui::Ui, settings: &mut Settings, tab: SettingsTab, labe
             egui::Color32::from_rgb(230, 70, 70),
         );
     }
+    resp.clicked()
 }
 
 /// A settings group, macOS System Settings style: an uppercase muted header
@@ -1341,7 +1351,7 @@ pub(crate) fn hint(ui: &mut egui::Ui, text: &str) {
 
 /// A themed frame for the settings window body (matches the Civitai / Backup
 /// popups: rounded-16 card with a soft drop shadow).
-fn window_frame() -> egui::Frame {
+pub(crate) fn window_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(PANEL())
         .corner_radius(egui::CornerRadius::same(16))

@@ -110,6 +110,18 @@ impl GemmaModel {
         }
     }
 
+    /// A few words for the chat's model picker (the longer `hint` is the
+    /// rows' hover text).
+    pub fn tagline(self) -> &'static str {
+        match self {
+            GemmaModel::E4B => "Fastest answers",
+            GemmaModel::G27B => "Strong all-rounder",
+            GemmaModel::D31B => "Strongest, thinks first",
+            GemmaModel::Qwen8B => "Fast, a different style",
+            GemmaModel::Qwen30B => "Deep reasoning",
+        }
+    }
+
     pub fn hint(self) -> &'static str {
         match self {
             GemmaModel::E4B => "~6 GB · fast, fits fully on 8 GB+ GPUs — the light pick",
@@ -506,8 +518,14 @@ pub struct LlmState {
     /// Sampling knobs (mirrors the persisted setting; sent with every ask, so
     /// edits apply from the next reply — no model reload).
     pub params: GenParams,
-    /// The chat list's AI-settings popup (the gear) is open.
+    /// The AI Settings window (the chat list's gear) is open.
     pub gen_settings_open: bool,
+    /// Which AI Settings tab is shown.
+    pub ai_settings_tab: crate::ai_settings::AiTab,
+    /// The AI's long-term memory across chats (src/memory.rs).
+    pub memory: crate::memory::MemoryStore,
+    /// The 3D memory map window (src/memory_map.rs).
+    pub memory_map: crate::memory_map::MapState,
     /// The variant the resident worker actually loaded — a mismatch drops
     /// the worker so the next ask loads the newly selected model.
     worker_model: GemmaModel,
@@ -595,6 +613,9 @@ impl Default for LlmState {
             model: GemmaModel::default(),
             params: GenParams::default(),
             gen_settings_open: false,
+            ai_settings_tab: Default::default(),
+            memory: crate::memory::MemoryStore::load(),
+            memory_map: Default::default(),
             worker_model: GemmaModel::default(),
             image_detail: ImageDetail::default(),
             worker_detail: ImageDetail::default(),
