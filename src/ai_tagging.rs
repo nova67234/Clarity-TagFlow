@@ -33,15 +33,20 @@ list in the image's .txt file, used to train image models. You may also get \
 zoomed-in sections of the same image; use them for small details only.\n\
 \n\
 - Answer my questions about the image and its tags normally.\n\
-- When I ask you to tag the image, or to add, remove, fix, clean up, reorder \
-or rewrite tags, make the change yourself: end your reply with control lines, \
-each on its own line and starting exactly with its marker:\n\
+- When I ask you to tag, caption, describe or prompt the image (\"caption \
+this\", \"write a prompt for it\", \"describe it for training\"), or to add, \
+remove, fix, clean up, reorder or rewrite tags, make the change yourself: end \
+your reply with control lines, each on its own line and starting exactly with \
+its marker:\n\
 TAGS_ADD: tag one, tag two\n\
 TAGS_REMOVE: tag three, tag four\n\
 TAGS_SET: every tag, in the new order (only to rewrite or reorder the whole list)\n\
 - Above the control lines, say in a sentence or two what you changed. The \
 control lines are hidden from me: the app applies them to the .txt file at \
 once, and I can undo.\n\
+- A caption or prompt goes in the file too: put it on one TAGS_ADD line (or \
+TAGS_SET to replace what's there), written as I asked for it, sentences \
+included.\n\
 - Only change tags when I ask, or after I agree to changes you suggested.\n\
 - Match the existing tags' style: the same separator inside tags (spaces or \
 underscores), the same letter case, and the same kind of vocabulary \
@@ -444,7 +449,11 @@ pub fn context(image: &Path, tags: Option<&[String]>) -> String {
         Some(t) => t.join(", "),
         None => "(its .txt file can't be read, so its tags can't be changed)".to_string(),
     };
-    format!("[Image: {}]\nCurrent tags: {tags}", file_name(image))
+    format!(
+        "[Image: {}]\nCurrent tags: {tags}\n(To change the tags, or to write a caption or prompt \
+         into them, end your reply with TAGS_ADD / TAGS_REMOVE / TAGS_SET lines.)",
+        file_name(image)
+    )
 }
 
 /// What goes in front of an older message: just which image it was about
@@ -732,8 +741,8 @@ mod tests {
     fn context_lines() {
         let p = Path::new("/pics/cat 01.png");
         let tags = v(&["cat", "hat"]);
-        assert_eq!(context(p, Some(&tags[..])), "[Image: cat 01.png]\nCurrent tags: cat, hat");
-        assert!(context(p, Some(&[][..])).ends_with("(none yet)"));
+        assert!(context(p, Some(&tags[..])).starts_with("[Image: cat 01.png]\nCurrent tags: cat, hat\n"));
+        assert!(context(p, Some(&[][..])).contains("Current tags: (none yet)\n"));
         assert!(context(p, None).contains("can't be read"));
         assert_eq!(label(p), "[Image: cat 01.png]");
     }

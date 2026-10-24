@@ -3295,7 +3295,7 @@ mod tests {
     /// the edits applied the way the app applies them. Prints each raw reply
     /// (thoughts and control lines included), the parsed edits and the file
     /// after, and fails on the wrong action or a broken style. Run in release:
-    ///   CTF_TAG_MODEL=31b (or e4b) CTF_TAG_RUNS=1 \
+    ///   CTF_TAG_MODEL=31b (or e4b) CTF_TAG_RUNS=1 CTF_TAG_ONLY=caption,booru \
     ///   cargo test --release --features llm llm_tag_images_smoke -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -3320,16 +3320,18 @@ mod tests {
             (
                 "booru.png",
                 "511c9d48-066f-4734-ace8-157a22953a93.png",
-                // cat_ears and wings are planted mistakes.
-                Some(b"1girl, solo, helmet, sword, fur_trim, armor, cat_ears, outdoors, water, wings".to_vec()),
+                // cat_ears and umbrella are planted mistakes (the helmet
+                // really has wings, so "wings" isn't one).
+                Some(b"1girl, solo, helmet, sword, fur_trim, armor, cat_ears, outdoors, water, umbrella".to_vec()),
             ),
             (
                 "robot.jpeg",
                 "e554bc32-cfab-40f4-a753-b48369a8c948.jpeg",
                 Some(b"\xEF\xBB\xBFdark background, glowing eyes, robot, metal, portrait\r\n".to_vec()),
             ),
+            ("caption.jpg", "pexels-462550161-37540258.jpg", None),
             (
-                "caption.jpg",
+                "caption2.jpg",
                 "pexels-462550161-37540258.jpg",
                 Some(b"A woman in a long coat walks past tall windows, black and white photo".to_vec()),
             ),
@@ -3360,10 +3362,16 @@ mod tests {
                     None => Ok(()),
                 }
             }),
+            ("caption.jpg", "hello can you caption this image please", true, false, |_, after| {
+                if after.join(", ").split_whitespace().count() < 8 {
+                    return Err(format!("no caption written: {after:?}"));
+                }
+                Ok(())
+            }),
             ("booru.png", "What is she holding?", false, false, ok),
             ("booru.png", "Remove the tags that are wrong", true, false, |_, after| {
                 let has = |t: &str| after.iter().any(|a| ai_tagging::same_tag(a, t));
-                if has("cat_ears") || has("wings") {
+                if has("cat_ears") || has("umbrella") {
                     return Err("a planted wrong tag survived".into());
                 }
                 if !has("sword") || !has("helmet") || !has("armor") {
@@ -3407,7 +3415,7 @@ mod tests {
                 }
                 Ok(())
             }),
-            ("caption.jpg", "Add a tag for the photo style", true, false, |before, after| {
+            ("caption2.jpg", "Add a tag for the photo style", true, false, |before, after| {
                 if !after.starts_with(before) {
                     return Err("the caption changed".into());
                 }
@@ -3430,7 +3438,7 @@ mod tests {
         let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, model, ImageDetail::Standard));
         let t0 = std::time::Instant::now();
         let mut failures = Vec::new();
-        let mut score = 0;
+        let (mut score, mut ran) = (0, 0);
         for run in 0..runs {
             // A fresh folder each run, so every run starts from the same tags.
             let _ = std::fs::remove_dir_all(&dir);
@@ -3443,6 +3451,13 @@ mod tests {
             }
             let mut prev: Option<(PathBuf, String, String)> = None;
             for (file, ask, should_change, follows, check) in &cases {
+                // CTF_TAG_ONLY=caption,booru runs just the cases about those files.
+                if let Ok(only) = std::env::var("CTF_TAG_ONLY")
+                    && !only.split(',').any(|o| file.starts_with(o.trim()))
+                {
+                    continue;
+                }
+                ran += 1;
                 let image = dir.join(file);
                 let before = read_tags(&image).expect("readable .txt");
                 let mut msgs = vec![
@@ -3506,11 +3521,11 @@ mod tests {
         drop(cmd_tx);
         handle.join().unwrap();
         // The caption's sentence and the UTF-16 / BOM encodings survived.
-        let caption = std::fs::read_to_string(txt("caption.jpg")).unwrap();
+        let caption = std::fs::read_to_string(txt("caption2.jpg")).unwrap();
         assert!(caption.starts_with("A woman in a long coat walks past tall windows"), "{caption}");
         assert!(std::fs::read(txt("robot.jpeg")).unwrap().starts_with(b"\xEF\xBB\xBF"), "robot lost its BOM");
         assert!(std::fs::read(txt("samurai.jpeg")).unwrap().starts_with(&[0xFF, 0xFE]), "samurai lost UTF-16");
-        eprintln!("\n{} — {score} of {} right in {:.0}s", model.label(), cases.len() * runs, t0.elapsed().as_secs_f32());
+        eprintln!("\n{} — {score} of {ran} right in {:.0}s", model.label(), t0.elapsed().as_secs_f32());
         assert!(failures.is_empty(), "failed: {failures:#?}");
     }
 
