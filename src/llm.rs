@@ -1112,7 +1112,10 @@ impl LlmState {
             pinned = 2;
         } else if self.roleplay.enabled {
             msgs.insert(0, CmdMsg { user: false, text: self.roleplay.ack(), image: None });
-            msgs.insert(0, CmdMsg { user: true, text: self.roleplay.preamble(), image: None });
+            // High / Max thinking lifts the role-play "think briefly" rule.
+            let deep = self.model.thinks()
+                && matches!(self.params.thinking, ThinkLevel::High | ThinkLevel::Max);
+            msgs.insert(0, CmdMsg { user: true, text: self.roleplay.preamble_with(deep), image: None });
             pinned = 2;
         }
 

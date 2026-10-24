@@ -229,8 +229,30 @@ impl RoleplayState {
         if n.is_empty() { "the user" } else { n }
     }
 
-    /// The priming turn injected (pinned) before the chat history.
+    /// The priming turn injected (pinned) before the chat history, with the
+    /// default (brief) thinking rule — what the tests prime with.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn preamble(&self) -> String {
+        self.preamble_with(false)
+    }
+
+    /// The priming turn, with the thinking rule matched to the chat's
+    /// thinking level. Normally the character is told to think briefly —
+    /// a rule written for the since-removed Gemma 4 26B A4B, which spent
+    /// whole replies privately redrafting and then answered nothing. At
+    /// High / Max (`deep_thinking`) the user asked for more thought, so the
+    /// rule lets it think things through; the worker's forced close still
+    /// guarantees an answer.
+    pub fn preamble_with(&self, deep_thinking: bool) -> String {
+        let thinking = if deep_thinking {
+            "- Think it through: before answering you may reason privately about \
+             the scene, what you know and how your character feels — then answer \
+             in character. Keep your reasoning as notes, not drafts of the reply.\n"
+        } else {
+            "- Think briefly: when you reason privately before answering, a few \
+             short notes are enough — decide, then answer. Never write drafts \
+             or revisions of your reply in your head.\n"
+        };
         let ai = self.ai_display();
         let user = self.user_display();
         let mut diary = String::new();
@@ -268,9 +290,7 @@ impl RoleplayState {
              to respond to — usually a few rich sentences up to a couple of \
              short paragraphs, more in big moments. One-line answers are almost \
              never enough.\n\
-             - Think briefly: when you reason privately before answering, a few \
-             short notes are enough — decide, then answer. Never write drafts \
-             or revisions of your reply in your head.\n\
+             {thinking}\
              \n\
              Your diary — long-term memories from earlier in your story:\n\
              {diary}\
@@ -315,6 +335,7 @@ impl RoleplayState {
              naturally in your visible text (e.g. \"oh, I want to go to this \
              park you showed me!\").\n\
              - These lines are also invisible to {user}.",
+            thinking = thinking,
             tag = MEMORY_TAG,
             keep = KEEP_IMAGE_TAG,
             show = SHOW_IMAGE_TAG,
@@ -601,6 +622,18 @@ SHOW_IMAGE: y"), "hi");
             assert_ne!(&stored, &data);
         }
         assert_eq!(crate::secret::unprotect_bytes(&stored).unwrap(), data);
+    }
+
+    /// High / Max thinking swaps the "think briefly" rule for "think it
+    /// through"; everything else in the priming stays the same.
+    #[test]
+    fn thinking_rule_follows_the_level() {
+        let rp = RoleplayState { ai_name: "Mira".into(), ..Default::default() };
+        let (brief, deep) = (rp.preamble_with(false), rp.preamble_with(true));
+        assert!(brief.contains("Think briefly") && !brief.contains("Think it through"));
+        assert!(deep.contains("Think it through") && !deep.contains("Think briefly"));
+        assert_eq!(rp.preamble(), brief);
+        assert!(deep.contains("You are Mira") && deep.contains("MEMORY:"));
     }
 
     /// Duplicate detection is wording-insensitive.
