@@ -86,6 +86,9 @@ pub struct Settings {
     /// Which local model the AI chat runs (Gemma E4B / 27B / 31B, Qwen3-VL
     /// 8B / 30B Thinking).
     pub ai_gemma_model: crate::llm::GemmaModel,
+    /// Image detail for Gemma 4 (vision tokens per image). A request — the
+    /// AI runs the highest level the GPU can safely handle.
+    pub ai_image_detail: crate::llm::ImageDetail,
     /// AI chat sampling knobs (temperature, top-k/p, reply length) — edited
     /// from the gear in the chat list panel.
     pub ai_gen: crate::llm::GenParams,
@@ -231,6 +234,7 @@ impl Default for Settings {
             ai_detailed_vision: false,
             ai_krea_prompts: false,
             ai_gemma_model: crate::llm::GemmaModel::default(),
+            ai_image_detail: crate::llm::ImageDetail::default(),
             ai_gen: crate::llm::GenParams::default(),
             ai_voice_ref_audio: String::new(),
             ai_voice_ref_text: String::new(),
@@ -831,6 +835,43 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
             ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(12.0));
         }
     });
+
+    // Image detail — Gemma 4 only (Gemma 3 has a fixed image size, Qwen
+    // counts image tokens differently).
+    if crate::llm::BUILT_WITH_LLM && settings.ai_gemma_model.has_image_detail() {
+        section(ui, "Image detail", |ui| {
+            row(
+                ui,
+                "Image detail",
+                Some(
+                    "How closely the AI reads each picture. Higher levels catch small                      text, jewelry and eye colour, but replies start slower and need                      more GPU memory — the AI lowers the level itself when the GPU                      can't take it. Changing it reloads the model on the next question.",
+                ),
+                |ui| {
+                    egui::ComboBox::from_id_salt("ai_image_detail")
+                        .width(130.0)
+                        .selected_text(settings.ai_image_detail.label())
+                        .show_ui(ui, |ui| {
+                            for level in crate::llm::ImageDetail::ALL {
+                                let text = format!("{} ({} tokens)", level.label(), level.tokens());
+                                if ui.selectable_label(settings.ai_image_detail == level, text).clicked() {
+                                    settings.ai_image_detail = level;
+                                    llm.set_image_detail(level);
+                                }
+                            }
+                        });
+                },
+            );
+            // The level actually running, when the GPU check lowered it.
+            if let Some(reason) = &llm.detail_reason {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(reason)
+                        .color(egui::Color32::from_rgb(214, 150, 40))
+                        .size(12.0),
+                );
+            }
+        });
+    }
 
     if llm.installed && crate::llm::BUILT_WITH_LLM {
         section(ui, "AI Chat", |ui| {

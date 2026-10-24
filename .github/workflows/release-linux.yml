@@ -40,7 +40,7 @@ jobs:
 
       # Video playback (libVLC) is Windows-only here, so build without it.
       - name: Build
-        run: cargo build --release --no-default-features
+        run: cargo build --release --no-default-features --features avif
 
       - name: Package into a .tar.gz (binary + .desktop + icon)
         run: |

@@ -194,15 +194,17 @@ impl ThinkLevel {
     }
 
     /// Tokens of thought allowed before the thought is force-closed and the
-    /// model must answer (`None` = no thinking at all). Never the whole
-    /// reply budget, so an answer always has room.
-    pub fn budget(self, max_reply: usize) -> Option<usize> {
+    /// model must answer — an allowance ON TOP of "Max reply length", so the
+    /// visible answer always keeps its full length. (It used to be carved
+    /// out of the reply length, which left Max the shortest answers.)
+    #[cfg_attr(not(feature = "llm"), allow(dead_code))]
+    pub fn budget(self) -> usize {
         match self {
-            ThinkLevel::Off => None,
-            ThinkLevel::Low => Some(256),
-            ThinkLevel::Medium => Some((max_reply / 3).max(256)),
-            ThinkLevel::High => Some((max_reply * 2 / 3).max(512)),
-            ThinkLevel::Max => Some(max_reply.saturating_sub(384).max(512)),
+            ThinkLevel::Off => 0,
+            ThinkLevel::Low => 256,
+            ThinkLevel::Medium => 1024,
+            ThinkLevel::High => 2048,
+            ThinkLevel::Max => 4096,
         }
     }
 }
@@ -212,6 +214,90 @@ impl GemmaModel {
     /// thinking slider affects.
     pub fn thinks(self) -> bool {
         matches!(self, GemmaModel::D31B | GemmaModel::Qwen30B)
+    }
+
+    /// Gemma 4 (E4B, 31B): the only models whose vision encoder takes a
+    /// per-image token budget, so the only ones Image detail applies to.
+    /// Gemma 3 uses a fixed image size; Qwen counts image tokens differently.
+    pub fn has_image_detail(self) -> bool {
+        matches!(self, GemmaModel::E4B | GemmaModel::D31B)
+    }
+}
+
+/// Image detail (Settings → AI Model): how many vision tokens Gemma 4 reads
+/// each image with. More tokens = higher resolution = small text, jewelry,
+/// eye colour that the default misses — at the cost of time and GPU memory.
+/// The user's pick is a request: after every model load the worker checks
+/// the GPU and runs the highest level that's safe (see `worker::decide_detail`).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum ImageDetail {
+    /// 280 tokens — Gemma 4's own default; today's behaviour.
+    #[default]
+    Standard,
+    /// 560 tokens.
+    High,
+    /// 1120 tokens.
+    Maximum,
+}
+
+impl ImageDetail {
+    pub const ALL: [ImageDetail; 3] = [ImageDetail::Standard, ImageDetail::High, ImageDetail::Maximum];
+
+    /// Vision tokens per image.
+    pub fn tokens(self) -> i32 {
+        match self {
+            ImageDetail::Standard => 280,
+            ImageDetail::High => 560,
+            ImageDetail::Maximum => 1120,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ImageDetail::Standard => "Standard",
+            ImageDetail::High => "High",
+            ImageDetail::Maximum => "Maximum",
+        }
+    }
+
+    /// One level down (`None` from Standard).
+    #[cfg_attr(not(feature = "llm"), allow(dead_code))]
+    pub fn lower(self) -> Option<Self> {
+        match self {
+            ImageDetail::Standard => None,
+            ImageDetail::High => Some(ImageDetail::Standard),
+            ImageDetail::Maximum => Some(ImageDetail::High),
+        }
+    }
+
+    /// Free GPU memory (bytes) this level needs *beyond a normal Standard
+    /// reply context* — measured on Gemma 4 31B (the biggest), RTX 5080
+    /// Laptop, Vulkan: the reply's compute buffer grows from 533 MB (batch
+    /// 512) to ~670 MB (640) / 1880 MB (1280), and the vision encoder needs
+    /// ~0.4 / ~0.8 GB more; +25% margin. Not measured on AMD.
+    #[cfg_attr(not(feature = "llm"), allow(dead_code))]
+    pub fn free_needed(self) -> usize {
+        const MB: usize = 1024 * 1024;
+        match self {
+            ImageDetail::Standard => 0,
+            ImageDetail::High => 768 * MB,
+            ImageDetail::Maximum => 2816 * MB,
+        }
+    }
+
+    /// Free GPU memory (bytes) the vision encoder needs for one image at
+    /// this level, checked right before encoding: llama.cpp ABORTS the whole
+    /// process (GGML_ASSERT) when that allocation fails, so it must never be
+    /// attempted without room. Measured 632 MB at 1024 tokens on the 31B;
+    /// +25% and scaled to the level's full budget.
+    #[cfg_attr(not(feature = "llm"), allow(dead_code))]
+    pub fn encode_needed(self) -> usize {
+        const MB: usize = 1024 * 1024;
+        match self {
+            ImageDetail::Standard => 0,
+            ImageDetail::High => 512 * MB,
+            ImageDetail::Maximum => 1024 * MB,
+        }
     }
 }
 
@@ -279,6 +365,9 @@ enum Msg {
     /// Generation finished (or failed). The worker stays alive for more
     /// prompts unless the error was fatal (model failed to load).
     Done(Result<(), String>),
+    /// After loading: the Image detail level actually running (`None` for
+    /// models without the setting) and, when it's lower than requested, why.
+    ImageDetail { effective: Option<ImageDetail>, reason: Option<String> },
 }
 
 struct Worker {
@@ -374,6 +463,8 @@ pub struct LlmState {
     pub run_err: Option<String>,
     /// A generation is in flight.
     pub running: bool,
+    /// When the streaming reply started (the live "Thinking… 42 s" counter).
+    pub gen_started: Option<std::time::Instant>,
     /// Latest worker status line, shown next to the spinner.
     pub status: String,
 
@@ -420,6 +511,18 @@ pub struct LlmState {
     /// The variant the resident worker actually loaded — a mismatch drops
     /// the worker so the next ask loads the newly selected model.
     worker_model: GemmaModel,
+    /// Image detail the user asked for (mirrors the persisted setting).
+    pub image_detail: ImageDetail,
+    /// The level the resident worker was started with — changing the setting
+    /// reloads the worker (the vision projector fixes it at load time).
+    worker_detail: ImageDetail,
+    /// What the loaded worker actually runs (`None` until it reports, or for
+    /// models without the setting) and why it's lower than asked, if it is.
+    pub detail_effective: Option<ImageDetail>,
+    pub detail_reason: Option<String>,
+    /// The chat's one-line "image detail was lowered" notice has been shown
+    /// this session (it shows once, not on every message).
+    pub detail_notice_done: bool,
     /// AI Chat was deactivated while a reply was streaming: drop the worker
     /// (freeing the weights) as soon as that reply finishes. Cleared if the
     /// chat is re-activated first.
@@ -475,6 +578,7 @@ impl Default for LlmState {
             lightbox: None,
             run_err: None,
             running: false,
+            gen_started: None,
             unload_when_done: false,
             status: String::new(),
             md_cache: egui_commonmark::CommonMarkCache::default(),
@@ -492,6 +596,11 @@ impl Default for LlmState {
             params: GenParams::default(),
             gen_settings_open: false,
             worker_model: GemmaModel::default(),
+            image_detail: ImageDetail::default(),
+            worker_detail: ImageDetail::default(),
+            detail_effective: None,
+            detail_reason: None,
+            detail_notice_done: false,
             auto_speak: false,
             detailed_vision: false,
             krea_prompts: false,
@@ -526,8 +635,28 @@ impl LlmState {
         self.model = model;
         self.installed = model.installed();
         if !self.running {
-            self.worker = None;
+            self.drop_worker();
         }
+    }
+
+    /// Change the requested Image detail. The level is fixed when the vision
+    /// projector loads, so — like switching models — an idle worker is
+    /// dropped and the next ask reloads at the new level.
+    pub fn set_image_detail(&mut self, level: ImageDetail) {
+        if self.image_detail == level {
+            return;
+        }
+        self.image_detail = level;
+        if !self.running && self.model.has_image_detail() {
+            self.drop_worker();
+        }
+    }
+
+    /// Unload the resident worker; its Image detail report goes with it.
+    fn drop_worker(&mut self) {
+        self.worker = None;
+        self.detail_effective = None;
+        self.detail_reason = None;
     }
 
     /// AI Chat was deactivated: free the resident worker — and the model
@@ -637,6 +766,10 @@ impl LlmState {
             for msg in worker_msgs {
                 match msg {
                     Msg::Status(s) => self.status = s,
+                    Msg::ImageDetail { effective, reason } => {
+                        self.detail_effective = effective;
+                        self.detail_reason = reason;
+                    }
                     Msg::Token(t) => {
                         // Stream into the reply bubble of the chat that asked,
                         // even if the user switched to another chat meanwhile.
@@ -836,6 +969,10 @@ impl LlmState {
         }
         self.run_err = None;
         self.status = "Starting…".to_string();
+        // The "image detail was lowered" notice has had its moment.
+        if self.detail_reason.is_some() {
+            self.detail_notice_done = true;
+        }
 
         let image = self.draft_image.take();
         self.draft_thumb = None;
@@ -961,12 +1098,16 @@ impl LlmState {
         // A different model was selected since the worker loaded — drop it so
         // the fresh spawn below loads the new weights (the old ones free when
         // the worker thread exits).
-        if self.worker.is_some() && self.worker_model != self.model {
-            self.worker = None;
+        if self.worker.is_some()
+            && (self.worker_model != self.model
+                || (self.model.has_image_detail() && self.worker_detail != self.image_detail))
+        {
+            self.drop_worker();
         }
         if self.worker.is_none() {
-            self.worker = spawn_worker(ctx.clone(), self.model);
+            self.worker = spawn_worker(ctx.clone(), self.model, self.image_detail);
             self.worker_model = self.model;
+            self.worker_detail = self.image_detail;
         }
         GEN_CANCEL.store(false, Ordering::SeqCst);
         match &self.worker {
@@ -991,6 +1132,7 @@ impl LlmState {
                         image: None,
                     });
                 self.running = true;
+                self.gen_started = Some(std::time::Instant::now());
                 self.gen_chat = Some(id);
             }
             _ => {
@@ -1222,15 +1364,15 @@ fn speech_text(md: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(feature = "llm"))]
-fn spawn_worker(_ctx: egui::Context, _model: GemmaModel) -> Option<Worker> {
+fn spawn_worker(_ctx: egui::Context, _model: GemmaModel, _detail: ImageDetail) -> Option<Worker> {
     None
 }
 
 #[cfg(feature = "llm")]
-fn spawn_worker(ctx: egui::Context, model: GemmaModel) -> Option<Worker> {
+fn spawn_worker(ctx: egui::Context, model: GemmaModel, detail: ImageDetail) -> Option<Worker> {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
     let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
-    std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, model));
+    std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, model, detail));
     Some(Worker { tx: cmd_tx, rx: msg_rx })
 }
 
@@ -1256,29 +1398,51 @@ mod worker {
     /// reasonable on ordinary machines while fitting the 50-message history
     /// cap plus a long reply.
     const N_CTX: u32 = 16384;
-    /// Prompt-eval batch size; must fit an image's token chunk (256 for Gemma).
+    /// Prompt-eval batch size at Standard image detail; must fit an image's
+    /// token chunk (280 for Gemma 4 by default).
     const N_BATCH: u32 = 512;
+    /// The batch a level runs with. Gemma 4's vision encoder uses non-causal
+    /// attention, so an image's whole token chunk must fit one micro-batch —
+    /// at 512, High (560) and Maximum (1120) fail with "non-causal attention
+    /// requires n_ubatch >= n_tokens". Each level gets just enough: the
+    /// compute buffer grows with the batch (the 31B needs 3.1 GB at 2048 vs
+    /// ~1.9 GB at 1280), and Standard keeps today's 512 exactly.
+    fn batch_for(level: super::ImageDetail) -> u32 {
+        match level {
+            super::ImageDetail::Standard => N_BATCH,
+            super::ImageDetail::High => 640,
+            super::ImageDetail::Maximum => 1280,
+        }
+    }
 
     /// The context configuration used for every generation — also created
     /// once as a probe during loading, so the GPU-offload ladder knows the
-    /// KV cache actually fits alongside the weights.
-    fn context_params(threads: i32) -> LlamaContextParams {
+    /// KV cache actually fits alongside the weights. `batch` sets both the
+    /// logical and the micro batch.
+    fn context_params(threads: i32, batch: u32) -> LlamaContextParams {
         LlamaContextParams::default()
             .with_n_threads(threads)
             .with_n_threads_batch(threads)
-            .with_n_batch(N_BATCH)
+            .with_n_batch(batch)
+            .with_n_ubatch(batch)
             .with_n_ctx(NonZeroU32::new(N_CTX))
     }
 
     /// Worker body: load everything once, then serve Generate commands until
     /// the UI side drops its sender. On a load failure the error is reported
     /// as a `Done(Err)` and the thread exits (the UI respawns it on demand).
-    pub(super) fn run(rx: Receiver<Cmd>, tx: Sender<Msg>, ctx: egui::Context, model: super::GemmaModel) {
+    pub(super) fn run(
+        rx: Receiver<Cmd>,
+        tx: Sender<Msg>,
+        ctx: egui::Context,
+        model: super::GemmaModel,
+        detail: super::ImageDetail,
+    ) {
         let send = |m: Msg| {
             let _ = tx.send(m);
             ctx.request_repaint();
         };
-        match load_and_serve(&rx, &send, model) {
+        match load_and_serve(&rx, &send, model, detail) {
             Ok(()) => {}
             Err(e) => send(Msg::Done(Err(e))),
         }
@@ -1288,6 +1452,7 @@ mod worker {
         rx: &Receiver<Cmd>,
         send: &dyn Fn(Msg),
         which: super::GemmaModel,
+        requested: super::ImageDetail,
     ) -> Result<(), String> {
         // GPU build on a machine with no Vulkan runtime: fail readably before
         // llama.cpp's first (delay-loaded, would-crash) Vulkan call.
@@ -1320,55 +1485,82 @@ mod worker {
         // projector, and a probe context — because weights fitting is not
         // enough: a big model can load into ~20 GB of VRAM and llama.cpp then
         // returns a null context when the KV cache no longer fits.
-        let mut loaded = None;
-        let mut last_err = String::new();
-        for (i, layers) in [1_000_000u32, 24, 0].into_iter().enumerate() {
-            if i > 0 {
-                send(Msg::Status(
-                    "Model doesn't fit in GPU memory — loading partly on the CPU…".into(),
-                ));
-            }
-            let params = LlamaModelParams::default().with_n_gpu_layers(layers);
-            let model = match LlamaModel::load_from_file(&backend, &model_path, &params) {
-                Ok(m) => m,
-                Err(e) => {
-                    last_err = format!("Load model: {e}");
+        // Image detail asked for on this load — dropped to Standard (with the
+        // reason kept) if the checks leave no room for a reply; see below.
+        let mut req = requested;
+        let mut carried_reason: Option<String> = None;
+        let (model, mtmd, detail) = loop {
+            let mut loaded = None;
+            let mut last_err = String::new();
+            // Which rung succeeded: 0 = the whole model on the GPU.
+            let mut rung = 0;
+            for (i, layers) in [1_000_000u32, 24, 0].into_iter().enumerate() {
+                if i > 0 {
+                    send(Msg::Status(
+                        "Model doesn't fit in GPU memory — loading partly on the CPU…".into(),
+                    ));
+                }
+                let params = LlamaModelParams::default().with_n_gpu_layers(layers);
+                let model = match LlamaModel::load_from_file(&backend, &model_path, &params) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        last_err = format!("Load model: {e}");
+                        continue;
+                    }
+                };
+                send(Msg::Status("Loading the vision projector…".into()));
+                let mtmd = match load_mtmd(&mmproj_path, &model, threads, -1) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        last_err = format!("Load vision projector: {e}");
+                        continue;
+                    }
+                };
+                // Probe context, created and dropped: proves generation will have
+                // room for the KV cache with this many layers on the GPU.
+                if let Err(e) = model.new_context(&backend, context_params(threads, N_BATCH)) {
+                    last_err = format!("Create context: {e}");
                     continue;
                 }
-            };
-            send(Msg::Status("Loading the vision projector…".into()));
-            let mtmd_params = MtmdContextParams {
-                // Like n_gpu_layers: uses the GPU when a backend exists, CPU otherwise.
-                use_gpu: true,
-                print_timings: false,
-                n_threads: threads,
-                media_marker: CString::new(llama_cpp_2::mtmd::mtmd_default_marker().to_string())
-                    .map_err(|e| e.to_string())?,
-                image_min_tokens: -1,
-                image_max_tokens: -1,
-            };
-            let mtmd = match MtmdContext::init_from_file(
-                &mmproj_path.to_string_lossy(),
-                &model,
-                &mtmd_params,
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    last_err = format!("Load vision projector: {e}");
-                    continue;
-                }
-            };
-            // Probe context, created and dropped: proves generation will have
-            // room for the KV cache with this many layers on the GPU.
-            if let Err(e) = model.new_context(&backend, context_params(threads)) {
-                last_err = format!("Create context: {e}");
-                continue;
+                loaded = Some((model, mtmd));
+                rung = i;
+                break;
             }
-            loaded = Some((model, mtmd));
-            break;
-        }
-        let Some((model, mtmd)) = loaded else {
-            return Err(last_err);
+            let Some((model, mtmd)) = loaded else {
+                return Err(last_err);
+            };
+            if !which.has_image_detail() {
+                send(Msg::ImageDetail { effective: None, reason: None });
+                break (model, mtmd, super::ImageDetail::Standard);
+            }
+
+            // Image detail: the requested level passes the GPU checks; the
+            // projector comes back loaded at the level that's safe to run.
+            let checked = decide_detail(req, rung, &backend, &model, mtmd, &mmproj_path, threads, send);
+            // Safety net: a reply's context must still fit. Failed probe
+            // allocations can leave Vulkan memory behind (seen on the 31B), so
+            // prove it — and if it doesn't fit, reload clean at Standard.
+            if let Ok((level, reason, mtmd)) = checked {
+                let reason = reason.or_else(|| carried_reason.take());
+                if req == super::ImageDetail::Standard
+                    || model.new_context(&backend, context_params(threads, batch_for(level))).is_ok()
+                {
+                    send(Msg::ImageDetail { effective: Some(level), reason });
+                    break (model, mtmd, level);
+                }
+                carried_reason = reason.or_else(|| {
+                    Some(format!(
+                        "Running at Standard: {} image detail left no room for replies on this GPU.",
+                        req.label()
+                    ))
+                });
+            } else if let Err(e) = checked {
+                carried_reason = Some(format!("Running at Standard: higher image detail failed on this GPU ({e})."));
+            }
+            eprintln!("[ai] image detail: reloading at Standard so replies have room");
+            send(Msg::Status("Reloading the model at Standard image detail…".into()));
+            req = super::ImageDetail::Standard;
+            drop(model);
         };
 
         let template = model
@@ -1380,7 +1572,7 @@ mod worker {
         while let Ok(Cmd::Generate { msgs, params, pinned, detailed }) = rx.recv() {
             let res = generate(
                 &backend, &model, &mtmd, &template, threads, which, &msgs, pinned, detailed,
-                &params, send,
+                detail, &params, send,
             );
             send(Msg::Done(res));
         }
@@ -1398,6 +1590,7 @@ mod worker {
         msgs: &[super::CmdMsg],
         pinned: usize,
         detailed: bool,
+        detail: super::ImageDetail,
         params: &super::GenParams,
         send: &dyn Fn(Msg),
     ) -> Result<(), String> {
@@ -1405,7 +1598,7 @@ mod worker {
         // guarantees no KV-cache state leaks — the whole (capped) history is
         // re-evaluated, which is what makes multi-turn chat work.
         let mut context = model
-            .new_context(backend, context_params(threads))
+            .new_context(backend, context_params(threads, batch_for(detail)))
             .map_err(|e| format!("Create context: {e}"))?;
 
         // The media marker tells the tokenizer where an image's tokens go;
@@ -1440,7 +1633,7 @@ mod worker {
                     }
                     text = format!("{header}{text}");
                 } else if let Some(tiles) =
-                    (tile_at == Some(mi)).then(|| detail_sections(mtmd, path)).flatten()
+                    (tile_at == Some(mi)).then(|| detail_sections(mtmd, path, detail)).flatten()
                 {
                     // The full picture first (the layout), then the labelled
                     // close-ups (the detail) — like a video's frames.
@@ -1556,6 +1749,10 @@ mod worker {
         // oldest unpinned turns (never the newest) until it fits, keeping the
         // window opening on a user turn.
         let n_ctx = N_CTX as usize;
+        // Room a reply needs beyond the answer: the thought, the 128-token
+        // grace window before a forced close, and the ~64-token close text.
+        let thinks = which.thinks() && params.thinking != super::ThinkLevel::Off;
+        let think_reserve = if thinks { params.thinking.budget() + 192 } else { 0 };
         let pinned = pinned.min(turns.len());
         let mut start = pinned;
         let chunks = loop {
@@ -1571,7 +1768,7 @@ mod worker {
                 .tokenize(input, &bitmap_refs)
                 .map_err(|e| format!("Tokenize: {e}"))?;
             let prompt = chunks.total_tokens();
-            if prompt + params.max_tokens <= n_ctx || start + 1 >= turns.len() {
+            if prompt + params.max_tokens + think_reserve <= n_ctx || start + 1 >= turns.len() {
                 // Only the newest message left: run it with whatever reply
                 // room remains, unless the message alone is too big.
                 if prompt + 256 > n_ctx {
@@ -1588,7 +1785,7 @@ mod worker {
             }
         };
         let mut n_past = chunks
-            .eval_chunks(mtmd, &context, 0, 0, N_BATCH as i32, true)
+            .eval_chunks(mtmd, &context, 0, 0, batch_for(detail) as i32, true)
             .map_err(|e| format!("Evaluate prompt: {e}"))?;
 
         // The user's sampling knobs (defaults are Gemma's recommendation:
@@ -1608,16 +1805,22 @@ mod worker {
         };
 
         let mut batch = LlamaBatch::new(N_BATCH as usize, 1);
-        // Thinking budget: a runaway thought channel (the model endlessly
-        // redrafting its answer in private) can otherwise eat the whole
-        // reply cap without ever answering. A thought still unclosed after a
-        // third of the budget is force-closed — the closing marker is fed
-        // into the context, so everything after it is the visible answer.
-        // The reply budget, shrunk to whatever room the prompt left.
-        let max_reply =
-            params.max_tokens.min(n_ctx.saturating_sub(n_past as usize));
-        // Off still gets a small budget: a stray thought is closed fast.
-        let think_budget = params.thinking.budget(max_reply).unwrap_or(64);
+        // Caps. The visible answer may use the full "Max reply length"; the
+        // thought gets its own allowance on top (`ThinkLevel::budget`). A
+        // runaway thought channel (the model endlessly redrafting its answer
+        // in private) is force-closed once it reaches that allowance — the
+        // closing marker is fed into the context, so everything after it is
+        // the visible answer. When the context is tight, the thought shrinks
+        // first and the answer keeps its length where it can.
+        let room = n_ctx.saturating_sub(n_past as usize);
+        let answer_cap = params.max_tokens.min(room);
+        let think_cap = if thinks {
+            params.thinking.budget().min(room.saturating_sub(answer_cap + 192))
+        } else {
+            64 // Off and non-thinking models: close a stray thought fast
+        };
+        // Only visible-answer tokens count against the reply length.
+        let mut answer_tokens = 0usize;
         let mut raw = String::new();
         // Mirror the Qwen prefill into the stream so the open-thought
         // bookkeeping below and the UI's split_channels both see the block
@@ -1645,7 +1848,7 @@ mod worker {
         // Streaming decoder: a token can end mid-way through a multi-byte
         // UTF-8 character (CJK, emoji), so bytes carry over between pieces.
         let mut decoder = encoding_rs::UTF_8.new_decoder();
-        for i in 0..max_reply {
+        for i in 0..(answer_cap + think_cap + 192) {
             // The UI's Stop button: end the reply here, keeping what streamed.
             if super::GEN_CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
@@ -1681,6 +1884,7 @@ mod worker {
                     }
                 break;
             }
+            let was_thinking = thought_open(&raw);
             let piece = model
                 .token_to_piece(token, &mut decoder, false, None)
                 .map_err(|e| format!("Decode token: {e}"))?;
@@ -1692,14 +1896,20 @@ mod worker {
             batch.add(token, n_past, &[0], true).map_err(|e| e.to_string())?;
             n_past += 1;
             context.decode(&mut batch).map_err(|e| format!("Decode: {e}"))?;
+            if !was_thinking && !thought_open(&raw) {
+                answer_tokens += 1;
+                if answer_tokens >= answer_cap {
+                    break;
+                }
+            }
 
             if !forced_close
-                && i >= think_budget
+                && i >= think_cap
                 && thought_open(&raw)
                 // Cut at a line boundary — interrupting mid-bullet makes the
                 // model finish the bullet in the visible text. Past a grace
                 // window, cut regardless.
-                && (raw.ends_with('\n') || i >= think_budget + 128)
+                && (raw.ends_with('\n') || i >= think_cap + 128)
             {
                 forced_close = true;
                 close_thought(
@@ -1841,6 +2051,219 @@ mod worker {
         Ok(list(&dir))
     }
 
+    /// Load the vision projector with an image token budget (`-1` = the
+    /// model's default). `image_min_tokens` stays at the default so small
+    /// images aren't upscaled.
+    fn load_mtmd(
+        mmproj: &Path,
+        model: &LlamaModel,
+        threads: i32,
+        max_tokens: i32,
+    ) -> Result<MtmdContext, String> {
+        let params = MtmdContextParams {
+            // Like n_gpu_layers: uses the GPU when a backend exists, CPU otherwise.
+            use_gpu: true,
+            print_timings: false,
+            n_threads: threads,
+            media_marker: CString::new(llama_cpp_2::mtmd::mtmd_default_marker().to_string())
+                .map_err(|e| e.to_string())?,
+            image_min_tokens: -1,
+            image_max_tokens: max_tokens,
+        };
+        MtmdContext::init_from_file(&mmproj.to_string_lossy(), model, &params).map_err(|e| e.to_string())
+    }
+
+    /// The GPU the model runs on, from llama.cpp's own device report — the
+    /// same source on NVIDIA, AMD and Intel (no vendor tools). Prefers the
+    /// dedicated GPU with the most memory; `None` = no GPU device at all.
+    fn model_gpu() -> Option<llama_cpp_2::LlamaBackendDevice> {
+        use llama_cpp_2::LlamaBackendDeviceType as T;
+        let devices = llama_cpp_2::list_llama_ggml_backend_devices();
+        let best = |t: T| {
+            devices.iter().filter(|d| d.device_type == t).max_by_key(|d| d.memory_total).cloned()
+        };
+        best(T::Gpu).or_else(|| best(T::IntegratedGpu))
+    }
+
+    /// Encode one test image at the projector's budget on a context with the
+    /// level's batch — the real proof the level runs on this GPU. Errors are
+    /// returned, never panics.
+    fn probe_detail(
+        backend: &LlamaBackend,
+        model: &LlamaModel,
+        mtmd: &MtmdContext,
+        threads: i32,
+        level: super::ImageDetail,
+    ) -> Result<(), String> {
+        // A detailed test pattern big enough to use the whole budget.
+        let path = std::env::temp_dir().join("clarity_tagflow_detail_probe.png");
+        if !path.exists() {
+            image::RgbImage::from_fn(1536, 1536, |x, y| {
+                image::Rgb([(x * 7 % 256) as u8, (y * 5 % 256) as u8, ((x ^ y) % 256) as u8])
+            })
+            .save(&path)
+            .map_err(|e| e.to_string())?;
+        }
+        let context = model
+            .new_context(backend, context_params(threads, batch_for(level)))
+            .map_err(|e| format!("Create context: {e}"))?;
+        // The encoder's buffer is allocated during the encode, and a failed
+        // allocation there aborts the process — check the room first.
+        match model_gpu().filter(|g| g.memory_free < g.memory_total) {
+            Some(g) if g.memory_free >= level.encode_needed() => {}
+            Some(g) => {
+                return Err(format!(
+                    "{} free for the image encoder, needs {}",
+                    gb(g.memory_free),
+                    gb(level.encode_needed())
+                ));
+            }
+            None => return Err("GPU free memory unknown".to_string()),
+        }
+        let bitmap = load_bitmap(mtmd, &path)?;
+        let marker = llama_cpp_2::mtmd::mtmd_default_marker();
+        let input = MtmdInputText { text: format!("{marker}\n"), add_special: true, parse_special: true };
+        let chunks = mtmd.tokenize(input, &[&bitmap]).map_err(|e| format!("Tokenize: {e}"))?;
+        let before = model_gpu().map(|g| g.memory_free);
+        chunks
+            .eval_chunks(mtmd, &context, 0, 0, batch_for(level) as i32, true)
+            .map_err(|e| format!("Encode: {e}"))?;
+        // Memory the level's context + encode holds (for tuning
+        // `ImageDetail::free_needed`; only meaningful when the driver
+        // reports real free memory).
+        if let (Some(b), Some(a)) = (before, model_gpu().map(|g| g.memory_free)) {
+            eprintln!(
+                "[ai] image detail {} probe: {} tokens, GPU free {} -> {}",
+                level.label(),
+                chunks.total_tokens(),
+                gb(b),
+                gb(a)
+            );
+        }
+        Ok(())
+    }
+
+    /// The three Image detail checks, run once per model load: (1) the
+    /// whole model is on a dedicated GPU, (2) enough free GPU memory per
+    /// `ImageDetail::free_needed` (skipped when the driver can't say), (3) a
+    /// test image actually encodes — stepping down a level on failure.
+    /// Takes the default (Standard) projector and returns the level to run,
+    /// why it's lower than asked (if it is), and the projector loaded at that
+    /// level. `Err` only if even the Standard projector can't be reloaded.
+    #[allow(clippy::too_many_arguments)]
+    fn decide_detail(
+        requested: super::ImageDetail,
+        rung: usize,
+        backend: &LlamaBackend,
+        model: &LlamaModel,
+        standard: MtmdContext,
+        mmproj: &Path,
+        threads: i32,
+        send: &dyn Fn(Msg),
+    ) -> Result<(super::ImageDetail, Option<String>, MtmdContext), String> {
+        use super::ImageDetail as D;
+        use llama_cpp_2::LlamaBackendDeviceType as T;
+        if requested == D::Standard {
+            return Ok((D::Standard, None, standard));
+        }
+        let capped = |why: &str| Some(format!("Running at Standard: {why}"));
+        // CPU-only build, or no GPU device.
+        let gpu = if super::BUILT_WITH_GPU { model_gpu() } else { None };
+        let Some(gpu) = gpu.filter(|g| g.device_type == T::Gpu) else {
+            return Ok((D::Standard, capped("higher image detail needs a dedicated graphics card."), standard));
+        };
+        // 1. Offload check: a model that didn't fit whole leaves no room.
+        // (Tests can skip it to measure the higher levels on a big model.)
+        let forced = cfg!(test) && std::env::var_os("CLARITY_FORCE_DETAIL_PROBE").is_some();
+        if rung > 0 && !forced {
+            return Ok((
+                D::Standard,
+                capped(
+                    "the model doesn't fit fully on this GPU, so higher image detail is turned \
+                     off to prevent crashes.",
+                ),
+                standard,
+            ));
+        }
+        // 2. Free memory, read while a normal Standard reply context exists
+        // (so the KV cache and compute buffers a reply needs are already
+        // counted). Drivers without the memory-budget extension report
+        // free == total: unknown. The spec let the probe decide then, but a
+        // probe that runs out of memory mid-encode aborts the app — so
+        // unknown stays at Standard.
+        let mut level = requested;
+        let mut reason = None;
+        let free = model
+            .new_context(backend, context_params(threads, N_BATCH))
+            .ok()
+            .and_then(|_ctx| model_gpu())
+            .filter(|g| g.memory_free < g.memory_total)
+            .map(|g| g.memory_free);
+        eprintln!(
+            "[ai] image detail: {} on {} ({} total)",
+            free.map_or("free memory unknown".to_string(), |f| format!("{} free beside a reply context", gb(f))),
+            gpu.description,
+            gb(gpu.memory_total),
+        );
+        match free {
+            None if !forced => {
+                return Ok((
+                    D::Standard,
+                    capped("this GPU's driver doesn't report free memory, so higher image detail is off to prevent crashes."),
+                    standard,
+                ));
+            }
+            Some(free) if !forced => {
+                while level.free_needed() > free {
+                    let Some(lower) = level.lower() else { break };
+                    level = lower;
+                }
+                if level < requested {
+                    reason = Some(format!(
+                        "Running at {}: {} needs about {} of free GPU memory and this GPU has {} free \
+                         with the model loaded. Try a smaller model or close other apps using the GPU.",
+                        level.label(),
+                        requested.label(),
+                        gb(requested.free_needed()),
+                        gb(free),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        if level == D::Standard {
+            return Ok((D::Standard, reason, standard));
+        }
+        // 3. Probe: encode a test image; step down on failure. The default
+        // projector is let go first so two are never loaded at once.
+        drop(standard);
+        while level > D::Standard {
+            send(Msg::Status(format!("Checking {} image detail…", level.label())));
+            let probed = load_mtmd(mmproj, model, threads, level.tokens())
+                .and_then(|m| probe_detail(backend, model, &m, threads, level).map(|_| m));
+            match probed {
+                Ok(m) => return Ok((level, reason, m)),
+                Err(e) => {
+                    eprintln!("[ai] image detail {} probe failed: {e}", level.label());
+                    let failed = level;
+                    level = level.lower().unwrap_or(D::Standard);
+                    reason = Some(format!(
+                        "Running at {}: {} image detail failed a test on this GPU ({e}).",
+                        level.label(),
+                        failed.label()
+                    ));
+                }
+            }
+        }
+        let standard = load_mtmd(mmproj, model, threads, -1)?;
+        Ok((D::Standard, reason, standard))
+    }
+
+    /// Bytes as "1.8 GB".
+    fn gb(bytes: usize) -> String {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+
     /// Below this long edge an image is already close to what the vision
     /// encoder reads, so close-up sections would add no detail.
     const TILE_MIN_EDGE: u32 = 1100;
@@ -1879,8 +2302,16 @@ mod worker {
     /// than the whole. `None` for a small image (send it whole). Sections are
     /// cached as temp PNGs keyed by path + size + modified time, like
     /// `video_frames`.
-    pub(super) fn image_tiles(path: &Path) -> Result<Option<Vec<(&'static str, PathBuf)>>, String> {
+    pub(super) fn image_tiles(
+        path: &Path,
+        level: super::ImageDetail,
+    ) -> Result<Option<Vec<(&'static str, PathBuf)>>, String> {
         use std::hash::{Hash, Hasher};
+        // At Maximum one image already carries ~4× Standard's detail, and each
+        // section would cost the full 1120 tokens — send it whole.
+        if level == super::ImageDetail::Maximum {
+            return Ok(None);
+        }
         // The shape as displayed: a sideways-stored phone portrait must get
         // the tall grid, and "Top-left" must mean the top-left the user sees.
         let (w, h) = crate::image_cache::oriented_dimensions(path).ok_or("Read image: unknown size")?;
@@ -1888,9 +2319,12 @@ mod worker {
             return Ok(None);
         }
         let aspect = w as f32 / h as f32;
-        let fine = w.max(h) >= TILE_FINE_EDGE;
-        // Labels run row by row, left to right.
+        let fine = w.max(h) >= TILE_FINE_EDGE && level == super::ImageDetail::Standard;
+        let high = level == super::ImageDetail::High;
+        // Labels run row by row, left to right. High allows at most 2 × 2.
         let (cols, rows, labels): (u32, u32, &[&'static str]) = match (aspect, fine) {
+            (a, _) if high && a > 1.33 => (2, 1, &["Left", "Right"]),
+            (a, _) if high && a < 0.75 => (1, 2, &["Top", "Bottom"]),
             (a, false) if a > 1.33 => (3, 1, &["Left", "Center", "Right"]),
             (a, false) if a < 0.75 => (1, 3, &["Top", "Middle", "Bottom"]),
             (_, false) => (2, 2, &["Top-left", "Top-right", "Bottom-left", "Bottom-right"]),
@@ -1917,7 +2351,7 @@ mod worker {
 
         let meta = std::fs::metadata(path).map_err(|e| format!("Read image: {e}"))?;
         let mut hsh = std::collections::hash_map::DefaultHasher::new();
-        (cols, rows, TILE_MAX_EDGE).hash(&mut hsh);
+        (cols, rows, TILE_MAX_EDGE, level).hash(&mut hsh);
         format!("{:?}", crate::image_cache::exif_orientation(path)).hash(&mut hsh);
         path.hash(&mut hsh);
         meta.len().hash(&mut hsh);
@@ -1962,8 +2396,12 @@ mod worker {
     /// `None` (send the plain image) when the picture is small or anything
     /// about cutting/loading the sections fails: a detail pass must never
     /// cost the user the whole reply.
-    fn detail_sections(mtmd: &MtmdContext, path: &Path) -> Option<Vec<(&'static str, MtmdBitmap)>> {
-        let tiles = match image_tiles(path) {
+    fn detail_sections(
+        mtmd: &MtmdContext,
+        path: &Path,
+        level: super::ImageDetail,
+    ) -> Option<Vec<(&'static str, MtmdBitmap)>> {
+        let tiles = match image_tiles(path, level) {
             Ok(t) => t?,
             Err(e) => {
                 eprintln!("[ai] detailed vision skipped for {}: {e}", path.display());
@@ -2147,11 +2585,12 @@ mod tests {
         drop(cmd_tx);
 
         let ctx = egui::Context::default();
-        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::E4B));
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::E4B, ImageDetail::Standard));
         let mut reply = String::new();
         let mut ok = false;
         for msg in msg_rx {
             match msg {
+                Msg::ImageDetail { .. } => {}
                 Msg::Status(_) => {}
                 Msg::Token(t) => reply.push_str(&t),
                 Msg::Done(r) => ok = r.is_ok(),
@@ -2224,11 +2663,12 @@ mod tests {
         drop(cmd_tx);
 
         let ctx = egui::Context::default();
-        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::E4B));
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::E4B, ImageDetail::Standard));
         let mut reply = String::new();
         let mut ok = false;
         for msg in msg_rx {
             match msg {
+                Msg::ImageDetail { .. } => {}
                 Msg::Status(_) => {}
                 Msg::Token(t) => reply.push_str(&t),
                 Msg::Done(r) => ok = r.is_ok(),
@@ -2319,12 +2759,13 @@ mod tests {
         drop(cmd_tx);
 
         let ctx = egui::Context::default();
-        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::E4B));
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::E4B, ImageDetail::Standard));
 
         let mut idx = 0;
         let mut current = String::new();
         for msg in msg_rx {
             match msg {
+                Msg::ImageDetail { .. } => {}
                 Msg::Status(_) => {}
                 Msg::Token(t) => current.push_str(&t),
                 Msg::Done(r) => {
@@ -2360,9 +2801,9 @@ mod tests {
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         cmd_tx
             .send(Cmd::Generate {
-                // A small cap (thinking budget floor is 256) so this probe
-                // also exercises the runaway-thought force-close path.
-                params: super::GenParams { max_tokens: 400, ..Default::default() },
+                // Thinking Low (a 256-token allowance) so this probe also
+                // exercises the runaway-thought force-close path.
+                params: super::GenParams { max_tokens: 400, thinking: ThinkLevel::Low, ..Default::default() },
                 pinned: 0,
                 detailed: false,
                 msgs: vec![CmdMsg {
@@ -2389,7 +2830,7 @@ mod tests {
         let m = |t: &str| CmdMsg { user: false, text: t.to_string(), image: None };
         cmd_tx
             .send(Cmd::Generate {
-                params: super::GenParams { max_tokens: 900, ..Default::default() },
+                params: super::GenParams { max_tokens: 900, thinking: ThinkLevel::Low, ..Default::default() },
                 pinned: 0,
                 detailed: false,
                 msgs: vec![
@@ -2405,11 +2846,12 @@ mod tests {
         drop(cmd_tx);
 
         let ctx = egui::Context::default();
-        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::D31B));
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::D31B, ImageDetail::Standard));
         let mut raw = String::new();
         let mut n = 0;
         for msg in msg_rx {
             match msg {
+                Msg::ImageDetail { .. } => {}
                 Msg::Status(s) => eprintln!("[status] {s}"),
                 Msg::Token(t) => raw.push_str(&t),
                 Msg::Done(r) => {
@@ -2476,12 +2918,13 @@ mod tests {
         drop(cmd_tx); // worker exits after serving these
 
         let ctx = egui::Context::default();
-        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::E4B));
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::E4B, ImageDetail::Standard));
 
         let mut responses: Vec<(String, Result<(), String>)> = Vec::new();
         let mut current = String::new();
         for msg in msg_rx {
             match msg {
+                Msg::ImageDetail { .. } => {}
                 Msg::Status(s) => eprintln!("[status] {s}"),
                 Msg::Token(t) => {
                     eprint!("{t}");
@@ -2589,12 +3032,13 @@ mod tests {
         drop(cmd_tx);
 
         let ctx = egui::Context::default();
-        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::D31B));
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::D31B, ImageDetail::Standard));
         let mut raw = String::new();
         let mut done: Vec<(Result<(), String>, String)> = Vec::new();
         let t0 = std::time::Instant::now();
         for msg in msg_rx {
             match msg {
+                Msg::ImageDetail { .. } => {}
                 Msg::Status(s) => eprintln!("[status {:>5.1}s] {s}", t0.elapsed().as_secs_f32()),
                 Msg::Token(t) => raw.push_str(&t),
                 Msg::Done(r) => {
@@ -2645,7 +3089,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&out);
         std::fs::create_dir_all(&out).unwrap();
         for (i, img) in imgs.iter().enumerate() {
-            let tiles = worker::image_tiles(img).unwrap().expect("big enough to tile");
+            let tiles = worker::image_tiles(img, ImageDetail::Standard).unwrap().expect("big enough to tile");
             for (label, p) in tiles {
                 std::fs::copy(&p, out.join(format!("{i}_{label}.png"))).unwrap();
             }
@@ -2681,13 +3125,14 @@ mod tests {
         drop(cmd_tx);
 
         let ctx = egui::Context::default();
-        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::D31B));
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::D31B, ImageDetail::Standard));
         let mut raw = String::new();
         let mut results = Vec::new();
         let t0 = std::time::Instant::now();
         let mut last = 0.0;
         for msg in msg_rx {
             match msg {
+                Msg::ImageDetail { .. } => {}
                 Msg::Status(s) => eprintln!("[status {:>6.1}s] {s}", t0.elapsed().as_secs_f32()),
                 Msg::Token(t) => raw.push_str(&t),
                 Msg::Done(r) => {
@@ -2724,7 +3169,7 @@ mod tests {
         let count = |w: u32, h: u32| {
             let p = dir.join(format!("{w}x{h}.png"));
             image::RgbImage::new(w, h).save(&p).unwrap();
-            worker::image_tiles(&p).unwrap().map(|t| t.len())
+            worker::image_tiles(&p, ImageDetail::Standard).unwrap().map(|t| t.len())
         };
         assert_eq!(count(800, 800), None, "small image goes whole");
         assert_eq!(count(1600, 1600), Some(4), "square-ish 2 x 2");
@@ -2733,6 +3178,15 @@ mod tests {
         assert_eq!(count(3600, 3600), Some(9), "big square-ish 3 x 3");
         assert_eq!(count(4800, 3000), Some(6), "big wide 3 x 2");
         assert_eq!(count(3000, 4500), Some(6), "big tall 2 x 3");
+        // Image detail: High allows at most 2 × 2, Maximum sends it whole.
+        let at = |w: u32, h: u32, level: ImageDetail| {
+            let p = dir.join(format!("{w}x{h}.png"));
+            worker::image_tiles(&p, level).unwrap().map(|t| t.len())
+        };
+        assert_eq!(at(3600, 3600, ImageDetail::High), Some(4), "High: big square-ish 2 x 2");
+        assert_eq!(at(4800, 3000, ImageDetail::High), Some(2), "High: wide 2 across");
+        assert_eq!(at(3000, 4500, ImageDetail::High), Some(2), "High: tall 2 down");
+        assert_eq!(at(3600, 3600, ImageDetail::Maximum), None, "Maximum: no tiles");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2746,7 +3200,7 @@ mod tests {
         let out = std::env::temp_dir().join("detail_tiles_preview");
         let _ = std::fs::remove_dir_all(&out);
         std::fs::create_dir_all(&out).unwrap();
-        for (label, p) in worker::image_tiles(&src).unwrap().unwrap() {
+        for (label, p) in worker::image_tiles(&src, ImageDetail::Standard).unwrap().unwrap() {
             std::fs::copy(&p, out.join(format!("{label}.png"))).unwrap();
         }
         eprintln!("{}", out.display());
@@ -2763,8 +3217,8 @@ mod tests {
     fn detail_tiles_follow_exif_orientation() {
         let side = PathBuf::from(std::env::var("CLARITY_ROTATED_SAMPLE").expect("CLARITY_ROTATED_SAMPLE"));
         let up = PathBuf::from(std::env::var("CLARITY_UPRIGHT_SAMPLE").expect("CLARITY_UPRIGHT_SAMPLE"));
-        let a = worker::image_tiles(&side).unwrap().expect("tiles");
-        let b = worker::image_tiles(&up).unwrap().expect("tiles");
+        let a = worker::image_tiles(&side, ImageDetail::Standard).unwrap().expect("tiles");
+        let b = worker::image_tiles(&up, ImageDetail::Standard).unwrap().expect("tiles");
         let labels = |t: &[(&'static str, PathBuf)]| t.iter().map(|(l, _)| *l).collect::<Vec<&str>>();
         assert_eq!(labels(&a), labels(&b), "rotated photo got a different grid");
         for ((label, pa), (_, pb)) in a.iter().zip(&b) {
@@ -2778,5 +3232,127 @@ mod tests {
         // The full image the model gets is upright too.
         let full = crate::image_cache::open_oriented(&side).unwrap();
         assert!(full.height() > full.width(), "full image still sideways");
+    }
+
+    /// Image detail on the real 31B (Vulkan build). Runs one worker per
+    /// level with Thinking off, asks about tests/example's boat photo, and
+    /// prints the level actually used, the reason, timing and the answer.
+    /// With CLARITY_FORCE_DETAIL_PROBE set the offload/memory checks are
+    /// skipped, so High/Maximum are probed (and measured) even on a GPU the
+    /// 31B doesn't fit — the n_ubatch fix and memory numbers come from that.
+    #[test]
+    #[ignore]
+    fn llm_image_detail_31b() {
+        assert!(GemmaModel::D31B.installed(), "Gemma 4 31B isn't installed");
+        let img = PathBuf::from("tests/example/pexels-vikkirillova-8813977.jpg");
+        let levels: Vec<ImageDetail> = match std::env::var("CLARITY_DETAIL_LEVELS").ok().as_deref() {
+            Some("max") => vec![ImageDetail::Maximum],
+            Some("high") => vec![ImageDetail::High],
+            _ => vec![ImageDetail::Maximum],
+        };
+        for level in levels {
+            let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+            let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+            cmd_tx
+                .send(Cmd::Generate {
+                    params: GenParams { temperature: 0.0, max_tokens: 300, thinking: ThinkLevel::Off, ..Default::default() },
+                    pinned: 0,
+                    detailed: false,
+                    msgs: vec![CmdMsg {
+                        user: true,
+                        text: "In one sentence: what is in her hair, what is on her ear, and what colour are her toenails?".into(),
+                        image: Some(img.clone()),
+                    }],
+                })
+                .unwrap();
+            drop(cmd_tx);
+            let ctx = egui::Context::default();
+            let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::D31B, level));
+            let t0 = std::time::Instant::now();
+            let (mut reply, mut effective, mut done) = (String::new(), None, None);
+            for msg in msg_rx {
+                match msg {
+                    Msg::Status(s) => eprintln!("[status {:>6.1}s] {s}", t0.elapsed().as_secs_f32()),
+                    Msg::Token(t) => reply.push_str(&t),
+                    Msg::ImageDetail { effective: e, reason } => {
+                        eprintln!("[detail] requested {level:?} -> {e:?}; reason: {reason:?}");
+                        effective = e;
+                    }
+                    Msg::Done(r) => done = Some(r),
+                }
+            }
+            handle.join().unwrap();
+            let (_, vis) = split_channels(&reply);
+            eprintln!("[{level:?} -> {effective:?}] {:.0}s: {vis}", t0.elapsed().as_secs_f32());
+            assert_eq!(done, Some(Ok(())), "generation failed");
+            assert!(!vis.trim().is_empty(), "empty answer");
+            assert!(effective.is_some(), "no image detail report");
+        }
+    }
+
+    /// Thinking allowance on top of the reply length (real 31B): per level,
+    /// counts thought tokens and visible-answer tokens. The answer must be a
+    /// real answer (never the thought), stay within the reply length, and at
+    /// Max not be squeezed short; the thought must stay within its allowance
+    /// (+128 grace).
+    #[test]
+    #[ignore]
+    fn llm_thinking_allowance_31b() {
+        assert!(GemmaModel::D31B.installed(), "Gemma 4 31B isn't installed");
+        let ask = "Write a 400-word story about an old lighthouse keeper. Just the story.";
+        let cases = [(ThinkLevel::Max, 600usize), (ThinkLevel::Low, 256), (ThinkLevel::Off, 256)];
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        for (level, max_tokens) in cases {
+            cmd_tx
+                .send(Cmd::Generate {
+                    params: GenParams { max_tokens, thinking: level, temperature: 0.7, ..Default::default() },
+                    pinned: 0,
+                    detailed: false,
+                    msgs: vec![CmdMsg { user: true, text: ask.into(), image: None }],
+                })
+                .unwrap();
+        }
+        drop(cmd_tx);
+        let ctx = egui::Context::default();
+        let handle =
+            std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::D31B, ImageDetail::Standard));
+        let t0 = std::time::Instant::now();
+        let (mut raw, mut think_toks, mut answer_toks, mut n) = (String::new(), 0usize, 0usize, 0usize);
+        for msg in msg_rx {
+            match msg {
+                Msg::Token(t) => {
+                    let thinking = raw.contains("<|channel>") && !raw.contains("<channel|>");
+                    raw.push_str(&t);
+                    let still = raw.contains("<|channel>") && !raw.contains("<channel|>");
+                    if thinking || still { think_toks += 1 } else { answer_toks += 1 }
+                }
+                Msg::Done(r) => {
+                    let (level, max_tokens) = cases[n];
+                    let (thought, vis) = split_channels(&raw);
+                    eprintln!(
+                        "\n### {level:?} (reply {max_tokens}) {:.0}s: {r:?} — thought ~{think_toks} tokens, answer ~{answer_toks} tokens, {} words\n{}\n###",
+                        t0.elapsed().as_secs_f32(),
+                        vis.split_whitespace().count(),
+                        vis.chars().take(300).collect::<String>()
+                    );
+                    assert_eq!(r, Ok(()));
+                    assert!(!vis.trim().is_empty(), "{level:?}: no visible answer");
+                    assert!(vis != thought || thought.is_empty(), "{level:?}: thought shown as reply");
+                    assert!(answer_toks <= max_tokens + 2, "{level:?}: answer {answer_toks} > reply length {max_tokens}");
+                    assert!(think_toks <= level.budget().max(64) + 128 + 200, "{level:?}: thought {think_toks} over allowance");
+                    if level == ThinkLevel::Max {
+                        assert!(vis.split_whitespace().count() >= 250, "Max answer squeezed short");
+                    }
+                    raw.clear();
+                    think_toks = 0;
+                    answer_toks = 0;
+                    n += 1;
+                }
+                _ => {}
+            }
+        }
+        handle.join().unwrap();
+        assert_eq!(n, cases.len());
     }
 }

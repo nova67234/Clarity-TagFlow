@@ -344,7 +344,7 @@ struct ViewerApp {
     /// Sidecars being (re-)read for tag search on a background thread — the
     /// first search over a big folder used to read every .txt on the UI
     /// thread. Results land in `tag_search_cache` and re-run the filter.
-    tag_index_rx: Option<std::sync::mpsc::Receiver<Vec<(PathBuf, Option<std::time::SystemTime>, String)>>>,
+    tag_index_rx: Option<std::sync::mpsc::Receiver<TagIndex>>,
     /// A crop being decoded/saved on a background thread (src, result).
     crop_rx: Option<std::sync::mpsc::Receiver<(PathBuf, Result<PathBuf, String>)>>,
     /// Favorited ("hearted") files, tracked by content hash so they survive
@@ -481,6 +481,9 @@ impl Default for ViewerApp {
         }
     }
 }
+
+/// Sidecar text read for tag search: (image, sidecar mtime, lowercase text).
+type TagIndex = Vec<(PathBuf, Option<std::time::SystemTime>, String)>;
 
 impl ViewerApp {
     /// Update the cached list of filtered indices based on the search string.
@@ -1906,6 +1909,7 @@ impl eframe::App for ViewerApp {
             self.llm.voice.ref_text = self.settings.ai_voice_ref_text.clone();
         }
         self.llm.auto_speak = self.settings.ai_auto_speak;
+        self.llm.set_image_detail(self.settings.ai_image_detail);
         self.llm.detailed_vision = self.settings.ai_detailed_vision;
         self.llm.krea_prompts = self.settings.ai_krea_prompts;
         self.llm.params = self.settings.ai_gen;

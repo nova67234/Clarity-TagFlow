@@ -377,6 +377,9 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
     if llm.run_err.is_some() {
         input_h += 22.0;
     }
+    if llm.detail_reason.is_some() && !llm.detail_notice_done {
+        input_h += 36.0;
+    }
     let msgs_h = (ui.available_height() - input_h).max(80.0);
 
     egui::ScrollArea::vertical()
@@ -512,6 +515,15 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
 
             if let Some(e) = llm.run_err.clone() {
                 ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(12.0));
+                ui.add_space(2.0);
+            }
+            // Image detail was lowered for this GPU: a quiet one-liner, shown
+            // once per session (until the next message is sent).
+            if let Some(reason) = llm.detail_reason.clone().filter(|_| !llm.detail_notice_done) {
+                ui.scope(|ui| {
+                    ui.set_max_width(col_w);
+                    ui.label(egui::RichText::new(reason).color(MUTED()).size(11.5));
+                });
                 ui.add_space(2.0);
             }
             // The same translucent PANEL fill as the top bar / chat list cards —
@@ -752,7 +764,7 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                                     crate::llm::ThinkLevel::Medium => "Balanced — the default.",
                                                     crate::llm::ThinkLevel::High => "Thinks it through. Slower replies.",
                                                     crate::llm::ThinkLevel::Max => {
-                                                        "Thinks as long as it needs — the slowest, most careful replies."
+                                                        "Thinks the longest before answering: the slowest replies,                                                          and long chats keep fewer old messages in memory."
                                                     }
                                                 }
                                             } else {
@@ -1153,7 +1165,13 @@ fn thinking_row(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, thinking: &
             toggled = true;
         }
 
-        let label = if live { "Thinking…" } else { "Thoughts" };
+        // While the thought streams, a seconds counter shows it hasn't
+        // stalled (Max can think for minutes on a partly-CPU 31B).
+        let label = match llm.gen_started.filter(|_| live) {
+            Some(t) => format!("Thinking… {} s", t.elapsed().as_secs()),
+            None if live => "Thinking…".to_string(),
+            None => "Thoughts".to_string(),
+        };
         // Muted like a caption normally; the chat text-colour override
         // (or the Aurora-glow black default) wins. While the thought streams
         // the label breathes, matching the orb's hot state.
@@ -1603,16 +1621,12 @@ fn thinking_slider(ui: &mut egui::Ui, level: &mut crate::llm::ThinkLevel) -> egu
     let a = 9.0;
     let base = egui::pos2(rect.left() + 46.0, rect.top() + 44.0);
     if is_max {
-        // A soft purple halo that breathes while Max is selected.
+        // A soft purple glow that breathes while Max is selected (radius 34
+        // keeps it inside the painter's clip — no flat top).
         let pulse = 0.65 + 0.35 * ((time * 2.4).sin() as f32 * 0.5 + 0.5);
-        for (r, alpha) in [(40.0, 0.10), (30.0, 0.16), (21.0, 0.22)] {
-            painter.circle_filled(
-                base + egui::vec2(0.0, -14.0),
-                r,
-                THINK_PURPLE.gamma_multiply(alpha * pulse),
-            );
-        }
-        ui.ctx().request_repaint();
+        soft_glow(&painter, base + egui::vec2(0.0, -14.0), 34.0, THINK_PURPLE.gamma_multiply(0.42 * pulse));
+        // ~30 fps is plenty for a slow pulse (same cap as the heart badges).
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
     }
     let count = THINK_CUBES[idx];
     if count == 0 {
@@ -1701,6 +1715,29 @@ fn thinking_slider(ui: &mut egui::Ui, level: &mut crate::llm::ThinkLevel) -> egu
         egui::Stroke::new(2.0, egui::Color32::WHITE.gamma_multiply(0.9 * dim)),
     );
     resp
+}
+
+/// A radial glow: `col` at the centre, half strength at 45% of the radius,
+/// fully clear at the rim, so there are no hard ring edges.
+fn soft_glow(painter: &egui::Painter, c: egui::Pos2, r: f32, col: egui::Color32) {
+    let n = 48u32;
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(c, col);
+    let mid = col.gamma_multiply(0.5);
+    for i in 0..n {
+        let a = i as f32 / n as f32 * std::f32::consts::TAU;
+        let d = egui::vec2(a.cos(), a.sin());
+        mesh.colored_vertex(c + d * (r * 0.45), mid);
+        mesh.colored_vertex(c + d * r, egui::Color32::TRANSPARENT);
+    }
+    for i in 0..n {
+        let (m0, o0) = (1 + 2 * i, 2 + 2 * i);
+        let (m1, o1) = (1 + 2 * ((i + 1) % n), 2 + 2 * ((i + 1) % n));
+        mesh.add_triangle(0, m0, m1);
+        mesh.add_triangle(m0, o0, o1);
+        mesh.add_triangle(m0, o1, m1);
+    }
+    painter.add(mesh);
 }
 
 fn icon_button_tinted(

@@ -33,7 +33,7 @@ jobs:
 
       # Video playback (libVLC) is Windows-only here, so build without it.
       - name: Build (Apple Silicon)
-        run: cargo build --release --no-default-features --target aarch64-apple-darwin
+        run: cargo build --release --no-default-features --features avif --target aarch64-apple-darwin
 
       - name: Stage the binary
         run: |

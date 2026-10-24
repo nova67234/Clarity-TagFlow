@@ -40,7 +40,7 @@ jobs:
       # src/llm.rs's inference code surface here instead of at release-tag time;
       # its smoke test needs model files on disk and is #[ignore]d too.
       - name: Check + test (no VLC)
-        run: cargo test --all-targets --no-default-features --features llm
+        run: cargo test --all-targets --no-default-features --features llm,avif
 
   macos:
     runs-on: macos-14 # Apple Silicon, like the release build.
@@ -53,7 +53,7 @@ jobs:
       # Compile-check the macOS target â€” this is the path the v5.3.2 cfg break
       # would have failed on. --all-targets also type-checks the test modules.
       - name: Check (Apple Silicon, no VLC)
-        run: cargo check --all-targets --no-default-features --target aarch64-apple-darwin
+        run: cargo check --all-targets --no-default-features --features avif --target aarch64-apple-darwin
 
   windows:
     runs-on: windows-2022
@@ -79,4 +79,4 @@ jobs:
         shell: pwsh
         env:
           RUSTFLAGS: -L native=${{ env.VLC_LIB }}
-        run: cargo check --all-targets --no-default-features --features vlc
+        run: cargo check --all-targets --no-default-features --features vlc,avif

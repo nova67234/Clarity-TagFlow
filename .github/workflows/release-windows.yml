@@ -89,7 +89,7 @@ jobs:
         shell: pwsh
         env:
           RUSTFLAGS: -L native=${{ env.VLC_LIB }}
-        run: cargo build --release --no-default-features --features vlc,llm-vulkan
+        run: cargo build --release --no-default-features --features vlc,llm-vulkan,avif
 
       # Guard: libvlc.dll AND vulkan-1.dll must be DELAY-loaded, never
       # load-time imports â€” a load-time import means the exe can't even start
