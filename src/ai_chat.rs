@@ -339,12 +339,15 @@ fn gen_settings_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings) 
         egui::Slider::new(&mut p.max_tokens, 256..=8192).step_by(64.0),
     );
 
-    if *p != crate::llm::GenParams::default()
+    // The thinking level lives in GenParams too, but it has its own control
+    // (tools menu) — resetting the sampling knobs leaves it alone.
+    let defaults = crate::llm::GenParams { thinking: p.thinking, ..Default::default() };
+    if *p != defaults
         && ui
         .button(egui::RichText::new("Reset to defaults").size(11.5))
         .clicked()
     {
-        *p = crate::llm::GenParams::default();
+        *p = defaults;
     }
 }
 
@@ -389,12 +392,13 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
             let chat = &llm.chats[llm.active_chat];
             if chat.msgs.is_empty() {
                 ui.add_space(msgs_h * 0.42);
+                let hint = if llm.krea_prompts {
+                    "Attach a picture with + or describe an idea — get a Krea 2 prompt"
+                } else {
+                    "Ask AI anything — attach an image with +"
+                };
                 ui.vertical_centered(|ui| {
-                    ui.label(
-                        egui::RichText::new("Ask AI anything — attach an image with +")
-                            .color(MUTED())
-                            .size(14.5),
-                    );
+                    ui.label(egui::RichText::new(hint).color(MUTED()).size(14.5));
                 });
             }
             ui.horizontal(|ui| {
@@ -402,10 +406,13 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                 ui.vertical(|ui| {
                     ui.set_width(col_w);
                     let n = llm.chats[llm.active_chat].msgs.len();
+                    // Only the chat the reply streams into shows it live —
+                    // another chat's last reply is finished text.
+                    let live_chat = llm.streams_into(llm.chats[llm.active_chat].id);
                     for i in 0..n {
                         let streaming = {
                             let msg = &llm.chats[llm.active_chat].msgs[i];
-                            llm.running && i + 1 == n && msg.role == ChatRole::Model
+                            live_chat && i + 1 == n && msg.role == ChatRole::Model
                         };
                         message(ui, llm, i, streaming);
                         ui.add_space(12.0);
@@ -560,7 +567,9 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
 
                         // Draft text: grows with its content (the card extends upward
                         // because it's bottom-anchored), scrolls inside past 8 lines.
-                        // Enter sends; Shift+Enter makes a newline.
+                        // Enter sends; Shift+Enter makes a newline (the editor's
+                        // return key, so a plain Enter never inserts one — not
+                        // even mid-text, where trimming couldn't remove it).
                         let mut send_now = false;
                         egui::ScrollArea::vertical()
                             .id_salt("ai_chat_draft")
@@ -574,6 +583,7 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                     .font(egui::FontId::proportional(15.0))
                                     .hint_text("Ask the AI")
                                     .desired_width(f32::INFINITY)
+                                    .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter))
                                     .show(ui);
                                 // Live spell-check: red squiggles + right-click
                                 // suggestions, same as the generator prompt boxes.
@@ -582,10 +592,6 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                 let enter = resp.has_focus()
                                     && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                                 if enter {
-                                    // Drop the newline the Enter keystroke inserted.
-                                    while llm.draft.ends_with('\n') {
-                                        llm.draft.pop();
-                                    }
                                     send_now = true;
                                 }
                             });
@@ -602,6 +608,7 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                 .pick_file()
                             {
                                 llm.draft_image = Some(path);
+                                llm.run_err = None;
                             }
                             // Tools menu: extra chat abilities with on/off toggles.
                             let tools_resp = icon_button(ui, egui::include_image!("../icons/tools.svg"), 18.0, "Tools", true);
@@ -633,6 +640,11 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                                     if crate::settings::switch(ui, &mut on).changed() {
                                                         llm.roleplay.enabled = on;
                                                         llm.roleplay.save();
+                                                        // One conversation mode at a time.
+                                                        if on {
+                                                            settings.ai_krea_prompts = false;
+                                                            llm.krea_prompts = false;
+                                                        }
                                                         // Persona + memory change the whole
                                                         // conversation contract — start fresh
                                                         // rather than switching mid-chat.
@@ -664,6 +676,90 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                                  finishes — click any reply's listen \
                                                  icon to stop.",
                                             );
+                                            crate::settings::row_sep(ui);
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("Krea 2 prompts").color(TEXT()).size(13.0));
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    let mut on = settings.ai_krea_prompts;
+                                                    if crate::settings::switch(ui, &mut on).changed() {
+                                                        settings.ai_krea_prompts = on;
+                                                        llm.krea_prompts = on;
+                                                        // One conversation mode at a time.
+                                                        if on && llm.roleplay.enabled {
+                                                            llm.roleplay.enabled = false;
+                                                            llm.roleplay.save();
+                                                        }
+                                                        // The brief changes the whole
+                                                        // conversation — start fresh, as
+                                                        // role play does.
+                                                        llm.new_chat();
+                                                    }
+                                                });
+                                            });
+                                            crate::settings::hint(
+                                                ui,
+                                                "Turn a picture — or an idea in words — \
+                                                 into a detailed prompt for Krea 2. Ask for \
+                                                 changes (\"make it night\") to rewrite it. \
+                                                 Reads pictures with Detailed vision.",
+                                            );
+                                            crate::settings::row_sep(ui);
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("Detailed vision").color(TEXT()).size(13.0));
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    // Forced on while the Krea 2
+                                                    // writer is (it relies on it).
+                                                    let forced = settings.ai_krea_prompts;
+                                                    let mut on = settings.ai_detailed_vision || forced;
+                                                    let resp = ui.add_enabled_ui(!forced, |ui| {
+                                                        crate::settings::switch(ui, &mut on)
+                                                    });
+                                                    if resp.inner.changed() {
+                                                        settings.ai_detailed_vision = on;
+                                                        llm.detailed_vision = on;
+                                                    }
+                                                });
+                                            });
+                                            crate::settings::hint(
+                                                ui,
+                                                "Show the AI the newest picture whole plus \
+                                                 a few close-up sections, so small details \
+                                                 (eyes, hands, text, jewelry) aren't missed. \
+                                                 Replies start slower. Always on with Krea 2 \
+                                                 prompts.",
+                                            );
+                                        });
+
+                                        // Thinking mode: its own card under the
+                                        // switches — a slider, not a toggle.
+                                        ui.add_space(10.0);
+                                        ui.label(egui::RichText::new("THINKING").color(MUTED()).strong().size(11.0));
+                                        ui.add_space(5.0);
+                                        crate::settings::card(ui, |ui| {
+                                            let thinks = llm.model.thinks();
+                                            let mut level = settings.ai_gen.thinking;
+                                            ui.add_enabled_ui(thinks, |ui| thinking_slider(ui, &mut level));
+                                            if level != settings.ai_gen.thinking {
+                                                settings.ai_gen.thinking = level;
+                                                llm.params.thinking = level;
+                                            }
+                                            let hint = if thinks {
+                                                match level {
+                                                    crate::llm::ThinkLevel::Off => {
+                                                        "Answers right away — fastest, but weaker on tricky questions."
+                                                    }
+                                                    crate::llm::ThinkLevel::Low => "A quick think before answering.",
+                                                    crate::llm::ThinkLevel::Medium => "Balanced — the default.",
+                                                    crate::llm::ThinkLevel::High => "Thinks it through. Slower replies.",
+                                                    crate::llm::ThinkLevel::Max => {
+                                                        "Thinks as long as it needs — the slowest, most careful replies."
+                                                    }
+                                                }
+                                            } else {
+                                                "This model answers directly — thinking applies to \
+                                                 Gemma 4 31B and Qwen3-VL 30B Thinking."
+                                            };
+                                            crate::settings::hint(ui, hint);
                                         });
                                     });
                                 llm.tools_open = open;
@@ -778,7 +874,8 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                                 .desired_rows(2)
                                 .frame(egui::Frame::NONE)
                                 .font(egui::FontId::proportional(14.0))
-                                .desired_width(f32::INFINITY),
+                                .desired_width(f32::INFINITY)
+                                .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter)),
                         );
                         let enter = resp.has_focus()
                             && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
@@ -804,10 +901,6 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                                 )
                                     .clicked();
                                 if (send || enter) && can_send {
-                                    // Drop the newline the Enter keystroke inserted.
-                                    while llm.edit_draft.ends_with('\n') {
-                                        llm.edit_draft.pop();
-                                    }
                                     llm.pending_edit = Some(index);
                                 }
                                 if cancel || escape {
@@ -1016,15 +1109,20 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
             } else {
                 "Read aloud"
             };
+            let chat_id = llm.chats[llm.active_chat].id;
             if msg_icon_button(ui, egui::include_image!("../icons/listen.svg"), 15.0, tip, true).clicked() {
+                llm.speak_target = Some((chat_id, index));
                 llm.listen(&text, ui.ctx());
             }
-            // First OmniVoice use loads the model — show that it's coming.
-            if llm.voice.loading || llm.voice.pending > 0 {
-                ui.add(egui::Spinner::new().size(11.0).color(MUTED()));
-            }
-            if let Some(e) = &llm.voice.last_err {
-                ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(11.0));
+            // Voice status belongs to the reply being read, not every reply.
+            if llm.speak_target == Some((chat_id, index)) {
+                // First OmniVoice use loads the model — show that it's coming.
+                if llm.voice.loading || llm.voice.pending > 0 {
+                    ui.add(egui::Spinner::new().size(11.0).color(MUTED()));
+                }
+                if let Some(e) = &llm.voice.last_err {
+                    ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(11.0));
+                }
             }
         });
     }
@@ -1153,24 +1251,9 @@ fn msg_thumb(
     llm: &mut LlmState,
     path: &std::path::Path,
 ) -> Option<egui::TextureHandle> {
-    if crate::is_video(path) {
-        // Poster still, captured off-thread; the chip shows while it loads.
-        return llm.video_poster(ctx, path);
-    }
-    if let Some(t) = llm.msg_thumbs.get(path) {
-        return t.clone();
-    }
-    let tex = image::open(path).ok().map(|img| {
-        let t = img.thumbnail(512, 512).to_rgba8();
-        let size = [t.width() as usize, t.height() as usize];
-        ctx.load_texture(
-            format!("ai-chat-img-{}", path.display()),
-            egui::ColorImage::from_rgba_unmultiplied(size, t.as_raw()),
-            Default::default(),
-        )
-    });
-    llm.msg_thumbs.insert(path.to_path_buf(), tex.clone());
-    tex
+    // Image still or video poster, decoded off-thread; the chip shows while
+    // it loads.
+    llm.media_thumb(ctx, path)
 }
 
 /// Keep `draft_thumb` in sync with `draft_image`: decode the attached image
@@ -1185,29 +1268,15 @@ fn ensure_draft_thumb(ctx: &egui::Context, llm: &mut LlmState) {
     if llm.draft_thumb.as_ref().is_some_and(|(p, _)| *p == path) {
         return;
     }
-    // Videos: the poster still is captured on a background thread (decoding
-    // here would stall the UI); a filename chip shows until it lands. The
-    // worker samples the actual frames at send time.
-    if crate::is_video(&path) {
-        llm.draft_thumb = llm.video_poster(ctx, &path).map(|t| (path, t));
-        return;
-    }
-    match image::open(&path) {
-        Ok(img) => {
-            let t = img.thumbnail(128, 128).to_rgba8();
-            let size = [t.width() as usize, t.height() as usize];
-            let tex = ctx.load_texture(
-                "ai-chat-draft-thumb",
-                egui::ColorImage::from_rgba_unmultiplied(size, t.as_raw()),
-                Default::default(),
-            );
-            llm.draft_thumb = Some((path, tex));
-        }
-        Err(e) => {
-            llm.draft_image = None;
-            llm.draft_thumb = None;
-            llm.run_err = Some(format!("Couldn't read that image: {e}"));
-        }
+    // Decoded on a background thread (a big photo or a video's poster
+    // capture would stall the UI); a filename chip shows until it lands. The
+    // same texture then serves the sent message. For a video the worker
+    // samples the actual frames at send time.
+    llm.draft_thumb = llm.media_thumb(ctx, &path).map(|t| (path.clone(), t));
+    if !crate::is_video(&path) && llm.thumb_failed(&path) {
+        llm.draft_image = None;
+        llm.draft_thumb = None;
+        llm.run_err = Some("Couldn't read that image.".to_string());
     }
 }
 
@@ -1451,6 +1520,189 @@ fn mic_button(ui: &mut egui::Ui, llm: &mut LlmState) {
     }
 }
 
+/// Thinking-slider colours: blue at the low end blending into purple at Max.
+const THINK_BLUE: egui::Color32 = egui::Color32::from_rgb(56, 132, 255);
+const THINK_PURPLE: egui::Color32 = egui::Color32::from_rgb(172, 82, 250);
+
+/// Blue → purple at `t` (0..=1).
+fn think_color(t: f32) -> egui::Color32 {
+    let l = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    egui::Color32::from_rgb(
+        l(THINK_BLUE.r(), THINK_PURPLE.r()),
+        l(THINK_BLUE.g(), THINK_PURPLE.g()),
+        l(THINK_BLUE.b(), THINK_PURPLE.b()),
+    )
+}
+
+/// Cubes in the pile per level (Off … Max): a lone cube for Low, a full row
+/// for Medium, a pyramid for Max.
+const THINK_CUBES: [usize; 5] = [0, 1, 3, 5, 6];
+/// Pile slots in grid units (x across, row up), in draw order — lower rows
+/// first so upper cubes overlap the ones they sit on.
+const THINK_SLOTS: [(f32, f32); 6] =
+    [(0.0, 0.0), (-1.0, 0.0), (1.0, 0.0), (-0.5, 1.0), (0.5, 1.0), (0.0, 2.0)];
+
+/// One isometric cube with its top-face centre-bottom at `c`, edge `a`:
+/// lit top, mid left face, shaded right face.
+fn paint_cube(painter: &egui::Painter, c: egui::Pos2, a: f32, col: egui::Color32, alpha: f32) {
+    let w = a * 0.87;
+    let p = |x: f32, y: f32| egui::pos2(c.x + x, c.y + y);
+    let tint = |col: egui::Color32| col.gamma_multiply(alpha);
+    let top = col.lerp_to_gamma(egui::Color32::WHITE, 0.35);
+    let right = col.lerp_to_gamma(egui::Color32::BLACK, 0.35);
+    let edge = egui::Stroke::new(0.8, tint(col.lerp_to_gamma(egui::Color32::WHITE, 0.55)));
+    painter.add(egui::Shape::convex_polygon(
+        vec![p(0.0, -a), p(w, -a / 2.0), p(0.0, 0.0), p(-w, -a / 2.0)],
+        tint(top),
+        edge,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        vec![p(-w, -a / 2.0), p(0.0, 0.0), p(0.0, a), p(-w, a / 2.0)],
+        tint(col),
+        edge,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        vec![p(0.0, 0.0), p(w, -a / 2.0), p(w, a / 2.0), p(0.0, a)],
+        tint(right),
+        edge,
+    ));
+}
+
+/// The tools menu's thinking slider: a pile of cubes that grows with the
+/// level (glowing at Max), the level's name, and a 5-stop track whose fill
+/// blends blue → purple. Click or drag anywhere on the track to set it.
+fn thinking_slider(ui: &mut egui::Ui, level: &mut crate::llm::ThinkLevel) -> egui::Response {
+    use crate::llm::ThinkLevel;
+    let enabled = ui.is_enabled();
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 76.0), egui::Sense::hover());
+    let track = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 10.0, rect.bottom() - 22.0),
+        egui::pos2(rect.right() - 10.0, rect.bottom() - 2.0),
+    );
+    let resp = ui
+        .interact(track, ui.id().with("think_track"), egui::Sense::click_and_drag())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if let Some(pos) = resp.interact_pointer_pos()
+        && (resp.dragged() || resp.clicked() || resp.is_pointer_button_down_on())
+    {
+        let t = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+        *level = ThinkLevel::ALL[(t * 4.0).round() as usize];
+    }
+
+    let idx = level.index();
+    // Glide the colour and knob between stops instead of snapping.
+    let t = ui.ctx().animate_value_with_time(ui.id().with("think_t"), idx as f32 / 4.0, 0.18);
+    let dim = if enabled { 1.0 } else { 0.4 };
+    let col = think_color(t).gamma_multiply(dim);
+    let painter = ui.painter_at(rect.expand(6.0));
+    let time = ui.input(|i| i.time);
+    let is_max = *level == ThinkLevel::Max && enabled;
+
+    // --- The cube pile, left of the level name. ---
+    let a = 9.0;
+    let base = egui::pos2(rect.left() + 46.0, rect.top() + 44.0);
+    if is_max {
+        // A soft purple halo that breathes while Max is selected.
+        let pulse = 0.65 + 0.35 * ((time * 2.4).sin() as f32 * 0.5 + 0.5);
+        for (r, alpha) in [(40.0, 0.10), (30.0, 0.16), (21.0, 0.22)] {
+            painter.circle_filled(
+                base + egui::vec2(0.0, -14.0),
+                r,
+                THINK_PURPLE.gamma_multiply(alpha * pulse),
+            );
+        }
+        ui.ctx().request_repaint();
+    }
+    let count = THINK_CUBES[idx];
+    if count == 0 {
+        // Off: a faint outline where the pile would be.
+        let c = base;
+        let w = a * 0.87;
+        let ghost = egui::Stroke::new(1.0, MUTED().gamma_multiply(0.6 * dim));
+        painter.add(egui::Shape::closed_line(
+            vec![
+                c + egui::vec2(0.0, -a), c + egui::vec2(w, -a / 2.0), c + egui::vec2(w, a / 2.0),
+                c + egui::vec2(0.0, a), c + egui::vec2(-w, a / 2.0), c + egui::vec2(-w, -a / 2.0),
+            ],
+            ghost,
+        ));
+    }
+    for (i, (sx, row)) in THINK_SLOTS.iter().enumerate() {
+        // Each cube pops in/out as the level changes.
+        let alpha = ui.ctx().animate_bool_with_time(
+            ui.id().with(("think_cube", i)),
+            i < count,
+            0.15,
+        );
+        if alpha <= 0.0 {
+            continue;
+        }
+        let c = base + egui::vec2(sx * a * 1.74, -row * a * 1.5 + (1.0 - alpha) * 4.0);
+        // Cubes higher in the pile lean further toward purple.
+        let cube_col = think_color((t + row * 0.12).min(1.0)).gamma_multiply(dim);
+        paint_cube(&painter, c, a, cube_col, alpha);
+    }
+
+    // --- Level name + a short caption, right of the pile. ---
+    let text_x = rect.left() + 92.0;
+    painter.text(
+        egui::pos2(text_x, rect.top() + 14.0),
+        egui::Align2::LEFT_CENTER,
+        level.label(),
+        egui::FontId::proportional(15.0),
+        if enabled { col } else { MUTED() },
+    );
+    painter.text(
+        egui::pos2(text_x, rect.top() + 32.0),
+        egui::Align2::LEFT_CENTER,
+        if *level == ThinkLevel::Off { "no thinking" } else { "thinking before it answers" },
+        egui::FontId::proportional(11.0),
+        MUTED().gamma_multiply(dim),
+    );
+
+    // --- The track: base rail, gradient fill to the knob, stop dots. ---
+    let cy = track.center().y;
+    let (x0, x1) = (track.left(), track.right());
+    let kx = x0 + (x1 - x0) * t;
+    painter.line_segment(
+        [egui::pos2(x0, cy), egui::pos2(x1, cy)],
+        egui::Stroke::new(5.0, EDGE().gamma_multiply(dim)),
+    );
+    if kx > x0 + 0.5 {
+        let mut mesh = egui::Mesh::default();
+        let (h, left_col) = (2.5, THINK_BLUE.gamma_multiply(dim));
+        mesh.colored_vertex(egui::pos2(x0, cy - h), left_col);
+        mesh.colored_vertex(egui::pos2(kx, cy - h), col);
+        mesh.colored_vertex(egui::pos2(kx, cy + h), col);
+        mesh.colored_vertex(egui::pos2(x0, cy + h), left_col);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(mesh);
+        painter.circle_filled(egui::pos2(x0, cy), h, left_col);
+    }
+    for i in 0..5 {
+        let sx = x0 + (x1 - x0) * i as f32 / 4.0;
+        let on = (i as f32 / 4.0) <= t + 0.001;
+        painter.circle_filled(
+            egui::pos2(sx, cy),
+            2.0,
+            if on { egui::Color32::WHITE.gamma_multiply(0.8 * dim) } else { MUTED().gamma_multiply(0.7 * dim) },
+        );
+    }
+    if is_max {
+        let pulse = 0.6 + 0.4 * ((time * 2.4).sin() as f32 * 0.5 + 0.5);
+        painter.circle_filled(egui::pos2(kx, cy), 13.0, THINK_PURPLE.gamma_multiply(0.25 * pulse));
+    }
+    painter.circle(
+        egui::pos2(kx, cy),
+        if resp.hovered() || resp.dragged() { 8.5 } else { 7.5 },
+        col,
+        egui::Stroke::new(2.0, egui::Color32::WHITE.gamma_multiply(0.9 * dim)),
+    );
+    resp
+}
+
 fn icon_button_tinted(
     ui: &mut egui::Ui,
     icon: egui::ImageSource<'_>,
@@ -1459,7 +1711,10 @@ fn icon_button_tinted(
     enabled: bool,
     tint: egui::Color32,
 ) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
+    // A disabled button only senses hover (for its tooltip) — it must not
+    // report clicks while it looks greyed out.
+    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), sense);
     let resp = resp.on_hover_text(tip);
     let resp = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
     if ui.is_rect_visible(rect) {

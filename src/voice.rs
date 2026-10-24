@@ -222,6 +222,10 @@ pub struct VoiceState {
     pub loading: bool,
     /// Synth requests sent and not yet answered.
     pub pending: usize,
+    /// How many of the oldest `pending` answers to throw away unplayed —
+    /// requests that were still synthesizing when Stop was pressed. The
+    /// worker answers in order, so the next `discard` results are theirs.
+    discard: usize,
     pub last_err: Option<String>,
 
     player_tx: Option<Sender<PlayerCmd>>,
@@ -247,6 +251,7 @@ impl Default for VoiceState {
             ready: false,
             loading: false,
             pending: 0,
+            discard: 0,
             last_err: None,
             player_tx: None,
             speaking: Arc::new(AtomicBool::new(false)),
@@ -270,12 +275,20 @@ impl VoiceState {
         self.speaking.load(Relaxed)
     }
 
-    /// Stop playback and discard queued requests' results.
+    /// True while a reply is playing OR still being synthesized (including
+    /// the first-use model load) — the window in which Listen means "Stop".
+    pub fn busy(&self) -> bool {
+        self.speaking() || self.pending > self.discard
+    }
+
+    /// Stop playback and discard queued requests' results — a reply still
+    /// synthesizing would otherwise start playing after Stop.
     pub fn stop(&mut self) {
         if let Some(tx) = &self.player_tx {
             let _ = tx.send(PlayerCmd::Stop);
         }
         self.speaking.store(false, Relaxed);
+        self.discard = self.pending;
     }
 
     /// Drain setup/engine messages. Call once per frame (from `LlmState::poll`).
@@ -325,12 +338,18 @@ impl VoiceState {
                 }
                 EngineMsg::Wav(path) => {
                     self.pending = self.pending.saturating_sub(1);
-                    let tx = self.player();
-                    let _ = tx.send(PlayerCmd::Play(path));
+                    if self.discard > 0 {
+                        // Synthesized for a request that was stopped.
+                        self.discard -= 1;
+                    } else {
+                        let tx = self.player();
+                        let _ = tx.send(PlayerCmd::Play(path));
+                    }
                 }
                 EngineMsg::Warn(w) => self.last_err = Some(w),
                 EngineMsg::Err(e) => {
                     self.pending = self.pending.saturating_sub(1);
+                    self.discard = self.discard.saturating_sub(1);
                     self.loading = false;
                     self.last_err = Some(e);
                 }
@@ -339,6 +358,7 @@ impl VoiceState {
                     self.engine_rx = None;
                     self.ready = false;
                     self.pending = 0;
+                    self.discard = 0;
                     // A crash before/at model load would otherwise be silent —
                     // surface the last thing it said on stderr.
                     if self.loading || self.last_err.is_none() {

@@ -147,11 +147,71 @@ pub struct GenParams {
     /// Cap on generated tokens per reply. 1024 turned out to truncate real
     /// answers mid-code-block; 3072 fits long code examples comfortably.
     pub max_tokens: usize,
+    /// How long the thinking models may reason before answering (the
+    /// slider at the bottom of the chat's tools menu).
+    pub thinking: ThinkLevel,
 }
 
 impl Default for GenParams {
     fn default() -> Self {
-        Self { temperature: 1.0, top_k: 64, top_p: 0.95, max_tokens: 3072 }
+        Self { temperature: 1.0, top_k: 64, top_p: 0.95, max_tokens: 3072, thinking: ThinkLevel::Medium }
+    }
+}
+
+/// Thinking mode: how much private reasoning a thinking model (the Gemma 4
+/// 31B, Qwen3-VL 30B Thinking) does before it answers. Mostly a speed knob —
+/// on a partly CPU-offloaded 31B the thought is most of the wait.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum ThinkLevel {
+    /// Answer straight away.
+    Off,
+    Low,
+    /// Today's behaviour: a third of the reply budget.
+    #[default]
+    Medium,
+    High,
+    /// Think as long as needed, leaving just enough room to answer.
+    Max,
+}
+
+impl ThinkLevel {
+    pub const ALL: [ThinkLevel; 5] =
+        [ThinkLevel::Off, ThinkLevel::Low, ThinkLevel::Medium, ThinkLevel::High, ThinkLevel::Max];
+
+    /// Position on the slider, 0 (Off) to 4 (Max).
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|l| *l == self).unwrap_or(2)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ThinkLevel::Off => "Off",
+            ThinkLevel::Low => "Low",
+            ThinkLevel::Medium => "Medium",
+            ThinkLevel::High => "High",
+            ThinkLevel::Max => "Max",
+        }
+    }
+
+    /// Tokens of thought allowed before the thought is force-closed and the
+    /// model must answer (`None` = no thinking at all). Never the whole
+    /// reply budget, so an answer always has room.
+    pub fn budget(self, max_reply: usize) -> Option<usize> {
+        match self {
+            ThinkLevel::Off => None,
+            ThinkLevel::Low => Some(256),
+            ThinkLevel::Medium => Some((max_reply / 3).max(256)),
+            ThinkLevel::High => Some((max_reply * 2 / 3).max(512)),
+            ThinkLevel::Max => Some(max_reply.saturating_sub(384).max(512)),
+        }
+    }
+}
+
+impl GemmaModel {
+    /// The models that reason before answering — the only ones the
+    /// thinking slider affects.
+    pub fn thinks(self) -> bool {
+        matches!(self, GemmaModel::D31B | GemmaModel::Qwen30B)
     }
 }
 
@@ -202,7 +262,11 @@ struct CmdMsg {
 /// chat works without keeping KV-cache state between requests.
 #[cfg_attr(not(feature = "llm"), allow(dead_code))]
 enum Cmd {
-    Generate { msgs: Vec<CmdMsg>, params: GenParams },
+    /// `pinned` leading messages (the role-play / Krea 2 priming pair) are
+    /// always kept; when the prompt outgrows the context, the oldest of the
+    /// rest go. `detailed` = Detailed Vision: the newest image goes as the
+    /// full picture plus overlapping close-up sections.
+    Generate { msgs: Vec<CmdMsg>, params: GenParams, pinned: usize, detailed: bool },
 }
 
 /// A message streamed back from the inference worker.
@@ -336,6 +400,9 @@ pub struct LlmState {
     /// synthesis in a spawned PowerShell; killed to stop playback). The
     /// fallback voice — OmniVoice below is used when installed.
     tts: Option<std::process::Child>,
+    /// The reply last sent to a voice, as (chat id, message index) — its
+    /// action row is the one that shows the voice's spinner / error.
+    pub speak_target: Option<(u64, usize)>,
     /// The OmniVoice neural voice (Python sidecar; see src/voice.rs).
     pub voice: crate::voice::VoiceState,
     /// Whisper mic dictation for the input card's mic button (src/dictate.rs).
@@ -360,6 +427,12 @@ pub struct LlmState {
     /// Auto-speak finished replies (mirrors the persisted setting; synced
     /// each frame by main.rs, toggled from the tools menu).
     pub auto_speak: bool,
+    /// Detailed Vision (mirrors the persisted setting): tile the newest
+    /// image into close-up sections so small details reach the model.
+    pub detailed_vision: bool,
+    /// Krea 2 prompt writer (mirrors the persisted setting; see
+    /// src/krea_prompt.rs). Implies detailed vision.
+    pub krea_prompts: bool,
     /// The input card's tools popup is open.
     pub tools_open: bool,
     /// Spell-check state for the input card (right-click suggestion menu),
@@ -375,6 +448,8 @@ impl Drop for LlmState {
         if let Some(mut c) = self.tts.take() {
             let _ = c.kill();
         }
+        // Nor decrypted album pictures in the temp folder.
+        crate::roleplay::clear_album_temp();
     }
 }
 
@@ -409,6 +484,7 @@ impl Default for LlmState {
             edit_draft: String::new(),
             pending_edit: None,
             tts: None,
+            speak_target: None,
             voice: crate::voice::VoiceState::default(),
             dictate: Default::default(),
             roleplay: crate::roleplay::RoleplayState::load(),
@@ -417,6 +493,8 @@ impl Default for LlmState {
             gen_settings_open: false,
             worker_model: GemmaModel::default(),
             auto_speak: false,
+            detailed_vision: false,
+            krea_prompts: false,
             tools_open: false,
             spell: crate::spellcheck::SpellcheckState::default(),
             worker: None,
@@ -472,10 +550,11 @@ impl LlmState {
     /// Drive background work — poll the setup download and drain any streamed
     /// tokens from the inference worker. Call once per frame from the tab.
     /// The cached poster still for a video attachment, kicking off a capture
-    /// on a background thread on first sight. `None` while the capture runs
-    /// (the chat shows a filename chip meanwhile) and for clips VLC can't
-    /// decode (cached, like unreadable images).
-    pub fn video_poster(
+    /// on a background thread on first sight — or, for an image, its
+    /// downscaled still. `None` while that runs (the chat shows a filename
+    /// chip meanwhile) and for files that can't be decoded (cached as such,
+    /// so they aren't retried every frame — see [`Self::thumb_failed`]).
+    pub fn media_thumb(
         &mut self,
         ctx: &egui::Context,
         path: &std::path::Path,
@@ -488,12 +567,30 @@ impl LlmState {
             let ctx = ctx.clone();
             let path = path.to_path_buf();
             std::thread::spawn(move || {
-                let img = crate::video::capture_poster(&path, 512);
+                // Stills decode here too: a big photo takes long enough to
+                // visibly freeze the UI thread.
+                let img = if crate::is_video(&path) {
+                    crate::video::capture_poster(&path, 512)
+                } else {
+                    image::open(&path).ok().map(|img| {
+                        let t = img.thumbnail(512, 512).to_rgba8();
+                        egui::ColorImage::from_rgba_unmultiplied(
+                            [t.width() as usize, t.height() as usize],
+                            t.as_raw(),
+                        )
+                    })
+                };
                 let _ = tx.send((path, img));
                 ctx.request_repaint();
             });
         }
         None
+    }
+
+    /// The attachment's thumbnail was attempted and the file couldn't be
+    /// decoded (as opposed to still loading).
+    pub fn thumb_failed(&self, path: &std::path::Path) -> bool {
+        matches!(self.msg_thumbs.get(path), Some(None))
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) {
@@ -558,8 +655,9 @@ impl LlmState {
                         // it moves onto the message's `thinking` (for the
                         // disclosure row) and out of the visible text — so it
                         // is never re-sent in the history, spoken, or copied.
-                        if res.is_ok()
-                            && let Some(m) = self
+                        // Done on errors too, so a reply cut short by a failure
+                        // doesn't show raw channel markers.
+                        if let Some(m) = self
                                 .gen_chat
                                 .and_then(|id| self.chats.iter_mut().find(|c| c.id == id))
                                 .and_then(|c| c.msgs.last_mut())
@@ -588,11 +686,14 @@ impl LlmState {
                                 .gen_chat
                                 .and_then(|id| self.chats.iter_mut().find(|c| c.id == id))
                             {
+                                // Only the message this reply answers — an
+                                // older photo must never be kept for words
+                                // the user merely typed.
                                 last_user_image = chat
                                     .msgs
                                     .iter()
                                     .rev()
-                                    .find(|m| m.role == ChatRole::User && m.image.is_some())
+                                    .find(|m| m.role == ChatRole::User)
                                     .and_then(|m| m.image.clone());
                                 if let Some(m) = chat.msgs.last_mut() {
                                     directives = Some(crate::roleplay::extract_directives(&mut m.text));
@@ -629,12 +730,14 @@ impl LlmState {
                         // Auto-speak: read the finished reply aloud (after the
                         // diary lines are gone, so they're never spoken).
                         if res.is_ok() && self.auto_speak {
-                            let text = self
+                            let target = self
                                 .gen_chat
                                 .and_then(|id| self.chats.iter().find(|c| c.id == id))
-                                .and_then(|c| c.msgs.last())
-                                .map(|m| m.text.clone());
-                            if let Some(t) = text {
+                                .and_then(|c| {
+                                    c.msgs.last().map(|m| (c.id, c.msgs.len() - 1, m.text.clone()))
+                                });
+                            if let Some((id, index, t)) = target {
+                                self.speak_target = Some((id, index));
                                 self.start_speaking(&t, ctx);
                             }
                         }
@@ -683,11 +786,35 @@ impl LlmState {
         if self.gen_chat == Some(removed.id) {
             self.gen_chat = None;
         }
+        if self.editing.is_some_and(|(id, _)| id == removed.id) {
+            self.editing = None;
+            self.edit_draft.clear();
+        }
+        self.think_orbs.retain(|(id, _), _| *id != removed.id);
+        // Free attachment textures no remaining chat (or the draft) shows.
+        let in_use = |p: &PathBuf| {
+            self.draft_image.as_ref() == Some(p)
+                || self.chats.iter().any(|c| c.msgs.iter().any(|m| m.image.as_ref() == Some(p)))
+        };
+        let stale: Vec<PathBuf> = self.msg_thumbs.keys().filter(|p| !in_use(p)).cloned().collect();
+        for p in stale {
+            self.msg_thumbs.remove(&p);
+        }
         if self.chats.is_empty() {
             self.chats.push(Chat { id: self.next_chat_id, msgs: Vec::new() });
             self.next_chat_id += 1;
         }
+        // Deleting a chat above the selected one shifts it up a row — follow
+        // it, rather than silently switching to its neighbour.
+        if index < self.active_chat {
+            self.active_chat -= 1;
+        }
         self.active_chat = self.active_chat.min(self.chats.len() - 1);
+    }
+
+    /// True while a reply is streaming into the chat with this id.
+    pub fn streams_into(&self, chat_id: u64) -> bool {
+        self.running && self.gen_chat == Some(chat_id)
     }
 
     /// Send the input pill's draft (text + attached image) as the next user
@@ -770,12 +897,19 @@ impl LlmState {
         // Snapshot the history for the worker, capped to the most recent
         // messages so a very long chat doesn't overflow the model's context,
         // and with only the newest few images attached (see HISTORY_IMAGES).
-        let mut msgs: Vec<CmdMsg> = chat
+        // Empty replies (a failed or instantly-stopped generation) are left
+        // out — an empty assistant turn only teaches the model to say nothing
+        // — and so is any reply the cap leaves at the front, so the window
+        // (and the role-play priming pair before it) always opens on a user
+        // turn.
+        let kept: Vec<&ChatMsg> = chat
             .msgs
             .iter()
-            .rev()
-            .take(HISTORY_MSGS)
-            .rev()
+            .filter(|m| m.role == ChatRole::User || !m.text.trim().is_empty())
+            .collect();
+        let mut msgs: Vec<CmdMsg> = kept[kept.len().saturating_sub(HISTORY_MSGS)..]
+            .iter()
+            .skip_while(|m| m.role == ChatRole::Model)
             .map(|m| CmdMsg {
                 user: m.role == ChatRole::User,
                 text: m.text.clone(),
@@ -811,9 +945,17 @@ impl LlmState {
         // Role play: pin the persona/diary priming turn in front of the
         // history — it never slides out of the window, so the character (and
         // everything in the diary) survives arbitrarily long sessions.
-        if self.roleplay.enabled {
+        let mut pinned = 0;
+        if self.krea_prompts {
+            // The Krea 2 brief is pinned the same way (the tools menu keeps
+            // it and role play mutually exclusive).
+            msgs.insert(0, CmdMsg { user: false, text: crate::krea_prompt::ACK.to_string(), image: None });
+            msgs.insert(0, CmdMsg { user: true, text: crate::krea_prompt::BRIEF.to_string(), image: None });
+            pinned = 2;
+        } else if self.roleplay.enabled {
             msgs.insert(0, CmdMsg { user: false, text: self.roleplay.ack(), image: None });
             msgs.insert(0, CmdMsg { user: true, text: self.roleplay.preamble(), image: None });
+            pinned = 2;
         }
 
         // A different model was selected since the worker loaded — drop it so
@@ -828,7 +970,17 @@ impl LlmState {
         }
         GEN_CANCEL.store(false, Ordering::SeqCst);
         match &self.worker {
-            Some(w) if w.tx.send(Cmd::Generate { msgs, params: self.params }).is_ok() => {
+            Some(w)
+                if w
+                    .tx
+                    .send(Cmd::Generate {
+                        msgs,
+                        params: self.params,
+                        pinned,
+                        detailed: self.detailed_vision || self.krea_prompts,
+                    })
+                    .is_ok() =>
+            {
                 // The empty reply bubble the tokens stream into.
                 self.chats[self.active_chat]
                     .msgs
@@ -872,9 +1024,10 @@ impl LlmState {
         }
     }
 
-    /// True while either voice backend is playing.
+    /// True while either voice backend is playing (or OmniVoice is still
+    /// synthesizing a reply — Listen means Stop then too).
     pub fn any_speaking(&mut self) -> bool {
-        self.voice.speaking() || self.speaking()
+        self.voice.busy() || self.speaking()
     }
 
     /// Read a reply aloud — or stop the current playback if one is speaking.
@@ -882,7 +1035,7 @@ impl LlmState {
     /// one-click setup has run; otherwise falls back to the OS speech
     /// synthesizer (Windows).
     pub fn listen(&mut self, text: &str, ctx: &egui::Context) {
-        if self.voice.speaking() {
+        if self.voice.busy() {
             self.voice.stop();
             return;
         }
@@ -1224,9 +1377,11 @@ mod worker {
 
         send(Msg::Status("Ready".into()));
 
-        while let Ok(Cmd::Generate { msgs, params }) = rx.recv() {
-            let res =
-                generate(&backend, &model, &mtmd, &template, threads, which, &msgs, &params, send);
+        while let Ok(Cmd::Generate { msgs, params, pinned, detailed }) = rx.recv() {
+            let res = generate(
+                &backend, &model, &mtmd, &template, threads, which, &msgs, pinned, detailed,
+                &params, send,
+            );
             send(Msg::Done(res));
         }
         Ok(())
@@ -1241,6 +1396,8 @@ mod worker {
         threads: i32,
         which: super::GemmaModel,
         msgs: &[super::CmdMsg],
+        pinned: usize,
+        detailed: bool,
         params: &super::GenParams,
         send: &dyn Fn(Msg),
     ) -> Result<(), String> {
@@ -1256,10 +1413,17 @@ mod worker {
         // message with an image gets a marker and its bitmap is pushed in the
         // same sequence (matches llama.cpp's mtmd-cli).
         let marker = llama_cpp_2::mtmd::mtmd_default_marker();
-        let mut bitmaps: Vec<MtmdBitmap> = Vec::new();
-        let mut turns: Vec<(bool, String)> = Vec::new();
-        for m in msgs {
+        // Each turn keeps its own bitmaps, so trimming old turns below drops
+        // their images along with their text.
+        let mut turns: Vec<(bool, String, Vec<MtmdBitmap>)> = Vec::new();
+        // Detailed Vision tiles only the newest still image; older ones go
+        // as the full picture, so a long chat doesn't fill up with tiles.
+        let tile_at = detailed
+            .then(|| msgs.iter().rposition(|m| m.image.as_deref().is_some_and(|p| !crate::is_video(p))))
+            .flatten();
+        for (mi, m) in msgs.iter().enumerate() {
             let mut text = m.text.clone();
+            let mut bitmaps: Vec<MtmdBitmap> = Vec::new();
             if let Some(path) = &m.image {
                 if crate::is_video(path) {
                     // A video becomes a handful of evenly-sampled frames, each
@@ -1275,6 +1439,20 @@ mod worker {
                         let _ = writeln!(header, "Frame at {}: {marker}", fmt_timestamp(*ms));
                     }
                     text = format!("{header}{text}");
+                } else if let Some(tiles) =
+                    (tile_at == Some(mi)).then(|| image_tiles(path)).transpose()?.flatten()
+                {
+                    // The full picture first (the layout), then the labelled
+                    // close-ups (the detail) — like a video's frames.
+                    send(Msg::Status("Reading the image in detail…".into()));
+                    use std::fmt::Write as _;
+                    bitmaps.push(load_bitmap(mtmd, path)?);
+                    let mut header = format!("{marker}\n{DETAIL_GUIDE}\n");
+                    for (label, tile) in &tiles {
+                        bitmaps.push(load_bitmap(mtmd, tile)?);
+                        let _ = writeln!(header, "{label} section: {marker}");
+                    }
+                    text = format!("{header}{text}");
                 } else {
                     send(Msg::Status("Reading the image…".into()));
                     bitmaps.push(load_bitmap(mtmd, path)?);
@@ -1283,87 +1461,132 @@ mod worker {
                     }
                 }
             }
-            turns.push((m.user, text));
+            turns.push((m.user, text, bitmaps));
         }
 
         send(Msg::Status("Thinking…".into()));
-        let chat: Vec<LlamaChatMessage> = turns
-            .iter()
-            .map(|(user, text)| {
-                let role = if *user { "user" } else { "assistant" };
-                LlamaChatMessage::new(role.to_string(), text.clone()).map_err(|e| e.to_string())
-            })
-            .collect::<Result<_, _>>()?;
-        // Gemma 4 embeds a huge Jinja chat template (tool calls, thinking
-        // channels) that llama.cpp's built-in non-Jinja formatter doesn't
-        // recognise (ffi error -1). Its actual wire format is simple, so fall
-        // back to formatting the turns by hand; the template path still
-        // serves models with conventional templates (Gemma 3's and Qwen's
-        // are both known to the built-in formatter, so their fallbacks below
-        // are belt-and-braces).
-        // The 31B reasons in a thought channel — but only when the wire
-        // format's global thinking switch is on: a `<|think|>` token at the
-        // very top of a system turn (straight from the GGUF's own Jinja
-        // template; merely opening the reply with the channel header gets an
-        // empty thought — verified via llm_raw_probe_31b). With the switch on
-        // the model opens `<|channel>thought\n{reasoning}<channel|>` by
-        // itself, which the UI's split_channels understands.
-        let think = matches!(which, super::GemmaModel::D31B);
-        let formatted = match model.apply_chat_template(template, &chat, true) {
-            Ok(s) => s,
-            Err(_) => match which {
-                // Gemma 4's wire format.
-                super::GemmaModel::E4B | super::GemmaModel::D31B => {
-                    use std::fmt::Write as _;
-                    let mut s = String::new();
-                    if think {
-                        s.push_str("<|turn>system\n<|think|>\n<turn|>\n");
+        // The wire-format prompt for a run of turns (re-run while trimming).
+        let format_prompt = |turns: &[&(bool, String, Vec<MtmdBitmap>)]| -> Result<String, String> {
+            let chat: Vec<LlamaChatMessage> = turns
+                .iter()
+                .map(|(user, text, _)| {
+                    let role = if *user { "user" } else { "assistant" };
+                    LlamaChatMessage::new(role.to_string(), text.clone()).map_err(|e| e.to_string())
+                })
+                .collect::<Result<_, _>>()?;
+            // Gemma 4 embeds a huge Jinja chat template (tool calls, thinking
+            // channels) that llama.cpp's built-in non-Jinja formatter doesn't
+            // recognise (ffi error -1). Its actual wire format is simple, so fall
+            // back to formatting the turns by hand; the template path still
+            // serves models with conventional templates (Gemma 3's and Qwen's
+            // are both known to the built-in formatter, so their fallbacks below
+            // are belt-and-braces).
+            // The 31B reasons in a thought channel — but only when the wire
+            // format's global thinking switch is on: a `<|think|>` token at the
+            // very top of a system turn (straight from the GGUF's own Jinja
+            // template; merely opening the reply with the channel header gets an
+            // empty thought — verified via llm_raw_probe_31b). With the switch on
+            // the model opens `<|channel>thought\n{reasoning}<channel|>` by
+            // itself, which the UI's split_channels understands.
+            // Thinking mode Off skips the switch, so the 31B answers directly.
+            let think = matches!(which, super::GemmaModel::D31B)
+                && params.thinking != super::ThinkLevel::Off;
+            let formatted = match model.apply_chat_template(template, &chat, true) {
+                Ok(s) => s,
+                Err(_) => match which {
+                    // Gemma 4's wire format.
+                    super::GemmaModel::E4B | super::GemmaModel::D31B => {
+                        use std::fmt::Write as _;
+                        let mut s = String::new();
+                        if think {
+                            s.push_str("<|turn>system\n<|think|>\n<turn|>\n");
+                        }
+                        for (user, text, _) in turns.iter().copied() {
+                            let role = if *user { "user" } else { "model" };
+                            let _ = writeln!(s, "<|turn>{role}\n{text}<turn|>");
+                        }
+                        s.push_str("<|turn>model\n");
+                        s
                     }
-                    for (user, text) in &turns {
-                        let role = if *user { "user" } else { "model" };
-                        let _ = writeln!(s, "<|turn>{role}\n{text}<turn|>");
+                    // Gemma 3's wire format.
+                    super::GemmaModel::G27B => {
+                        use std::fmt::Write as _;
+                        let mut s = String::new();
+                        for (user, text, _) in turns.iter().copied() {
+                            let role = if *user { "user" } else { "model" };
+                            let _ = writeln!(s, "<start_of_turn>{role}\n{text}<end_of_turn>");
+                        }
+                        s.push_str("<start_of_turn>model\n");
+                        s
                     }
-                    s.push_str("<|turn>model\n");
-                    s
-                }
-                // Gemma 3's wire format.
-                super::GemmaModel::G27B => {
-                    use std::fmt::Write as _;
-                    let mut s = String::new();
-                    for (user, text) in &turns {
-                        let role = if *user { "user" } else { "model" };
-                        let _ = writeln!(s, "<start_of_turn>{role}\n{text}<end_of_turn>");
+                    // ChatML, Qwen's wire format.
+                    super::GemmaModel::Qwen8B | super::GemmaModel::Qwen30B => {
+                        use std::fmt::Write as _;
+                        let mut s = String::new();
+                        for (user, text, _) in turns.iter().copied() {
+                            let role = if *user { "user" } else { "assistant" };
+                            let _ = writeln!(s, "<|im_start|>{role}\n{text}<|im_end|>");
+                        }
+                        s.push_str("<|im_start|>assistant\n");
+                        s
                     }
-                    s.push_str("<start_of_turn>model\n");
-                    s
-                }
-                // ChatML, Qwen's wire format.
-                super::GemmaModel::Qwen8B | super::GemmaModel::Qwen30B => {
-                    use std::fmt::Write as _;
-                    let mut s = String::new();
-                    for (user, text) in &turns {
-                        let role = if *user { "user" } else { "assistant" };
-                        let _ = writeln!(s, "<|im_start|>{role}\n{text}<|im_end|>");
-                    }
-                    s.push_str("<|im_start|>assistant\n");
-                    s
-                }
-            },
-        };
-        // Qwen's thinking flavour was trained with the assistant turn
-        // pre-opened by `<think>` — its Jinja template hardcodes the prefill,
-        // which both llama.cpp's built-in ChatML formatter and the hand
-        // fallback above miss. Without it the reasoning arrives untagged and
-        // would all land in the visible bubble.
-        let mut formatted = formatted;
+                },
+            };
+            // Qwen's thinking flavour was trained with the assistant turn
+            // pre-opened by `<think>` — its Jinja template hardcodes the prefill,
+            // which both llama.cpp's built-in ChatML formatter and the hand
+            // fallback above miss. Without it the reasoning arrives untagged and
+            // would all land in the visible bubble.
+            let mut formatted = formatted;
         if matches!(which, super::GemmaModel::Qwen30B) {
-            formatted.push_str("<think>\n");
-        }
-        let input = MtmdInputText { text: formatted, add_special: true, parse_special: true };
-        let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
-        let chunks = mtmd
-            .tokenize(input, &bitmap_refs)
-            .map_err(|e| format!("Tokenize: {e}"))?;
+                // Thinking mode Off pre-closes an empty thought (Qwen's own
+                // no-think form), so the model goes straight to the answer.
+                formatted.push_str(if params.thinking == super::ThinkLevel::Off {
+                    "<think>\n\n</think>\n\n"
+                } else {
+                    "<think>\n"
+                });
+            }
+            Ok(formatted)
+        };
+
+        // Fit the context: the prompt plus the reply budget must stay within
+        // N_CTX, or llama.cpp fails the decode — and since the history only
+        // grows, every later message in the chat would fail too. Drop the
+        // oldest unpinned turns (never the newest) until it fits, keeping the
+        // window opening on a user turn.
+        let n_ctx = N_CTX as usize;
+        let pinned = pinned.min(turns.len());
+        let mut start = pinned;
+        let chunks = loop {
+            let kept: Vec<&(bool, String, Vec<MtmdBitmap>)> =
+                turns[..pinned].iter().chain(&turns[start..]).collect();
+            let input = MtmdInputText {
+                text: format_prompt(&kept)?,
+                add_special: true,
+                parse_special: true,
+            };
+            let bitmap_refs: Vec<&MtmdBitmap> = kept.iter().flat_map(|t| t.2.iter()).collect();
+            let chunks = mtmd
+                .tokenize(input, &bitmap_refs)
+                .map_err(|e| format!("Tokenize: {e}"))?;
+            let prompt = chunks.total_tokens();
+            if prompt + params.max_tokens <= n_ctx || start + 1 >= turns.len() {
+                // Only the newest message left: run it with whatever reply
+                // room remains, unless the message alone is too big.
+                if prompt + 256 > n_ctx {
+                    return Err(format!(
+                        "This message is too long for the model ({prompt} tokens, the limit \
+                         is {n_ctx}) — try a shorter message or a smaller attachment."
+                    ));
+                }
+                break chunks;
+            }
+            start += 1;
+            while start + 1 < turns.len() && !turns[start].0 {
+                start += 1;
+            }
+        };
         let mut n_past = chunks
             .eval_chunks(mtmd, &context, 0, 0, N_BATCH as i32, true)
             .map_err(|e| format!("Evaluate prompt: {e}"))?;
@@ -1378,7 +1601,9 @@ mod worker {
                 LlamaSampler::top_k(params.top_k.max(1)),
                 LlamaSampler::top_p(params.top_p.clamp(0.05, 1.0), 1),
                 LlamaSampler::temp(params.temperature),
-                LlamaSampler::dist(1234),
+                // A fresh seed per reply — a fixed one made "Regenerate"
+                // reproduce the same answer for the same history.
+                LlamaSampler::dist(random_seed()),
             ])
         };
 
@@ -1388,12 +1613,16 @@ mod worker {
         // reply cap without ever answering. A thought still unclosed after a
         // third of the budget is force-closed — the closing marker is fed
         // into the context, so everything after it is the visible answer.
-        let think_budget = (params.max_tokens / 3).max(256);
+        // The reply budget, shrunk to whatever room the prompt left.
+        let max_reply =
+            params.max_tokens.min(n_ctx.saturating_sub(n_past as usize));
+        // Off still gets a small budget: a stray thought is closed fast.
+        let think_budget = params.thinking.budget(max_reply).unwrap_or(64);
         let mut raw = String::new();
         // Mirror the Qwen prefill into the stream so the open-thought
         // bookkeeping below and the UI's split_channels both see the block
         // the prompt already opened.
-        if matches!(which, super::GemmaModel::Qwen30B) {
+        if matches!(which, super::GemmaModel::Qwen30B) && params.thinking != super::ThinkLevel::Off {
             raw.push_str("<think>\n");
             send(Msg::Token("<think>\n".into()));
         }
@@ -1416,9 +1645,14 @@ mod worker {
         // Streaming decoder: a token can end mid-way through a multi-byte
         // UTF-8 character (CJK, emoji), so bytes carry over between pieces.
         let mut decoder = encoding_rs::UTF_8.new_decoder();
-        for i in 0..params.max_tokens {
+        for i in 0..max_reply {
             // The UI's Stop button: end the reply here, keeping what streamed.
             if super::GEN_CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            // A forced thought-close feeds extra tokens, so also stop at the
+            // context's edge rather than failing the decode.
+            if n_past as usize + 1 >= n_ctx {
                 break;
             }
             let token = sampler.sample(&context, -1);
@@ -1476,6 +1710,15 @@ mod worker {
             }
         }
         Ok(())
+    }
+
+    /// A per-reply sampler seed from the clock (no RNG crate needed).
+    fn random_seed() -> u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        (nanos ^ (nanos >> 32)) as u32
     }
 
     /// Force-close a thought channel: feed a hidden first-person wrap-up plus
@@ -1596,6 +1839,120 @@ mod worker {
                 .map_err(|e| format!("Save frame: {e}"))?;
         }
         Ok(list(&dir))
+    }
+
+    /// Below this long edge an image is already close to what the vision
+    /// encoder reads, so close-up sections would add no detail.
+    const TILE_MIN_EDGE: u32 = 1100;
+    /// From this long edge up, the finer grids are used: Gemma 4's encoder
+    /// reads every image (section) at most 280 tokens — roughly 800 × 800 px
+    /// — so a 3-strip cut of a 6000-px photo still shrinks earrings, nails
+    /// and hair ties to a few pixels.
+    const TILE_FINE_EDGE: u32 = 3000;
+    /// How much neighbouring sections overlap, so a face or hand on a seam
+    /// appears whole in at least one of them.
+    const TILE_OVERLAP: f32 = 0.12;
+    /// Sections are saved no bigger than this (the encoder downsizes anyway).
+    const TILE_MAX_EDGE: u32 = 1280;
+
+    /// What the model is told before the close-up sections: they're parts of
+    /// one picture (so nothing is double-counted), plus a checklist of the
+    /// small details the sections exist to catch — left to itself the model
+    /// describes the big picture again and skips them.
+    const DETAIL_GUIDE: &str = "The sections below are zoomed-in parts of the same picture. \
+        Describe the picture once, and count each person or object only once. Use the \
+        sections to catch the small details a quick look misses, and include them. Look \
+        closely for: jewelry and accessories (earrings, necklaces, rings, bracelets, \
+        watches, glasses, hair clips, scarves, scrunchies, ribbons, bows, belts, bags); \
+        nail and toenail polish and its colour; makeup and lipstick; tattoos, freckles, \
+        piercings; eye colour; fabric patterns, prints, textures, stitching, buttons, \
+        laces, logos and labels; any text or lettering, word for word; small objects being \
+        held or lying nearby; surface details such as moss, lichen, rust, cracks, peeling \
+        paint, water droplets and reflections; plants, flowers and small background \
+        details.";
+
+    /// Detailed Vision: cut `path` into overlapping, position-labelled
+    /// close-up sections. The grid follows the picture's shape — 2 × 2 when
+    /// square-ish (aspect 0.75–1.33), 3 across when wide, 3 down when tall —
+    /// and gets finer for big photos (3 × 3, or 2 across × 3 down when tall,
+    /// 3 across × 2 down when wide), so each section is seen 2.5–3× sharper
+    /// than the whole. `None` for a small image (send it whole). Sections are
+    /// cached as temp PNGs keyed by path + size + modified time, like
+    /// `video_frames`.
+    pub(super) fn image_tiles(path: &Path) -> Result<Option<Vec<(&'static str, PathBuf)>>, String> {
+        use std::hash::{Hash, Hasher};
+        let (w, h) = image::image_dimensions(path).map_err(|e| format!("Read image: {e}"))?;
+        if w.max(h) < TILE_MIN_EDGE {
+            return Ok(None);
+        }
+        let aspect = w as f32 / h as f32;
+        let fine = w.max(h) >= TILE_FINE_EDGE;
+        // Labels run row by row, left to right.
+        let (cols, rows, labels): (u32, u32, &[&'static str]) = match (aspect, fine) {
+            (a, false) if a > 1.33 => (3, 1, &["Left", "Center", "Right"]),
+            (a, false) if a < 0.75 => (1, 3, &["Top", "Middle", "Bottom"]),
+            (_, false) => (2, 2, &["Top-left", "Top-right", "Bottom-left", "Bottom-right"]),
+            (a, true) if a > 1.33 => (
+                3,
+                2,
+                &["Top-left", "Top-center", "Top-right", "Bottom-left", "Bottom-center", "Bottom-right"],
+            ),
+            (a, true) if a < 0.75 => (
+                2,
+                3,
+                &["Top-left", "Top-right", "Middle-left", "Middle-right", "Bottom-left", "Bottom-right"],
+            ),
+            (_, true) => (
+                3,
+                3,
+                &[
+                    "Top-left", "Top-center", "Top-right",
+                    "Middle-left", "Center", "Middle-right",
+                    "Bottom-left", "Bottom-center", "Bottom-right",
+                ],
+            ),
+        };
+
+        let meta = std::fs::metadata(path).map_err(|e| format!("Read image: {e}"))?;
+        let mut hsh = std::collections::hash_map::DefaultHasher::new();
+        (cols, rows, TILE_MAX_EDGE).hash(&mut hsh);
+        path.hash(&mut hsh);
+        meta.len().hash(&mut hsh);
+        if let Ok(t) = meta.modified()
+            && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                d.as_secs().hash(&mut hsh);
+            }
+        let dir = std::env::temp_dir().join(format!("clarity_tagflow_ai_tiles_{:016x}", hsh.finish()));
+        let tiles: Vec<(&'static str, PathBuf)> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (*l, dir.join(format!("{i}.png"))))
+            .collect();
+        if tiles.iter().all(|(_, p)| p.exists()) {
+            return Ok(Some(tiles));
+        }
+
+        let img = image::open(path).map_err(|e| format!("Read image: {e}"))?;
+        // Section size along one axis: n sections overlapping by TILE_OVERLAP
+        // span the whole edge; each starts one (1 - overlap) step further on.
+        let span = |edge: u32, n: u32| -> (u32, f32) {
+            let size = edge as f32 / (n as f32 - (n as f32 - 1.0) * TILE_OVERLAP);
+            (size.round().min(edge as f32) as u32, size * (1.0 - TILE_OVERLAP))
+        };
+        let (tw, step_x) = span(w, cols);
+        let (th, step_y) = span(h, rows);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("Tile cache: {e}"))?;
+        for (i, (_, out)) in tiles.iter().enumerate() {
+            let (cx, cy) = (i as u32 % cols, i as u32 / cols);
+            let x = ((cx as f32 * step_x).round() as u32).min(w - tw);
+            let y = ((cy as f32 * step_y).round() as u32).min(h - th);
+            img.crop_imm(x, y, tw, th)
+                .thumbnail(TILE_MAX_EDGE, TILE_MAX_EDGE)
+                .to_rgb8()
+                .save_with_format(out, image::ImageFormat::Png)
+                .map_err(|e| format!("Save section: {e}"))?;
+        }
+        Ok(Some(tiles))
     }
 
     /// Load an image for the vision pipeline. llama.cpp's own loader (stb)
@@ -1743,6 +2100,8 @@ mod tests {
         cmd_tx
             .send(Cmd::Generate {
                 params: Default::default(),
+                pinned: 0,
+                detailed: false,
                 msgs: vec![
                     CmdMsg { user: true, text: rp.preamble(), image: None },
                     CmdMsg { user: false, text: rp.ack(), image: None },
@@ -1821,6 +2180,8 @@ mod tests {
         cmd_tx
             .send(Cmd::Generate {
                 params: Default::default(),
+                pinned: 0,
+                detailed: false,
                 msgs: vec![
                     CmdMsg { user: true, text: rp.preamble(), image: None },
                     CmdMsg { user: false, text: rp.ack(), image: None },
@@ -1926,7 +2287,7 @@ mod tests {
 
         let names: Vec<&str> = scenarios.iter().map(|(n, _)| *n).collect();
         for (_, msgs) in scenarios {
-            cmd_tx.send(Cmd::Generate { msgs, params: Default::default() }).unwrap();
+            cmd_tx.send(Cmd::Generate { msgs, params: Default::default(), pinned: 0, detailed: false }).unwrap();
         }
         drop(cmd_tx);
 
@@ -1975,6 +2336,8 @@ mod tests {
                 // A small cap (thinking budget floor is 256) so this probe
                 // also exercises the runaway-thought force-close path.
                 params: super::GenParams { max_tokens: 400, ..Default::default() },
+                pinned: 0,
+                detailed: false,
                 msgs: vec![CmdMsg {
                     user: true,
                     text: "I have 3 apples, eat one, then buy two more bags of 4 apples \
@@ -2000,6 +2363,8 @@ mod tests {
         cmd_tx
             .send(Cmd::Generate {
                 params: super::GenParams { max_tokens: 900, ..Default::default() },
+                pinned: 0,
+                detailed: false,
                 msgs: vec![
                     u(&rp.preamble()),
                     m(&rp.ack()),
@@ -2056,6 +2421,8 @@ mod tests {
         cmd_tx
             .send(Cmd::Generate {
                 params: Default::default(),
+                pinned: 0,
+                detailed: false,
                 msgs: vec![CmdMsg {
                     user: true,
                     text: "Say hello in one short sentence.".to_string(),
@@ -2066,6 +2433,8 @@ mod tests {
         cmd_tx
             .send(Cmd::Generate {
                 params: Default::default(),
+                pinned: 0,
+                detailed: false,
                 msgs: vec![
                     CmdMsg { user: true, text: "Say hello in one short sentence.".to_string(), image: None },
                     CmdMsg { user: false, text: "Hello!".to_string(), image: None },
@@ -2103,5 +2472,256 @@ mod tests {
             assert_eq!(*result, Ok(()), "generation {i} failed");
             assert!(!text.trim().is_empty(), "generation {i} produced no tokens");
         }
+    }
+
+    /// The AI-chat bug-review fixes against the real 31B (Vulkan build):
+    /// vision on real photos, a fresh seed per reply (regenerate differs),
+    /// a history far past the 16k context trimmed to fit instead of failing,
+    /// and a single oversized message rejected readably. Images come from
+    /// tests/example. Never touches the persisted role-play diary.
+    #[test]
+    #[ignore]
+    fn llm_fixes_31b() {
+        assert!(GemmaModel::D31B.installed(), "Gemma 4 31B isn't installed");
+        let imgs: Vec<PathBuf> = std::fs::read_dir("tests/example")
+            .expect("tests/example")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png"))
+            })
+            .take(3)
+            .collect();
+        assert_eq!(imgs.len(), 3, "need 3 images in tests/example");
+        eprintln!("[images] {imgs:?}");
+
+        let u = |t: &str, image: Option<PathBuf>| CmdMsg { user: true, text: t.to_string(), image };
+        let m = |t: &str| CmdMsg { user: false, text: t.to_string(), image: None };
+        let short = super::GenParams { max_tokens: 700, ..Default::default() };
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+
+        // 1. Vision on a real photo.
+        cmd_tx
+            .send(Cmd::Generate {
+                params: short,
+                pinned: 0,
+                detailed: false,
+                msgs: vec![u("Describe this image in one sentence.", Some(imgs[0].clone()))],
+            })
+            .unwrap();
+        // 2 + 3. The same ask twice — must not reproduce the same reply.
+        for _ in 0..2 {
+            cmd_tx
+                .send(Cmd::Generate {
+                    params: short,
+                    pinned: 0,
+                    detailed: false,
+                    msgs: vec![u(
+                        "Invent five unusual names for a pet dragon. Reply with just the names, comma-separated.",
+                        None,
+                    )],
+                })
+                .unwrap();
+        }
+        // 4. ~40k tokens of history behind a pinned role-play pair: the
+        // oldest turns (and their images) must be trimmed so it fits.
+        let rp = crate::roleplay::RoleplayState {
+            enabled: true,
+            ai_name: "Mira".to_string(),
+            user_name: "Sam".to_string(),
+            persona: "a cheerful travel guide".to_string(),
+            ..Default::default()
+        };
+        let filler = "We walked along the old harbour wall and talked about boats, weather, \
+                      maps and the long road home. "
+            .repeat(40);
+        let mut msgs = vec![u(&rp.preamble(), None), m(&rp.ack())];
+        for i in 0..28 {
+            let img = (i < 2).then(|| imgs[i + 1].clone());
+            msgs.push(u(&format!("Day {i}: {filler}"), img));
+            msgs.push(m(&format!("What a day {i} that was! {filler}")));
+        }
+        msgs.push(u(
+            "Important: my sister's name is Ottilie. What is my sister's name? Answer in one short sentence.",
+            None,
+        ));
+        cmd_tx
+            .send(Cmd::Generate { params: Default::default(), pinned: 2, detailed: false, msgs })
+            .unwrap();
+        // 5. One message bigger than the whole context.
+        cmd_tx
+            .send(Cmd::Generate {
+                params: short,
+                pinned: 0,
+                detailed: false,
+                msgs: vec![u(&"lorem ipsum dolor sit amet ".repeat(5000), None)],
+            })
+            .unwrap();
+        drop(cmd_tx);
+
+        let ctx = egui::Context::default();
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::D31B));
+        let mut raw = String::new();
+        let mut done: Vec<(Result<(), String>, String)> = Vec::new();
+        let t0 = std::time::Instant::now();
+        for msg in msg_rx {
+            match msg {
+                Msg::Status(s) => eprintln!("[status {:>5.1}s] {s}", t0.elapsed().as_secs_f32()),
+                Msg::Token(t) => raw.push_str(&t),
+                Msg::Done(r) => {
+                    let (_, vis) = split_channels(&raw);
+                    eprintln!(
+                        "[done {} at {:.1}s] {r:?}\n=== VISIBLE ===\n{vis}\n=== END ===",
+                        done.len() + 1,
+                        t0.elapsed().as_secs_f32()
+                    );
+                    done.push((r, vis));
+                    raw.clear();
+                }
+            }
+        }
+        handle.join().unwrap();
+        assert_eq!(done.len(), 5, "expected five completed generations");
+        assert_eq!(done[0].0, Ok(()), "vision ask failed");
+        assert!(!done[0].1.trim().is_empty(), "vision ask: no visible answer");
+        assert_eq!(done[1].0, Ok(()));
+        assert_eq!(done[2].0, Ok(()));
+        assert_ne!(done[1].1, done[2].1, "same ask twice gave the identical reply (fixed seed?)");
+        assert_eq!(done[3].0, Ok(()), "over-long history wasn't trimmed to fit");
+        assert!(done[3].1.contains("Ottilie"), "trimmed history lost the newest message");
+        let err = done[4].0.clone().expect_err("an oversized message must be rejected");
+        assert!(err.contains("too long"), "unexpected error: {err}");
+    }
+
+    /// Review harness for the Krea 2 prompt writer + Detailed Vision on the
+    /// real 31B: each tests/example picture is turned into a Krea 2 prompt
+    /// with tiling off, then on (same sampling), plus a words-only idea and a
+    /// follow-up edit. Prints everything for side-by-side review and copies
+    /// the cut sections to %TEMP%\krea_review_tiles for a visual check.
+    #[test]
+    #[ignore]
+    fn llm_krea_review_31b() {
+        assert!(GemmaModel::D31B.installed(), "Gemma 4 31B isn't installed");
+        let names = [
+            "pexels-maria-boutylina-2164524446-39873481.jpg",    // wide → 3 across
+            "pexels-kamaleshwaran-p-2164694161-40077073.jpg",   // tall → 3 down
+            "pexels-daniqux-12588915.jpg",                      // square-ish → 2 × 2
+            "0652ac34-5aa1-4075-bc34-41b91cbc6641.jpeg",         // square-ish AI art
+        ];
+        let imgs: Vec<PathBuf> =
+            names.iter().map(|n| PathBuf::from("tests/example").join(n)).collect();
+
+        // The cut sections, for eyeballing the grids and overlap.
+        let out = std::env::temp_dir().join("krea_review_tiles");
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+        for (i, img) in imgs.iter().enumerate() {
+            let tiles = worker::image_tiles(img).unwrap().expect("big enough to tile");
+            for (label, p) in tiles {
+                std::fs::copy(&p, out.join(format!("{i}_{label}.png"))).unwrap();
+            }
+        }
+        eprintln!("[tiles] {}", out.display());
+
+        let brief = || {
+            vec![
+                CmdMsg { user: true, text: crate::krea_prompt::BRIEF.to_string(), image: None },
+                CmdMsg { user: false, text: crate::krea_prompt::ACK.to_string(), image: None },
+            ]
+        };
+        let params = super::GenParams { temperature: 0.4, max_tokens: 1500, ..Default::default() };
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        let mut labels = Vec::new();
+        for (img, name) in imgs.iter().zip(names) {
+            for detailed in [false, true] {
+                let mut msgs = brief();
+                msgs.push(CmdMsg { user: true, text: String::new(), image: Some(img.clone()) });
+                cmd_tx.send(Cmd::Generate { msgs, params, pinned: 2, detailed }).unwrap();
+                labels.push(format!("{name} detailed={detailed}"));
+            }
+        }
+        let mut msgs = brief();
+        msgs.push(CmdMsg {
+            user: true,
+            text: "an old lighthouse keeper reading a letter by lamplight during a storm".into(),
+            image: None,
+        });
+        cmd_tx.send(Cmd::Generate { msgs, params, pinned: 2, detailed: true }).unwrap();
+        labels.push("idea in words".into());
+        drop(cmd_tx);
+
+        let ctx = egui::Context::default();
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::D31B));
+        let mut raw = String::new();
+        let mut results = Vec::new();
+        let t0 = std::time::Instant::now();
+        let mut last = 0.0;
+        for msg in msg_rx {
+            match msg {
+                Msg::Status(s) => eprintln!("[status {:>6.1}s] {s}", t0.elapsed().as_secs_f32()),
+                Msg::Token(t) => raw.push_str(&t),
+                Msg::Done(r) => {
+                    let (_, vis) = split_channels(&raw);
+                    let now = t0.elapsed().as_secs_f32();
+                    let i = results.len();
+                    eprintln!(
+                        "\n######## [{i}] {} — {r:?} — {:.0}s, {} words\n{vis}\n########\n",
+                        labels[i],
+                        now - last,
+                        vis.split_whitespace().count()
+                    );
+                    last = now;
+                    results.push((r, vis));
+                    raw.clear();
+                }
+            }
+        }
+        handle.join().unwrap();
+        assert_eq!(results.len(), labels.len());
+        for (i, (r, vis)) in results.iter().enumerate() {
+            assert_eq!(*r, Ok(()), "[{i}] {} failed", labels[i]);
+            assert!(!vis.trim().is_empty(), "[{i}] {}: empty prompt", labels[i]);
+        }
+    }
+
+    /// Detailed Vision grids: none for small images, the coarse grids for
+    /// medium ones, the finer ones for big photos (no model needed).
+    #[cfg(feature = "llm")]
+    #[test]
+    fn detail_tile_grids() {
+        let dir = std::env::temp_dir().join("clarity_tile_grid_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let count = |w: u32, h: u32| {
+            let p = dir.join(format!("{w}x{h}.png"));
+            image::RgbImage::new(w, h).save(&p).unwrap();
+            worker::image_tiles(&p).unwrap().map(|t| t.len())
+        };
+        assert_eq!(count(800, 800), None, "small image goes whole");
+        assert_eq!(count(1600, 1600), Some(4), "square-ish 2 x 2");
+        assert_eq!(count(2400, 1200), Some(3), "wide 3 across");
+        assert_eq!(count(1200, 2400), Some(3), "tall 3 down");
+        assert_eq!(count(3600, 3600), Some(9), "big square-ish 3 x 3");
+        assert_eq!(count(4800, 3000), Some(6), "big wide 3 x 2");
+        assert_eq!(count(3000, 4500), Some(6), "big tall 2 x 3");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writes the Detailed Vision sections of one tests/example photo to
+    /// %TEMP%\detail_tiles_preview for a visual check.
+    #[cfg(feature = "llm")]
+    #[test]
+    #[ignore]
+    fn detail_tiles_preview() {
+        let src = PathBuf::from("tests/example/pexels-vikkirillova-8813977.jpg");
+        let out = std::env::temp_dir().join("detail_tiles_preview");
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+        for (label, p) in worker::image_tiles(&src).unwrap().unwrap() {
+            std::fs::copy(&p, out.join(format!("{label}.png"))).unwrap();
+        }
+        eprintln!("{}", out.display());
     }
 }

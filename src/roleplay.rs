@@ -13,11 +13,14 @@
 //!
 //! Everything persists to a JSON sidecar in the models dir, so the character
 //! and its memories survive restarts (unlike the chats themselves, for now).
-//! The file is **encrypted at rest** (src/secret.rs — DPAPI on Windows, tied
+//! On Windows the file is **encrypted at rest** (src/secret.rs — DPAPI, tied
 //! to the user account): diaries can hold private story material, so they
 //! shouldn't be readable as plaintext from disk, by other user accounts, or
-//! when copied to another machine. Pre-encryption plaintext files still load
-//! and get encrypted on their next save.
+//! when copied to another machine. On macOS/Linux it is only obfuscated (a
+//! fixed-key XOR), not encrypted. Pre-encryption plaintext files still load
+//! and get protected on their next save. A file that exists but can't be
+//! read back (another PC, a reinstalled Windows, a different account) is
+//! never overwritten — see `load_failed`.
 
 use eframe::egui;
 
@@ -59,6 +62,11 @@ pub struct RoleplayState {
     /// The "add a memory" input box (not persisted).
     #[serde(skip)]
     pub new_memory: String,
+    /// A diary file exists but couldn't be decrypted/parsed (e.g. DPAPI on a
+    /// new PC or user account). Saving is refused so the blank state never
+    /// overwrites the real diary; the panel offers to set it aside instead.
+    #[serde(skip)]
+    pub load_failed: bool,
 }
 
 fn store_path() -> std::path::PathBuf {
@@ -70,16 +78,39 @@ fn album_dir() -> std::path::PathBuf {
     crate::tagger::models_root().join("ai_chat_album")
 }
 
+/// Decrypted album pictures shown in chat. Plain copies by necessity (the
+/// chat and the model read files), so they're wiped at exit and at startup.
+fn album_temp_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("clarity_album")
+}
+
+/// Delete every decrypted album copy (see [`album_temp_dir`]).
+pub fn clear_album_temp() {
+    let _ = std::fs::remove_dir_all(album_temp_dir());
+}
+
 impl RoleplayState {
     pub fn load() -> Self {
-        std::fs::read_to_string(store_path())
-            .ok()
-            .map(|s| crate::secret::unprotect(s.trim()))
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        // Decrypted album pictures from a previous run (a crash skips the
+        // exit-time cleanup) — never leave them lying around.
+        clear_album_temp();
+        let Ok(stored) = std::fs::read_to_string(store_path()) else {
+            return Self::default(); // no diary yet
+        };
+        if stored.trim().is_empty() {
+            return Self::default();
+        }
+        // `unprotect` yields "" for ciphertext this account can't decrypt.
+        match serde_json::from_str(&crate::secret::unprotect(stored.trim())) {
+            Ok(state) => state,
+            Err(_) => Self { load_failed: true, ..Default::default() },
+        }
     }
 
     pub fn save(&self) {
+        if self.load_failed {
+            return; // never clobber a diary we couldn't read
+        }
         if let Ok(json) = serde_json::to_string(self) {
             let _ = std::fs::create_dir_all(crate::tagger::models_root());
             let _ = std::fs::write(store_path(), crate::secret::protect(&json));
@@ -118,7 +149,19 @@ impl RoleplayState {
             .and_then(|e| e.to_str())
             .unwrap_or("jpg")
             .to_ascii_lowercase();
-        let n = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) / 2 + 1;
+        // One past the highest number in use — counting files would reuse a
+        // number (and overwrite a kept picture) once any had been forgotten.
+        let n = std::fs::read_dir(&dir)
+            .map(|d| {
+                d.filter_map(|e| {
+                    let name = e.ok()?.file_name().to_string_lossy().to_string();
+                    name.strip_prefix("img_")?.split('.').next()?.parse::<u32>().ok()
+                })
+                .max()
+                .unwrap_or(0)
+            })
+            .unwrap_or(0)
+            + 1;
         let name = format!("img_{n:03}.{ext}");
 
         let bytes = std::fs::read(src).map_err(|e| format!("read image: {e}"))?;
@@ -139,9 +182,40 @@ impl RoleplayState {
         let name = std::path::Path::new(name).file_name()?.to_string_lossy().to_string();
         let stored = std::fs::read(album_dir().join(format!("{name}.enc"))).ok()?;
         let bytes = crate::secret::unprotect_bytes(&stored)?;
-        let tmp = std::env::temp_dir().join(format!("clarity_album_{name}"));
+        let dir = album_temp_dir();
+        std::fs::create_dir_all(&dir).ok()?;
+        let tmp = dir.join(&name);
         std::fs::write(&tmp, bytes).ok()?;
         Some(tmp)
+    }
+
+    /// Forget diary entry `i`; an entry about an album picture takes the
+    /// picture (and its description) with it.
+    pub fn forget(&mut self, i: usize) {
+        if i >= self.memories.len() {
+            return;
+        }
+        let m = self.memories.remove(i);
+        if let Some(name) = m.image
+            && let Some(name) = std::path::Path::new(&name).file_name()
+        {
+            let name = name.to_string_lossy().to_string();
+            let stem = name.split('.').next().unwrap_or(&name).to_string();
+            let dir = album_dir();
+            let _ = std::fs::remove_file(dir.join(format!("{name}.enc")));
+            let _ = std::fs::remove_file(dir.join(format!("{stem}.txt.enc")));
+            let _ = std::fs::remove_file(album_temp_dir().join(&name));
+        }
+        self.save();
+    }
+
+    /// Give up on an unreadable diary: move it aside (kept as a `.bak`, in
+    /// case the original account/PC can still read it) and start fresh.
+    pub fn start_new_diary(&mut self) {
+        let path = store_path();
+        let _ = std::fs::rename(&path, path.with_extension("json.bak"));
+        *self = Self { enabled: self.enabled, ..Default::default() };
+        self.save();
     }
 
     /// The display name used for the AI ("the AI" placeholder when unset).
@@ -347,6 +421,25 @@ pub fn panel_ui(ui: &mut egui::Ui, rp: &mut RoleplayState) {
     });
     ui.add_space(6.0);
 
+    if rp.load_failed {
+        ui.label(
+            egui::RichText::new(
+                "Your saved diary couldn't be unlocked — it was encrypted on \
+                 another PC or user account. Nothing will be saved over it.",
+            )
+            .color(egui::Color32::from_rgb(210, 70, 70))
+            .size(11.5),
+        );
+        if ui
+            .button(egui::RichText::new("Start a new diary").size(11.5))
+            .on_hover_text("Keeps the old file as ai_chat_roleplay.json.bak")
+            .clicked()
+        {
+            rp.start_new_diary();
+        }
+        ui.add_space(6.0);
+    }
+
     let mut changed = false;
     ui.horizontal(|ui| {
         let w = (ui.available_width() - 16.0) / 2.0;
@@ -435,8 +528,7 @@ pub fn panel_ui(ui: &mut egui::Ui, rp: &mut RoleplayState) {
                 });
         }
         if let Some(i) = delete {
-            rp.memories.remove(i);
-            rp.save();
+            rp.forget(i);
         }
         if rp.memories.is_empty() {
             ui.label(
@@ -501,7 +593,7 @@ SHOW_IMAGE: y"), "hi");
     /// as plaintext (Windows).
     #[test]
     fn album_bytes_encrypt_round_trip() {
-        let data = b"fake image bytes   with binary".to_vec();
+        let data = b"fake image bytes \x00\x01\x02 with binary".to_vec();
         let stored = crate::secret::protect_bytes(&data);
         #[cfg(windows)]
         {

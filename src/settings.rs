@@ -77,6 +77,12 @@ pub struct Settings {
     pub ai_voice_style: String,
     /// Auto-speak: read every finished AI reply aloud (tools menu toggle).
     pub ai_auto_speak: bool,
+    /// Detailed vision: the chat's newest image goes to the model as the full
+    /// picture plus overlapping close-up sections (tools menu toggle).
+    pub ai_detailed_vision: bool,
+    /// Krea 2 prompts: the chat turns pictures and ideas into Krea 2
+    /// text-to-image prompts (tools menu toggle; implies detailed vision).
+    pub ai_krea_prompts: bool,
     /// Which local model the AI chat runs (Gemma E4B / 27B / 31B, Qwen3-VL
     /// 8B / 30B Thinking).
     pub ai_gemma_model: crate::llm::GemmaModel,
@@ -180,6 +186,8 @@ impl Default for Settings {
             ai_chat: false,
             ai_voice_style: crate::voice::DEFAULT_STYLE.to_string(),
             ai_auto_speak: false,
+            ai_detailed_vision: false,
+            ai_krea_prompts: false,
             ai_gemma_model: crate::llm::GemmaModel::default(),
             ai_gen: crate::llm::GenParams::default(),
             ai_voice_ref_audio: String::new(),

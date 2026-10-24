@@ -73,6 +73,8 @@ mod ai_chat;
 mod voice;
 // Role playing for the AI Chat: persona, names, shared memory diary.
 mod roleplay;
+// Krea 2 prompt writer for the AI Chat (tools menu).
+mod krea_prompt;
 // The zip viewer only needs the (non-optional) `zip` crate, so it compiles in
 // every build — including the no-default-features release/CI configurations.
 mod archive;
@@ -1592,6 +1594,13 @@ impl eframe::App for ViewerApp {
         self.video_previews.set_enabled(self.settings.video_thumbnail_play);
         self.video_previews.begin_frame();
 
+        // Chat switched off mid-reply: keep draining the worker so the reply
+        // finishes and the deferred unload frees the model weights (nothing
+        // else polls once the chat view and Settings are closed).
+        if !self.settings.ai_chat && self.llm.running {
+            self.llm.poll(ui.ctx());
+        }
+
         // AI Chat mode replaces the panels with a full-window chat with the
         // local model (the top bar stays). Takes precedence over the layouts.
         if self.settings.ai_chat {
@@ -1785,6 +1794,8 @@ impl eframe::App for ViewerApp {
             self.llm.voice.ref_text = self.settings.ai_voice_ref_text.clone();
         }
         self.llm.auto_speak = self.settings.ai_auto_speak;
+        self.llm.detailed_vision = self.settings.ai_detailed_vision;
+        self.llm.krea_prompts = self.settings.ai_krea_prompts;
         self.llm.params = self.settings.ai_gen;
         self.llm.set_model(self.settings.ai_gemma_model);
         settings::show(ui.ctx(), &mut self.settings, &mut self.update, &mut self.ftp, &mut self.llm);
