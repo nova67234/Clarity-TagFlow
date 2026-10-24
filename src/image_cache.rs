@@ -527,9 +527,35 @@ pub(crate) fn exif_orientation(path: &Path) -> image::metadata::Orientation {
 /// viewer shows it. Phones often store portraits sideways with a "rotate
 /// this" flag; anything that decodes stills outside the viewer (the AI
 /// chat's thumbnails, its vision input and Detailed Vision sections) uses
-/// this so it never sees them sideways.
+/// this so it never sees them sideways. Like the viewer, it reads images
+/// inside a mounted zip, and SVG, HDR and (with the `avif` feature)
+/// AVIF/HEIC through the viewer's own decoders — so the AI can see anything
+/// the browser shows.
 pub(crate) fn open_oriented(path: &Path) -> image::ImageResult<image::DynamicImage> {
-    let mut img = image::open(path)?;
+    let special = if ext_eq(path, "svg") {
+        decode_svg(path, 2048)
+    } else if ext_eq(path, "hdr") {
+        decode_hdr(path)
+    } else {
+        None
+    };
+    if let Some(rgba) = special {
+        return Ok(image::DynamicImage::ImageRgba8(rgba));
+    }
+    #[cfg(feature = "avif")]
+    {
+        if path.extension().and_then(|e| e.to_str()).is_some_and(crate::is_extended_extension)
+            && let Some(rgba) = crate::avif::decode_avif(path)
+        {
+            return Ok(image::DynamicImage::ImageRgba8(rgba));
+        }
+    }
+    let mut reader = image_reader(path).map_err(image::ImageError::IoError)?;
+    match image::ImageFormat::from_path(path) {
+        Ok(format) => reader.set_format(format),
+        Err(_) => reader = reader.with_guessed_format().map_err(image::ImageError::IoError)?,
+    }
+    let mut img = reader.decode()?;
     img.apply_orientation(exif_orientation(path));
     Ok(img)
 }

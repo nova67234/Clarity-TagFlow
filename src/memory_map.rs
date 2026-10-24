@@ -10,12 +10,13 @@
 //! inside a brain-shaped volume (two hemispheres split by the central fissure,
 //! temporal lobes, cerebellum and brainstem), rotated and projected with a
 //! simple perspective every frame, far points dimmer and smaller than near
-//! ones. Opened from AI Settings → Memory (src/ai_settings.rs).
+//! ones. Opened from AI Settings → Memory (src/ai_settings.rs), or → Role
+//! play for role play's own memories (the same map, a separate store).
 
 use eframe::egui;
 use egui::{Color32, CornerRadius, Pos2, Rect, Stroke, Vec2};
 
-use crate::memory::{format_date, MemoryStore};
+use crate::memory::{format_date, MemoryKind, MemoryStore};
 use crate::theme::*;
 
 /// Topic colours, in topic order (wraps after ten).
@@ -325,6 +326,13 @@ enum Panel {
 /// The memory map window's state, owned by `LlmState`.
 pub struct MapState {
     pub open: bool,
+    /// Which store the map shows: the main memory or role play's.
+    kind: MemoryKind,
+    /// Role play: the character's name, for the title ("Mira's memories").
+    ai_name: String,
+    /// A memory just forgotten, for the window to finish off (role play
+    /// deletes the album picture it was about).
+    forgotten: Option<crate::memory::Memory>,
     /// Rotation the user dragged to (the idle sway swings around it).
     base_yaw: f32,
     pitch: f32,
@@ -351,6 +359,9 @@ impl Default for MapState {
     fn default() -> Self {
         Self {
             open: false,
+            kind: MemoryKind::Main,
+            ai_name: String::new(),
+            forgotten: None,
             base_yaw: START_YAW,
             pitch: START_PITCH,
             zoom: 1.0,
@@ -386,6 +397,7 @@ pub fn window(ctx: &egui::Context, llm: &mut crate::llm::LlmState) {
         return;
     }
     let mut map = std::mem::take(&mut llm.memory_map);
+    map.ai_name = llm.roleplay.ai_display().to_string();
     let mut ask: Option<String> = None;
     let screen = ctx.content_rect();
     let size = egui::vec2(
@@ -400,7 +412,20 @@ pub fn window(ctx: &egui::Context, llm: &mut crate::llm::LlmState) {
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .frame(crate::settings::window_frame())
         .fixed_size(size)
-        .show(ctx, |ui| map.ui(ui, &mut llm.memory, &mut ask));
+        .show(ctx, |ui| {
+            let store = match map.kind {
+                MemoryKind::Main => &mut llm.memory,
+                MemoryKind::Roleplay => &mut llm.rp_memory,
+            };
+            map.ui(ui, store, &mut ask);
+        });
+    // Role play: forgetting a memory about a kept picture deletes the picture.
+    if let Some(m) = map.forgotten.take()
+        && map.kind == MemoryKind::Roleplay
+        && let Some(image) = m.image
+    {
+        crate::roleplay::remove_album_picture(&image);
+    }
     if let Some(q) = ask {
         llm.draft = q;
         map.open = false;
@@ -409,6 +434,26 @@ pub fn window(ctx: &egui::Context, llm: &mut crate::llm::LlmState) {
 }
 
 impl MapState {
+    /// Open the map on `kind`'s memories (switching stores starts afresh:
+    /// no selection, search or hidden topics carried over).
+    pub fn show(&mut self, kind: MemoryKind) {
+        if self.kind != kind {
+            *self = MapState { kind, ..Default::default() };
+        }
+        self.open = true;
+    }
+
+    /// The window's title: "Memory map", or the character's memories.
+    fn title(&self) -> String {
+        match self.kind {
+            MemoryKind::Main => "Memory map".to_string(),
+            MemoryKind::Roleplay if self.ai_name.is_empty() || self.ai_name == "the AI" => {
+                "Role play memories".to_string()
+            }
+            MemoryKind::Roleplay => format!("{}'s memories", self.ai_name),
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, store: &mut MemoryStore, ask: &mut Option<String>) {
         // Same rounded inputs as the Settings window.
         let radius = CornerRadius::same(10);
@@ -471,7 +516,7 @@ impl MapState {
                     .fit_to_exact_size(egui::vec2(22.0, 22.0))
                     .tint(TEXT()),
             );
-            ui.label(egui::RichText::new("Memory map").color(TEXT()).strong().size(17.0));
+            ui.label(egui::RichText::new(self.title()).color(TEXT()).strong().size(17.0));
             let (n, t) = (store.count(), store.topics.len());
             let counts = format!(
                 "{n} {} · {t} {}",
@@ -511,7 +556,11 @@ impl MapState {
 
     fn start_new(&mut self, store: &MemoryStore) {
         self.panel = Panel::New;
-        self.draft_topic = store.topics.first().map(|t| t.name.clone()).unwrap_or_default();
+        self.draft_topic = match store.topics.first() {
+            Some(t) => t.name.clone(),
+            None if self.kind == MemoryKind::Roleplay => "Story".to_string(),
+            None => String::new(),
+        };
         self.draft_new_topic.clear();
         self.draft_title.clear();
         self.draft_text.clear();
@@ -716,10 +765,18 @@ impl MapState {
                 TEXT(),
                 rect.width() * 0.7,
             );
+            let how = match self.kind {
+                MemoryKind::Main => {
+                    "Turn on Remember across chats in AI Settings, and the AI will file what it learns \
+                     here after each chat. You can also add one yourself with New memory."
+                }
+                MemoryKind::Roleplay => {
+                    "The AI writes memories here as the story unfolds. You can also add one yourself \
+                     with New memory."
+                }
+            };
             let sub = painter.layout(
-                "Turn on Remember across chats in AI Settings, and the AI will file what it learns \
-                 here after each chat. You can also add one yourself with New memory."
-                    .to_string(),
+                how.to_string(),
                 egui::FontId::proportional(12.0),
                 MUTED(),
                 rect.width() * 0.7,
@@ -755,10 +812,16 @@ impl MapState {
         if store.load_failed {
             ui.label(egui::RichText::new("Memories couldn't be read").color(TEXT()).strong().size(14.0));
             ui.label(
-                egui::RichText::new(
-                    "They were probably saved on another computer or user account. They're left \
-                     untouched; AI Settings → Memory can start fresh.",
-                )
+                egui::RichText::new(match self.kind {
+                    MemoryKind::Main => {
+                        "They were probably saved on another computer or user account. They're left \
+                         untouched; AI Settings → Memory can start fresh."
+                    }
+                    MemoryKind::Roleplay => {
+                        "They were probably saved on another computer or user account. They're left \
+                         untouched; AI Settings → Role play can start fresh."
+                    }
+                })
                 .color(MUTED())
                 .size(12.0),
             );
@@ -818,12 +881,31 @@ impl MapState {
             } else {
                 format!("Saved {}", format_date(m.created))
             };
-            ui.label(egui::RichText::new(when).color(MUTED()).size(11.5));
+            let who = match (m.by_ai, self.kind) {
+                (false, _) => "added by you".to_string(),
+                (true, MemoryKind::Main) => "by the AI".to_string(),
+                (true, MemoryKind::Roleplay) => format!("by {}", self.ai_name),
+            };
+            ui.label(egui::RichText::new(format!("{when} · {who}")).color(MUTED()).size(11.5));
         });
         ui.add_space(4.0);
         ui.label(egui::RichText::new(&m.title).color(TEXT()).strong().size(15.0));
         if !m.text.is_empty() {
             ui.label(egui::RichText::new(&m.text).color(MUTED()).size(12.5));
+        }
+        if m.image.is_some() {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Image::new(egui::include_image!("../icons/image.svg"))
+                        .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                        .tint(MUTED()),
+                );
+                ui.label(
+                    egui::RichText::new("About a picture in the album (forgetting this deletes it)")
+                        .color(MUTED())
+                        .size(11.5),
+                );
+            });
         }
         ui.add_space(10.0);
         ui.horizontal(|ui| {
@@ -832,8 +914,11 @@ impl MapState {
                 .on_hover_text("Put a question about this memory in the chat box")
                 .clicked()
             {
-                // The topic helps the model look up the right memories.
-                *ask = Some(format!("What do you remember about \"{}\" ({})?", m.title, topic.name));
+                *ask = Some(match self.kind {
+                    // The topic helps the model look up the right memories.
+                    MemoryKind::Main => format!("What do you remember about \"{}\" ({})?", m.title, topic.name),
+                    MemoryKind::Roleplay => format!("Do you remember this: \"{}\"?", m.title),
+                });
             }
             if ui.button(egui::RichText::new("Edit").size(12.5)).clicked() {
                 self.draft_title.clone_from(&m.title);
@@ -890,7 +975,7 @@ impl MapState {
                 .fill(Color32::from_rgb(180, 40, 40));
             if ui.add(forget).clicked() {
                 if let Some(id) = self.selected.take() {
-                    store.delete(ti, id);
+                    self.forgotten = store.delete(ti, id);
                 }
                 self.panel = Panel::Overview;
             }
@@ -909,12 +994,21 @@ impl MapState {
         } else {
             self.draft_topic.clone()
         };
+        // Role play offers its categories even before they have memories.
+        let mut choices: Vec<String> = store.topics.iter().map(|t| t.name.clone()).collect();
+        if self.kind == MemoryKind::Roleplay {
+            for t in crate::roleplay::TOPICS {
+                if store.find_topic(t).is_none() {
+                    choices.push(t.to_string());
+                }
+            }
+        }
         egui::ComboBox::from_id_salt("memory_new_topic")
             .width(ui.available_width())
             .selected_text(shown)
             .show_ui(ui, |ui| {
-                for t in &store.topics {
-                    ui.selectable_value(&mut self.draft_topic, t.name.clone(), &t.name);
+                for name in &choices {
+                    ui.selectable_value(&mut self.draft_topic, name.clone(), name);
                 }
                 ui.selectable_value(&mut self.draft_topic, NEW.to_string(), "New topic…");
             });

@@ -268,6 +268,61 @@ impl Default for RightPanelState {
     }
 }
 
+impl RightPanelState {
+    /// `image`'s tags are open in the Details editor with changes not saved
+    /// yet — the AI chat leaves that .txt alone rather than write under them.
+    pub fn unsaved_edit(&self, image: &Path) -> bool {
+        self.is_editing && self.last_path.as_deref() == Some(image) && self.current_tags != self.loaded_tags
+    }
+
+    /// Tags were written to `image`'s .txt from outside the panel (the AI
+    /// chat's Tag images mode): show them, as saved.
+    pub fn tags_written(&mut self, image: &Path, text: &str) {
+        if self.last_path.as_deref() == Some(image) {
+            self.current_tags = text.to_string();
+            self.loaded_tags = text.to_string();
+            self.tags_error = None;
+        }
+    }
+}
+
+/// The AI chat's Tag images view: the right panel held on the Tag Manager,
+/// with the same width, card and selection handling as the normal one.
+pub fn show_tag_panel(
+    ui: &mut egui::Ui,
+    state: &mut RightPanelState,
+    current_image: Option<&Path>,
+    tag_manager: &mut TagManagerState,
+    all_images: &[PathBuf],
+) {
+    // An unsaved edit from the Details view is saved first, so the AI and the
+    // Tag Manager never work from text that isn't on disk.
+    if state.is_editing {
+        if state.current_tags != state.loaded_tags
+            && let Some(prev) = state.last_path.clone()
+            && !crate::archive::is_entry(&prev)
+            && !save_tags(state, &prev)
+        {
+            eprintln!("[tags] couldn't save the edit to {}", sidecar_txt(&prev).display());
+        }
+        state.is_editing = false;
+    }
+    sync_selection(state, current_image, ui.ctx());
+    egui::Panel::right("right_details")
+        .resizable(false)
+        .exact_size(PANEL_WIDTH)
+        .show_separator_line(false)
+        .frame(egui::Frame::new().fill(BG()).inner_margin(egui::Margin { left: 10, right: 10, top: 0, bottom: 10 }))
+        .show_inside(ui, |ui| {
+            card_frame(22)
+                .inner_margin(egui::Margin { left: 12, right: 12, top: 12, bottom: 12 })
+                .show(ui, |ui| {
+                    ui.set_min_height(ui.available_height());
+                    crate::tag_manager::show(ui, tag_manager, current_image, &mut state.current_tags, all_images);
+                });
+        });
+}
+
 /// Actions that the right panel can request the main app to perform
 /// (since the panel itself doesn't own the image list).
 pub enum RightPanelAction {
@@ -297,23 +352,10 @@ fn save_tags(state: &mut RightPanelState, image: &Path) -> bool {
     ok
 }
 
-/// Render the right details panel.
-pub fn show(
-    ui: &mut egui::Ui,
-    state: &mut RightPanelState,
-    current_image: Option<&Path>,
-    confirm_before_delete: &mut bool,
-    tag_manager: &mut TagManagerState,
-    all_images: &[PathBuf],
-) -> RightPanelAction {
-    // 0. Non-blocking check to see if our background thread finished calculating
-    if let Some(rx) = &state.meta_rx
-        && let Ok(meta) = rx.try_recv() {
-            state.meta = meta;
-            state.meta_rx = None; // Finished!
-        }
-
-    // 1. Sync the text box state when the selected image changes.
+/// Load the newly selected image's tags (and kick off its metadata) when the
+/// selection changes, saving an unsaved edit of the image being left first.
+/// Shared by the right panel and the AI chat's Tag images view.
+fn sync_selection(state: &mut RightPanelState, current_image: Option<&Path>, ctx: &egui::Context) {
     if state.last_path.as_deref() != current_image {
         // Leaving an image mid-edit (clicking another thumbnail, arrow keys)
         // saves the edit instead of silently dropping it.
@@ -378,7 +420,7 @@ pub fn show(
             let meta_gen = Arc::clone(&state.meta_gen);
 
             let path_clone = path.to_path_buf();
-            let ctx = ui.ctx().clone();
+            let ctx = ctx.clone();
 
             thread::spawn(move || {
                 // Skip the heavy decode entirely if the selection already moved on.
@@ -403,6 +445,27 @@ pub fn show(
             state.meta = ImageMeta::default();
         }
     }
+
+}
+
+/// Render the right details panel.
+pub fn show(
+    ui: &mut egui::Ui,
+    state: &mut RightPanelState,
+    current_image: Option<&Path>,
+    confirm_before_delete: &mut bool,
+    tag_manager: &mut TagManagerState,
+    all_images: &[PathBuf],
+) -> RightPanelAction {
+    // 0. Non-blocking check to see if our background thread finished calculating
+    if let Some(rx) = &state.meta_rx
+        && let Ok(meta) = rx.try_recv() {
+            state.meta = meta;
+            state.meta_rx = None; // Finished!
+        }
+
+    // 1. Sync the text box state when the selected image changes.
+    sync_selection(state, current_image, ui.ctx());
 
     let mut action = RightPanelAction::None;
 

@@ -170,21 +170,38 @@ pub fn apply_tags(old: &str, new_tags: &[String]) -> String {
         return format!("{}{}{}", &old[..a], added[0], &old[b..]);
     }
 
-    // Cut removed segments (each with the separator after it, or before it
-    // for the last one), back to front so earlier spans stay valid.
+    // Cut removed segments, each with one separator: the one after it, or —
+    // for removed segments after the last kept one — the one before it, from
+    // the end of the last kept segment. The ranges are worked out on the
+    // original text and merged where they meet (several trailing tags removed
+    // at once share one cut), then cut back to front so earlier spans stay
+    // valid.
     let mut text = old.to_string();
-    for &i in removed.iter().rev() {
-        let (a, b) = segs[i];
-        let (cut_a, cut_b) = match segs.get(i + 1) {
-            // Up to the next segment: drops "tag, " cleanly.
-            Some(&(next, _)) => (a, next),
-            // Last segment: drop the separator before it instead.
-            None => (
-                old[..a].trim_end().trim_end_matches([',', '\n']).trim_end().len(),
-                b,
-            ),
-        };
-        text.replace_range(cut_a..cut_b, "");
+    let last_kept = (0..segs.len()).rev().find(|i| !removed.contains(i));
+    let mut cuts: Vec<(usize, usize)> = removed
+        .iter()
+        .map(|&i| {
+            let (a, b) = segs[i];
+            match last_kept {
+                // Up to the next segment: drops "tag, " cleanly.
+                Some(k) if i < k => (a, segs[i + 1].0),
+                // After the last kept tag: drop the separator before it.
+                Some(k) => (segs[k].1, b),
+                // Every tag goes: the words and what separates them.
+                None => (a, segs.get(i + 1).map_or(b, |s| s.0)),
+            }
+        })
+        .collect();
+    cuts.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in cuts {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    for &(a, b) in merged.iter().rev() {
+        text.replace_range(a..b, "");
     }
     for t in added {
         let base = text.trim_end();
@@ -253,5 +270,26 @@ mod tests {
         assert_eq!(apply_tags(old, &v(&["1girl", "solo", "red hair", "smile"])), old);
         assert_eq!(apply_tags(old, &v(&["solo", "1girl", "red hair", "smile"])), "solo, 1girl, red hair, smile");
         assert_eq!(apply_tags("", &v(&["a", "b"])), "a, b");
+    }
+
+    /// Several tags removed at once — at the end, in a row, or all of them —
+    /// with additions in the same write (the AI chat's edits and undos do
+    /// this) cut cleanly instead of overlapping (which used to panic).
+    #[test]
+    fn several_removals_at_once() {
+        let old = "a, b, c, d";
+        assert_eq!(apply_tags(old, &v(&["a", "b"])), "a, b");
+        assert_eq!(apply_tags(old, &v(&["a", "c"])), "a, c");
+        assert_eq!(apply_tags(old, &v(&["d"])), "d");
+        assert_eq!(apply_tags(old, &v(&["x"])), "x");
+        assert_eq!(apply_tags("a, b, c\n", &v(&["a"])), "a\n");
+        let tagged = "scenery, sunset, mountain, lake, orange sky, reflection, no humans, outdoors, golden hour, sun";
+        assert_eq!(
+            apply_tags(
+                tagged,
+                &v(&["scenery", "sunset", "mountain", "lake", "orange sky", "reflection", "no humans", "outdoors", "cloud"])
+            ),
+            "scenery, sunset, mountain, lake, orange sky, reflection, no humans, outdoors, cloud"
+        );
     }
 }

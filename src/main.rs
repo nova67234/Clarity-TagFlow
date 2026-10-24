@@ -69,17 +69,22 @@ mod ai_models;
 mod ai_orb;
 // The full-window AI Chat view (Settings → AI Model → Activate AI Chat).
 mod ai_chat;
-// AI Settings window (the chat list's gear): replies + memory tabs.
+// AI Settings window (the chat list's or Tools menu's gear): replies, memory
+// and role play tabs.
 mod ai_settings;
-// The AI's long-term memory across chats, and its 3D memory map.
+// The AI's long-term memory across chats (and role play's own, kept apart),
+// and the 3D memory map.
 mod memory;
 mod memory_map;
 // The OmniVoice neural voice for the chat's Listen buttons (Python sidecar).
 mod voice;
-// Role playing for the AI Chat: persona, names, shared memory diary.
+// Role playing for the AI Chat: persona, names, its own memories.
 mod roleplay;
 // Krea 2 prompt writer for the AI Chat (tools menu).
 mod krea_prompt;
+// Tag images with the AI Chat (tools menu): the image, the chat and the Tag
+// Manager side by side; the AI can change tags.
+mod ai_tagging;
 // Encoding-tolerant, minimal-change .txt tag sidecar reading/writing.
 mod sidecar;
 // The zip viewer only needs the (non-optional) `zip` crate, so it compiles in
@@ -1232,6 +1237,234 @@ impl ViewerApp {
         };
     }
 
+    /// Mirror Tag Manager choices into the persisted Settings so they
+    /// auto-save: the chosen tagger model (restored next launch) and the
+    /// gear popup's settings (it has no Save button).
+    fn sync_tag_manager_settings(&mut self) {
+        if self.settings.last_ai_model != self.tag_manager.ai_model {
+            self.settings.last_ai_model = self.tag_manager.ai_model.clone();
+        }
+        if self.settings.tag_manager != self.tag_manager.settings {
+            self.settings.tag_manager = self.tag_manager.settings.clone();
+        }
+    }
+
+    /// The AI chat's Tag images view, left panel: the selected image with
+    /// previous/next (src/ai_tagging.rs draws it; the textures come from the
+    /// centre viewer's caches, so switching views doesn't reload).
+    fn ai_tag_image_panel(&mut self, ui: &mut egui::Ui, path: &std::path::Path, width: f32) {
+        let now = ui.input(|i| i.time);
+        let (tex, loading, failed) = if is_video(path) {
+            (self.video_thumbs.request(path, ui.ctx()), false, false)
+        } else {
+            match self.viewer.request(path, now) {
+                image_cache::Cached::Ready(tex) => (Some(tex), false, false),
+                image_cache::Cached::Animated(frame) => {
+                    // Keep a GIF playing, capped like the centre viewer.
+                    ui.ctx().request_repaint_after(Duration::from_millis(16));
+                    (Some(frame), false, false)
+                }
+                image_cache::Cached::Failed => (None, false, true),
+                image_cache::Cached::Loading => {
+                    ui.ctx().request_repaint_after(Duration::from_millis(60));
+                    match self.thumbs.request(path, now) {
+                        image_cache::Cached::Ready(t) | image_cache::Cached::Animated(t) => (Some(t), true, false),
+                        _ => (None, true, false),
+                    }
+                }
+            }
+        };
+        let position = self
+            .selected
+            .and_then(|sel| self.filtered.iter().position(|&i| i == sel))
+            .map(|p| p + 1);
+        let step = ai_tagging::image_panel(
+            ui,
+            ai_tagging::PanelImage {
+                path,
+                position,
+                total: self.filtered.len(),
+                tex: tex.as_ref(),
+                loading,
+                failed,
+            },
+            width,
+        );
+        if step != 0 {
+            self.step_selection(step);
+        }
+    }
+
+    /// Carry out the AI chat's tag edits and undos (Tag images mode): write
+    /// the image's .txt, refresh the Tag Manager when it's the image on show,
+    /// and keep the change on the reply for its note and Undo button.
+    fn apply_ai_tag_requests(&mut self, ctx: &egui::Context) {
+        for request in self.llm.take_tag_requests() {
+            match request {
+                ai_tagging::TagRequest::Apply { chat_id, index, image, edits } => {
+                    let change = self.ai_apply_tags(image, &edits);
+                    if let Some(m) = self.llm.msg_mut(chat_id, index) {
+                        m.tag_change = Some(change);
+                    }
+                }
+                ai_tagging::TagRequest::Undo { chat_id, index } => {
+                    self.ai_undo_reply(chat_id, index, false);
+                }
+                // Regenerate / edit-and-resend: the replies being replaced
+                // take their tag changes back first — newest first, so each
+                // finds the file as it left it — then the chat resends.
+                ai_tagging::TagRequest::Rewind { chat_id, from, then } => {
+                    let len = self.llm.chats.iter().find(|c| c.id == chat_id).map_or(0, |c| c.msgs.len());
+                    let undone = (from..len).rev().all(|index| self.ai_undo_reply(chat_id, index, true));
+                    let still_open = self.llm.chats.get(self.llm.active_chat).is_some_and(|c| c.id == chat_id);
+                    if !undone {
+                        self.llm.run_err = Some(
+                            "Couldn't take back a reply's tag changes, so nothing was resent — the note under \
+                             it says why."
+                                .to_string(),
+                        );
+                        // The rewritten message isn't lost: back into its editor.
+                        if let ai_tagging::Resend::Edit(i, text) = then {
+                            self.llm.editing = Some((chat_id, i));
+                            self.llm.edit_draft = text;
+                        }
+                    } else if still_open {
+                        match then {
+                            ai_tagging::Resend::Retry(i) => self.llm.retry_now(i, ctx),
+                            ai_tagging::Resend::Edit(i, text) => self.llm.apply_edit_now(i, text, ctx),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Undo the tag change of reply `index` in chat `chat_id`, if it has one
+    /// still in place. False when that failed: its note then says why, and
+    /// keeps Undo to try again. `rewinding` (the reply is about to be
+    /// replaced): an image that's gone since — moved or deleted, its tags
+    /// with it — doesn't hold the resend up.
+    fn ai_undo_reply(&mut self, chat_id: u64, index: usize, rewinding: bool) -> bool {
+        let Some(change) = self.llm.msg_mut(chat_id, index).and_then(|m| m.tag_change.clone()) else {
+            return true;
+        };
+        if change.undone || !change.changed() || (rewinding && !change.image.exists()) {
+            return true;
+        }
+        let result = self.ai_undo_tags(&change);
+        if let Some(c) = self.llm.msg_mut(chat_id, index).and_then(|m| m.tag_change.as_mut()) {
+            match result {
+                Ok(()) => {
+                    c.undone = true;
+                    c.undo_error = None;
+                }
+                Err(e) => c.undo_error = Some(e.to_string()),
+            }
+        }
+        result.is_ok()
+    }
+
+    /// The image's .txt, if the AI may change it: not inside a zip backup,
+    /// and the image still there.
+    fn ai_tag_file(image: &std::path::Path) -> Result<PathBuf, &'static str> {
+        if archive::is_entry(image) {
+            return Err("it's inside a zip backup, which is read-only");
+        }
+        if !image.exists() {
+            return Err("the image isn't there any more");
+        }
+        Ok(right_details::sidecar_txt(image))
+    }
+
+    /// Apply the AI's tag edits to `image`'s .txt like a manual edit (only
+    /// what changed, same encoding). Returns the change for the reply's note.
+    fn ai_apply_tags(&mut self, image: PathBuf, edits: &ai_tagging::TagEdits) -> ai_tagging::TagChange {
+        let txt = match Self::ai_tag_file(&image) {
+            Ok(txt) => txt,
+            Err(why) => return ai_tagging::TagChange::failed(image, why),
+        };
+        // Never write under an edit the user hasn't saved yet.
+        if self.right_state.unsaved_edit(&image) {
+            return ai_tagging::TagChange::failed(
+                image,
+                "its tags are open in Edit Text with changes not saved yet, so nothing was written — save \
+                 them and ask again",
+            );
+        }
+        let Ok(sc) = sidecar::read(&txt) else {
+            return ai_tagging::TagChange::failed(image, "its .txt file can't be read");
+        };
+        // The file's exact bytes, so Undo can put back the very same file.
+        let before_bytes = if sc.existed {
+            match std::fs::read(&txt) {
+                Ok(bytes) => Some(bytes),
+                Err(_) => return ai_tagging::TagChange::failed(image, "its .txt file can't be read"),
+            }
+        } else {
+            None
+        };
+        let before = tag_manager::parse_tags(&sc.text);
+        let after = ai_tagging::apply(&before, edits);
+        let before_text = sc.existed.then(|| sc.text.clone());
+        let after_text = if after == before {
+            sc.text.clone()
+        } else {
+            match tag_manager::write_tags(&image, &after) {
+                Some(text) => text,
+                None => return ai_tagging::TagChange::failed(image, "its .txt file can't be written"),
+            }
+        };
+        let change =
+            ai_tagging::TagChange { image, before, after, before_text, after_text, before_bytes, ..Default::default() };
+        if change.changed() {
+            self.ai_tags_written(&change.image, &change.after_text, &change.before, &change.after, false);
+        }
+        change
+    }
+
+    /// Undo a reply's tag change. When the .txt is exactly as the AI left it,
+    /// the very same file comes back, byte for byte (and a .txt the AI
+    /// created is removed); otherwise only the AI's own change is taken back,
+    /// keeping later edits.
+    fn ai_undo_tags(&mut self, change: &ai_tagging::TagChange) -> Result<(), &'static str> {
+        let txt = Self::ai_tag_file(&change.image)?;
+        if self.right_state.unsaved_edit(&change.image) {
+            return Err("its tags are open in Edit Text with changes not saved yet — save them first");
+        }
+        let sc = sidecar::read(&txt).map_err(|_| "its .txt file can't be read")?;
+        let current = tag_manager::parse_tags(&sc.text);
+        let (text, now) = if sc.text == change.after_text {
+            match &change.before_bytes {
+                Some(bytes) => {
+                    std::fs::write(&txt, bytes).map_err(|_| "its .txt file can't be written")?;
+                    (change.before_text.clone().unwrap_or_default(), change.before.clone())
+                }
+                None => {
+                    if sc.existed {
+                        std::fs::remove_file(&txt).map_err(|_| "its .txt file can't be removed")?;
+                    }
+                    (String::new(), Vec::new())
+                }
+            }
+        } else {
+            let tags = ai_tagging::undo(&current, change);
+            let text = tag_manager::write_tags(&change.image, &tags).ok_or("its .txt file can't be written")?;
+            (text, tags)
+        };
+        self.ai_tags_written(&change.image, &text, &current, &now, true);
+        Ok(())
+    }
+
+    /// After the AI chat wrote an image's tags: the right panel shows the new
+    /// text, and when it's the image on show the Tag Manager tints and
+    /// flashes the change.
+    fn ai_tags_written(&mut self, image: &std::path::Path, text: &str, before: &[String], after: &[String], undo: bool) {
+        self.right_state.tags_written(image, text);
+        if self.selected.and_then(|i| self.images.get(i)).is_some_and(|p| p == image) {
+            tag_manager::ai_changed_tags(&mut self.tag_manager, before, after, undo);
+        }
+    }
+
     /// Apply a viewer right-click action (favorite / crop / copy / bg-remove) to
     /// `path`. Shared by the centre viewer and the gallery-detail popup.
     fn handle_viewer_action(&mut self, action: zoom::ViewerAction, path: &std::path::Path, ctx: &egui::Context) {
@@ -1728,6 +1961,23 @@ impl eframe::App for ViewerApp {
             // clip selected in Panels would keep playing behind the chat.
             self.video_player = None;
             self.last_video_path = None;
+            // Tag images (Tools menu): the selected image on the left and the
+            // Tag Manager on the right, around the chat. With no image
+            // selected, only the chat shows.
+            if let Some(i) = self.selected
+                && i >= self.images.len()
+            {
+                self.selected = if self.images.is_empty() { None } else { Some(self.images.len() - 1) };
+            }
+            let tag_view = self.llm.tag_images && llm::BUILT_WITH_LLM && self.llm.installed;
+            let current = if tag_view { self.selected.map(|i| self.images[i].clone()) } else { None };
+            self.llm.tag_target = current.clone();
+            if let Some(path) = current {
+                let left_w = (ui.available_width() * 0.28).clamp(280.0, 560.0);
+                right_details::show_tag_panel(ui, &mut self.right_state, Some(&path), &mut self.tag_manager, &self.images);
+                self.sync_tag_manager_settings();
+                self.ai_tag_image_panel(ui, &path, left_w);
+            }
             ai_chat::show(ui, &mut self.llm, &mut self.settings);
         } else
         // When the Gallery layout is active, replace the three panels with a
@@ -1854,16 +2104,7 @@ impl eframe::App for ViewerApp {
             &mut self.tag_manager,
             &self.images,
         );
-
-        // Remember the chosen AI model so it's restored next launch.
-        if self.settings.last_ai_model != self.tag_manager.ai_model {
-            self.settings.last_ai_model = self.tag_manager.ai_model.clone();
-        }
-        // Mirror any Tag Manager settings edits into the persisted Settings so
-        // they auto-save (the gear popup has no Save button).
-        if self.settings.tag_manager != self.tag_manager.settings {
-            self.settings.tag_manager = self.tag_manager.settings.clone();
-        }
+        self.sync_tag_manager_settings();
 
         match action {
             // The right panel handles its own confirmation (gated by the setting),
@@ -1876,6 +2117,10 @@ impl eframe::App for ViewerApp {
         // 3. Central Panel (Fills remaining space)
         self.center(ui);
         } // end of the classic Panels layout
+
+        // Tag edits and undos the AI chat asked for (Tag images mode) — done
+        // here because they touch the Tag Manager and the right panel.
+        self.apply_ai_tag_requests(&ui.ctx().clone());
 
         // Stop previews for any video tile that wasn't drawn this frame (scrolled
         // off-screen, or the other layout), freeing their decoders.
@@ -1917,6 +2162,7 @@ impl eframe::App for ViewerApp {
         self.llm.set_image_detail(self.settings.ai_image_detail);
         self.llm.detailed_vision = self.settings.ai_detailed_vision;
         self.llm.krea_prompts = self.settings.ai_krea_prompts;
+        self.llm.tag_images = self.settings.ai_tag_images;
         self.llm.params = self.settings.ai_gen;
         self.llm.set_model(self.settings.ai_gemma_model);
         settings::show(ui.ctx(), &mut self.settings, &mut self.update, &mut self.ftp, &mut self.llm);

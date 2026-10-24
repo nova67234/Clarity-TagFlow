@@ -36,6 +36,11 @@ const VIDEO_PICK_EXTS: &[&str] = &["mp4", "mov", "mkv", "webm", "avi", "m4v", "w
 /// with no known pointer position (common on Windows mid-drag) is claimed
 /// whenever the card is live, since it was showing the highlight.
 pub fn claims_drop(llm: &crate::llm::LlmState, ctx: &egui::Context) -> bool {
+    // Tag images sends the image on the left instead; a drop goes to the
+    // browser (opening a folder to tag, say).
+    if llm.tag_images && llm.tag_target.is_some() {
+        return false;
+    }
     let Some((rect, t)) = llm.input_rect else {
         return false;
     };
@@ -64,33 +69,24 @@ pub fn show(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::setting
     }
 
     // --- Left: the chat list, in the image browser's card panel style. ---
-    egui::Panel::left("ai_chat_list")
-        .resizable(false)
-        .exact_size(PANEL_W)
-        .show_separator_line(false)
-        .frame(egui::Frame::new().fill(BG()).inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 10 }))
-        .show_inside(ui, |ui| {
-            card_frame(22).show(ui, |ui| {
-                // Fill the panel's full height, like the browser card.
-                ui.set_min_height(ui.available_height());
-                ui.set_width(ui.available_width());
-                if llm.roleplay.enabled {
-                    // Role play: chats get the top, the character + shared
-                    // memory diary take the rest.
-                    let h = ui.available_height();
-                    egui::ScrollArea::vertical()
-                        .id_salt("ai_chat_list_outer")
-                        .max_height(h * 0.32)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| chat_list(ui, llm));
-                    ui.add_space(6.0);
-                    ui.separator();
-                    crate::roleplay::panel_ui(ui, &mut llm.roleplay);
-                } else {
+    // Tag images mode has no chat list: main.rs puts the image there (and the
+    // Tag Manager on the right) — or, with no image selected, only the chat
+    // shows. Role play's character and memories live in AI Settings.
+    if !llm.tag_images {
+        egui::Panel::left("ai_chat_list")
+            .resizable(false)
+            .exact_size(PANEL_W)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(BG()).inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 10 }))
+            .show_inside(ui, |ui| {
+                card_frame(22).show(ui, |ui| {
+                    // Fill the panel's full height, like the browser card.
+                    ui.set_min_height(ui.available_height());
+                    ui.set_width(ui.available_width());
                     chat_list(ui, llm);
-                }
+                });
             });
-        });
+    }
 
     // --- Centre: the conversation + input pill, in a centred column. ---
     egui::CentralPanel::default()
@@ -289,6 +285,81 @@ fn chat_list(ui: &mut egui::Ui, llm: &mut LlmState) {
     });
 }
 
+/// The Tools menu's conversation modes — one at a time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatMode {
+    Roleplay,
+    Krea,
+    TagImages,
+}
+
+/// Whether a conversation mode is on.
+pub(crate) fn mode_on(llm: &LlmState, settings: &crate::settings::Settings, mode: ChatMode) -> bool {
+    match mode {
+        ChatMode::Roleplay => llm.roleplay.enabled,
+        ChatMode::Krea => settings.ai_krea_prompts,
+        ChatMode::TagImages => settings.ai_tag_images,
+    }
+}
+
+/// Turn a conversation mode on or off. Turning one on switches the others
+/// off, and either way a fresh chat starts: each mode changes the whole
+/// conversation (its brief, persona or memories), so it never switches
+/// mid-chat. (`new_chat` reuses the current chat if it's still empty.)
+pub(crate) fn set_mode(llm: &mut LlmState, settings: &mut crate::settings::Settings, mode: ChatMode, on: bool) {
+    if on {
+        if mode != ChatMode::Roleplay && llm.roleplay.enabled {
+            llm.roleplay.enabled = false;
+            llm.roleplay.save();
+        }
+        if mode != ChatMode::Krea {
+            settings.ai_krea_prompts = false;
+            llm.krea_prompts = false;
+        }
+        if mode != ChatMode::TagImages {
+            settings.ai_tag_images = false;
+            llm.tag_images = false;
+        }
+    }
+    match mode {
+        ChatMode::Roleplay => {
+            llm.roleplay.enabled = on;
+            llm.roleplay.save();
+        }
+        ChatMode::Krea => {
+            settings.ai_krea_prompts = on;
+            llm.krea_prompts = on;
+        }
+        ChatMode::TagImages => {
+            settings.ai_tag_images = on;
+            llm.tag_images = on;
+        }
+    }
+    llm.new_chat();
+}
+
+/// One conversation mode's row in the Tools menu: label and switch, with a
+/// muted hint beneath.
+fn mode_row(
+    ui: &mut egui::Ui,
+    llm: &mut LlmState,
+    settings: &mut crate::settings::Settings,
+    mode: ChatMode,
+    label: &str,
+    hint: &str,
+) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).color(TEXT()).size(13.0));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut on = mode_on(llm, settings, mode);
+            if crate::settings::switch(ui, &mut on).changed() {
+                set_mode(llm, settings, mode, on);
+            }
+        });
+    });
+    crate::settings::hint(ui, hint);
+}
+
 /// The conversation column: scrollable bubbles + the bottom input pill, both
 /// centred on the same column (like the sketch's two guide lines).
 fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::settings::Settings) {
@@ -333,12 +404,18 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
             let chat = &llm.chats[llm.active_chat];
             if chat.msgs.is_empty() {
                 ui.add_space(msgs_h * 0.42);
-                let hint = if llm.krea_prompts {
+                let hint = if llm.tag_images && llm.tag_target.is_some() {
+                    "Ask the AI to tag this image, fix its tags or describe it — changes save right \
+                     away, with Undo under each reply"
+                } else if llm.tag_images {
+                    "Open a folder to tag its images with the AI"
+                } else if llm.krea_prompts {
                     "Attach a picture with + or describe an idea — get a Krea 2 prompt"
                 } else {
                     "Ask AI anything — attach an image with +"
                 };
                 ui.vertical_centered(|ui| {
+                    ui.set_max_width(col_w);
                     ui.label(egui::RichText::new(hint).color(MUTED()).size(14.5));
                 });
             }
@@ -387,7 +464,9 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
     // (like the text-to-image prompt box); dropping attaches the file. The
     // hover/drop checks use last frame's card rect; an unknown pointer
     // position mid-drag (common on Windows) counts as over the card.
-    let dragging_files = ui.input(|i| !i.raw.hovered_files.is_empty());
+    // (Not in Tag images: the image on the left is what gets sent.)
+    let dragging_files =
+        ui.input(|i| !i.raw.hovered_files.is_empty()) && !(llm.tag_images && llm.tag_target.is_some());
     if dragging_files {
         ui.ctx().request_repaint();
     }
@@ -550,8 +629,17 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                         // middle, send on the right.
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            if icon_button(ui, egui::include_image!("../icons/add.svg"), 20.0, "Attach an image or video", !llm.running)
+                            // Tag images sends the image on the left with every
+                            // message, so attaching another one is switched off.
+                            let tagging = llm.tag_images && llm.tag_target.is_some();
+                            let attach_tip = if tagging {
+                                "Tag images sends the image on the left with every message"
+                            } else {
+                                "Attach an image or video"
+                            };
+                            if icon_button(ui, egui::include_image!("../icons/add.svg"), 20.0, attach_tip, !llm.running && !tagging)
                                 .clicked()
+                                && !tagging
                                 && let Some(path) = rfd::FileDialog::new()
                                 .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"])
                                 .add_filter("Videos", VIDEO_PICK_EXTS)
@@ -580,34 +668,38 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                         // Apple-style settings card: label + macOS
                                         // switch per row, muted hint beneath, faint
                                         // separator between rows (src/settings.rs).
-                                        ui.label(egui::RichText::new("TOOLS").color(MUTED()).strong().size(11.0));
+                                        // The header's gear opens AI Settings — on the
+                                        // Role play tab while role play is on.
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new("TOOLS").color(MUTED()).strong().size(11.0));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                let tip = if llm.roleplay.enabled {
+                                                    "Role play settings and memories"
+                                                } else {
+                                                    "AI settings"
+                                                };
+                                                if icon_button(ui, egui::include_image!("../icons/settings.svg"), 16.0, tip, true)
+                                                    .clicked()
+                                                {
+                                                    if llm.roleplay.enabled {
+                                                        llm.ai_settings_tab = crate::ai_settings::AiTab::Roleplay;
+                                                    }
+                                                    llm.gen_settings_open = true;
+                                                    llm.tools_open = false;
+                                                }
+                                            });
+                                        });
                                         ui.add_space(5.0);
                                         crate::settings::card(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                ui.label(egui::RichText::new("Role playing").color(TEXT()).size(13.0));
-                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                    let mut on = llm.roleplay.enabled;
-                                                    if crate::settings::switch(ui, &mut on).changed() {
-                                                        llm.roleplay.enabled = on;
-                                                        llm.roleplay.save();
-                                                        // One conversation mode at a time.
-                                                        if on {
-                                                            settings.ai_krea_prompts = false;
-                                                            llm.krea_prompts = false;
-                                                        }
-                                                        // Persona + memory change the whole
-                                                        // conversation contract — start fresh
-                                                        // rather than switching mid-chat.
-                                                        // (Reuses the chat if it's empty.)
-                                                        llm.new_chat();
-                                                    }
-                                                });
-                                            });
-                                            crate::settings::hint(
+                                            mode_row(
                                                 ui,
-                                                "Give the AI a persona and a shared memory \
-                                                 diary (left panel). It remembers facts, \
-                                                 permissions and the story as it unfolds.",
+                                                llm,
+                                                settings,
+                                                ChatMode::Roleplay,
+                                                "Role playing",
+                                                "The AI plays a character with its own name, \
+                                                 persona and memories, kept apart from its main \
+                                                 memory. Set it up with the gear above.",
                                             );
                                             crate::settings::row_sep(ui);
                                             ui.horizontal(|ui| {
@@ -627,31 +719,28 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                                  icon to stop.",
                                             );
                                             crate::settings::row_sep(ui);
-                                            ui.horizontal(|ui| {
-                                                ui.label(egui::RichText::new("Krea 2 prompts").color(TEXT()).size(13.0));
-                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                    let mut on = settings.ai_krea_prompts;
-                                                    if crate::settings::switch(ui, &mut on).changed() {
-                                                        settings.ai_krea_prompts = on;
-                                                        llm.krea_prompts = on;
-                                                        // One conversation mode at a time.
-                                                        if on && llm.roleplay.enabled {
-                                                            llm.roleplay.enabled = false;
-                                                            llm.roleplay.save();
-                                                        }
-                                                        // The brief changes the whole
-                                                        // conversation — start fresh, as
-                                                        // role play does.
-                                                        llm.new_chat();
-                                                    }
-                                                });
-                                            });
-                                            crate::settings::hint(
+                                            mode_row(
                                                 ui,
+                                                llm,
+                                                settings,
+                                                ChatMode::Krea,
+                                                "Krea 2 prompts",
                                                 "Turn a picture — or an idea in words — \
                                                  into a detailed prompt for Krea 2. Ask for \
                                                  changes (\"make it night\") to rewrite it. \
                                                  Reads pictures with Detailed vision.",
+                                            );
+                                            crate::settings::row_sep(ui);
+                                            mode_row(
+                                                ui,
+                                                llm,
+                                                settings,
+                                                ChatMode::TagImages,
+                                                "Tag images",
+                                                "Tag the open folder with the AI: the image on \
+                                                 the left, the Tag Manager on the right. The AI \
+                                                 sees each image's tags and can change them, \
+                                                 with Undo.",
                                             );
                                             crate::settings::row_sep(ui);
                                             ui.horizontal(|ui| {
@@ -729,15 +818,33 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
 /// lists, headings, code blocks) straight on the background, like current
 /// assistant UIs. A streaming reply shows a ▌ cursor.
 fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool) {
-    let (role, text, stored_thinking, image) = {
+    let (role, text, stored_thinking, image, tag_image, tag_change) = {
         let m = &llm.chats[llm.active_chat].msgs[index];
-        (m.role, m.text.clone(), m.thinking.clone(), m.image.clone())
+        (m.role, m.text.clone(), m.thinking.clone(), m.image.clone(), m.tag_image.clone(), m.tag_change.clone())
     };
 
     if role == ChatRole::User {
         let max_w = ui.available_width() * 0.82;
         let chat_id = llm.chats[llm.active_chat].id;
         ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+            // Tag images: which image this message was about.
+            if let Some(path) = &tag_image {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.add(
+                        egui::Image::new(egui::include_image!("../icons/tag.svg"))
+                            .fit_to_exact_size(egui::vec2(12.0, 12.0))
+                            .tint(chat_icon_tint(MUTED())),
+                    );
+                    ui.label(
+                        egui::RichText::new(crate::ai_tagging::file_name(path))
+                            .color(chat_text_override().unwrap_or(MUTED()))
+                            .size(11.5),
+                    )
+                    .on_hover_text(path.display().to_string());
+                });
+                ui.add_space(2.0);
+            }
             // The attached image shows as its own rounded thumbnail, separate
             // from (and above) the text bubble.
             if let Some(path) = &image {
@@ -924,6 +1031,13 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         // Diary lines are extracted for real when the reply finishes; hide
         // them while it streams so they never flash up.
         crate::roleplay::strip_memory_lines(&body)
+    } else if streaming
+        && (llm.tag_images
+            || index.checked_sub(1).and_then(|i| llm.chats[llm.active_chat].msgs.get(i)).is_some_and(|m| m.tag_image.is_some()))
+    {
+        // Same for Tag images' tag-edit lines (also when the mode was
+        // switched off while the reply streams).
+        crate::ai_tagging::strip_lines(&body)
     } else {
         body.clone()
     };
@@ -1001,6 +1115,12 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         });
     }
 
+    // Tag images: what this reply changed in the image's tags, with Undo.
+    if let Some(change) = &tag_change {
+        ui.add_space(4.0);
+        tag_change_note(ui, llm, index, change);
+    }
+
     // Action row under every finished reply: copy / regenerate / listen.
     if !streaming {
         ui.add_space(2.0);
@@ -1044,6 +1164,99 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
             }
         });
     }
+}
+
+/// Tag images: the note under a reply that changed tags — which image, the
+/// tags it added (violet, like the Tag Manager's AI tint) and removed, and an
+/// Undo button (main.rs carries the undo out).
+fn tag_change_note(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, change: &crate::ai_tagging::TagChange) {
+    let violet = crate::tag_manager::AI_NEW_VIOLET;
+    // A deeper violet for text on the light themes' pale card.
+    let violet_ink = if crate::theme::is_light() { egui::Color32::from_rgb(104, 72, 200) } else { violet };
+    let chat_id = llm.chats[llm.active_chat].id;
+    let file = crate::ai_tagging::file_name(&change.image);
+    let (added, removed) = change.diff();
+    // A new order or spelling is a change too, with nothing to list.
+    let changed = change.changed();
+    let ink = chat_text();
+    egui::Frame::new()
+        .fill(violet.gamma_multiply(0.07))
+        .stroke(egui::Stroke::new(1.0_f32, violet.gamma_multiply(0.35)))
+        .corner_radius(egui::CornerRadius::same(12))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width().min(560.0));
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.add(
+                    egui::Image::new(egui::include_image!("../icons/tag.svg"))
+                        .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                        .tint(violet_ink),
+                );
+                let (title, col) = if let Some(e) = &change.error {
+                    let title = if file.is_empty() {
+                        format!("Couldn't change any tags: {e}")
+                    } else {
+                        format!("Couldn't change the tags on {file}: {e}")
+                    };
+                    (title, egui::Color32::from_rgb(210, 70, 70))
+                } else if !changed {
+                    (format!("No tag changes needed on {file}"), MUTED())
+                } else if change.undone {
+                    (format!("Undid the tag changes on {file}"), MUTED())
+                } else {
+                    (format!("Changed the tags on {file}"), ink)
+                };
+                ui.add(egui::Label::new(egui::RichText::new(title).color(col).size(12.5)).wrap());
+                if changed && change.error.is_none() && !change.undone {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can_undo = !llm.running;
+                        let undo = ui
+                            .add_enabled(can_undo, egui::Button::new(egui::RichText::new("Undo").size(12.0)))
+                            .on_hover_text("Put this image's tags back the way they were");
+                        if undo.clicked() {
+                            llm.tag_requests.push(crate::ai_tagging::TagRequest::Undo { chat_id, index });
+                        }
+                    });
+                }
+            });
+            if changed {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                    const SHOWN: usize = 16;
+                    let dim = change.undone;
+                    if added.is_empty() && removed.is_empty() {
+                        let what = if change.respelled() { "Same tags, new spelling" } else { "Same tags, new order" };
+                        ui.label(egui::RichText::new(what).color(MUTED()).size(12.0));
+                    }
+                    for t in added.iter().take(SHOWN) {
+                        let c = if dim { MUTED() } else { violet_ink };
+                        ui.label(egui::RichText::new(format!("+ {t}")).color(c).size(12.0));
+                    }
+                    for t in removed.iter().take(SHOWN.saturating_sub(added.len())) {
+                        ui.label(egui::RichText::new(format!("− {t}")).color(MUTED()).strikethrough().size(12.0));
+                    }
+                    let more = (added.len() + removed.len()).saturating_sub(SHOWN);
+                    if more > 0 {
+                        ui.label(egui::RichText::new(format!("and {more} more")).color(MUTED()).size(12.0));
+                    }
+                });
+            }
+            // A failed Undo leaves the change in place; say why, and Undo
+            // stays to try again.
+            if let Some(e) = change.undo_error.as_ref().filter(|_| changed && !change.undone) {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("Couldn't undo: {e}"))
+                            .color(egui::Color32::from_rgb(210, 70, 70))
+                            .size(12.0),
+                    )
+                    .wrap(),
+                );
+            }
+        });
 }
 
 /// The collapsible "Thinking" row above a reply: the little AI orb, a muted

@@ -6,6 +6,10 @@
 //! * **Replies:** the sampling knobs (temperature, top-k, top-p, reply length).
 //! * **Memory:** remembering across chats, the 3D memory map
 //!   (src/memory_map.rs), the AI's own notes, and forgetting.
+//! * **Role play:** the character (names, persona) and its memories — a
+//!   store of their own (`MemoryKind::Roleplay`), kept apart from the main
+//!   memory, with the same map. The Tools menu's gear opens this tab while
+//!   role play is on.
 
 use eframe::egui;
 
@@ -19,6 +23,7 @@ pub enum AiTab {
     #[default]
     Replies,
     Memory,
+    Roleplay,
 }
 
 /// Draw the AI Settings window when it's open (`llm.gen_settings_open`).
@@ -67,7 +72,9 @@ pub fn window(ctx: &egui::Context, llm: &mut LlmState, settings: &mut Settings) 
                     ui.painter().hline(line.x_range(), line.center().y, egui::Stroke::new(1.0_f32, EDGE()));
                     ui.add_space(10.0);
                     ui.spacing_mut().item_spacing.y = 4.0;
-                    for (tab, label) in [(AiTab::Replies, "Replies"), (AiTab::Memory, "Memory")] {
+                    for (tab, label) in
+                        [(AiTab::Replies, "Replies"), (AiTab::Memory, "Memory"), (AiTab::Roleplay, "Role play")]
+                    {
                         if crate::settings::side_tab(ui, llm.ai_settings_tab == tab, label, false) {
                             llm.ai_settings_tab = tab;
                         }
@@ -104,6 +111,7 @@ pub fn window(ctx: &egui::Context, llm: &mut LlmState, settings: &mut Settings) 
                             ui.push_id(llm.ai_settings_tab, |ui| match llm.ai_settings_tab {
                                 AiTab::Replies => replies_tab(ui, settings),
                                 AiTab::Memory => memory_tab(ui, llm, settings),
+                                AiTab::Roleplay => roleplay_tab(ui, llm, settings),
                             });
                         });
                     crate::edge_scroll_done(ui, &scroll_ui, SCROLL_GUTTER);
@@ -159,7 +167,7 @@ fn replies_tab(ui: &mut egui::Ui, settings: &mut Settings) {
         );
     });
     // The thinking level lives in GenParams too, but it has its own control
-    // (the chat's Tools menu) — resetting the sampling knobs leaves it alone.
+    // (the chat's model picker) — resetting the sampling knobs leaves it alone.
     let defaults = crate::llm::GenParams { thinking: p.thinking, ..Default::default() };
     ui.horizontal(|ui| {
         if ui
@@ -168,7 +176,7 @@ fn replies_tab(ui: &mut egui::Ui, settings: &mut Settings) {
         {
             *p = defaults;
         }
-        ui.label(egui::RichText::new("Thinking is set in the chat's Tools menu.").color(MUTED()).size(11.0));
+        ui.label(egui::RichText::new("Thinking is set in the chat's model picker.").color(MUTED()).size(11.0));
     });
 }
 
@@ -231,7 +239,7 @@ fn memory_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
                 .on_hover_text("See every memory as a 3D brain")
                 .clicked()
             {
-                llm.memory_map.open = true;
+                llm.memory_map.show(crate::memory::MemoryKind::Main);
                 llm.gen_settings_open = false;
             }
         });
@@ -290,6 +298,169 @@ fn memory_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
                         .fill(egui::Color32::from_rgb(180, 40, 40));
                     if ui.add(yes).clicked() {
                         llm.memory.clear_all();
+                        ui.data_mut(|d| d.remove::<bool>(confirm_id));
+                    }
+                    if ui.button(egui::RichText::new("Cancel").size(12.5)).clicked() {
+                        ui.data_mut(|d| d.remove::<bool>(confirm_id));
+                    }
+                } else if ui.add_enabled(enabled, egui::Button::new(egui::RichText::new("Clear…").size(12.5))).clicked() {
+                    ui.data_mut(|d| d.insert_temp(confirm_id, true));
+                }
+            },
+        );
+    });
+}
+
+/// A small label above a text box (the Role play tab's character fields).
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).color(TEXT()).size(13.0));
+    ui.add_space(2.0);
+}
+
+/// Role play: the character (names, persona) and its memories, which live in
+/// a store of their own — the same format and map as the main memory, never
+/// mixed with it.
+fn roleplay_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
+    if llm.roleplay.load_failed {
+        section(ui, "The character couldn't be read", |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "It was probably saved on another computer or user account. It's left untouched, \
+                     and nothing is saved over it until you start a new one. Starting a new one keeps \
+                     the old file as ai_chat_roleplay.json.bak.",
+                )
+                .color(TEXT())
+                .size(12.5),
+            );
+            ui.add_space(6.0);
+            if ui.button(egui::RichText::new("Start a new character").size(12.5)).clicked() {
+                llm.roleplay.start_new_diary();
+            }
+        });
+    }
+    if llm.rp_memory.load_failed {
+        section(ui, "Role play memories couldn't be read", |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "They were probably saved on another computer or user account. They're left \
+                     untouched, and nothing new is saved until you start fresh. Starting fresh keeps \
+                     the old folder as ai_memory_roleplay.bak.",
+                )
+                .color(TEXT())
+                .size(12.5),
+            );
+            ui.add_space(6.0);
+            if ui.button(egui::RichText::new("Start fresh").size(12.5)).clicked() {
+                llm.rp_memory.start_fresh();
+            }
+        });
+    }
+
+    section(ui, "Role play", |ui| {
+        row(
+            ui,
+            "Role playing",
+            Some("The AI plays a character with its own name, persona and memories. Switching starts a new chat."),
+            |ui| {
+                let mut on = llm.roleplay.enabled;
+                if switch(ui, &mut on).changed() {
+                    crate::ai_chat::set_mode(llm, settings, crate::ai_chat::ChatMode::Roleplay, on);
+                }
+            },
+        );
+    });
+
+    section(ui, "Character", |ui| {
+        let rp = &mut llm.roleplay;
+        let mut changed = false;
+        ui.add_enabled_ui(!rp.load_failed, |ui| {
+            ui.horizontal(|ui| {
+                let w = ((ui.available_width() - 12.0) / 2.0).max(60.0);
+                ui.vertical(|ui| {
+                    ui.set_width(w);
+                    field_label(ui, "AI's name");
+                    changed |= ui
+                        .add(egui::TextEdit::singleline(&mut rp.ai_name).hint_text("e.g. Mira").desired_width(w))
+                        .lost_focus();
+                });
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    ui.set_width(w);
+                    field_label(ui, "Your name");
+                    changed |= ui
+                        .add(egui::TextEdit::singleline(&mut rp.user_name).hint_text("What it calls you").desired_width(w))
+                        .lost_focus();
+                });
+            });
+            row_sep(ui);
+            field_label(ui, "Persona");
+            changed |= ui
+                .add(
+                    egui::TextEdit::multiline(&mut rp.persona)
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Who is the AI? Looks, personality, the world you're in…"),
+                )
+                .lost_focus();
+        });
+        if changed {
+            rp.save();
+        }
+    });
+
+    let (n, topics) = (llm.rp_memory.count(), llm.rp_memory.topics.len());
+    section(ui, "Memories", |ui| {
+        let stats = if n == 0 {
+            "Nothing remembered yet — the AI writes memories as the story unfolds.".to_string()
+        } else {
+            let updated = llm
+                .rp_memory
+                .last_updated()
+                .map(|t| format!(", updated {}", crate::memory::format_date(t)))
+                .unwrap_or_default();
+            format!(
+                "{n} {} in {topics} {}{updated}.",
+                if n == 1 { "memory" } else { "memories" },
+                if topics == 1 { "topic" } else { "topics" },
+            )
+        };
+        row(ui, "Memory map", Some(&stats), |ui| {
+            if ui
+                .button(egui::RichText::new("Open").size(12.5))
+                .on_hover_text("See the character's memories as a 3D brain")
+                .clicked()
+            {
+                llm.memory_map.show(crate::memory::MemoryKind::Roleplay);
+                llm.gen_settings_open = false;
+            }
+        });
+        row_sep(ui);
+        ui.label(
+            egui::RichText::new(
+                "Kept apart from the AI's main memory, so the story never comes up in normal chats. \
+                 Add, edit or forget memories in the map.",
+            )
+            .color(MUTED())
+            .size(10.5),
+        );
+    });
+
+    // Forgetting: asks once before deleting everything.
+    let confirm_id = ui.id().with("confirm_clear_rp");
+    let confirming = ui.data(|d| d.get_temp::<bool>(confirm_id)).unwrap_or(false);
+    card(ui, |ui| {
+        row(
+            ui,
+            "Clear role play memories",
+            Some("Deletes every role play memory and the pictures the AI kept, from this computer."),
+            |ui| {
+                let enabled = !llm.rp_memory.load_failed && n > 0;
+                if confirming {
+                    let yes = egui::Button::new(egui::RichText::new("Delete all").color(egui::Color32::WHITE).size(12.5))
+                        .fill(egui::Color32::from_rgb(180, 40, 40));
+                    if ui.add(yes).clicked() {
+                        llm.rp_memory.clear_all();
+                        crate::roleplay::clear_album();
                         ui.data_mut(|d| d.remove::<bool>(confirm_id));
                     }
                     if ui.button(egui::RichText::new("Cancel").size(12.5)).clicked() {

@@ -86,6 +86,10 @@ pub struct Settings {
     /// Remember across chats (AI Settings → Memory): the AI keeps long-term
     /// memories (src/memory.rs) and looks them up when they're useful.
     pub ai_memory_enabled: bool,
+    /// Tag images: the chat becomes a tagging view — the image, the chat and
+    /// the Tag Manager — and the AI can change tags (Tools menu toggle;
+    /// src/ai_tagging.rs).
+    pub ai_tag_images: bool,
     /// Which local model the AI chat runs (Gemma E4B / 27B / 31B, Qwen3-VL
     /// 8B / 30B Thinking).
     pub ai_gemma_model: crate::llm::GemmaModel,
@@ -237,6 +241,7 @@ impl Default for Settings {
             ai_detailed_vision: false,
             ai_krea_prompts: false,
             ai_memory_enabled: false,
+            ai_tag_images: false,
             ai_gemma_model: crate::llm::GemmaModel::default(),
             ai_image_detail: crate::llm::ImageDetail::default(),
             ai_gen: crate::llm::GenParams::default(),

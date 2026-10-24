@@ -17,7 +17,7 @@ const DUP_TEXT_AMBER: Color32 = Color32::from_rgb(216, 162, 36);
 const DUP_FLASH_AMBER: Color32 = Color32::from_rgb(240, 198, 60);
 /// Chips the AI tagger just added: violet — distinct from the amber
 /// duplicate flash, the green "Saved" status and the theme selection colour.
-const AI_NEW_VIOLET: Color32 = Color32::from_rgb(155, 130, 240);
+pub(crate) const AI_NEW_VIOLET: Color32 = Color32::from_rgb(155, 130, 240);
 /// How long the duplicate chip flash runs (two pulses fading out).
 const DUP_FLASH_SECS: f32 = 1.6;
 
@@ -1092,7 +1092,7 @@ fn start_tag_job(state: &mut TagManagerState, current_image: Option<&Path>) {
 
 /// Split a sidecar string into trimmed, de-duplicated tags (case-insensitive),
 /// preserving first-seen order.
-fn parse_tags(s: &str) -> Vec<String> {
+pub(crate) fn parse_tags(s: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for raw in s.split([',', '\n']) {
         let t = raw.trim();
@@ -1200,6 +1200,37 @@ fn write_sidecar(path: &Path, tags: &[String]) -> Option<String> {
         return None;
     }
     Some(text)
+}
+
+/// An image's tags as its .txt holds them now (`None` when the .txt exists
+/// but can't be read) — for the AI chat's Tag images mode.
+pub(crate) fn read_tags(path: &Path) -> Option<Vec<String>> {
+    read_sidecar(path)
+}
+
+/// Write `tags` to an image's .txt the way a manual edit does (only what
+/// changed, same encoding). Returns the new file text, or `None` when the
+/// existing .txt can't be read (nothing written).
+pub(crate) fn write_tags(path: &Path, tags: &[String]) -> Option<String> {
+    write_sidecar(path, tags)
+}
+
+/// The AI chat just changed the tags of the image on show (or undid such a
+/// change): tint the tags it added violet (like the AI tagger's; an undo
+/// clears the tint) and flash the change in the header.
+pub(crate) fn ai_changed_tags(state: &mut TagManagerState, before: &[String], after: &[String], undo: bool) {
+    let added: HashSet<String> = after
+        .iter()
+        .filter(|t| !before.iter().any(|b| b.eq_ignore_ascii_case(t)))
+        .cloned()
+        .collect();
+    let removed = before.iter().filter(|t| !after.iter().any(|a| a.eq_ignore_ascii_case(t))).count();
+    state.selected_tags.clear();
+    let changed = added.len() + removed;
+    state.ai_new_tags = if undo { HashSet::new() } else { added };
+    if changed > 0 {
+        set_change_status(state, if undo { "Undid" } else { "AI changed" }, changed, after.len());
+    }
 }
 
 /// Add `new_tags` to every loaded file's sidecar, skipping files that already

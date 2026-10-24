@@ -1,30 +1,30 @@
-//! Role playing for the AI Chat (toggled from the input card's tools menu).
+//! Role playing for the AI Chat (toggled from the input card's Tools menu,
+//! set up in AI Settings → Role play).
 //!
 //! Gives the chat a persistent character: the AI gets a name and a persona,
-//! the user gets a name the AI addresses them by, and both sides share a
-//! "diary" of memories shown in the left panel. The user adds memories by
-//! hand; the AI adds its own by ending a reply with `MEMORY:` lines, which
-//! the app strips from the visible reply and stores (deduplicated). Every
-//! generation is primed with the persona, the names, the full diary, and
-//! the diary-writing rules — the model is told to read its diary before
-//! recording anything new, to treat what the user says as fact, and to write
-//! entries descriptively in its persona's voice (facts, permissions,
-//! feelings, romance, promises, boundaries, key events).
+//! the user gets a name the AI addresses them by, and the character keeps
+//! memories of its own. Those live in their own memory store
+//! (`MemoryKind::Roleplay`, src/memory.rs): the same format, 3D map and
+//! settings as the AI's main memory, but a separate folder, so the story
+//! never leaks into normal chats. The AI adds memories by ending a reply
+//! with `MEMORY: [Category] …` lines, which the app strips from the visible
+//! reply and files under that category (deduplicated); the user adds, edits
+//! and forgets them in the memory map. Every generation is primed with the
+//! persona, the names, the newest memories, and the rules for writing them —
+//! the model is told to read its memories before recording anything new, to
+//! treat what the user says as fact, and to write entries descriptively in
+//! its persona's voice (facts, permissions, feelings, romance, promises,
+//! boundaries, key events).
 //!
-//! Everything persists to a JSON sidecar in the models dir, so the character
-//! and its memories survive restarts (unlike the chats themselves, for now).
-//! On Windows the file is **encrypted at rest** (src/secret.rs — DPAPI, tied
-//! to the user account): diaries can hold private story material, so they
-//! shouldn't be readable as plaintext from disk, by other user accounts, or
-//! when copied to another machine. On macOS/Linux it is only obfuscated (a
-//! fixed-key XOR), not encrypted. Pre-encryption plaintext files still load
-//! and get protected on their next save. A file that exists but can't be
-//! read back (another PC, a reinstalled Windows, a different account) is
-//! never overwritten — see `load_failed`.
+//! The character itself (names, persona, on/off) persists to a JSON sidecar
+//! in the models dir. On Windows it is **encrypted at rest** (src/secret.rs —
+//! DPAPI, tied to the user account); on macOS/Linux it is only obfuscated (a
+//! fixed-key XOR). A file that exists but can't be read back (another PC, a
+//! reinstalled Windows, a different account) is never overwritten — see
+//! `load_failed`. Older versions kept the diary in that file too; it moves
+//! into the role-play memory store on first load ([`migrate_diary`]).
 
-use eframe::egui;
-
-use crate::theme::*;
+use crate::memory::{MemoryKind, MemoryStore};
 
 /// The marker the model is told to prefix memory lines with.
 pub const MEMORY_TAG: &str = "MEMORY:";
@@ -34,10 +34,21 @@ pub const KEEP_IMAGE_TAG: &str = "KEEP_IMAGE:";
 /// Sends a previously saved album image back into the chat.
 pub const SHOW_IMAGE_TAG: &str = "SHOW_IMAGE:";
 
-/// How many diary entries ride along in the prompt (newest kept).
+/// How many memories ride along in the prompt (newest kept).
 const PROMPT_MEMORIES: usize = 75;
 
-/// One diary entry.
+/// The categories the AI files its memories under (`MEMORY: [Names] …`);
+/// they become the role-play memory map's topics.
+pub const TOPICS: [&str; 7] = ["Names", "Permissions", "Boundaries", "Facts", "Promises", "Feelings", "Story"];
+/// Memories about a picture the AI kept in its album.
+pub const PICTURES_TOPIC: &str = "Pictures";
+/// Where a memory without a (known) category goes.
+const DEFAULT_TOPIC: &str = "Story";
+/// Memories carried over from the old diary, which had no categories.
+const LEGACY_TOPIC: &str = "Diary";
+
+/// One entry of the old diary (before role play got its own memory store);
+/// only read to move it over — see [`migrate_diary`].
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Memory {
     pub text: String,
@@ -58,10 +69,10 @@ pub struct RoleplayState {
     pub ai_name: String,
     pub user_name: String,
     pub persona: String,
+    /// The old diary. Empty once [`migrate_diary`] has moved it into the
+    /// role-play memory store.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub memories: Vec<Memory>,
-    /// The "add a memory" input box (not persisted).
-    #[serde(skip)]
-    pub new_memory: String,
     /// A diary file exists but couldn't be decrypted/parsed (e.g. DPAPI on a
     /// new PC or user account). Saving is refused so the blank state never
     /// overwrites the real diary; the panel offers to set it aside instead.
@@ -117,27 +128,6 @@ impl RoleplayState {
         }
     }
 
-    /// Add a diary entry unless an equivalent one already exists (the "it can
-    /// not add the same memories" rule, enforced app-side on top of the
-    /// prompt). True when added.
-    pub fn add_memory(&mut self, text: &str, by_ai: bool) -> bool {
-        self.add_memory_with_image(text, by_ai, None)
-    }
-
-    pub fn add_memory_with_image(&mut self, text: &str, by_ai: bool, image: Option<String>) -> bool {
-        let text = text.trim();
-        if text.is_empty() {
-            return false;
-        }
-        let key = normalize(text);
-        if self.memories.iter().any(|m| normalize(&m.text) == key) {
-            return false;
-        }
-        self.memories.push(Memory { text: text.to_string(), by_ai, image });
-        self.save();
-        true
-    }
-
     /// Copy `src` (the image the user just sent) into the AI's album,
     /// encrypted, plus a same-named encrypted .txt describing why it was
     /// kept. Returns the album file name (e.g. "img_003.jpg").
@@ -189,26 +179,6 @@ impl RoleplayState {
         Some(tmp)
     }
 
-    /// Forget diary entry `i`; an entry about an album picture takes the
-    /// picture (and its description) with it.
-    pub fn forget(&mut self, i: usize) {
-        if i >= self.memories.len() {
-            return;
-        }
-        let m = self.memories.remove(i);
-        if let Some(name) = m.image
-            && let Some(name) = std::path::Path::new(&name).file_name()
-        {
-            let name = name.to_string_lossy().to_string();
-            let stem = name.split('.').next().unwrap_or(&name).to_string();
-            let dir = album_dir();
-            let _ = std::fs::remove_file(dir.join(format!("{name}.enc")));
-            let _ = std::fs::remove_file(dir.join(format!("{stem}.txt.enc")));
-            let _ = std::fs::remove_file(album_temp_dir().join(&name));
-        }
-        self.save();
-    }
-
     /// Give up on an unreadable diary: move it aside (kept as a `.bak`, in
     /// case the original account/PC can still read it) and start fresh.
     pub fn start_new_diary(&mut self) {
@@ -229,11 +199,12 @@ impl RoleplayState {
         if n.is_empty() { "the user" } else { n }
     }
 
-    /// The priming turn injected (pinned) before the chat history, with the
-    /// default (brief) thinking rule — what the tests prime with.
+    /// The priming turn injected (pinned) before the chat history: the
+    /// character, and its newest memories from the role-play store, with
+    /// the default (brief) thinking rule — what the tests prime with.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn preamble(&self) -> String {
-        self.preamble_with(false)
+    pub fn preamble(&self, memories: &MemoryStore) -> String {
+        self.preamble_with(memories, false)
     }
 
     /// The priming turn, with the thinking rule matched to the chat's
@@ -243,7 +214,7 @@ impl RoleplayState {
     /// High / Max (`deep_thinking`) the user asked for more thought, so the
     /// rule lets it think things through; the worker's forced close still
     /// guarantees an answer.
-    pub fn preamble_with(&self, deep_thinking: bool) -> String {
+    pub fn preamble_with(&self, memories: &MemoryStore, deep_thinking: bool) -> String {
         let thinking = if deep_thinking {
             "- Think it through: before answering you may reason privately about \
              the scene, what you know and how your character feels — then answer \
@@ -256,19 +227,19 @@ impl RoleplayState {
         let ai = self.ai_display();
         let user = self.user_display();
         let mut diary = String::new();
-        let skip = self.memories.len().saturating_sub(PROMPT_MEMORIES);
-        for m in self.memories.iter().skip(skip) {
-            diary.push_str("- ");
+        for (topic, m) in memories.recent(PROMPT_MEMORIES) {
+            use std::fmt::Write as _;
+            let _ = write!(diary, "- [{topic}] ");
             if let Some(img) = &m.image {
-                use std::fmt::Write as _;
                 let _ = write!(diary, "[saved picture {img}] ");
             }
-            diary.push_str(&m.text);
+            diary.push_str(if m.text.trim().is_empty() { &m.title } else { &m.text });
             diary.push('\n');
         }
         if diary.is_empty() {
             diary = "(the diary is empty so far)\n".to_string();
         }
+        let categories = TOPICS.join(", ");
         let persona = if self.persona.trim().is_empty() {
             "(no persona set — be yourself, warm and consistent)".to_string()
         } else {
@@ -305,8 +276,7 @@ impl RoleplayState {
              - You MUST record it, every single time it happens: a name or \
              NICKNAME either of you starts using; a permission {user} grants or \
              revokes — anything you are now allowed or forbidden to do (e.g. \
-             `{tag} {user} gave me permission to fight monsters at their side`); \
-             rules and boundaries; facts about {user} (people, places, likes, \
+             fighting monsters at their side); rules and boundaries; facts about {user} (people, places, likes, \
              fears, plans); promises made; feelings, romance or love developing; \
              and key story events (victories, losses, discoveries).\n\
              - Before you finish ANY reply, check yourself: did {user} just \
@@ -314,11 +284,14 @@ impl RoleplayState {
              did something big happen? If yes, it goes in the diary NOW — \
              small details matter more than you think.\n\
              - Record by ending your reply with one line per new memory, each \
-             starting exactly with `{tag}` — nothing else on that line before it.\n\
+             starting exactly with `{tag}` — nothing else on that line before it — \
+             followed by its category in square brackets, one of: {categories}. \
+             For example `{tag} [Permissions] {user} gave me permission to fight \
+             monsters at their side`.\n\
              - Write each entry like a diary in {ai}'s own voice: descriptive \
              and specific — exact names, exact permissions, what was said and \
-             why it matters. `{tag} {user} said I may call them Billie from now \
-             on` is right; \"we talked about names\" is useless.\n\
+             why it matters. `{tag} [Names] {user} said I may call them Billie \
+             from now on` is right; \"we talked about names\" is useless.\n\
              - The `{tag}` lines are stripped before {user} sees your reply; \
              never talk about the diary mechanism in the visible text.\n\
              \n\
@@ -349,15 +322,148 @@ impl RoleplayState {
     }
 }
 
-/// Case/punctuation-insensitive form used for duplicate detection.
-fn normalize(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-        .flat_map(|c| c.to_lowercase())
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+/// A short title for a memory written as one diary sentence: its first
+/// sentence, cut to eight words ("Andrew said I may call them Billie…").
+pub fn title_from(text: &str) -> String {
+    let text = text.trim();
+    let first = text.split_inclusive(['.', '!', '?']).next().unwrap_or(text).trim();
+    // "Dr. Mills…" — a "sentence" that short was an abbreviation.
+    let base = if first.split_whitespace().count() >= 3 { first } else { text };
+    let words: Vec<&str> = base.split_whitespace().collect();
+    if words.len() <= 8 {
+        words.join(" ").trim_end_matches(['.', '!', '?']).to_string()
+    } else {
+        format!("{}…", words[..8].join(" ").trim_end_matches([',', ';', ':', '.']))
+    }
+}
+
+/// Split a `MEMORY:` line's content into its category (a role-play topic)
+/// and the memory itself: `[Permissions] Andrew let me…`. A missing or
+/// unknown category files it under Story.
+pub fn parse_memory_line(line: &str) -> (&'static str, &str) {
+    let line = line.trim();
+    if let Some(rest) = line.strip_prefix('[')
+        && let Some((category, text)) = rest.split_once(']')
+    {
+        let category = category.trim();
+        let topic = TOPICS
+            .iter()
+            .chain(std::iter::once(&PICTURES_TOPIC))
+            .find(|t| t.eq_ignore_ascii_case(category))
+            .copied()
+            .unwrap_or(DEFAULT_TOPIC);
+        return (topic, text.trim());
+    }
+    (DEFAULT_TOPIC, line)
+}
+
+/// Record one memory the AI wrote (`MEMORY:` line content) in the role-play
+/// store, unless it's already there in any wording (the "never record the
+/// same thing twice" rule, enforced app-side on top of the prompt). True
+/// when added.
+pub fn record(store: &mut MemoryStore, line: &str, by_ai: bool) -> bool {
+    let (topic, text) = parse_memory_line(line);
+    if text.is_empty() || store.contains_text(text) {
+        return false;
+    }
+    let title = store.unique_title(topic, &title_from(text));
+    store.add_entry(topic, &title, text, by_ai, None).is_some()
+}
+
+/// Remember a picture the AI kept (already saved to the album as `name`),
+/// with why it loved it.
+pub fn record_picture(store: &mut MemoryStore, name: String, why: &str) -> bool {
+    let title = store.unique_title(PICTURES_TOPIC, &title_from(why));
+    store.add_entry(PICTURES_TOPIC, &title, why, true, Some(name)).is_some()
+}
+
+/// Delete a kept picture (and its description) from the album — when the
+/// memory about it is forgotten.
+pub fn remove_album_picture(name: &str) {
+    let Some(name) = std::path::Path::new(name).file_name() else { return };
+    let name = name.to_string_lossy().to_string();
+    let stem = name.split('.').next().unwrap_or(&name).to_string();
+    let dir = album_dir();
+    let _ = std::fs::remove_file(dir.join(format!("{name}.enc")));
+    let _ = std::fs::remove_file(dir.join(format!("{stem}.txt.enc")));
+    let _ = std::fs::remove_file(album_temp_dir().join(&name));
+}
+
+/// Delete every kept picture (clearing all role-play memories).
+pub fn clear_album() {
+    let _ = std::fs::remove_dir_all(album_dir());
+    clear_album_temp();
+}
+
+/// Move the old diary (kept inside the role-play JSON before role play had
+/// its own memory store) into `store`, once. Entries without a category go
+/// under "Diary", pictures under "Pictures". The old list is only dropped
+/// after the store reads every entry back from disk, and only once the old
+/// file is kept as `ai_chat_roleplay.json.pre-memory.bak`.
+pub fn migrate_diary(rp: &mut RoleplayState, store: &mut MemoryStore) {
+    if rp.memories.is_empty() || rp.load_failed || store.load_failed || store.kind != MemoryKind::Roleplay {
+        return;
+    }
+    // No backup, no move: the old diary stays as it is until next launch.
+    let path = store_path();
+    let bak = path.with_extension("json.pre-memory.bak");
+    if !bak.exists() && std::fs::copy(&path, &bak).is_err() {
+        return;
+    }
+    for m in rp.memories.iter().filter(worth_moving) {
+        if holds(store, m) {
+            continue; // an earlier, interrupted run already moved it
+        }
+        let topic = if m.image.is_some() { PICTURES_TOPIC } else { LEGACY_TOPIC };
+        let title = match (title_from(&m.text), &m.image) {
+            (t, Some(name)) if t.is_empty() => name.clone(),
+            (t, _) => t,
+        };
+        let title = store.unique_title(topic, &title);
+        store.add_entry(topic, &title, &m.text, m.by_ai, m.image.clone());
+    }
+    let saved = MemoryStore::load(MemoryKind::Roleplay);
+    if !saved.load_failed && rp.memories.iter().filter(worth_moving).all(|m| holds(&saved, m)) {
+        rp.memories.clear();
+        rp.save();
+    }
+}
+
+/// The store holds an old diary entry when it has its very text (and
+/// picture) — never just something similar, so nothing gets lost.
+fn holds(store: &MemoryStore, m: &Memory) -> bool {
+    store.topics.iter().flat_map(|t| &t.memories).any(|x| x.text == m.text.trim() && x.image == m.image)
+}
+
+/// An old diary entry with something in it: words, or a picture.
+fn worth_moving(m: &&Memory) -> bool {
+    !m.text.trim().is_empty() || m.image.is_some()
+}
+
+/// A role-play memory store that lives only in memory (nothing on disk), for
+/// tests: `(topic, text)` pairs in story order.
+#[cfg(test)]
+pub(crate) fn test_store(entries: &[(&str, &str)]) -> MemoryStore {
+    let mut store = MemoryStore { kind: MemoryKind::Roleplay, ..Default::default() };
+    for (i, (topic, text)) in entries.iter().enumerate() {
+        let ti = match store.topics.iter().position(|t| t.name == *topic) {
+            Some(ti) => ti,
+            None => {
+                store.topics.push(crate::memory::Topic { name: topic.to_string(), memories: Vec::new() });
+                store.topics.len() - 1
+            }
+        };
+        store.topics[ti].memories.push(crate::memory::Memory {
+            id: i as u64 + 1,
+            title: title_from(text),
+            text: text.to_string(),
+            created: i as i64,
+            updated: i as i64,
+            by_ai: true,
+            image: None,
+        });
+    }
+    store
 }
 
 /// Everything the model asked the app to do via control lines in a reply.
@@ -427,141 +533,6 @@ pub fn strip_memory_lines(text: &str) -> String {
         .join("\n")
 }
 
-/// The role-play block of the chat's left panel: character setup (names,
-/// persona) and the shared diary.
-pub fn panel_ui(ui: &mut egui::Ui, rp: &mut RoleplayState) {
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.add_space(4.0);
-        ui.add(
-            egui::Image::new(egui::include_image!("../icons/ai-brain.svg"))
-                .fit_to_exact_size(egui::vec2(14.0, 14.0))
-                .tint(MUTED()),
-        );
-        ui.label(egui::RichText::new("ROLE PLAY").color(MUTED()).strong().size(11.0));
-    });
-    ui.add_space(6.0);
-
-    if rp.load_failed {
-        ui.label(
-            egui::RichText::new(
-                "Your saved diary couldn't be unlocked — it was encrypted on \
-                 another PC or user account. Nothing will be saved over it.",
-            )
-            .color(egui::Color32::from_rgb(210, 70, 70))
-            .size(11.5),
-        );
-        if ui
-            .button(egui::RichText::new("Start a new diary").size(11.5))
-            .on_hover_text("Keeps the old file as ai_chat_roleplay.json.bak")
-            .clicked()
-        {
-            rp.start_new_diary();
-        }
-        ui.add_space(6.0);
-    }
-
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        let w = (ui.available_width() - 16.0) / 2.0;
-        changed |= ui
-            .add_sized(
-                egui::vec2(w, 24.0),
-                egui::TextEdit::singleline(&mut rp.ai_name).hint_text("AI's name"),
-            )
-            .lost_focus();
-        changed |= ui
-            .add_sized(
-                egui::vec2(w, 24.0),
-                egui::TextEdit::singleline(&mut rp.user_name).hint_text("Your name"),
-            )
-            .lost_focus();
-    });
-    ui.add_space(4.0);
-    changed |= ui
-        .add(
-            egui::TextEdit::multiline(&mut rp.persona)
-                .desired_rows(3)
-                .desired_width(f32::INFINITY)
-                .hint_text("Persona — who is the AI? Looks, personality, world…"),
-        )
-        .lost_focus();
-    if changed {
-        rp.save();
-    }
-
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(format!("MEMORIES ({})", rp.memories.len()))
-                .color(MUTED())
-                .strong()
-                .size(11.0),
-        );
-    });
-    ui.add_space(4.0);
-
-    // Add-a-memory row (the user's side of the diary).
-    ui.horizontal(|ui| {
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut rp.new_memory)
-                .desired_width(ui.available_width() - 30.0)
-                .hint_text("Add a memory…"),
-        );
-        let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if (ui.small_button("＋").on_hover_text("Add").clicked() || submit)
-            && !rp.new_memory.trim().is_empty()
-        {
-            let text = std::mem::take(&mut rp.new_memory);
-            rp.add_memory(&text, false);
-        }
-    });
-    ui.add_space(4.0);
-
-    egui::ScrollArea::vertical().id_salt("rp_memories").show(ui, |ui| {
-        ui.spacing_mut().item_spacing.y = 4.0;
-        let mut delete: Option<usize> = None;
-        for (i, m) in rp.memories.iter().enumerate().rev() {
-            egui::Frame::new()
-                .fill(ui.visuals().extreme_bg_color.gamma_multiply(0.6))
-                .corner_radius(egui::CornerRadius::same(8))
-                .inner_margin(egui::Margin::symmetric(8, 6))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        let mut who = if m.by_ai { rp.ai_display().to_string() } else { "you".to_string() };
-                        if m.image.is_some() {
-                            who.push_str("  🖼");
-                        }
-                        ui.label(egui::RichText::new(who).color(ACCENT1()).size(10.0));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                            if ui
-                                .add(egui::Button::new(egui::RichText::new("✕").color(MUTED()).size(10.0)).frame(false))
-                                .on_hover_text("Forget this")
-                                .clicked()
-                            {
-                                delete = Some(i);
-                            }
-                        });
-                    });
-                    ui.label(egui::RichText::new(&m.text).color(TEXT()).size(11.5));
-                });
-        }
-        if let Some(i) = delete {
-            rp.forget(i);
-        }
-        if rp.memories.is_empty() {
-            ui.label(
-                egui::RichText::new("Nothing remembered yet — the diary fills \
-                     itself as the story unfolds, and you can add entries above.")
-                    .color(MUTED())
-                    .size(11.0),
-            );
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,22 +600,96 @@ SHOW_IMAGE: y"), "hi");
     #[test]
     fn thinking_rule_follows_the_level() {
         let rp = RoleplayState { ai_name: "Mira".into(), ..Default::default() };
-        let (brief, deep) = (rp.preamble_with(false), rp.preamble_with(true));
+        let (brief, deep) = (rp.preamble_with(&MemoryStore::default(), false), rp.preamble_with(&MemoryStore::default(), true));
         assert!(brief.contains("Think briefly") && !brief.contains("Think it through"));
         assert!(deep.contains("Think it through") && !deep.contains("Think briefly"));
-        assert_eq!(rp.preamble(), brief);
+        assert_eq!(rp.preamble(&MemoryStore::default()), brief);
         assert!(deep.contains("You are Mira") && deep.contains("MEMORY:"));
     }
 
-    /// Duplicate detection is wording-insensitive.
+    /// Duplicate detection (in the role-play store) is wording-insensitive.
     #[test]
     fn diary_rejects_duplicates() {
-        let mut rp = RoleplayState::default();
-        // Note: add_memory saves to disk; use texts that build a throwaway
-        // state without touching the persisted file.
-        rp.memories.push(Memory { text: "Andrew granted permission to use the garden.".into(), by_ai: true, image: None });
-        let key_dup = "  Andrew GRANTED permission, to use the garden!! ";
-        let normalized_matches = super::normalize(key_dup) == super::normalize(&rp.memories[0].text);
-        assert!(normalized_matches, "normalization should treat these as the same memory");
+        let mut store = MemoryStore { kind: MemoryKind::Roleplay, ..Default::default() };
+        store.topics.push(crate::memory::Topic {
+            name: "Permissions".into(),
+            memories: vec![crate::memory::Memory {
+                id: 1,
+                title: "Andrew granted permission".into(),
+                text: "Andrew granted permission to use the garden.".into(),
+                created: 1,
+                updated: 1,
+                by_ai: true,
+                image: None,
+            }],
+        });
+        assert!(store.contains_text("  Andrew GRANTED permission, to use the garden!! "));
+    }
+
+    /// The old diary counts as moved only when the store holds every entry's
+    /// very text and picture: a look-alike title isn't enough, and entries
+    /// made only of symbols count too.
+    #[test]
+    fn diary_moves_exactly() {
+        let old = |text: &str, image: Option<&str>| Memory { text: text.into(), by_ai: true, image: image.map(Into::into) };
+        let a = old("We met at the harbour. It was cold and the gulls were loud.", None);
+        let b = old("We met at the harbour.", Some("img_001.jpg"));
+        let heart = old("❤️", None);
+        // A is in, titled "We met at the harbour" — B still has to move.
+        let mut store = test_store(&[("Diary", a.text.as_str())]);
+        assert!(holds(&store, &a));
+        assert!(!holds(&store, &b));
+        assert!(!holds(&store, &heart));
+        store.topics[0].memories.push(crate::memory::Memory {
+            id: 9,
+            title: "❤️".into(),
+            text: "❤️".into(),
+            created: 2,
+            updated: 2,
+            by_ai: true,
+            image: None,
+        });
+        assert!(holds(&store, &heart));
+        assert!(store.contains_text("❤️") && !store.contains_text("🌹"));
+        assert_eq!(store.unique_title("Diary", "🌹"), "🌹");
+        assert_eq!(store.unique_title("Diary", "❤️"), "❤️ (2)");
+        assert!(!worth_moving(&&old("  ", None)));
+        assert!(worth_moving(&&old("", Some("img_002.jpg"))));
+    }
+
+    /// `MEMORY: [Category] text` files under that category; anything else
+    /// goes under Story.
+    #[test]
+    fn memory_lines_carry_their_category() {
+        assert_eq!(
+            parse_memory_line("[permissions]  Andrew let me fight at their side."),
+            ("Permissions", "Andrew let me fight at their side.")
+        );
+        assert_eq!(parse_memory_line("[Pictures] The lighthouse."), ("Pictures", "The lighthouse."));
+        assert_eq!(parse_memory_line("[Weather] Rain all day."), ("Story", "Rain all day."));
+        assert_eq!(parse_memory_line("We reached the harbour."), ("Story", "We reached the harbour."));
+    }
+
+    /// The prompt carries the store's memories in story order, with their
+    /// categories, and explains the categories.
+    #[test]
+    fn preamble_lists_memories_with_categories() {
+        let rp = RoleplayState { ai_name: "Mira".into(), user_name: "Andrew".into(), ..Default::default() };
+        let store = test_store(&[("Names", "Andrew said I may call them Billie."), ("Story", "We reached the harbour.")]);
+        let p = rp.preamble(&store);
+        assert!(p.contains("- [Names] Andrew said I may call them Billie.\n- [Story] We reached the harbour.\n"));
+        assert!(p.contains("one of: Names, Permissions, Boundaries, Facts, Promises, Feelings, Story"));
+        assert!(rp.preamble(&MemoryStore::default()).contains("(the diary is empty so far)"));
+    }
+
+    /// Titles are the first sentence, eight words at most.
+    #[test]
+    fn titles_from_diary_sentences() {
+        assert_eq!(title_from("We reached the harbour. It was cold."), "We reached the harbour");
+        assert_eq!(
+            title_from("Andrew said I may call them Billie from now on, always."),
+            "Andrew said I may call them Billie from…"
+        );
+        assert_eq!(title_from("Dr. Mills is Andrew's doctor."), "Dr. Mills is Andrew's doctor");
     }
 }

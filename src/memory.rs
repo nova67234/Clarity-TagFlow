@@ -15,14 +15,29 @@
 //! this module is the store they share with the memory map and the settings
 //! tab.
 //!
-//! Files live in `models_root()/ai_memory/`: `header.json` plus
-//! `topics/<slug>.json`, each **encrypted at rest** with src/secret.rs like the
-//! role-play diary. A file that exists but can't be read (say the folder was
-//! copied from another computer or user account) marks the store
-//! `load_failed`, and nothing is ever written over it until the user chooses
-//! to start fresh.
+//! There are two stores of the same shape, kept apart on purpose (see
+//! [`MemoryKind`]): the AI's main memory, and role play's own memories, so a
+//! story's events never leak into normal chats and real memories never break
+//! a character.
+//!
+//! Files live in `models_root()/ai_memory/` (role play:
+//! `ai_memory_roleplay/`): `header.json` plus `topics/<slug>.json`, each
+//! **encrypted at rest** with src/secret.rs. A file that exists but can't be
+//! read (say the folder was copied from another computer or user account)
+//! marks the store `load_failed`, and nothing is ever written over it until
+//! the user chooses to start fresh.
 
 use std::path::PathBuf;
+
+/// Which memory a store holds. Same format and code, separate folders.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, Hash)]
+pub enum MemoryKind {
+    /// The AI's memory across normal chats.
+    #[default]
+    Main,
+    /// Role play's own memories (the character's diary).
+    Roleplay,
+}
 
 /// One remembered thing.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -35,6 +50,13 @@ pub struct Memory {
     /// Unix seconds.
     pub created: i64,
     pub updated: i64,
+    /// Written by the AI rather than added by the user.
+    #[serde(default)]
+    pub by_ai: bool,
+    /// Role play: the album picture this memory is about (its file name in
+    /// the album, e.g. "img_003.jpg").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 /// A topic's memories (one file on disk).
@@ -77,6 +99,8 @@ pub struct Header {
 /// The whole memory as the UI sees it: the header plus every topic.
 #[derive(Default)]
 pub struct MemoryStore {
+    /// Which store this is (decides the folder it lives in).
+    pub kind: MemoryKind,
     pub header: Header,
     /// Every topic, in index order.
     pub topics: Vec<Topic>,
@@ -86,20 +110,23 @@ pub struct MemoryStore {
     pub revision: u64,
 }
 
-fn dir() -> PathBuf {
-    crate::tagger::models_root().join("ai_memory")
+fn dir(kind: MemoryKind) -> PathBuf {
+    crate::tagger::models_root().join(match kind {
+        MemoryKind::Main => "ai_memory",
+        MemoryKind::Roleplay => "ai_memory_roleplay",
+    })
 }
 
-fn topics_dir() -> PathBuf {
-    dir().join("topics")
+fn topics_dir(kind: MemoryKind) -> PathBuf {
+    dir(kind).join("topics")
 }
 
-fn header_path() -> PathBuf {
-    dir().join("header.json")
+fn header_path(kind: MemoryKind) -> PathBuf {
+    dir(kind).join("header.json")
 }
 
-fn topic_path(slug: &str) -> PathBuf {
-    topics_dir().join(format!("{slug}.json"))
+fn topic_path(kind: MemoryKind, slug: &str) -> PathBuf {
+    topics_dir(kind).join(format!("{slug}.json"))
 }
 
 pub fn now() -> i64 {
@@ -119,6 +146,13 @@ fn normalize(s: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The same words, ignoring case, spacing and punctuation — or, for text
+/// that's all symbols ("❤️"), exactly the same text.
+fn same_words(a: &str, b: &str) -> bool {
+    let (ka, kb) = (normalize(a), normalize(b));
+    if ka.is_empty() || kb.is_empty() { a.trim() == b.trim() } else { ka == kb }
 }
 
 /// The file stem for a new topic: an opaque `topic-N` (the first one `taken`
@@ -178,9 +212,9 @@ fn write_json<T: serde::Serialize>(path: &std::path::Path, value: &T) {
 
 impl MemoryStore {
     /// Load the header and every topic it indexes.
-    pub fn load() -> Self {
-        let mut store = MemoryStore::default();
-        match read_json::<Header>(&header_path()) {
+    pub fn load(kind: MemoryKind) -> Self {
+        let mut store = MemoryStore { kind, ..Default::default() };
+        match read_json::<Header>(&header_path(kind)) {
             Ok(Some(h)) => store.header = h,
             Ok(None) => return store, // nothing remembered yet
             Err(()) => {
@@ -190,7 +224,7 @@ impl MemoryStore {
         }
         let index = store.header.index.clone();
         for entry in &index {
-            match Self::load_topic_file(&entry.slug) {
+            match Self::load_topic_file(kind, &entry.slug) {
                 Ok(Some(t)) => store.topics.push(t),
                 Ok(None) => store.topics.push(Topic { name: entry.name.clone(), memories: Vec::new() }),
                 Err(()) => {
@@ -204,8 +238,8 @@ impl MemoryStore {
 
     /// Read one topic's file by its slug, without loading anything else —
     /// the cheap lookup a chat uses when it needs a topic's memories.
-    pub fn load_topic_file(slug: &str) -> Result<Option<Topic>, ()> {
-        read_json::<Topic>(&topic_path(slug))
+    pub fn load_topic_file(kind: MemoryKind, slug: &str) -> Result<Option<Topic>, ()> {
+        read_json::<Topic>(&topic_path(kind, slug))
     }
 
     /// Total memories across all topics.
@@ -232,7 +266,7 @@ impl MemoryStore {
 
     fn save_header(&self) {
         if !self.load_failed {
-            write_json(&header_path(), &self.header);
+            write_json(&header_path(self.kind), &self.header);
         }
     }
 
@@ -241,7 +275,7 @@ impl MemoryStore {
             return;
         }
         if let (Some(t), Some(e)) = (self.topics.get(i), self.header.index.get(i)) {
-            write_json(&topic_path(&e.slug), t);
+            write_json(&topic_path(self.kind, &e.slug), t);
         }
     }
 
@@ -265,7 +299,8 @@ impl MemoryStore {
         if let Some(i) = self.find_topic(name) {
             return i;
         }
-        let slug = next_slug(|s| self.header.index.iter().any(|e| e.slug == s) || topic_path(s).exists());
+        let kind = self.kind;
+        let slug = next_slug(|s| self.header.index.iter().any(|e| e.slug == s) || topic_path(kind, s).exists());
         self.topics.push(Topic { name: name.trim().to_string(), memories: Vec::new() });
         self.header.index.push(IndexEntry {
             name: name.trim().to_string(),
@@ -276,21 +311,36 @@ impl MemoryStore {
         self.topics.len() - 1
     }
 
-    /// Remember something under `topic`. A memory with the same title in that
-    /// topic is updated in place instead of duplicated. Returns the topic
-    /// index and the memory id, or `None` for empty input or an unreadable
-    /// store.
+    /// Remember something under `topic` (added by the user). A memory with
+    /// the same title in that topic is updated in place instead of
+    /// duplicated. Returns the topic index and the memory id, or `None` for
+    /// empty input or an unreadable store.
     pub fn add(&mut self, topic: &str, title: &str, text: &str) -> Option<(usize, u64)> {
+        self.add_entry(topic, title, text, false, None)
+    }
+
+    /// [`add`](Self::add) with who wrote it and, for role play, the album
+    /// picture it's about.
+    pub fn add_entry(
+        &mut self,
+        topic: &str,
+        title: &str,
+        text: &str,
+        by_ai: bool,
+        image: Option<String>,
+    ) -> Option<(usize, u64)> {
         let (topic, title, text) = (topic.trim(), title.trim(), text.trim());
         if self.load_failed || topic.is_empty() || (title.is_empty() && text.is_empty()) {
             return None;
         }
         let ti = self.topic_mut_or_create(topic);
-        let key = normalize(title);
         let t = now();
-        let id = if let Some(m) = self.topics[ti].memories.iter_mut().find(|m| normalize(&m.title) == key) {
+        let id = if let Some(m) = self.topics[ti].memories.iter_mut().find(|m| same_words(&m.title, title)) {
             m.text = text.to_string();
             m.updated = t;
+            if image.is_some() {
+                m.image = image;
+            }
             m.id
         } else {
             self.header.next_id += 1;
@@ -301,6 +351,8 @@ impl MemoryStore {
                 text: text.to_string(),
                 created: t,
                 updated: t,
+                by_ai,
+                image,
             });
             id
         };
@@ -309,6 +361,50 @@ impl MemoryStore {
         self.save_header();
         self.touch();
         Some((ti, id))
+    }
+
+    /// `title`, or `title (2)`, `title (3)`… — whichever isn't used in
+    /// `topic` yet, so adding never overwrites an existing memory.
+    pub fn unique_title(&self, topic: &str, title: &str) -> String {
+        let Some(ti) = self.find_topic(topic) else {
+            return title.to_string();
+        };
+        let taken = |t: &str| self.topics[ti].memories.iter().any(|m| same_words(&m.title, t));
+        if !taken(title) {
+            return title.to_string();
+        }
+        let mut n = 2;
+        loop {
+            let candidate = format!("{title} ({n})");
+            if !taken(&candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// True when some memory already says `text` (ignoring case, spacing and
+    /// punctuation) — in its details or as its title.
+    pub fn contains_text(&self, text: &str) -> bool {
+        !text.trim().is_empty()
+            && self
+                .topics
+                .iter()
+                .flat_map(|t| &t.memories)
+                .any(|m| same_words(&m.text, text) || same_words(&m.title, text))
+    }
+
+    /// The newest `n` memories across every topic, oldest first, each with
+    /// its topic's name — the order a story happened in.
+    pub fn recent(&self, n: usize) -> Vec<(&str, &Memory)> {
+        let mut all: Vec<(&str, &Memory)> = self
+            .topics
+            .iter()
+            .flat_map(|t| t.memories.iter().map(move |m| (t.name.as_str(), m)))
+            .collect();
+        all.sort_by_key(|(_, m)| (m.created, m.id));
+        let skip = all.len().saturating_sub(n);
+        all.split_off(skip)
     }
 
     /// Change a memory's title and text.
@@ -328,21 +424,24 @@ impl MemoryStore {
         self.touch();
     }
 
-    /// Forget one memory. A topic left empty is removed with its file.
-    pub fn delete(&mut self, topic: usize, id: u64) {
+    /// Forget one memory, returning it (role play then deletes its album
+    /// picture). A topic left empty is removed with its file.
+    pub fn delete(&mut self, topic: usize, id: u64) -> Option<Memory> {
         if self.load_failed {
-            return;
+            return None;
         }
-        let Some(t) = self.topics.get_mut(topic) else { return };
-        t.memories.retain(|m| m.id != id);
+        let t = self.topics.get_mut(topic)?;
+        let pos = t.memories.iter().position(|m| m.id == id)?;
+        let removed = t.memories.remove(pos);
         if t.memories.is_empty() {
             self.delete_topic(topic);
-            return;
+            return Some(removed);
         }
         self.reindex(topic);
         self.save_topic(topic);
         self.save_header();
         self.touch();
+        Some(removed)
     }
 
     /// Forget a whole topic.
@@ -352,7 +451,7 @@ impl MemoryStore {
         }
         self.topics.remove(topic);
         let entry = self.header.index.remove(topic);
-        let _ = std::fs::remove_file(topic_path(&entry.slug));
+        let _ = std::fs::remove_file(topic_path(self.kind, &entry.slug));
         self.save_header();
         self.touch();
     }
@@ -372,7 +471,7 @@ impl MemoryStore {
         if self.load_failed {
             return;
         }
-        let _ = std::fs::remove_dir_all(dir());
+        let _ = std::fs::remove_dir_all(dir(self.kind));
         let next_id = self.header.next_id;
         self.header = Header { next_id, ..Default::default() };
         self.topics.clear();
@@ -380,12 +479,14 @@ impl MemoryStore {
     }
 
     /// Give up on an unreadable memory: move the folder aside (kept as
-    /// `ai_memory.bak`, replacing an older backup) and start empty.
+    /// `ai_memory.bak` / `ai_memory_roleplay.bak`, replacing an older backup)
+    /// and start empty.
     pub fn start_fresh(&mut self) {
-        let bak = dir().with_file_name("ai_memory.bak");
+        let folder = dir(self.kind);
+        let bak = folder.with_extension("bak");
         let _ = std::fs::remove_dir_all(&bak);
-        let _ = std::fs::rename(dir(), &bak);
-        *self = MemoryStore { revision: self.revision + 1, ..Default::default() };
+        let _ = std::fs::rename(&folder, &bak);
+        *self = MemoryStore { kind: self.kind, revision: self.revision + 1, ..Default::default() };
     }
 }
 
@@ -438,7 +539,15 @@ mod tests {
         let path = dir.join("topics").join("work.json");
         let topic = Topic {
             name: "Work".into(),
-            memories: vec![Memory { id: 7, title: "Title".into(), text: "Some detail".into(), created: 1, updated: 2 }],
+            memories: vec![Memory {
+                id: 7,
+                title: "Title".into(),
+                text: "Some detail".into(),
+                created: 1,
+                updated: 2,
+                by_ai: true,
+                image: Some("img_001.jpg".into()),
+            }],
         };
         write_json(&path, &topic);
         write_json(&path, &topic); // replacing an existing file works too
@@ -446,6 +555,38 @@ mod tests {
         assert_eq!(back.memories, topic.memories);
         assert!(!path.with_extension("json.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn mem(id: u64, title: &str, text: &str, created: i64) -> Memory {
+        Memory { id, title: title.into(), text: text.into(), created, updated: created, by_ai: true, image: None }
+    }
+
+    /// Titles never collide, duplicates are spotted in any wording, and the
+    /// newest memories come back in story order (no disk access).
+    #[test]
+    fn titles_duplicates_and_story_order() {
+        let mut s = MemoryStore { kind: MemoryKind::Roleplay, ..Default::default() };
+        s.topics.push(Topic {
+            name: "Story".into(),
+            memories: vec![mem(1, "We met at the harbour", "We met at the harbour.", 10), mem(3, "A storm", "A storm hit.", 30)],
+        });
+        s.topics.push(Topic { name: "Names".into(), memories: vec![mem(2, "Billie", "I may call Andrew Billie.", 20)] });
+        assert_eq!(s.unique_title("story", "A storm"), "A storm (2)");
+        assert_eq!(s.unique_title("Story", "Calm sea"), "Calm sea");
+        assert_eq!(s.unique_title("New topic", "A storm"), "A storm");
+        assert!(s.contains_text("  i MAY call andrew billie "));
+        assert!(!s.contains_text("Andrew likes tea."));
+        let recent: Vec<u64> = s.recent(2).iter().map(|(_, m)| m.id).collect();
+        assert_eq!(recent, vec![2, 3]);
+        assert_eq!(s.recent(10)[0].0, "Story");
+    }
+
+    /// The two stores live in separate folders.
+    #[test]
+    fn stores_are_kept_apart() {
+        assert_ne!(dir(MemoryKind::Main), dir(MemoryKind::Roleplay));
+        assert!(dir(MemoryKind::Roleplay).ends_with("ai_memory_roleplay"));
+        assert!(dir(MemoryKind::Roleplay).with_extension("bak").ends_with("ai_memory_roleplay.bak"));
     }
 
     /// An unreadable store refuses every write, so nothing overwrites it.

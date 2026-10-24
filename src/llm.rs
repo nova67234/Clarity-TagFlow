@@ -26,6 +26,11 @@ use eframe::egui;
 /// scheme as the text-to-image view's cancel flag.
 static GEN_CANCEL: AtomicBool = AtomicBool::new(false);
 
+/// Set by the worker when a reply stopped before the model ended it — at
+/// Max reply length or the context's edge — so its last line may be cut
+/// short (Tag images then leaves the reply's tag edits unapplied).
+static GEN_CUT_OFF: AtomicBool = AtomicBool::new(false);
+
 /// Model folder under the shared models root (`tagger::models_root()`).
 pub const FOLDER: &str = "gemma-4";
 /// The instruct weights (Q4_K_M quant, ~5 GB).
@@ -407,6 +412,11 @@ pub struct ChatMsg {
     pub thinking: Option<String>,
     /// Image attached to a user message (the vision input).
     pub image: Option<PathBuf>,
+    /// Tag images mode: the image a user message was about (sent along as
+    /// its vision input with its current tags; see src/ai_tagging.rs).
+    pub tag_image: Option<PathBuf>,
+    /// Tag images mode: the tag change a reply made, for its note and Undo.
+    pub tag_change: Option<crate::ai_tagging::TagChange>,
 }
 
 /// One conversation in the AI Chat view (the left strip switches between them).
@@ -510,9 +520,20 @@ pub struct LlmState {
     pub voice: crate::voice::VoiceState,
     /// Whisper mic dictation for the input card's mic button (src/dictate.rs).
     pub dictate: crate::dictate::DictationState,
-    /// Role playing: persona, names and the shared memory diary
-    /// (src/roleplay.rs; toggled from the input card's tools menu).
+    /// Role playing: the character's names and persona (src/roleplay.rs;
+    /// toggled from the input card's Tools menu, set up in AI Settings).
     pub roleplay: crate::roleplay::RoleplayState,
+    /// Role play's own memories: the same kind of store as `memory`, kept
+    /// apart from it (src/memory.rs, `MemoryKind::Roleplay`).
+    pub rp_memory: crate::memory::MemoryStore,
+    /// Tag images mode (mirrors the persisted setting; src/ai_tagging.rs).
+    pub tag_images: bool,
+    /// The image on show in Tag images mode (set by main.rs every frame);
+    /// a message sent now is about it.
+    pub tag_target: Option<PathBuf>,
+    /// Tag edits and undos for main.rs to carry out (it owns the Tag
+    /// Manager and the right panel).
+    pub tag_requests: Vec<crate::ai_tagging::TagRequest>,
     /// The Gemma 4 variant to chat with (mirrors the persisted setting).
     pub model: GemmaModel,
     /// Sampling knobs (mirrors the persisted setting; sent with every ask, so
@@ -577,6 +598,11 @@ impl Drop for LlmState {
 impl Default for LlmState {
     fn default() -> Self {
         let (video_poster_tx, video_poster_rx) = std::sync::mpsc::channel();
+        // Role play's memories have their own store; an older diary kept in
+        // the role-play file moves into it the first time.
+        let mut roleplay = crate::roleplay::RoleplayState::load();
+        let mut rp_memory = crate::memory::MemoryStore::load(crate::memory::MemoryKind::Roleplay);
+        crate::roleplay::migrate_diary(&mut roleplay, &mut rp_memory);
         Self {
             installed: installed(),
             download: None,
@@ -609,12 +635,16 @@ impl Default for LlmState {
             speak_target: None,
             voice: crate::voice::VoiceState::default(),
             dictate: Default::default(),
-            roleplay: crate::roleplay::RoleplayState::load(),
+            roleplay,
+            rp_memory,
+            tag_images: false,
+            tag_target: None,
+            tag_requests: Vec::new(),
             model: GemmaModel::default(),
             params: GenParams::default(),
             gen_settings_open: false,
             ai_settings_tab: Default::default(),
-            memory: crate::memory::MemoryStore::load(),
+            memory: crate::memory::MemoryStore::load(crate::memory::MemoryKind::Main),
             memory_map: Default::default(),
             worker_model: GemmaModel::default(),
             image_detail: ImageDetail::default(),
@@ -854,15 +884,17 @@ impl LlmState {
                                 }
                             }
                             if let Some(d) = directives {
+                                // Into role play's own memory store, filed
+                                // under the category the line names.
                                 for mem in d.memories {
-                                    self.roleplay.add_memory(&mem, true);
+                                    crate::roleplay::record(&mut self.rp_memory, &mem, true);
                                 }
                                 // "I love this picture" → encrypted album copy
-                                // + a diary entry that remembers why.
+                                // + a memory that remembers why.
                                 if let (Some(why), Some(src)) = (d.keep_image, last_user_image) {
                                     match self.roleplay.save_album_image(&src, &why) {
                                         Ok(name) => {
-                                            self.roleplay.add_memory_with_image(&why, true, Some(name));
+                                            crate::roleplay::record_picture(&mut self.rp_memory, name, &why);
                                         }
                                         Err(e) => eprintln!("[roleplay] album save failed: {e}"),
                                     }
@@ -878,6 +910,63 @@ impl LlmState {
                                     {
                                         m.image = img;
                                     }
+                                }
+                            }
+                        }
+                        // Tag images: a finished reply may end in tag edits —
+                        // pull them out of the visible text and hand them to
+                        // main.rs for the image the user's message was about.
+                        // Only a reply the model ended itself is applied: one
+                        // the user stopped, one cut off at Max reply length
+                        // or one that failed may have a line cut short, so
+                        // its edits are dropped, and the note says why.
+                        let stopped = GEN_CANCEL.load(Ordering::SeqCst);
+                        let cut_off = GEN_CUT_OFF.load(Ordering::SeqCst);
+                        let tagging = self.tag_images;
+                        if let Some(chat) = self
+                            .gen_chat
+                            .and_then(|id| self.chats.iter_mut().find(|c| c.id == id))
+                        {
+                            let image = chat
+                                .msgs
+                                .iter()
+                                .rev()
+                                .find(|m| m.role == ChatRole::User)
+                                .and_then(|m| m.tag_image.clone());
+                            let (chat_id, index) = (chat.id, chat.msgs.len().saturating_sub(1));
+                            if (tagging || image.is_some())
+                                && let Some(m) = chat.msgs.last_mut()
+                            {
+                                let edits = crate::ai_tagging::extract(&mut m.text);
+                                let why = if edits.is_empty() {
+                                    None
+                                } else if res.is_err() {
+                                    Some("the reply failed, so nothing was written")
+                                } else if stopped {
+                                    Some("the reply was stopped, so nothing was written")
+                                } else if cut_off {
+                                    Some("the reply hit Max reply length before it ended, so nothing was written")
+                                } else if !tagging {
+                                    Some("Tag images was switched off, so nothing was written")
+                                } else if image.is_none() {
+                                    Some("no image was selected")
+                                } else {
+                                    None
+                                };
+                                match (why, image) {
+                                    (Some(why), image) => {
+                                        m.tag_change =
+                                            Some(crate::ai_tagging::TagChange::failed(image.unwrap_or_default(), why));
+                                    }
+                                    (None, Some(image)) if !edits.is_empty() => {
+                                        self.tag_requests.push(crate::ai_tagging::TagRequest::Apply {
+                                            chat_id,
+                                            index,
+                                            image,
+                                            edits,
+                                        });
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -998,16 +1087,72 @@ impl LlmState {
         let image = self.draft_image.take();
         self.draft_thumb = None;
         self.draft.clear();
-        self.chats[self.active_chat]
-            .msgs
-            .push(ChatMsg { role: ChatRole::User, text, thinking: None, image });
+        // Tag images: the message is about the image on show right now —
+        // that's what the AI sees, instead of any picture attached before
+        // the mode was switched on.
+        let tag_image = if self.tag_images { self.tag_target.clone() } else { None };
+        let image = if tag_image.is_some() { None } else { image };
+        self.chats[self.active_chat].msgs.push(ChatMsg {
+            role: ChatRole::User,
+            text,
+            thinking: None,
+            image,
+            tag_image,
+            tag_change: None,
+        });
         self.begin_generation(ctx);
+    }
+
+    /// The tag edits and undos waiting for main.rs, oldest first.
+    pub fn take_tag_requests(&mut self) -> Vec<crate::ai_tagging::TagRequest> {
+        std::mem::take(&mut self.tag_requests)
+    }
+
+    /// The replies from `from` on in the active chat are about to be
+    /// replaced: when any of them changed an image's tags, ask main.rs to
+    /// take those changes back first and then resend (`then`). True when it
+    /// was asked — the resend then waits for main.rs.
+    fn rewind_tags(&mut self, from: usize, then: crate::ai_tagging::Resend) -> bool {
+        let chat = &self.chats[self.active_chat];
+        // A reply that only just finished may have its edits still queued
+        // for main.rs (written at the end of this frame): they count too —
+        // the Rewind queued after them takes them back.
+        let queued = self.tag_requests.iter().any(|r| {
+            matches!(r, crate::ai_tagging::TagRequest::Apply { chat_id, index, .. }
+                if *chat_id == chat.id && *index >= from)
+        });
+        let in_place = queued
+            || chat.msgs.iter().skip(from).any(|m| m.tag_change.as_ref().is_some_and(|c| c.changed() && !c.undone));
+        if in_place {
+            self.tag_requests.push(crate::ai_tagging::TagRequest::Rewind { chat_id: chat.id, from, then });
+        }
+        in_place
+    }
+
+    /// The message at `index` of the chat with id `chat_id`, if both still
+    /// exist (a chat may have been deleted, or an edit cut it short).
+    pub fn msg_mut(&mut self, chat_id: u64, index: usize) -> Option<&mut ChatMsg> {
+        self.chats.iter_mut().find(|c| c.id == chat_id)?.msgs.get_mut(index)
     }
 
     /// Regenerate the model reply at `msg_index` of the active chat: that
     /// reply — and everything after it — is discarded, and the conversation
-    /// up to its user message is resent.
+    /// up to its user message is resent. Tag images: tag changes those
+    /// replies made are taken back first (main.rs does that, then calls
+    /// [`retry_now`](Self::retry_now)).
     pub fn retry(&mut self, msg_index: usize, ctx: &egui::Context) {
+        if self.running
+            || self.chats[self.active_chat].msgs.get(msg_index).map(|m| m.role) != Some(ChatRole::Model)
+            || self.rewind_tags(msg_index, crate::ai_tagging::Resend::Retry(msg_index))
+        {
+            return;
+        }
+        self.retry_now(msg_index, ctx);
+    }
+
+    /// [`retry`](Self::retry), once the replies it discards have no tag
+    /// changes left in place.
+    pub fn retry_now(&mut self, msg_index: usize, ctx: &egui::Context) {
         if self.running {
             return;
         }
@@ -1026,8 +1171,25 @@ impl LlmState {
 
     /// Apply an edited user message: it keeps its attached image, gets the
     /// new text, everything after it is discarded, and a fresh reply is
-    /// generated — like `retry`, but with rewritten words.
+    /// generated — like `retry`, but with rewritten words (and, like it,
+    /// taking back the discarded replies' tag changes first).
     pub fn apply_edit(&mut self, msg_index: usize, text: String, ctx: &egui::Context) {
+        if self.running {
+            return;
+        }
+        let msgs = &self.chats[self.active_chat].msgs;
+        if msgs.get(msg_index).map(|m| m.role) != Some(ChatRole::User)
+            || (text.trim().is_empty() && msgs[msg_index].image.is_none())
+            || self.rewind_tags(msg_index + 1, crate::ai_tagging::Resend::Edit(msg_index, text.clone()))
+        {
+            return;
+        }
+        self.apply_edit_now(msg_index, text, ctx);
+    }
+
+    /// [`apply_edit`](Self::apply_edit), once the replies it discards have
+    /// no tag changes left in place.
+    pub fn apply_edit_now(&mut self, msg_index: usize, text: String, ctx: &egui::Context) {
         if self.running {
             return;
         }
@@ -1065,15 +1227,35 @@ impl LlmState {
             .iter()
             .filter(|m| m.role == ChatRole::User || !m.text.trim().is_empty())
             .collect();
-        let mut msgs: Vec<CmdMsg> = kept[kept.len().saturating_sub(HISTORY_MSGS)..]
+        let window: Vec<&ChatMsg> = kept[kept.len().saturating_sub(HISTORY_MSGS)..]
             .iter()
             .skip_while(|m| m.role == ChatRole::Model)
-            .map(|m| CmdMsg {
-                user: m.role == ChatRole::User,
-                text: m.text.clone(),
+            .copied()
+            .collect();
+        let newest_user = window.iter().rposition(|m| m.role == ChatRole::User);
+        let mut msgs: Vec<CmdMsg> = window
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let user = m.role == ChatRole::User;
+                let mut text = m.text.clone();
                 // Only the user's images go through the vision encoder —
                 // album pictures the AI showed back are display-only.
-                image: if m.role == ChatRole::User { m.image.clone() } else { None },
+                let mut image = if user { m.image.clone() } else { None };
+                // Tag images: the newest message carries the image it's
+                // about as its vision input, plus that image's tags read
+                // fresh from its .txt (hand edits since count); older ones
+                // only say which image they were about.
+                if let Some(tag_image) = m.tag_image.as_ref().filter(|_| user) {
+                    if Some(i) == newest_user {
+                        let tags = crate::tag_manager::read_tags(tag_image);
+                        text = format!("{}\n\n{text}", crate::ai_tagging::context(tag_image, tags.as_deref()));
+                        image = Some(tag_image.clone());
+                    } else {
+                        text = format!("{}\n{text}", crate::ai_tagging::label(tag_image));
+                    }
+                }
+                CmdMsg { user, text, image }
             })
             .collect();
         let mut kept_images = 0;
@@ -1115,7 +1297,15 @@ impl LlmState {
             // High / Max thinking lifts the role-play "think briefly" rule.
             let deep = self.model.thinks()
                 && matches!(self.params.thinking, ThinkLevel::High | ThinkLevel::Max);
-            msgs.insert(0, CmdMsg { user: true, text: self.roleplay.preamble_with(deep), image: None });
+            msgs.insert(
+                0,
+                CmdMsg { user: true, text: self.roleplay.preamble_with(&self.rp_memory, deep), image: None },
+            );
+            pinned = 2;
+        } else if self.tag_images {
+            // The tagging brief: how to see the image and change its tags.
+            msgs.insert(0, CmdMsg { user: false, text: crate::ai_tagging::ACK.to_string(), image: None });
+            msgs.insert(0, CmdMsg { user: true, text: crate::ai_tagging::BRIEF.to_string(), image: None });
             pinned = 2;
         }
 
@@ -1134,6 +1324,7 @@ impl LlmState {
             self.worker_detail = self.image_detail;
         }
         GEN_CANCEL.store(false, Ordering::SeqCst);
+        GEN_CUT_OFF.store(false, Ordering::SeqCst);
         match &self.worker {
             Some(w)
                 if w
@@ -1154,6 +1345,8 @@ impl LlmState {
                         text: String::new(),
                         thinking: None,
                         image: None,
+                        tag_image: None,
+                        tag_change: None,
                     });
                 self.running = true;
                 self.gen_started = Some(std::time::Instant::now());
@@ -1872,6 +2065,8 @@ mod worker {
         // Streaming decoder: a token can end mid-way through a multi-byte
         // UTF-8 character (CJK, emoji), so bytes carry over between pieces.
         let mut decoder = encoding_rs::UTF_8.new_decoder();
+        // The model ended the turn itself (rather than a cap cutting it off).
+        let mut ended = false;
         for i in 0..(answer_cap + think_cap + 192) {
             // The UI's Stop button: end the reply here, keeping what streamed.
             if super::GEN_CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1906,6 +2101,7 @@ mod worker {
                         eog_rejects += 1;
                         continue;
                     }
+                ended = true;
                 break;
             }
             let was_thinking = thought_open(&raw);
@@ -1942,6 +2138,11 @@ mod worker {
                 )?;
                 closed_at = Some(raw.len());
             }
+        }
+        // Not ended by the model (nor stopped by the user): the length cap
+        // or the context's edge cut it off, maybe mid-line.
+        if !ended && !super::GEN_CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
+            super::GEN_CUT_OFF.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         Ok(())
     }
@@ -2571,18 +2772,17 @@ mod tests {
     #[ignore]
     fn llm_roleplay_smoke() {
         assert!(installed(), "place a GGUF pair in tools/gemma-4/ first");
-        let mut rp = crate::roleplay::RoleplayState {
+        let rp = crate::roleplay::RoleplayState {
             enabled: true,
             ai_name: "Mira".to_string(),
             user_name: "William".to_string(),
             persona: "a cheerful village alchemist who loves rare herbs".to_string(),
             ..Default::default()
         };
-        rp.memories.push(crate::roleplay::Memory {
-            text: "William is allergic to silverleaf; I must never brew it near them.".to_string(),
-            by_ai: true,
-            image: None,
-        });
+        let diary = crate::roleplay::test_store(&[(
+            "Boundaries",
+            "William is allergic to silverleaf; I must never brew it near them.",
+        )]);
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
@@ -2592,7 +2792,7 @@ mod tests {
                 pinned: 0,
                 detailed: false,
                 msgs: vec![
-                    CmdMsg { user: true, text: rp.preamble(), image: None },
+                    CmdMsg { user: true, text: rp.preamble(&diary), image: None },
                     CmdMsg { user: false, text: rp.ack(), image: None },
                     CmdMsg {
                         user: true,
@@ -2673,7 +2873,7 @@ mod tests {
                 pinned: 0,
                 detailed: false,
                 msgs: vec![
-                    CmdMsg { user: true, text: rp.preamble(), image: None },
+                    CmdMsg { user: true, text: rp.preamble(&Default::default()), image: None },
                     CmdMsg { user: false, text: rp.ack(), image: None },
                     CmdMsg {
                         user: true,
@@ -2858,7 +3058,7 @@ mod tests {
                 pinned: 0,
                 detailed: false,
                 msgs: vec![
-                    u(&rp.preamble()),
+                    u(&rp.preamble(&Default::default())),
                     m(&rp.ack()),
                     u("hey sabrina are you ready to go eat or should i wait for you till your ready?"),
                     m("I'm almost ready, Peter! Just grabbing my purse. Give me two minutes \
@@ -3031,7 +3231,7 @@ mod tests {
         let filler = "We walked along the old harbour wall and talked about boats, weather, \
                       maps and the long road home. "
             .repeat(40);
-        let mut msgs = vec![u(&rp.preamble(), None), m(&rp.ack())];
+        let mut msgs = vec![u(&rp.preamble(&Default::default()), None), m(&rp.ack())];
         for i in 0..28 {
             let img = (i < 2).then(|| imgs[i + 1].clone());
             msgs.push(u(&format!("Day {i}: {filler}"), img));
@@ -3088,6 +3288,230 @@ mod tests {
         assert!(done[3].1.contains("Ottilie"), "trimmed history lost the newest message");
         let err = done[4].0.clone().expect_err("an oversized message must be rejected");
         assert!(err.contains("too long"), "unexpected error: {err}");
+    }
+
+    /// Tag images smoke on a real model: the real brief, real tests/example
+    /// images in a scratch folder with .txt files in different styles, and
+    /// the edits applied the way the app applies them. Prints each raw reply
+    /// (thoughts and control lines included), the parsed edits and the file
+    /// after, and fails on the wrong action or a broken style. Run in release:
+    ///   CTF_TAG_MODEL=31b (or e4b) CTF_TAG_RUNS=1 \
+    ///   cargo test --release --features llm llm_tag_images_smoke -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn llm_tag_images_smoke() {
+        use crate::ai_tagging;
+        use crate::tag_manager::{read_tags, write_tags};
+        let model = match std::env::var("CTF_TAG_MODEL").as_deref() {
+            Ok("e4b") => GemmaModel::E4B,
+            _ => GemmaModel::D31B,
+        };
+        assert!(model.installed(), "{} isn't installed", model.label());
+        let runs: usize = std::env::var("CTF_TAG_RUNS").ok().and_then(|r| r.parse().ok()).unwrap_or(1);
+
+        // The scratch folder: (file, source in tests/example, .txt bytes).
+        let utf16 = |t: &str| {
+            let mut b = vec![0xFF, 0xFE];
+            b.extend(t.encode_utf16().flat_map(|u| u.to_le_bytes()));
+            b
+        };
+        let files: Vec<(&str, &str, Option<Vec<u8>>)> = vec![
+            ("untagged.jpg", "pexels-ahmetyuksek-39720701.jpg", None),
+            (
+                "booru.png",
+                "511c9d48-066f-4734-ace8-157a22953a93.png",
+                // cat_ears and wings are planted mistakes.
+                Some(b"1girl, solo, helmet, sword, fur_trim, armor, cat_ears, outdoors, water, wings".to_vec()),
+            ),
+            (
+                "robot.jpeg",
+                "e554bc32-cfab-40f4-a753-b48369a8c948.jpeg",
+                Some(b"\xEF\xBB\xBFdark background, glowing eyes, robot, metal, portrait\r\n".to_vec()),
+            ),
+            (
+                "caption.jpg",
+                "pexels-462550161-37540258.jpg",
+                Some(b"A woman in a long coat walks past tall windows, black and white photo".to_vec()),
+            ),
+            (
+                "mixed.jpg",
+                "pexels-caio-mantovani-97605853-39468579.jpg",
+                Some(b"Woman, Lamp, Reading, Indoors".to_vec()),
+            ),
+            (
+                "samurai.jpeg",
+                "4e9b6ef8-c829-41ae-993f-a76ec0387e3a.jpeg",
+                Some(utf16("1girl, samurai, armor, katana, helmet, maple leaves")),
+            ),
+        ];
+        let dir = std::env::temp_dir().join("clarity_tag_images_smoke");
+        let txt = |f: &str| dir.join(f).with_extension("txt");
+
+        // (file, ask, should change, follows the case before, check on the tags after)
+        type Check = fn(&[String], &[String]) -> Result<(), String>;
+        let ok: Check = |_, _| Ok(());
+        let cases: Vec<(&str, &str, bool, bool, Check)> = vec![
+            ("untagged.jpg", "Tag this image", true, false, |_, after| {
+                if after.len() < 8 {
+                    return Err(format!("only {} tags", after.len()));
+                }
+                match after.iter().find(|t| t.contains('_') || t.chars().any(char::is_uppercase)) {
+                    Some(t) => Err(format!("not lowercase with spaces: {t}")),
+                    None => Ok(()),
+                }
+            }),
+            ("booru.png", "What is she holding?", false, false, ok),
+            ("booru.png", "Remove the tags that are wrong", true, false, |_, after| {
+                let has = |t: &str| after.iter().any(|a| ai_tagging::same_tag(a, t));
+                if has("cat_ears") || has("wings") {
+                    return Err("a planted wrong tag survived".into());
+                }
+                if !has("sword") || !has("helmet") || !has("armor") {
+                    return Err("removed a right tag".into());
+                }
+                Ok(())
+            }),
+            ("booru.png", "Add her hair colour", true, false, |before, after| {
+                let added: Vec<_> = after.iter().filter(|t| !before.contains(t)).collect();
+                if !added.iter().any(|t| t.contains("hair")) {
+                    return Err(format!("no hair tag added: {added:?}"));
+                }
+                if added.iter().any(|t| t.contains(' ')) {
+                    return Err(format!("spaces in an underscore file: {added:?}"));
+                }
+                if before.iter().any(|t| !after.contains(t)) {
+                    return Err("removed something".into());
+                }
+                Ok(())
+            }),
+            ("robot.jpeg", "Are any tags missing? Don't change anything yet.", false, false, ok),
+            ("robot.jpeg", "Yes, add those", true, true, |before, after| {
+                if before.iter().any(|t| !after.contains(t)) {
+                    return Err("removed something".into());
+                }
+                match after.iter().find(|t| t.contains('_')) {
+                    Some(t) => Err(format!("underscore in a spaces file: {t}")),
+                    None => Ok(()),
+                }
+            }),
+            ("robot.jpeg", "Put the subject tags first", true, false, |before, after| {
+                let mut a: Vec<String> = before.iter().map(|t| t.to_lowercase()).collect();
+                let mut b: Vec<String> = after.iter().map(|t| t.to_lowercase()).collect();
+                a.sort();
+                b.sort();
+                if a != b {
+                    return Err(format!("not the same tags: {before:?} -> {after:?}"));
+                }
+                if after.first().map(String::as_str) != Some("robot") {
+                    return Err(format!("robot isn't first: {after:?}"));
+                }
+                Ok(())
+            }),
+            ("caption.jpg", "Add a tag for the photo style", true, false, |before, after| {
+                if !after.starts_with(before) {
+                    return Err("the caption changed".into());
+                }
+                Ok(())
+            }),
+            ("mixed.jpg", "add a tag for the book", true, false, |before, after| {
+                if !after.starts_with(before) {
+                    return Err("existing tags rewritten".into());
+                }
+                Ok(())
+            }),
+            ("samurai.jpeg", "Remove all tags", true, false, |_, after| {
+                if after.is_empty() { Ok(()) } else { Err(format!("left {after:?}")) }
+            }),
+        ];
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, model, ImageDetail::Standard));
+        let t0 = std::time::Instant::now();
+        let mut failures = Vec::new();
+        let mut score = 0;
+        for run in 0..runs {
+            // A fresh folder each run, so every run starts from the same tags.
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            for (name, src, tags) in &files {
+                std::fs::copy(PathBuf::from("tests/example").join(src), dir.join(name)).unwrap();
+                if let Some(b) = tags {
+                    std::fs::write(txt(name), b).unwrap();
+                }
+            }
+            let mut prev: Option<(PathBuf, String, String)> = None;
+            for (file, ask, should_change, follows, check) in &cases {
+                let image = dir.join(file);
+                let before = read_tags(&image).expect("readable .txt");
+                let mut msgs = vec![
+                    CmdMsg { user: true, text: ai_tagging::BRIEF.to_string(), image: None },
+                    CmdMsg { user: false, text: ai_tagging::ACK.to_string(), image: None },
+                ];
+                if *follows {
+                    let (img, q, a) = prev.clone().expect("a case before");
+                    msgs.push(CmdMsg { user: true, text: format!("{}\n\n{q}", ai_tagging::label(&img)), image: None });
+                    msgs.push(CmdMsg { user: false, text: a, image: None });
+                }
+                let text = format!("{}\n\n{ask}", ai_tagging::context(&image, Some(&before)));
+                msgs.push(CmdMsg { user: true, text, image: Some(image.clone()) });
+                let started = t0.elapsed().as_secs_f32();
+                cmd_tx.send(Cmd::Generate { msgs, params: Default::default(), pinned: 2, detailed: false }).unwrap();
+                let mut raw = String::new();
+                let res = loop {
+                    match msg_rx.recv().expect("worker alive") {
+                        Msg::Token(t) => raw.push_str(&t),
+                        Msg::Done(r) => break r,
+                        _ => {}
+                    }
+                };
+                let cut_off = GEN_CUT_OFF.swap(false, std::sync::atomic::Ordering::SeqCst);
+                let (_thinking, mut visible) = split_channels(&raw);
+                let edits = ai_tagging::extract(&mut visible);
+                let after = if edits.is_empty() { before.clone() } else { ai_tagging::apply(&before, &edits) };
+                if after != before && !cut_off && res.is_ok() {
+                    write_tags(&image, &after).expect("written");
+                }
+                let file_now = std::fs::read(txt(file)).map(|b| String::from_utf8_lossy(&b).into_owned());
+                eprintln!(
+                    "\n===== run {run} · {file}: {ask} ({res:?}{}, {:.0}s) =====\n{raw}\n--- edits: {edits:?}\n--- tags: {after:?}\n--- .txt: {file_now:?}",
+                    if cut_off { ", CUT OFF" } else { "" },
+                    t0.elapsed().as_secs_f32() - started
+                );
+                let label = format!("run {run} · {file}: {ask}");
+                let mut wrong: Vec<String> = Vec::new();
+                if res.is_err() || cut_off {
+                    wrong.push(format!("{res:?} cut_off={cut_off}"));
+                } else if edits.is_empty() == *should_change {
+                    wrong.push(if *should_change { "no edit".into() } else { format!("edited: {edits:?}") });
+                } else if *should_change {
+                    if let Err(why) = check(&before, &after) {
+                        wrong.push(why);
+                    }
+                }
+                for line in visible.lines() {
+                    let l = line.trim_start();
+                    if l.contains("TAGS_") || l.starts_with("[Image:") || l.starts_with("Current tags:") {
+                        wrong.push(format!("left in the reply: {line}"));
+                    }
+                }
+                if wrong.is_empty() {
+                    score += 1;
+                }
+                failures.extend(wrong.into_iter().map(|why| format!("{label}: {why}")));
+                prev = Some((image, ask.to_string(), visible.trim().to_string()));
+            }
+        }
+        drop(cmd_tx);
+        handle.join().unwrap();
+        // The caption's sentence and the UTF-16 / BOM encodings survived.
+        let caption = std::fs::read_to_string(txt("caption.jpg")).unwrap();
+        assert!(caption.starts_with("A woman in a long coat walks past tall windows"), "{caption}");
+        assert!(std::fs::read(txt("robot.jpeg")).unwrap().starts_with(b"\xEF\xBB\xBF"), "robot lost its BOM");
+        assert!(std::fs::read(txt("samurai.jpeg")).unwrap().starts_with(&[0xFF, 0xFE]), "samurai lost UTF-16");
+        eprintln!("\n{} — {score} of {} right in {:.0}s", model.label(), cases.len() * runs, t0.elapsed().as_secs_f32());
+        assert!(failures.is_empty(), "failed: {failures:#?}");
     }
 
     /// Review harness for the Krea 2 prompt writer + Detailed Vision on the
