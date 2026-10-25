@@ -57,7 +57,7 @@ jobs:
       # Link's networking runs differently per OS (accepted sockets, timeouts):
       # its end-to-end tests (loopback host + receiver) run here too.
       - name: Link tests
-        run: cargo test --no-default-features --features avif --target aarch64-apple-darwin link::
+        run: "cargo test --no-default-features --features avif --target aarch64-apple-darwin link::"
 
   windows:
     runs-on: windows-2022
@@ -87,4 +87,4 @@ jobs:
       # Link's networking runs differently per OS (accepted sockets, timeouts):
       # its end-to-end tests (loopback host + receiver) run here too.
       - name: Link tests
-        run: cargo test --no-default-features --features avif link::
+        run: "cargo test --no-default-features --features avif link::"
