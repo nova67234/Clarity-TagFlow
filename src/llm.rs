@@ -1270,6 +1270,12 @@ impl LlmState {
                                 .find(|c| c.id == id)
                                 .and_then(|c| c.msgs.last_mut())
                             {
+                                // The "Thinking… X s" counter starts with the
+                                // reply itself, not the model load and the
+                                // prompt / picture reading before it.
+                                if m.text.is_empty() {
+                                    self.gen_started = Some(std::time::Instant::now());
+                                }
                                 m.text.push_str(&t);
                             }
                     }
@@ -1280,17 +1286,22 @@ impl LlmState {
                         // is never re-sent in the history, spoken, or copied.
                         // Done on errors too, so a reply cut short by a failure
                         // doesn't show raw channel markers.
+                        let stopped = GEN_CANCEL.load(Ordering::SeqCst);
+                        let cut_off = GEN_CUT_OFF.load(Ordering::SeqCst);
                         if let Some(m) = self
                                 .gen_chat
                                 .and_then(|id| self.chats.iter_mut().find(|c| c.id == id))
                                 .and_then(|c| c.msgs.last_mut())
                             {
                                 let (thinking, visible) = split_channels(&m.text);
-                                if visible.is_empty() && !thinking.is_empty() {
+                                if visible.is_empty() && !thinking.is_empty() && res.is_ok() && !stopped {
                                     // Last resort: the model wrote everything
                                     // inside its head and ignored every nudge
                                     // to say it out loud — better to show the
-                                    // thought than an empty bubble.
+                                    // thought than an empty bubble. Not for a
+                                    // reply stopped mid-thought: its half
+                                    // thought stays a thought (never re-sent
+                                    // in the history or spoken).
                                     m.text = thinking;
                                 } else {
                                     if !thinking.is_empty() {
@@ -1308,8 +1319,6 @@ impl LlmState {
                         // itself is acted on: a stopped, cut-off or failed one
                         // may end mid-line ("MEMORY: Peter is allergic to"),
                         // so its control lines are only hidden.
-                        let stopped = GEN_CANCEL.load(Ordering::SeqCst);
-                        let cut_off = GEN_CUT_OFF.load(Ordering::SeqCst);
                         if self.gen_roleplay {
                             let complete = res.is_ok() && !stopped && !cut_off;
                             let mut directives = None;
@@ -1418,9 +1427,10 @@ impl LlmState {
                         }
                         // Auto-speak: read the finished reply aloud (after the
                         // diary lines are gone, so they're never spoken) —
-                        // unless AI Chat was switched off meanwhile: nothing
-                        // would be on screen to stop it with.
-                        if res.is_ok() && self.auto_speak && !self.unload_when_done {
+                        // unless it was stopped (Stop means stop), or AI Chat
+                        // was switched off meanwhile: nothing would be on
+                        // screen to stop it with.
+                        if res.is_ok() && !stopped && self.auto_speak && !self.unload_when_done {
                             let target = self
                                 .gen_chat
                                 .and_then(|id| self.chats.iter().find(|c| c.id == id))
@@ -2107,6 +2117,7 @@ mod worker {
     use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
     use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText};
     use llama_cpp_2::sampling::LlamaSampler;
+    use llama_cpp_2::token::logit_bias::LlamaLogitBias;
 
     use super::{Cmd, Msg};
 
@@ -2566,18 +2577,53 @@ mod worker {
         // The user's sampling knobs (defaults are Gemma's recommendation:
         // top-k 64, top-p 0.95, temperature 1.0). Temperature ~0 means "always
         // the most likely token" — plain greedy, no need to sample.
-        let mut sampler = if params.temperature <= 0.01 {
-            LlamaSampler::greedy()
-        } else {
-            LlamaSampler::chain_simple([
-                LlamaSampler::top_k(params.top_k.max(1)),
-                LlamaSampler::top_p(params.top_p.clamp(0.05, 1.0), 1),
-                LlamaSampler::temp(params.temperature),
-                // A fresh seed per reply — a fixed one made "Regenerate"
-                // reproduce the same answer for the same history.
-                LlamaSampler::dist(random_seed()),
-            ])
+        let greedy = params.temperature <= 0.01;
+        // Gemma reasons in `<|channel>thought … <channel|>`, Qwen's thinking
+        // model in `<think> … </think>` — same budget machinery, different
+        // markers.
+        let (thought_start, thought_end) = match which {
+            super::GemmaModel::Qwen30B => ("<think>", "</think>"),
+            _ => ("<|channel>", "<channel|>"),
         };
+        // Once the thought is closed its markers can't come again: greedy
+        // decoding otherwise loops on the closing marker after a forced close
+        // ("<channel|>\n" up to the length cap — an empty-looking answer).
+        let marker_bans: Vec<LlamaLogitBias> = [thought_start, thought_end]
+            .iter()
+            .filter_map(|m| match model.str_to_token(m, AddBos::Never) {
+                Ok(t) if t.len() == 1 => Some(LlamaLogitBias::new(t[0], f32::NEG_INFINITY)),
+                _ => None,
+            })
+            .collect();
+        let n_vocab = model.n_vocab();
+        // `temperature: None` = greedy; `ban` = the thought's markers are out.
+        let sampler_for = |temperature: Option<f32>, ban: bool| {
+            let mut chain = Vec::new();
+            if ban {
+                chain.push(LlamaSampler::logit_bias(n_vocab, &marker_bans));
+            }
+            match temperature {
+                None => chain.push(LlamaSampler::greedy()),
+                Some(t) => chain.extend([
+                    LlamaSampler::top_k(params.top_k.max(1)),
+                    LlamaSampler::top_p(params.top_p.clamp(0.05, 1.0), 1),
+                    LlamaSampler::temp(t),
+                    // A fresh seed per reply — a fixed one made "Regenerate"
+                    // reproduce the same answer for the same history.
+                    LlamaSampler::dist(random_seed()),
+                ]),
+            }
+            LlamaSampler::chain_simple(chain)
+        };
+        // Greedy, while a rejected end of turn is being resampled (see below).
+        let mut unstick = false;
+        let mut banned = false;
+        let sampling = |unstick: bool| match (greedy, unstick) {
+            (false, _) => Some(params.temperature),
+            (true, false) => None,
+            (true, true) => Some(0.6),
+        };
+        let mut sampler = sampler_for(sampling(false), false);
 
         let mut batch = LlamaBatch::new(N_BATCH as usize, 1);
         // Caps. The visible answer may use the full "Max reply length"; the
@@ -2611,13 +2657,6 @@ mod worker {
         // treating its hidden draft as "already said").
         let mut closed_at: Option<usize> = None;
         let mut eog_rejects = 0;
-        // Gemma reasons in `<|channel>thought … <channel|>`, Qwen's thinking
-        // model in `<think> … </think>` — same budget machinery, different
-        // markers.
-        let (thought_start, thought_end) = match which {
-            super::GemmaModel::Qwen30B => ("<think>", "</think>"),
-            _ => ("<|channel>", "<channel|>"),
-        };
         let thought_open =
             |raw: &String| raw.contains(thought_start) && !raw.contains(thought_end);
         // Streaming decoder: a token can end mid-way through a multi-byte
@@ -2649,14 +2688,23 @@ mod worker {
                         thought_end, send,
                     )?;
                     closed_at = Some(raw.len());
+                    banned = true;
+                    sampler = sampler_for(sampling(unstick), banned);
                     continue;
                 }
                 // Turn ending straight after a forced close, with nothing
                 // visible yet: reject and resample (the EOG never enters the
                 // context; the sampler's RNG moves on) until it speaks.
+                // Greedy has no RNG — it would pick the same end every time
+                // — so it samples for a moment instead, until the answer
+                // starts (then greedy again).
                 if let Some(p) = closed_at
                     && raw[p..].trim().is_empty() && eog_rejects < 24 {
                         eog_rejects += 1;
+                        if greedy && !unstick {
+                            unstick = true;
+                            sampler = sampler_for(sampling(unstick), banned);
+                        }
                         continue;
                     }
                 ended = true;
@@ -2667,6 +2715,15 @@ mod worker {
             if !piece.is_empty() {
                 raw.push_str(&piece);
                 send(Msg::Token(piece));
+            }
+            if unstick && closed_at.is_some_and(|p| !raw[p..].trim().is_empty()) {
+                unstick = false;
+                sampler = sampler_for(sampling(unstick), banned);
+            }
+            // The model closed its thought itself.
+            if was_thinking && !banned && !thought_open(&raw) {
+                banned = true;
+                sampler = sampler_for(sampling(unstick), banned);
             }
             batch.clear();
             batch.add(token, n_past, &[0], true).map_err(|e| e.to_string())?;
@@ -2693,6 +2750,8 @@ mod worker {
                     thought_end, send,
                 )?;
                 closed_at = Some(raw.len());
+                banned = true;
+                sampler = sampler_for(sampling(unstick), banned);
             }
         }
         // Not ended by the model (nor stopped by the user): the length cap
@@ -4114,6 +4173,76 @@ mod tests {
         assert!(done[3].1.contains("Ottilie"), "trimmed history lost the newest message");
         let err = done[4].0.clone().expect_err("an oversized message must be rejected");
         assert!(err.contains("too long"), "unexpected error: {err}");
+    }
+
+    /// Greedy sampling (temperature 0) through a forced thought-close on the
+    /// 31B: thinking at Low (256 tokens) on asks it wants to think long about,
+    /// so the thought is cut and the model must still answer out loud — with
+    /// greedy, a rejected end of turn used to be resampled as the same end 24
+    /// times, leaving the answer empty. Run in release with the Vulkan env
+    /// (see llm_fixes_31b):
+    ///   cargo test --release --features llm-vulkan --bin Clarity_TagFlow \
+    ///     llm_thinking_greedy_31b -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn llm_thinking_greedy_31b() {
+        assert!(GemmaModel::D31B.installed(), "Gemma 4 31B isn't installed");
+        let asks = [
+            "Plan a careful 10-day trip through Japan for a family with two small children, weighing \
+             every trade-off. Then give me only a two-sentence summary.",
+            "Work out which is larger, 2^100 or 10^30, checking your reasoning twice. Answer in one sentence.",
+        ];
+        let params = super::GenParams {
+            temperature: 0.0,
+            max_tokens: 400,
+            thinking: super::ThinkLevel::Low,
+            ..Default::default()
+        };
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        for q in asks {
+            cmd_tx
+                .send(Cmd::Generate {
+                    params,
+                    pinned: 0,
+                    detailed: false,
+                    msgs: vec![CmdMsg { user: true, text: q.to_string(), image: None }],
+                })
+                .unwrap();
+        }
+        drop(cmd_tx);
+        let ctx = egui::Context::default();
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::D31B, ImageDetail::Standard));
+        let mut raw = String::new();
+        let mut done = Vec::new();
+        let t0 = std::time::Instant::now();
+        for msg in msg_rx {
+            match msg {
+                Msg::Token(t) => raw.push_str(&t),
+                Msg::Done(r) => {
+                    let (thought, vis) = split_channels(&raw);
+                    eprintln!(
+                        "[done {} at {:.1}s] {r:?} — thought {} chars\n=== VISIBLE ===\n{vis}\n=== END ===",
+                        done.len() + 1,
+                        t0.elapsed().as_secs_f32(),
+                        thought.len()
+                    );
+                    if vis.trim().is_empty() {
+                        eprintln!("=== RAW ===\n{raw:?}\n=== END RAW ===");
+                    }
+                    done.push((r, thought, vis));
+                    raw.clear();
+                }
+                _ => {}
+            }
+        }
+        handle.join().unwrap();
+        assert_eq!(done.len(), asks.len());
+        for (i, (r, thought, vis)) in done.iter().enumerate() {
+            assert_eq!(*r, Ok(()), "ask {i} failed");
+            assert!(!thought.trim().is_empty(), "ask {i}: no thought (thinking didn't run)");
+            assert!(!vis.trim().is_empty(), "ask {i}: no visible answer after the thought");
+        }
     }
 
     /// Tag images smoke on a real model: the real brief, real tests/example

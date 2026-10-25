@@ -1054,7 +1054,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
     } else {
         body.clone()
     };
-    if streaming && !body.is_empty() {
+    if streaming && !shown.trim().is_empty() {
         shown.push('▌');
     }
 
@@ -1068,7 +1068,15 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
     }
     if !shown.trim().is_empty() {
         chat_markdown(ui, &mut llm.md_cache, &shown, false);
+    } else if !streaming && !thinking.is_empty() {
+        // Ended (stopped, or failed) while still thinking: no answer, only
+        // the thought (in the Thoughts row above) — say so rather than
+        // leave a blank.
+        ui.add_space(2.0);
+        let col = chat_text_override().or_else(chat_aurora_ink).unwrap_or(MUTED());
+        ui.label(egui::RichText::new("Ended while still thinking — no answer").color(col).size(12.5).italics());
     }
+    let has_text = !text.trim().is_empty();
 
     // Tag images: what this reply changed in the image's tags, with Undo.
     if let Some(change) = &tag_change {
@@ -1076,12 +1084,14 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         tag_change_note(ui, llm, index, change);
     }
 
-    // Action row under every finished reply: copy / regenerate / listen.
+    // Action row under every finished reply: copy / regenerate / listen
+    // (copy and listen only when there's text to copy or read).
     if !streaming {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            if msg_icon_button(ui, egui::include_image!("../icons/copy.svg"), 15.0, "Copy message", true)
-                .clicked()
+            if has_text
+                && msg_icon_button(ui, egui::include_image!("../icons/copy.svg"), 15.0, "Copy message", true)
+                    .clicked()
             {
                 ui.ctx().copy_text(text.clone());
             }
@@ -1103,7 +1113,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                 "Read aloud"
             };
             let chat_id = llm.chats[llm.active_chat].id;
-            if msg_icon_button(ui, egui::include_image!("../icons/listen.svg"), 15.0, tip, true).clicked() {
+            if has_text && msg_icon_button(ui, egui::include_image!("../icons/listen.svg"), 15.0, tip, true).clicked() {
                 llm.speak_target = Some((chat_id, index));
                 llm.listen(&text, ui.ctx());
             }
@@ -1619,12 +1629,13 @@ fn chat_model_selector(
     let menu_id = ui.id().with("chat_model_menu");
     let open = egui::Popup::is_id_open(ui.ctx(), menu_id);
 
-    // "Gemma 4 31B" + a muted " Medium" when the model thinks.
+    // "Gemma 4 31B" + a muted " · Medium" when the model thinks (the dot
+    // keeps "Qwen3-VL 30B Thinking · Off" from reading "Thinking Off").
     let mut job = egui::text::LayoutJob::default();
     job.append(&label, 0.0, egui::TextFormat::simple(egui::FontId::proportional(12.0), TEXT()));
     if thinks {
         job.append(
-            settings.ai_gen.thinking.label(),
+            &format!("· {}", settings.ai_gen.thinking.label()),
             5.0,
             egui::TextFormat::simple(egui::FontId::proportional(12.0), MUTED()),
         );
