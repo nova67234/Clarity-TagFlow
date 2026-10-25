@@ -907,9 +907,9 @@ pub fn settings_tab(ui: &mut egui::Ui, settings: &mut crate::settings::Settings,
     section(ui, "Link", |ui| {
         ui.label(
             egui::RichText::new(
-                "Use another PC's AI models and GPU — or share this one's — and send images and \
-                 videos between the two. Local network only; everything between the two apps is \
-                 encrypted end to end.",
+                "Use another PC's AI models and GPU — or share this one's — and send images, \
+                 videos and zip archives between the two. Local network only; everything between \
+                 the two apps is encrypted end to end.",
             )
             .color(MUTED())
             .size(11.5),
@@ -935,6 +935,22 @@ pub fn settings_tab(ui: &mut egui::Ui, settings: &mut crate::settings::Settings,
         LinkMode::Receiver => receiver_ui(ui, settings, link),
     }
     if settings.link.mode != LinkMode::Off {
+        // Zips never show in the browser (whose right-click menu sends
+        // images and videos), so they're sent from here.
+        let targets = link.send_targets();
+        if !targets.is_empty() {
+            section(ui, "Send files", |ui| {
+                for (key, name) in targets {
+                    row(ui, &format!("Send a zip to {name}"), Some("Images and videos: right-click them in the browser"), |ui| {
+                        if ui.button("Choose zip…").clicked()
+                            && let Some(path) = rfd::FileDialog::new().add_filter("Zip archive", &["zip"]).pick_file()
+                        {
+                            link.send(&key, vec![path]);
+                        }
+                    });
+                }
+            });
+        }
         section(ui, "Received files", |ui| {
             let dir = received_dir(&settings.link);
             row(ui, "Save files to", Some(&dir.display().to_string()), |ui| {

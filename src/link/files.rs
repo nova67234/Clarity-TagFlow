@@ -256,8 +256,8 @@ impl FileHub {
 }
 
 /// A file list another PC sent: sensible length, plain names (no folders —
-/// nothing can land outside the received folder), images / videos and their
-/// .txt files only.
+/// nothing can land outside the received folder), images / videos with
+/// their .txt files, and zip archives only.
 fn check_list(files: &[BlobMeta]) -> Result<(), String> {
     if files.is_empty() || files.len() > MAX_FILES {
         return Err("Too many files".into());
@@ -266,9 +266,9 @@ fn check_list(files: &[BlobMeta]) -> Result<(), String> {
         if !is_plain_name(&f.name) {
             return Err(format!("Unusable file name: {}", f.name));
         }
-        let txt = Path::new(&f.name).extension().is_some_and(|e| e.eq_ignore_ascii_case("txt"));
-        if !txt && !crate::has_sidecar_extension(Path::new(&f.name)) {
-            return Err(format!("Not an image or video: {}", f.name));
+        let ext_is = |x: &str| Path::new(&f.name).extension().is_some_and(|e| e.eq_ignore_ascii_case(x));
+        if !ext_is("txt") && !ext_is("zip") && !crate::has_sidecar_extension(Path::new(&f.name)) {
+            return Err(format!("Not an image, video or zip: {}", f.name));
         }
         if f.size > MAX_FILE {
             return Err(format!("{} is too large", f.name));
@@ -397,6 +397,9 @@ mod tests {
         assert!(check_list(&[f("a/cat.png", 10)]).is_err());
         assert!(check_list(&[f(".hidden.png", 10)]).is_err());
         assert!(check_list(&[f("run.exe", 10)]).is_err());
+        assert!(check_list(&[f("photos.zip", 10)]).is_ok());
+        assert!(check_list(&[f("photos.ZIP", 10)]).is_ok());
+        assert!(check_list(&[f("run.exe.zip.exe", 10)]).is_err());
         assert!(check_list(&[f("cat:x.png", 10)]).is_err());
         assert!(check_list(&[f("a\\cat.png", 10)]).is_err());
         assert!(check_list(&[]).is_err());
