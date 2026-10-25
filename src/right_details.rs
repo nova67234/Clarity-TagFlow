@@ -1796,7 +1796,7 @@ pub(crate) fn delete_confirm_dialog(
         .resizable(false)
         .collapsible(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO) // Anchor directly in the middle of the screen
-        .frame(crate::float_card_frame(22)) // match the rest of the UI (radius 22, shadow; opaque fill)
+        .frame(crate::float_card_frame(22)) // match the rest of the UI (radius 22, shadow)
         .show(ctx, |ui| {
             ui.set_max_width(260.0); // Stop it from stretching too wide
 

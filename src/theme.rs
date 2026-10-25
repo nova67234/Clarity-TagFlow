@@ -435,19 +435,20 @@ pub fn PANEL() -> Color32 {
 }
 
 /// Fill for surfaces that float over the UI: windows, popups, menus and
-/// tooltips. The same as [`PANEL`], except in the Glass themes, where the
-/// panel fill is translucent and a floating window showed the panels and text
-/// beneath it through its own content. There it is the panel tint laid over
-/// the Glass background colour, flattened to an opaque colour: a floating
-/// window looks like the glass panels while nothing beneath shows through.
+/// tooltips. The panel colour — so in the Glass themes they're glass too,
+/// see-through like the panels (by design: don't make them opaque).
 #[allow(non_snake_case)]
 pub fn FLOAT() -> Color32 {
-    float_fill(palette(), glass_config().0)
+    palette().panel
 }
 
-/// [`FLOAT`] for palette `p` over the Glass background colour `glass_bg`.
-fn float_fill(p: &Palette, glass_bg: Color32) -> Color32 {
-    if p.glass { glass_bg.blend(p.panel) } else { p.panel }
+/// For a separate OS window with nothing of the app behind it (the voice
+/// pill), which can't be see-through on Windows: [`PANEL`], with the Glass
+/// themes' translucent panel tint flattened over the Glass background colour.
+#[allow(non_snake_case)]
+pub fn SOLID_PANEL() -> Color32 {
+    let p = palette();
+    if p.glass { glass_config().0.blend(p.panel) } else { p.panel }
 }
 
 #[allow(non_snake_case)]
@@ -538,8 +539,8 @@ pub fn apply(ctx: &egui::Context) {
     };
     v.panel_fill = p.bg;
     // egui's own windows, popups, menus and tooltips (combo-box lists, the
-    // colour picker) are opaque even in the Glass themes — see FLOAT.
-    v.window_fill = float_fill(p, glass_config().0);
+    // colour picker): glass in the Glass themes — see FLOAT.
+    v.window_fill = p.panel;
     v.extreme_bg_color = p.field; // text-edit background
     v.override_text_color = Some(p.text);
     // Selection highlight follows the theme accent, but Aurora uses its pink so
@@ -898,22 +899,12 @@ mod tests {
         }
     }
 
-    /// Windows and popups never let what's beneath them show through: their
-    /// fill is opaque in every theme, the panel colour where that's already
-    /// opaque, and in Glass exactly what a panel looks like over the
-    /// background colour.
+    /// Windows and popups are the panel colour in every theme — in Glass
+    /// that's see-through, on purpose.
     #[test]
-    fn floating_surfaces_are_opaque() {
-        let bg = Color32::from_rgb(40, 20, 90);
-        for p in [&DARK, &LIGHT, &SPACE, &AURORA, &GLASS, &GLASS_LIGHT] {
-            let f = float_fill(p, bg);
-            assert_eq!(f.a(), 255, "{f:?}");
-            if !p.glass {
-                assert_eq!(f, p.panel);
-            }
-        }
-        assert_eq!(float_fill(&GLASS, bg), bg.blend(GLASS.panel));
-        assert_ne!(float_fill(&GLASS, bg), float_fill(&GLASS, Color32::BLACK), "follows the background colour");
+    fn floating_surfaces_are_panels() {
+        assert_eq!(FLOAT(), palette().panel);
+        assert!(GLASS.panel.a() < 255 && GLASS_LIGHT.panel.a() < 255);
     }
 
     #[test]

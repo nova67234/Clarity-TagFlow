@@ -356,9 +356,8 @@ struct ViewerApp {
     /// Last-applied Glass dark/light panel mode — a palette change that doesn't
     /// change `theme`, so it needs its own re-apply tracking.
     last_glass_light: bool,
-    /// The Glass background colour the visuals were last applied with: the
-    /// opaque fill of egui's own popups (combo lists, tooltips) is the glass
-    /// tint over it, so picking a new colour re-applies them.
+    /// The Glass background colour the visuals were last applied with, so
+    /// picking a new colour re-applies them.
     last_glass_bg: [u8; 3],
     /// Last-applied media-type filter (Filter tab), so we re-filter the browser
     /// only when the user actually changes it.
@@ -2870,8 +2869,8 @@ fn install_fallback_fonts(ctx: &egui::Context) {
 }
 
 /// [`card_frame`] for something floating over the UI (a popup, a dialog):
-/// the same card with the opaque [`FLOAT`] fill, so in the Glass theme the
-/// panels and text beneath it don't show through.
+/// the same card with the [`FLOAT`] fill (see-through glass in the Glass
+/// themes).
 pub(crate) fn float_card_frame(radius: u8) -> egui::Frame {
     card_frame(radius).fill(FLOAT())
 }

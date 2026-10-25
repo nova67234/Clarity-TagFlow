@@ -1411,8 +1411,8 @@ pub(crate) fn settings_window_size(screen: egui::Rect) -> (f32, f32) {
 }
 
 /// A themed frame for the settings window body (matches the Civitai / Backup
-/// popups: rounded-16 card with a soft drop shadow). Opaque in every theme
-/// ([`FLOAT`]), so the Glass theme's panels and text don't show through it.
+/// popups: rounded-16 card with a soft drop shadow), filled with [`FLOAT`]
+/// (see-through glass in the Glass themes).
 pub(crate) fn window_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(FLOAT())

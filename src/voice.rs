@@ -858,7 +858,7 @@ pub fn recorder_window(ctx: &egui::Context, voice: &mut VoiceState) {
                     // Opaque: in the Glass theme PANEL is see-through, and
                     // this window has nothing of the app behind it.
                     egui::Frame::new()
-                        .fill(crate::theme::FLOAT())
+                        .fill(crate::theme::SOLID_PANEL())
                         .corner_radius(radius)
                         .inner_margin(egui::Margin::symmetric(12, 10))
                         .stroke(stroke)

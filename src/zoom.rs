@@ -1129,7 +1129,7 @@ const MENU_W: f32 = 158.0;
 /// Shared with other context menus (e.g. the LoRA picker's).
 pub(crate) fn menu_frame() -> egui::Frame {
     egui::Frame::new()
-        // Opaque in every theme (the Glass panels are see-through).
+        // Glass in the Glass themes, like the panels (see FLOAT).
         .fill(crate::theme::FLOAT())
         .stroke(Stroke::new(1.0, crate::theme::EDGE()))
         .corner_radius(CornerRadius::same(12))
