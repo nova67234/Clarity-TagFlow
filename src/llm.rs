@@ -218,8 +218,8 @@ impl ThinkLevel {
     /// Tokens of thought allowed before the thought is force-closed and the
     /// model must answer — an allowance ON TOP of "Max reply length", so the
     /// visible answer always keeps its full length. (It used to be carved
-    /// out of the reply length, which left Max the shortest answers.)
-    #[cfg_attr(not(feature = "llm"), allow(dead_code))]
+    /// out of the reply length, which left Max the shortest answers.) Also
+    /// shown on the chat's thinking slider.
     pub fn budget(self) -> usize {
         match self {
             ThinkLevel::Off => 0,

@@ -1608,12 +1608,15 @@ fn msg_icon_button(
     icon_button_tinted(ui, icon, icon_size, tip, enabled, chat_icon_tint(TEXT()))
 }
 
-/// The model picker next to the mic, Gemini-style: the button reads the
-/// model and (for the models that think) its thinking level, e.g. "Gemma 4
-/// 31B Medium". It opens an upward list of ONLY the installed models — each
-/// with a short tagline and a check on the active one — then a divider and a
-/// "Thinking level ▸" submenu holding the cube slider. Hidden while nothing
-/// is installed yet (Settings → AI Model handles first-time setup).
+/// The model picker next to the mic. Closed, it blends into the composer
+/// bar: no pill or border, just the model's name — with its thinking level
+/// after a muted dot when it thinks ("Gemma 4 31B · Max") — and a small
+/// arrow. It opens a popover docked 10 px above the input card (so it never
+/// covers the draft) listing ONLY the installed models: a card each with a
+/// tagline (and, for the models that think, what kind of thinker), the
+/// active one tinted with a check. Under a divider, a "Thinking level" row
+/// unfolds the cube slider in a recessed well. Hidden while nothing is
+/// installed yet (Settings → AI Model handles first-time setup).
 fn chat_model_selector(
     ui: &mut egui::Ui,
     llm: &mut LlmState,
@@ -1643,17 +1646,17 @@ fn chat_model_selector(
     // "Gemma 4 31B" + a muted " · Medium" when the model thinks (the dot
     // keeps "Qwen3-VL 30B Thinking · Off" from reading "Thinking Off").
     let mut job = egui::text::LayoutJob::default();
-    job.append(&label, 0.0, egui::TextFormat::simple(egui::FontId::proportional(12.0), TEXT()));
+    job.append(&label, 0.0, egui::TextFormat::simple(egui::FontId::proportional(12.5), TEXT()));
     if thinks {
         job.append(
             &format!("· {}", settings.ai_gen.thinking.label()),
             5.0,
-            egui::TextFormat::simple(egui::FontId::proportional(12.0), MUTED()),
+            egui::TextFormat::simple(egui::FontId::proportional(12.5), MUTED()),
         );
     }
-    job.wrap = egui::text::TextWrapping::truncate_at_width(190.0);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(200.0);
     let galley = ui.fonts_mut(|f| f.layout_job(job));
-    let (arrow, gap) = (14.0, 2.0);
+    let (arrow, gap) = (14.0, 4.0);
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(galley.size().x + gap + arrow, 28.0), egui::Sense::click());
     let tip = match &remote {
@@ -1675,104 +1678,204 @@ fn chat_model_selector(
         );
         egui::Image::new(arrow_src).tint(icon_tint(MUTED())).paint_at(ui, arrow_rect);
     }
+
+    // Docked to the input card's top edge, not to this button: the button
+    // sits in the card's bottom row, so a gap from it alone would cover the
+    // draft. Right edges line up with the button. (The card's rect is last
+    // frame's; before there is one, the button stands in.)
+    let dock = llm.input_rect.map_or(resp.rect, |(card, _)| {
+        egui::Rect::from_x_y_ranges(resp.rect.x_range(), card.top()..=card.top())
+    });
     egui::Popup::menu(&resp)
         .id(menu_id)
+        .anchor(dock)
         .align(egui::RectAlign::TOP_END)
+        .gap(10.0)
         // Dragging the thinking slider mustn't close the menu; picking a
         // model closes it explicitly.
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .frame(
-            egui::Frame::new()
-                .fill(PANEL())
-                .corner_radius(egui::CornerRadius::same(22))
-                .inner_margin(egui::Margin::same(10))
-                .stroke(egui::Stroke::new(1.0, EDGE())),
-        )
+        // The popover paints its own card (below); in the Glass themes it's
+        // see-through glass, like the Settings window.
+        .frame(egui::Frame::NONE)
         .show(|ui| {
-            ui.set_width(250.0);
-            ui.spacing_mut().item_spacing.y = 2.0;
-            if let Some(host) = &remote {
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new(format!("{label} on {host}")).color(TEXT()).size(13.0));
-                ui.label(
-                    egui::RichText::new("Its model is picked on that PC. Settings → Link to run on this one.")
-                        .color(MUTED())
-                        .size(10.5),
-                );
-                ui.add_space(4.0);
-            }
-            for m in installed {
-                if model_row(ui, m, llm.model == m) {
-                    settings.ai_gemma_model = m;
-                    llm.set_model(m);
-                    ui.close();
-                }
-            }
-            ui.add_space(4.0);
-            ui.separator();
-            ui.add_space(2.0);
-            // Thinking level — expands in place (no second popup): a row with
-            // the current level and a chevron that turns down to reveal the
-            // cube slider underneath.
-            let open_id = ui.id().with("thinking_expanded");
-            let mut expanded = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
-            if thinking_row_header(ui, thinks, settings.ai_gen.thinking, expanded) {
-                expanded = !expanded;
-                ui.data_mut(|d| d.insert_temp(open_id, expanded));
-            }
-            let anim = ui.ctx().animate_bool(open_id.with("anim"), expanded);
-            if anim > 0.0 {
-                ui.scope(|ui| {
-                    ui.set_opacity(anim);
-                    ui.add_space(4.0 * anim);
-                    ui.add_enabled_ui(thinks, |ui| {
-                        let mut level = settings.ai_gen.thinking;
-                        thinking_slider(ui, &mut level);
-                        if level != settings.ai_gen.thinking {
-                            settings.ai_gen.thinking = level;
-                            llm.params.thinking = level;
-                        }
+            egui::Frame::new()
+                .fill(picker_fill())
+                .corner_radius(egui::CornerRadius::same(22))
+                .inner_margin(egui::Margin::same(8))
+                .stroke(egui::Stroke::new(1.0_f32, EDGE()))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 16],
+                    blur: 42,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(165),
+                })
+                .show(ui, |ui| {
+                    ui.set_width(292.0);
+                    ui.spacing_mut().item_spacing.y = 3.0;
+
+                    // What the list is: this PC's models, or the linked PC's.
+                    let header = if remote.is_some() { "RUNS ON ANOTHER PC" } else { "INSTALLED MODELS" };
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(header).color(MUTED().gamma_multiply(0.85)).strong().size(9.5));
                     });
                     ui.add_space(2.0);
-                    crate::settings::hint(ui, &thinking_hint(thinks, settings.ai_gen.thinking));
+
+                    if let Some(host) = &remote {
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(format!("{label} on {host}")).color(TEXT()).strong().size(13.0));
+                                ui.label(
+                                    egui::RichText::new("Its model is picked on that PC. Settings → Link to run on this one.")
+                                        .color(MUTED())
+                                        .size(10.5),
+                                );
+                            });
+                        });
+                        ui.add_space(4.0);
+                    }
+
+                    for m in installed {
+                        if model_row(ui, m, llm.model == m) {
+                            settings.ai_gemma_model = m;
+                            llm.set_model(m);
+                            ui.close();
+                        }
+                    }
+
+                    ui.add_space(3.0);
+                    ui.separator();
+                    ui.add_space(3.0);
+
+                    // Thinking level — expands in place (no second popup): a row with
+                    // the current level and a chevron that turns down to reveal the
+                    // cube slider in a recessed well underneath.
+                    let open_id = ui.id().with("thinking_expanded");
+                    let mut expanded = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
+                    if thinking_row_header(ui, thinks, settings.ai_gen.thinking, expanded) {
+                        expanded = !expanded;
+                        ui.data_mut(|d| d.insert_temp(open_id, expanded));
+                    }
+                    let anim = ui.ctx().animate_bool(open_id.with("anim"), expanded);
+                    if anim > 0.0 {
+                        ui.scope(|ui| {
+                            ui.set_opacity(anim);
+                            ui.add_space(4.0 * anim);
+                            egui::Frame::new()
+                                .fill(picker_well_fill())
+                                .corner_radius(egui::CornerRadius::same(15))
+                                .inner_margin(egui::Margin::symmetric(12, 10))
+                                .stroke(egui::Stroke::new(1.0_f32, picker_hairline()))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.add_enabled_ui(thinks, |ui| {
+                                        let mut level = settings.ai_gen.thinking;
+                                        thinking_slider(ui, &mut level);
+                                        if level != settings.ai_gen.thinking {
+                                            settings.ai_gen.thinking = level;
+                                            llm.params.thinking = level;
+                                        }
+                                    });
+                                    // A hairline between the slider and what the level means.
+                                    ui.add_space(6.0);
+                                    let (line, _) =
+                                        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+                                    ui.painter().rect_filled(line, 0.0, picker_hairline());
+                                    ui.add_space(5.0);
+                                    // As tall as the longest level's hint (Max's runs to
+                                    // three lines, most take one), so the slider doesn't
+                                    // jump under the pointer as the level changes — the
+                                    // popover grows upward from the card. Left-aligned:
+                                    // the menu's justified layout would stretch the
+                                    // gaps between words.
+                                    let w = ui.available_width();
+                                    let tallest = crate::llm::ThinkLevel::ALL
+                                        .into_iter()
+                                        .map(|l| {
+                                            // settings::hint's text size outside the Settings window.
+                                            let font = egui::FontId::proportional(11.0);
+                                            ui.fonts_mut(|f| f.layout(thinking_hint(thinks, l), font, MUTED(), w)).size().y
+                                        })
+                                        .fold(0.0_f32, f32::max);
+                                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                        ui.set_min_height(tallest + 2.0); // + hint's space above
+                                        crate::settings::hint(ui, &thinking_hint(thinks, settings.ai_gen.thinking));
+                                    });
+                                });
+                        });
+                    }
                 });
-            }
         });
 }
 
-/// The picker's "Thinking level" row: label, the current level (muted) and
-/// a chevron that points right when folded and down when open. True when
-/// clicked.
+/// The picker's "Thinking level" row: a wireframe cube in the level's
+/// colour, the label, the level in a pill tinted the same, and a chevron
+/// that points right when folded and down when open — all grey while the
+/// level is Off. True when clicked.
 fn thinking_row_header(ui: &mut egui::Ui, thinks: bool, level: crate::llm::ThinkLevel, expanded: bool) -> bool {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
-        if resp.hovered() {
-            p.rect_stroke(
-                rect.shrink(1.0),
-                egui::CornerRadius::same(14),
-                egui::Stroke::new(1.5, TEXT().gamma_multiply(0.85)),
-                egui::StrokeKind::Inside,
-            );
+        if expanded || resp.hovered() {
+            let shade = if resp.hovered() { 0.06 } else { 0.03 };
+            p.rect_filled(rect, egui::CornerRadius::same(13), TEXT().gamma_multiply(shade));
         }
-        let x = rect.left() + 34.0;
-        p.text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, "Thinking level", egui::FontId::proportional(13.5), TEXT());
-        let value = if thinks { level.label() } else { "Off" };
+
+        let on = thinks && level != crate::llm::ThinkLevel::Off;
+        let col = if on { think_color(level.index() as f32 / 4.0) } else { MUTED() };
+        paint_wire_cube(p, egui::pos2(rect.left() + 19.0, rect.center().y), 6.8, col);
         p.text(
-            egui::pos2(rect.right() - 30.0, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            value,
-            egui::FontId::proportional(12.5),
-            MUTED(),
+            egui::pos2(rect.left() + 34.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            "Thinking level",
+            egui::FontId::proportional(13.0),
+            TEXT(),
         );
+
+        // The level ("Max", "Medium", "Off", …) in a pill.
+        let value = if thinks { level.label() } else { "Off" };
+        let ink = if on { picker_ink(col, 0.45) } else { MUTED() };
+        let text = p.layout_no_wrap(value.to_string(), egui::FontId::proportional(11.0), ink);
+        let w = text.size().x + 16.0;
+        let pill = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 28.0 - w / 2.0, rect.center().y),
+            egui::vec2(w, 20.0),
+        );
+        p.rect_filled(pill, egui::CornerRadius::same(10), col.gamma_multiply(0.18));
+        p.rect_stroke(
+            pill,
+            egui::CornerRadius::same(10),
+            egui::Stroke::new(1.0_f32, col.gamma_multiply(0.40)),
+            egui::StrokeKind::Inside,
+        );
+        p.galley(pill.center() - text.size() / 2.0, text, ink);
+
         let turn = ui.ctx().animate_bool(ui.id().with("thinking_chevron"), expanded);
         egui::Image::new(egui::include_image!("../icons/arrow_right.svg"))
             .tint(icon_tint(MUTED()))
             .rotate(turn * std::f32::consts::FRAC_PI_2, egui::Vec2::splat(0.5))
-            .paint_at(ui, egui::Rect::from_center_size(egui::pos2(rect.right() - 16.0, rect.center().y), egui::vec2(14.0, 14.0)));
+            .paint_at(ui, egui::Rect::from_center_size(egui::pos2(rect.right() - 14.0, rect.center().y), egui::vec2(16.0, 16.0)));
     }
     resp.clicked()
+}
+
+/// The Thinking level row's icon: an isometric cube in outline — a hexagon
+/// with the three edges that meet at the near corner.
+fn paint_wire_cube(painter: &egui::Painter, c: egui::Pos2, r: f32, col: egui::Color32) {
+    let (w, h) = (r * 0.866, r * 0.5);
+    let top = egui::pos2(c.x, c.y - r);
+    let tr = egui::pos2(c.x + w, c.y - h);
+    let br = egui::pos2(c.x + w, c.y + h);
+    let bot = egui::pos2(c.x, c.y + r);
+    let bl = egui::pos2(c.x - w, c.y + h);
+    let tl = egui::pos2(c.x - w, c.y - h);
+    let stroke = egui::Stroke::new(1.5_f32, col);
+    painter.add(egui::Shape::closed_line(vec![top, tr, br, bot, bl, tl], stroke));
+    painter.line_segment([tl, c], stroke);
+    painter.line_segment([tr, c], stroke);
+    painter.line_segment([bot, c], stroke);
 }
 
 /// What the thinking level means, under the slider.
@@ -1794,31 +1897,131 @@ fn thinking_hint(thinks: bool, level: crate::llm::ThinkLevel) -> String {
     .to_string()
 }
 
-/// One model in the picker: a check for the active one, the name with its
-/// tagline beneath, and a rounded outline on hover. True when clicked.
+/// One model in the picker: a rounded card — tinted, with an edge, for the
+/// active one; faintly on hover — holding the name (followed, for the models
+/// that think, by a badge saying what kind of thinker), the tagline beneath,
+/// and a check at the right end on the active one. True when clicked.
 fn model_row(ui: &mut egui::Ui, m: crate::llm::GemmaModel, active: bool) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 48.0), egui::Sense::click());
     let resp = resp.on_hover_text(m.hint()).on_hover_cursor(egui::CursorIcon::PointingHand);
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
-        if resp.hovered() {
+        let radius = egui::CornerRadius::same(15);
+        if active {
+            p.rect_filled(rect, radius, THINK_BLUE.gamma_multiply(0.15));
             p.rect_stroke(
-                rect.shrink(1.0),
-                egui::CornerRadius::same(14),
-                egui::Stroke::new(1.5, TEXT().gamma_multiply(0.85)),
+                rect,
+                radius,
+                egui::Stroke::new(1.0_f32, picker_blue().gamma_multiply(0.38)),
                 egui::StrokeKind::Inside,
             );
+        } else if resp.hovered() {
+            p.rect_filled(rect, radius, TEXT().gamma_multiply(0.05));
         }
+
+        let x = rect.left() + 13.0;
+        let title_y = rect.top() + 16.0;
+        let title_ink = if active { TEXT() } else { TEXT().gamma_multiply(0.92) };
+        let title = p.layout_no_wrap(m.label().to_string(), egui::FontId::proportional(13.5), title_ink);
+        let title_w = title.size().x;
+        p.galley(egui::pos2(x, title_y - title.size().y / 2.0), title, title_ink);
+
+        if let Some(badge) = thinker_badge(m) {
+            let ink = picker_badge_ink();
+            let text = p.layout_no_wrap(badge.to_string(), egui::FontId::proportional(9.5), ink);
+            let pill = egui::Rect::from_min_size(
+                egui::pos2(x + title_w + 7.0, title_y - 8.5),
+                egui::vec2(text.size().x + 12.0, 17.0),
+            );
+            p.rect_filled(pill, egui::CornerRadius::same(9), THINK_BLUE.gamma_multiply(0.18));
+            p.rect_stroke(
+                pill,
+                egui::CornerRadius::same(9),
+                egui::Stroke::new(1.0_f32, picker_blue().gamma_multiply(0.30)),
+                egui::StrokeKind::Inside,
+            );
+            p.galley(pill.center() - text.size() / 2.0, text, ink);
+        }
+
+        p.text(
+            egui::pos2(x, rect.top() + 33.5),
+            egui::Align2::LEFT_CENTER,
+            m.tagline(),
+            egui::FontId::proportional(11.5),
+            MUTED(),
+        );
+
         if active {
+            // The icon's tick fills only half its box: 20 points draws a
+            // ~10-point check (at 15 it was a faint 7).
             egui::Image::new(egui::include_image!("../icons/check.svg"))
-                .tint(TEXT())
-                .paint_at(ui, egui::Rect::from_center_size(egui::pos2(rect.left() + 16.0, rect.center().y), egui::vec2(16.0, 16.0)));
+                .tint(picker_blue())
+                .paint_at(ui, egui::Rect::from_center_size(egui::pos2(rect.right() - 18.0, rect.center().y), egui::vec2(20.0, 20.0)));
         }
-        let x = rect.left() + 34.0;
-        p.text(egui::pos2(x, rect.top() + 14.0), egui::Align2::LEFT_CENTER, m.label(), egui::FontId::proportional(13.5), TEXT());
-        p.text(egui::pos2(x, rect.top() + 31.0), egui::Align2::LEFT_CENTER, m.tagline(), egui::FontId::proportional(11.5), MUTED());
     }
     resp.clicked()
+}
+
+/// The badge after a thinking model's name in the picker: how it's built,
+/// and that it thinks. None for the models that answer straight away.
+fn thinker_badge(m: crate::llm::GemmaModel) -> Option<&'static str> {
+    use crate::llm::GemmaModel as G;
+    if !m.thinks() {
+        return None;
+    }
+    Some(match m {
+        G::D31B => "Dense · Thinks",
+        G::Qwen30B => "MoE · Thinks",
+        _ => "Thinks",
+    })
+}
+
+/// The picker popover's fill: in the Glass themes the Settings window's
+/// see-through glass; otherwise a step darker than the card in dark themes,
+/// the card's own white in light ones (darkened, it turns a muddy grey).
+fn picker_fill() -> egui::Color32 {
+    if is_glass() {
+        FLOAT()
+    } else if is_light() {
+        PANEL()
+    } else {
+        PANEL().lerp_to_gamma(egui::Color32::BLACK, 0.14)
+    }
+}
+
+/// The thinking slider's recessed well: sunk darker in dark themes, the
+/// field grey in light ones.
+fn picker_well_fill() -> egui::Color32 {
+    if is_light() { FIELD() } else { FIELD().lerp_to_gamma(egui::Color32::BLACK, 0.25) }
+}
+
+/// The picker's hairlines: the well's edge and its divider (the slider's
+/// rail is the same ink, a little stronger). Ink-based, because the theme's
+/// EDGE is a faint dark line that vanishes on these dark fills — and is
+/// fully clear in the Glass themes.
+fn picker_hairline() -> egui::Color32 {
+    TEXT().gamma_multiply(0.08)
+}
+
+/// The picker's blue: the active model's edge and check, the badges' edges
+/// — deeper on light themes, where the pale blue washes out.
+fn picker_blue() -> egui::Color32 {
+    if is_light() { egui::Color32::from_rgb(37, 99, 235) } else { egui::Color32::from_rgb(96, 165, 250) }
+}
+
+/// The text on the picker's thinker badges.
+fn picker_badge_ink() -> egui::Color32 {
+    if is_light() { egui::Color32::from_rgb(29, 78, 216) } else { egui::Color32::from_rgb(147, 197, 253) }
+}
+
+/// `col` as text in the picker: lifted toward white by `lift` on dark
+/// themes; deepened on light ones, where a lifted tint would wash out.
+fn picker_ink(col: egui::Color32, lift: f32) -> egui::Color32 {
+    if is_light() {
+        col.lerp_to_gamma(egui::Color32::BLACK, 0.2)
+    } else {
+        col.lerp_to_gamma(egui::Color32::WHITE, lift)
+    }
 }
 
 /// The input card's mic: local Whisper dictation (src/dictate.rs). Idle it's
@@ -1913,20 +2116,27 @@ fn paint_cube(painter: &egui::Painter, c: egui::Pos2, a: f32, col: egui::Color32
     ));
 }
 
-/// The tools menu's thinking slider: a pile of cubes that grows with the
-/// level (glowing at Max), the level's name, and a 5-stop track whose fill
-/// blends blue → purple. Click or drag anywhere on the track to set it.
+/// The model picker's thinking slider: a pile of cubes that grows with the
+/// level (glowing at Max), the level's name with its allowance of thinking
+/// tokens in a chip ("4,096 tok"), and a 5-stop track whose fill blends
+/// blue → purple, named under each stop. Click or drag anywhere on the
+/// track — or click a stop's name — to set it.
 fn thinking_slider(ui: &mut egui::Ui, level: &mut crate::llm::ThinkLevel) -> egui::Response {
     use crate::llm::ThinkLevel;
     let enabled = ui.is_enabled();
     let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 76.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 94.0), egui::Sense::hover());
     let track = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 10.0, rect.bottom() - 22.0),
-        egui::pos2(rect.right() - 10.0, rect.bottom() - 2.0),
+        egui::pos2(rect.left() + 8.0, rect.bottom() - 38.0),
+        egui::pos2(rect.right() - 8.0, rect.bottom() - 16.0),
+    );
+    // The track plus the stop names under it.
+    let hit = egui::Rect::from_min_max(
+        egui::pos2(track.left() - 4.0, track.top() - 8.0),
+        egui::pos2(track.right() + 4.0, rect.bottom()),
     );
     let resp = ui
-        .interact(track, ui.id().with("think_track"), egui::Sense::click_and_drag())
+        .interact(hit, ui.id().with("think_track"), egui::Sense::click_and_drag())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     if let Some(pos) = resp.interact_pointer_pos()
         && (resp.dragged() || resp.clicked() || resp.is_pointer_button_down_on())
@@ -1946,12 +2156,12 @@ fn thinking_slider(ui: &mut egui::Ui, level: &mut crate::llm::ThinkLevel) -> egu
 
     // --- The cube pile, left of the level name. ---
     let a = 9.0;
-    let base = egui::pos2(rect.left() + 46.0, rect.top() + 44.0);
+    let base = egui::pos2(rect.left() + 38.0, rect.top() + 42.0);
     if is_max {
-        // A soft purple glow that breathes while Max is selected (radius 34
+        // A soft purple glow that breathes while Max is selected (radius 32
         // keeps it inside the painter's clip — no flat top).
         let pulse = 0.65 + 0.35 * ((time * 2.4).sin() as f32 * 0.5 + 0.5);
-        soft_glow(&painter, base + egui::vec2(0.0, -14.0), 34.0, THINK_PURPLE.gamma_multiply(0.42 * pulse));
+        soft_glow(&painter, base + egui::vec2(0.0, -14.0), 32.0, THINK_PURPLE.gamma_multiply(0.42 * pulse));
         // ~30 fps is plenty for a slow pulse (same cap as the heart badges).
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
     }
@@ -1985,15 +2195,35 @@ fn thinking_slider(ui: &mut egui::Ui, level: &mut crate::llm::ThinkLevel) -> egu
         paint_cube(&painter, c, a, cube_col, alpha);
     }
 
-    // --- Level name + a short caption, right of the pile. ---
-    let text_x = rect.left() + 92.0;
+    // --- Level name, its thinking-token allowance, a short caption. ---
+    let text_x = rect.left() + 82.0;
     painter.text(
         egui::pos2(text_x, rect.top() + 14.0),
         egui::Align2::LEFT_CENTER,
         level.label(),
         egui::FontId::proportional(15.0),
-        if enabled { col } else { MUTED() },
+        if enabled { picker_ink(think_color(t), 0.2) } else { MUTED() },
     );
+    // The real allowance (ThinkLevel::budget), so the chip can't drift
+    // from what the model is given.
+    let chip_ink = picker_ink(think_color(t), 0.45).gamma_multiply(dim);
+    let chip_text = painter.layout_no_wrap(
+        format!("{} tok", thousands(level.budget())),
+        egui::FontId::monospace(9.5),
+        chip_ink,
+    );
+    let chip = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - chip_text.size().x - 18.0, rect.top() + 5.0),
+        egui::vec2(chip_text.size().x + 14.0, 18.0),
+    );
+    painter.rect_filled(chip, egui::CornerRadius::same(9), col.gamma_multiply(0.14));
+    painter.rect_stroke(
+        chip,
+        egui::CornerRadius::same(9),
+        egui::Stroke::new(1.0_f32, col.gamma_multiply(0.32)),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(chip.center() - chip_text.size() / 2.0, chip_text, chip_ink);
     painter.text(
         egui::pos2(text_x, rect.top() + 32.0),
         egui::Align2::LEFT_CENTER,
@@ -2002,17 +2232,17 @@ fn thinking_slider(ui: &mut egui::Ui, level: &mut crate::llm::ThinkLevel) -> egu
         MUTED().gamma_multiply(dim),
     );
 
-    // --- The track: base rail, gradient fill to the knob, stop dots. ---
+    // --- The track: rail, gradient fill to the knob, stop dots and names. ---
     let cy = track.center().y;
     let (x0, x1) = (track.left(), track.right());
     let kx = x0 + (x1 - x0) * t;
     painter.line_segment(
         [egui::pos2(x0, cy), egui::pos2(x1, cy)],
-        egui::Stroke::new(5.0, EDGE().gamma_multiply(dim)),
+        egui::Stroke::new(5.5_f32, TEXT().gamma_multiply(0.12 * dim)),
     );
     if kx > x0 + 0.5 {
         let mut mesh = egui::Mesh::default();
-        let (h, left_col) = (2.5, THINK_BLUE.gamma_multiply(dim));
+        let (h, left_col) = (2.75, THINK_BLUE.gamma_multiply(dim));
         mesh.colored_vertex(egui::pos2(x0, cy - h), left_col);
         mesh.colored_vertex(egui::pos2(kx, cy - h), col);
         mesh.colored_vertex(egui::pos2(kx, cy + h), col);
@@ -2022,24 +2252,37 @@ fn thinking_slider(ui: &mut egui::Ui, level: &mut crate::llm::ThinkLevel) -> egu
         painter.add(mesh);
         painter.circle_filled(egui::pos2(x0, cy), h, left_col);
     }
-    for i in 0..5 {
+    let names = ["Off", "Low", "Med", "High", "Max"];
+    for (i, name) in names.into_iter().enumerate() {
         let sx = x0 + (x1 - x0) * i as f32 / 4.0;
         let on = (i as f32 / 4.0) <= t + 0.001;
         painter.circle_filled(
             egui::pos2(sx, cy),
             2.0,
-            if on { egui::Color32::WHITE.gamma_multiply(0.8 * dim) } else { MUTED().gamma_multiply(0.7 * dim) },
+            if on { egui::Color32::WHITE.gamma_multiply(0.85 * dim) } else { MUTED().gamma_multiply(0.65 * dim) },
         );
+        // The end names sit flush with the track's ends.
+        let (x, align) = match i {
+            0 => (x0 - 2.0, egui::Align2::LEFT_CENTER),
+            4 => (x1 + 2.0, egui::Align2::RIGHT_CENTER),
+            _ => (sx, egui::Align2::CENTER_CENTER),
+        };
+        let ink = if i == idx {
+            picker_ink(think_color(t), 0.3).gamma_multiply(dim)
+        } else {
+            MUTED().gamma_multiply(0.75 * dim)
+        };
+        painter.text(egui::pos2(x, rect.bottom() - 6.0), align, name, egui::FontId::proportional(9.5), ink);
     }
     if is_max {
         let pulse = 0.6 + 0.4 * ((time * 2.4).sin() as f32 * 0.5 + 0.5);
-        painter.circle_filled(egui::pos2(kx, cy), 13.0, THINK_PURPLE.gamma_multiply(0.25 * pulse));
+        painter.circle_filled(egui::pos2(kx, cy), 12.5, THINK_PURPLE.gamma_multiply(0.25 * pulse));
     }
     painter.circle(
         egui::pos2(kx, cy),
         if resp.hovered() || resp.dragged() { 8.5 } else { 7.5 },
         col,
-        egui::Stroke::new(2.0, egui::Color32::WHITE.gamma_multiply(0.9 * dim)),
+        egui::Stroke::new(2.0_f32, egui::Color32::WHITE.gamma_multiply(0.92 * dim)),
     );
     // Sparkles: four at Max, two at High. They animate, so keep the
     // slider redrawing (~30 fps) while they show.
@@ -2053,6 +2296,19 @@ fn thinking_slider(ui: &mut egui::Ui, level: &mut crate::llm::ThinkLevel) -> egu
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
     }
     resp
+}
+
+/// 4096 → "4,096".
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Little four-point stars twinkling slowly around the knob (`count` of
@@ -2142,4 +2398,18 @@ fn icon_button_tinted(
             .paint_at(ui, egui::Rect::from_center_size(rect.center(), egui::vec2(icon_size, icon_size)));
     }
     resp
+}
+#[cfg(test)]
+mod tests {
+    use super::thousands;
+
+    /// The thinking chip's allowance reads "4,096 tok", not "4096 tok".
+    #[test]
+    fn thousands_groups_digits() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(256), "256");
+        assert_eq!(thousands(1024), "1,024");
+        assert_eq!(thousands(4096), "4,096");
+        assert_eq!(thousands(1_234_567), "1,234,567");
+    }
 }
