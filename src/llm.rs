@@ -390,6 +390,25 @@ enum Msg {
 struct Worker {
     tx: Sender<Cmd>,
     rx: Receiver<Msg>,
+    /// The worker thread, handed on when this worker is dropped so the next
+    /// one waits for it (see `RETIRED`).
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Worker threads that were let go (model switch, reset) and may still be
+/// freeing their model. The next worker waits for them before sizing its GPU
+/// offload — otherwise it sees the old model's memory as taken and loads on
+/// the CPU only.
+static RETIRED: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(Vec::new());
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        if let Some(t) = self.thread.take() {
+            let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+            retired.retain(|t| !t.is_finished());
+            retired.push(t);
+        }
+    }
 }
 
 /// Who authored a chat message.
@@ -1592,8 +1611,17 @@ fn spawn_worker(_ctx: egui::Context, _model: GemmaModel, _detail: ImageDetail) -
 fn spawn_worker(ctx: egui::Context, model: GemmaModel, detail: ImageDetail) -> Option<Worker> {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
     let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
-    std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, model, detail));
-    Some(Worker { tx: cmd_tx, rx: msg_rx })
+    let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
+    let thread = std::thread::spawn(move || {
+        // Let the previous model free its memory first (it stops once its
+        // command channel is gone, after any reply it's still writing).
+        let t0 = std::time::Instant::now();
+        while retired.iter().any(|t| !t.is_finished()) && t0.elapsed().as_secs() < 30 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        worker::run(cmd_rx, msg_tx, ctx, model, detail)
+    });
+    Some(Worker { tx: cmd_tx, rx: msg_rx, thread: Some(thread) })
 }
 
 #[cfg(feature = "llm")]
@@ -1714,7 +1742,7 @@ mod worker {
             let mut last_err = String::new();
             // Which rung succeeded: 0 = the whole model on the GPU.
             let mut rung = 0;
-            for (i, layers) in [1_000_000u32, 24, 0].into_iter().enumerate() {
+            for (i, layers) in offload_rungs(&model_path, &mmproj_path) {
                 if i > 0 {
                     send(Msg::Status(
                         "Model doesn't fit in GPU memory — loading partly on the CPU…".into(),
@@ -2301,6 +2329,140 @@ mod worker {
             image_max_tokens: max_tokens,
         };
         MtmdContext::init_from_file(&mmproj.to_string_lossy(), model, &params).map_err(|e| e.to_string())
+    }
+
+    /// The GPU-offload attempts, best first, as (rung, GPU layers); rung 0 is
+    /// the whole model on the GPU, the last is CPU only. When the GPU reports
+    /// its free memory and the model clearly can't fit whole, the whole-model
+    /// attempt is skipped and the partial one is sized from that memory: the
+    /// doomed attempt used to fill the GPU to the last byte before failing
+    /// (the 31B: ~15 GB into a 16 GB card), stalling the app's own drawing
+    /// for the whole first load, and it read the 18 GB file twice. Without a
+    /// memory report it's the old fixed ladder.
+    fn offload_rungs(model_path: &Path, mmproj_path: &Path) -> Vec<(usize, u32)> {
+        let ladder = vec![(0, 1_000_000), (1, 24), (2, 0)];
+        // Diagnostics: the old fixed ladder, for comparing first loads.
+        if std::env::var_os("CLARITY_FULL_LADDER").is_some() {
+            return ladder;
+        }
+        let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).ok();
+        let (Some(gpu), Some(weights), Some(projector)) = (
+            model_gpu().filter(|g| g.memory_free < g.memory_total),
+            size(model_path),
+            size(mmproj_path),
+        ) else {
+            return ladder;
+        };
+        let free = gpu.memory_free as u64;
+        if fits_whole(weights, projector, free) {
+            return ladder;
+        }
+        // The layer count, from the file's header (no weights read).
+        let Some(n_layer) = gguf_block_count(model_path).filter(|&n| n > 0) else {
+            return ladder[1..].to_vec();
+        };
+        let fit = layers_that_fit(weights, projector, free, n_layer);
+        eprintln!(
+            "[ai] offload: {:.1} GB model, {:.1} GB free on {} — {fit} of {} layers on the GPU",
+            weights as f64 / 1e9,
+            free as f64 / 1e9,
+            gpu.description,
+            n_layer + 1,
+        );
+        let mut rungs = Vec::new();
+        if fit > 0 {
+            rungs.push((1, fit));
+            // The estimate is a model; half of it is a safe second try.
+            if fit / 2 > 0 {
+                rungs.push((1, fit / 2));
+            }
+        }
+        rungs.push((2, 0));
+        rungs
+    }
+
+    /// Per layer, the 16k-token reply context (KV cache) adds about 75% on top
+    /// of the layer's weights (the 31B: 300 MB + 224 MB).
+    const KV_FACTOR: f64 = 1.75;
+    /// GPU memory kept free besides the layers: the compute buffer, the app's
+    /// own drawing and the driver.
+    const GPU_RESERVE: u64 = 1_600 << 20;
+
+    /// What the layers may use: free memory less the vision projector (also on
+    /// the GPU) and the reserve.
+    fn layer_budget(projector: u64, free: u64) -> f64 {
+        free.saturating_sub(projector + GPU_RESERVE) as f64
+    }
+
+    /// The whole model, with its reply context, fits in `free` bytes.
+    pub(super) fn fits_whole(weights: u64, projector: u64, free: u64) -> bool {
+        weights as f64 * KV_FACTOR <= layer_budget(projector, free)
+    }
+
+    /// How many of the `n_layer` layers fit on the GPU (the output layer
+    /// counts as one more in the size per layer).
+    pub(super) fn layers_that_fit(weights: u64, projector: u64, free: u64, n_layer: u32) -> u32 {
+        let per_layer = weights as f64 / f64::from(n_layer + 1) * KV_FACTOR;
+        ((layer_budget(projector, free) / per_layer) as u32).min(n_layer)
+    }
+
+    /// A GGUF file's layer count (`<arch>.block_count`), read from its
+    /// metadata header. `None` when the file isn't GGUF or the key is
+    /// missing.
+    pub(super) fn gguf_block_count(path: &Path) -> Option<u32> {
+        use std::io::Read;
+        let mut r = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+        fn bytes<const N: usize>(r: &mut impl Read) -> Option<[u8; N]> {
+            let mut b = [0u8; N];
+            r.read_exact(&mut b).ok()?;
+            Some(b)
+        }
+        let u32_ = |r: &mut std::io::BufReader<std::fs::File>| bytes::<4>(r).map(u32::from_le_bytes);
+        let u64_ = |r: &mut std::io::BufReader<std::fs::File>| bytes::<8>(r).map(u64::from_le_bytes);
+        if &bytes::<4>(&mut r)? != b"GGUF" || u32_(&mut r)? < 2 {
+            return None;
+        }
+        let _tensors = u64_(&mut r)?;
+        let kv_count = u64_(&mut r)?;
+        // Skip one value of GGUF type `t` (strings and arrays included).
+        fn skip(r: &mut std::io::BufReader<std::fs::File>, t: u32) -> Option<()> {
+            let n = match t {
+                0 | 1 | 7 => 1,
+                2 | 3 => 2,
+                4..=6 => 4,
+                10..=12 => 8,
+                8 => u64::from_le_bytes(bytes::<8>(r)?),
+                9 => {
+                    let item = u32::from_le_bytes(bytes::<4>(r)?);
+                    let len = u64::from_le_bytes(bytes::<8>(r)?);
+                    for _ in 0..len {
+                        skip(r, item)?;
+                    }
+                    return Some(());
+                }
+                _ => return None,
+            };
+            std::io::copy(&mut r.by_ref().take(n), &mut std::io::sink()).ok().filter(|&c| c == n)?;
+            Some(())
+        }
+        for _ in 0..kv_count {
+            let len = u64_(&mut r)?;
+            if len > 1 << 16 {
+                return None;
+            }
+            let mut key = vec![0u8; len as usize];
+            r.read_exact(&mut key).ok()?;
+            let t = u32_(&mut r)?;
+            if key.ends_with(b".block_count") && !key.starts_with(b"general.") {
+                return match t {
+                    4 | 5 => u32_(&mut r),
+                    10 | 11 => u64_(&mut r).and_then(|n| u32::try_from(n).ok()),
+                    _ => None,
+                };
+            }
+            skip(&mut r, t)?;
+        }
+        None
     }
 
     /// The GPU the model runs on, from llama.cpp's own device report — the
@@ -3532,6 +3694,80 @@ mod tests {
         assert!(std::fs::read(txt("samurai.jpeg")).unwrap().starts_with(&[0xFF, 0xFE]), "samurai lost UTF-16");
         eprintln!("\n{} — {score} of {ran} right in {:.0}s", model.label(), t0.elapsed().as_secs_f32());
         assert!(failures.is_empty(), "failed: {failures:#?}");
+    }
+
+    /// The offload sizing on real numbers: the 31B on a 16 GB card gets the
+    /// 24 layers that loaded fine by trial before, an 8 GB card about half,
+    /// and the E4B fits whole.
+    #[test]
+    fn offload_sizing() {
+        let gib = |g: f64| (g * (1u64 << 30) as f64) as u64;
+        let (w31, p31) = (18_323_733_440, 1_198_957_024);
+        assert!(!worker::fits_whole(w31, p31, gib(14.9)));
+        assert_eq!(worker::layers_that_fit(w31, p31, gib(14.9), 60), 24);
+        assert_eq!(worker::layers_that_fit(w31, p31, gib(7.5), 60), 9);
+        assert_eq!(worker::layers_that_fit(w31, p31, gib(1.0), 60), 0);
+        assert!(worker::fits_whole(gib(5.0), gib(0.9), gib(14.9)));
+    }
+
+    /// The layer count comes straight from the GGUF header (the 31B has 60).
+    #[test]
+    #[ignore]
+    fn gguf_block_count_31b() {
+        let path = crate::tagger::resolve(GemmaModel::D31B.folder(), GemmaModel::D31B.model_file())
+            .expect("Gemma 4 31B isn't installed");
+        let t = std::time::Instant::now();
+        assert_eq!(worker::gguf_block_count(&path), Some(60));
+        eprintln!("read in {:?}", t.elapsed());
+        assert_eq!(worker::gguf_block_count(std::path::Path::new("Cargo.toml")), None);
+    }
+
+    /// First load of the 31B: how long until Ready, and how badly a thread
+    /// standing in for the UI (wakes every 16 ms) is held up meanwhile.
+    /// Compare with the old ladder: set CLARITY_FULL_LADDER=1.
+    #[test]
+    #[ignore]
+    fn llm_first_load_31b() {
+        assert!(GemmaModel::D31B.installed(), "Gemma 4 31B isn't installed");
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let beat = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let (mut worst, mut late) = (0.0f32, 0);
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    let t = std::time::Instant::now();
+                    std::thread::sleep(std::time::Duration::from_millis(16));
+                    let gap = t.elapsed().as_secs_f32() * 1000.0;
+                    worst = worst.max(gap);
+                    late += usize::from(gap > 100.0);
+                }
+                (worst, late)
+            })
+        };
+        let ctx = egui::Context::default();
+        let t0 = std::time::Instant::now();
+        let _worker =
+            std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::D31B, ImageDetail::Standard));
+        for msg in msg_rx {
+            match msg {
+                Msg::Status(s) => {
+                    eprintln!("[status {:>6.1}s] {s}", t0.elapsed().as_secs_f32());
+                    if s == "Ready" {
+                        break;
+                    }
+                }
+                Msg::Done(Err(e)) => panic!("load failed: {e}"),
+                _ => {}
+            }
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (worst, late) = beat.join().unwrap();
+        eprintln!(
+            "\n[first load] Ready after {:.1}s; UI stand-in: worst wake {worst:.0} ms, {late} wakes over 100 ms",
+            t0.elapsed().as_secs_f32()
+        );
     }
 
     /// Review harness for the Krea 2 prompt writer + Detailed Vision on the
