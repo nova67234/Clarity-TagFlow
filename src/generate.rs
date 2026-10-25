@@ -222,7 +222,7 @@ impl GenFamily {
 }
 
 /// A specific model variant offered in a family's picker.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum GenModel {
     // Flux (GGUF UNet)
     SchnellQ4,
@@ -530,7 +530,7 @@ fn read_lora_info(path: &Path) -> LoraInfo {
 
 /// A LoRA's base model, sniffed from its safetensors header — so each tab's
 /// picker only offers compatible files (a Z-Image LoRA on Flux produces noise).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 enum LoraBase {
     Flux,
     ZImage,
@@ -877,16 +877,20 @@ fn scan_checkpoints() -> Vec<(String, PathBuf)> {
 /// header read) and keeping cached results for known ones. Drops the current
 /// custom-checkpoint selection if that file has gone away.
 fn refresh_checkpoints(state: &mut GenerateState) {
-    state.checkpoints = scan_checkpoints()
-        .into_iter()
-        .map(|(f, path)| {
-            let prev = state.checkpoints.iter().find(|c| c.file == f);
-            CkptEntry {
-                base: prev.map(|c| c.base).unwrap_or_else(|| sniff_checkpoint_base(&path)),
-                file: f,
-            }
-        })
-        .collect();
+    if let Some(cat) = &state.remote_catalog {
+        state.checkpoints = cat.checkpoints.iter().map(|(f, b)| CkptEntry { file: f.clone(), base: *b }).collect();
+    } else {
+        state.checkpoints = scan_checkpoints()
+            .into_iter()
+            .map(|(f, path)| {
+                let prev = state.checkpoints.iter().find(|c| c.file == f);
+                CkptEntry {
+                    base: prev.map(|c| c.base).unwrap_or_else(|| sniff_checkpoint_base(&path)),
+                    file: f,
+                }
+            })
+            .collect();
+    }
     if let Some(sel) = &state.checkpoint
         && !state.checkpoints.iter().any(|c| &c.file == sel) {
             state.checkpoint = None;
@@ -975,6 +979,27 @@ fn scan_embeddings() -> Vec<(String, PathBuf)> {
 /// worker thread (like LoRAs) so opening the picker never blocks the UI. Kicks
 /// off the background Civitai-thumbnail fetch for any file without a preview.
 fn refresh_embeddings(state: &mut GenerateState, ctx: &egui::Context) {
+    if let Some(cat) = state.remote_catalog.clone() {
+        state.embeddings = cat
+            .embeddings
+            .iter()
+            .map(|(f, base)| {
+                let prev = state.embeddings.iter().find(|e| e.file == *f);
+                EmbeddingEntry {
+                    base: *base,
+                    sniffed: true,
+                    selected: prev.map(|e| e.selected).unwrap_or(false),
+                    negative: prev.map(|e| e.negative).unwrap_or(false),
+                    strength: prev.map(|e| e.strength).unwrap_or(1.0),
+                    thumb: prev.and_then(|e| e.thumb.clone()),
+                    thumb_missing: prev.map(|e| e.thumb_missing).unwrap_or(false),
+                    file: f.clone(),
+                }
+            })
+            .collect();
+        spawn_remote_thumbs(true, state.embeddings.iter().map(|e| e.file.clone()).collect(), ctx.clone());
+        return;
+    }
     let mut to_sniff: Vec<PathBuf> = Vec::new();
     {
         let cache = SNIFF_CACHE.lock().unwrap();
@@ -1018,6 +1043,14 @@ fn embed_stem(file: &str) -> &str {
 /// Where downloaded embedding preview thumbnails live: `<stem>.img` is the raw
 /// JPEG; `<stem>.none` remembers "this hash isn't on Civitai".
 fn embedding_thumbs_dir() -> PathBuf {
+    match picker_host() {
+        Some((_, cache)) => cache.join("embedding_thumbs"),
+        None => local_embedding_thumbs_dir(),
+    }
+}
+
+/// This PC's own embedding thumbnail cache.
+fn local_embedding_thumbs_dir() -> PathBuf {
     comfy_base().join("embedding_thumbs")
 }
 
@@ -1490,6 +1523,12 @@ pub struct GenerateState {
     /// Set by the header's Text-to-Image model dropdown when the user picks a
     /// different family; the right panel reads and clears it to switch views.
     pub family_switch: Option<GenFamily>,
+    /// Link: the host this tab generates on, and what it has ready (`None`:
+    /// generating on this PC, with its own files). Updated each frame.
+    remote_host: Option<String>,
+    remote_catalog: Option<Catalog>,
+    /// The catalog generation last listed in the pickers.
+    catalog_seen: u64,
 }
 
 impl Default for GenerateState {
@@ -1568,6 +1607,9 @@ impl GenerateState {
             nodes_status: None,
             imported_workflow: None,
             family_switch: None,
+            remote_host: None,
+            remote_catalog: None,
+            catalog_seen: 0,
         }
     }
 
@@ -1662,6 +1704,30 @@ fn scan_loras() -> Vec<String> {
 /// compatible with a pending flag. Also kicks off the background
 /// Civitai-thumbnail fetch for any file without a cached preview.
 fn refresh_loras(state: &mut GenerateState, ctx: &egui::Context) {
+    if let Some(cat) = state.remote_catalog.clone() {
+        state.loras = cat
+            .loras
+            .iter()
+            .map(|(f, base)| {
+                let prev = state.loras.iter().find(|l| l.file == *f);
+                LoraEntry {
+                    selected: prev.map(|l| l.selected).unwrap_or(false),
+                    strength: prev.map(|l| l.strength).unwrap_or(1.0),
+                    base: *base,
+                    sniffed: true,
+                    info_open: prev.map(|l| l.info_open).unwrap_or(false),
+                    info: prev.and_then(|l| l.info.clone()),
+                    thumb: prev.and_then(|l| l.thumb.clone()),
+                    thumb_missing: prev.map(|l| l.thumb_missing).unwrap_or(false),
+                    anim: prev.and_then(|l| l.anim.clone()),
+                    anim_missing: prev.map(|l| l.anim_missing).unwrap_or(false),
+                    file: f.clone(),
+                }
+            })
+            .collect();
+        spawn_remote_thumbs(false, state.loras.iter().map(|l| l.file.clone()).collect(), ctx.clone());
+        return;
+    }
     let dir = comfy_base().join("ComfyUI").join("models").join("loras");
     let mut to_sniff: Vec<PathBuf> = Vec::new();
     {
@@ -1703,6 +1769,14 @@ fn refresh_loras(state: &mut GenerateState, ctx: &egui::Context) {
 /// Where downloaded LoRA preview thumbnails live: `<stem>.img` is the raw
 /// downloaded JPEG; `<stem>.none` remembers "this hash isn't on Civitai".
 fn lora_thumbs_dir() -> PathBuf {
+    match picker_host() {
+        Some((_, cache)) => cache.join("lora_thumbs"),
+        None => local_lora_thumbs_dir(),
+    }
+}
+
+/// This PC's own LoRA thumbnail cache.
+fn local_lora_thumbs_dir() -> PathBuf {
     comfy_base().join("lora_thumbs")
 }
 
@@ -1993,6 +2067,10 @@ fn lora_row(
     tdir: &Path,
     off_family: bool,
 ) -> bool {
+    // A host's LoRA: its details come from the host (once they've arrived).
+    if l.info_open && l.info.is_none() && picker_host().is_some() {
+        l.info = remote_lora_info_cached(&l.file, ui.ctx());
+    }
     // Pick up an animated GIF thumbnail (video-only Civitai previews). The
     // multi-frame decode runs on a worker thread; until it lands (or if it
     // fails) the still poster below shows as usual.
@@ -2143,6 +2221,10 @@ fn lora_row(
                 });
             });
         });
+        if l.info_open && l.info.is_none() {
+            ui.add_space(6.0);
+            ui.label(RichText::new("Loading…").color(MUTED()).size(10.5));
+        }
         if l.info_open
             && let Some(info) = &l.info {
                 // Hairline between the card body and its details, Settings-style.
@@ -2196,7 +2278,7 @@ fn lora_row(
         let hit = |r: Option<egui::Rect>| matches!((p, r), (Some(p), Some(r)) if r.contains(p));
         if hit(info_rect) {
             l.info_open = !l.info_open;
-            if l.info_open && l.info.is_none() {
+            if l.info_open && l.info.is_none() && picker_host().is_none() {
                 l.info = Some(read_lora_info(&loras_dir.join(&l.file)));
             }
         } else if hit(copy_rect) {
@@ -2222,10 +2304,13 @@ fn lora_row(
                 want_thumb = true;
                 ui.close();
             }
-            crate::zoom::menu_sep(ui);
-            if crate::zoom::menu_item(ui, egui::include_image!("../icons/delete.svg"), "Delete LoRA…") {
-                want_delete = true;
-                ui.close();
+            // A host's LoRA is its owner's to delete, not this PC's.
+            if picker_host().is_none() {
+                crate::zoom::menu_sep(ui);
+                if crate::zoom::menu_item(ui, egui::include_image!("../icons/delete.svg"), "Delete LoRA…") {
+                    want_delete = true;
+                    ui.close();
+                }
             }
         });
     if want_thumb
@@ -2410,6 +2495,9 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
                         .clicked()
                     {
                         state.lora_refresh_spin = Some(std::time::Instant::now());
+                        if state.remote_host.is_some() {
+                            refetch_catalog();
+                        }
                         refresh_loras(state, ui.ctx());
                     }
                 });
@@ -2680,6 +2768,9 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
                         .clicked()
                     {
                         state.embeddings_refresh_spin = Some(std::time::Instant::now());
+                        if state.remote_host.is_some() {
+                            refetch_catalog();
+                        }
                         refresh_embeddings(state, ui.ctx());
                     }
                 });
@@ -3018,10 +3109,13 @@ fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, tdir: &Path, off_fam
                 want_thumb = true;
                 ui.close();
             }
-            crate::zoom::menu_sep(ui);
-            if crate::zoom::menu_item(ui, egui::include_image!("../icons/delete.svg"), "Delete Embedding…") {
-                want_delete = true;
-                ui.close();
+            // A host's embedding is its owner's to delete, not this PC's.
+            if picker_host().is_none() {
+                crate::zoom::menu_sep(ui);
+                if crate::zoom::menu_item(ui, egui::include_image!("../icons/delete.svg"), "Delete Embedding…") {
+                    want_delete = true;
+                    ui.close();
+                }
             }
         });
     if want_thumb
@@ -3243,6 +3337,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState, current_image: Option<
 /// stretches so the content below it ends exactly at that height.
 fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current_image: Option<&Path>) {
     let top_y = ui.cursor().min.y;
+    sync_remote(state, ui.ctx());
     // Drain background-runner messages.
     if let Some(rx) = &state.rx {
         let mut finished = false;
@@ -3352,25 +3447,42 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
 
     ui.add_space(8.0);
 
-    // --- Setup row. ---
-    ui.horizontal(|ui| {
-        let setup = egui::Button::new(RichText::new("Setup Requirements").color(Color32::WHITE))
-            .fill(Color32::from_rgb(96, 99, 105))
-            .corner_radius(CornerRadius::same(12));
-        if ui.add_enabled_ui(!state.running, |ui| ui.add_sized(egui::vec2(150.0, 28.0), setup)).inner.clicked() {
-            start_setup(state, ui.ctx());
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let txt = if is_installed() { "Installed" } else { "NVIDIA GPU required" };
-            ui.label(RichText::new(txt).color(MUTED()).size(11.0));
+    // --- Setup row (or, on a Link host, where the job runs). ---
+    if let Some(host) = state.remote_host.clone() {
+        ui.horizontal(|ui| {
+            ui.set_min_height(28.0);
+            ui.label(RichText::new(format!("Runs on {host}")).color(TEXT()).strong().size(12.5))
+                .on_hover_text("Settings → Link: this PC uses that PC's GPU and models");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let txt = match &state.remote_catalog {
+                    None if catalog_error().is_some() => "Couldn't get its models",
+                    None => "Checking its models…",
+                    Some(c) if !c.installed => "Generation isn't set up there",
+                    Some(_) => "Its GPU and models",
+                };
+                ui.label(RichText::new(txt).color(MUTED()).size(11.0));
+            });
         });
-    });
+    } else {
+        ui.horizontal(|ui| {
+            let setup = egui::Button::new(RichText::new("Setup Requirements").color(Color32::WHITE))
+                .fill(Color32::from_rgb(96, 99, 105))
+                .corner_radius(CornerRadius::same(12));
+            if ui.add_enabled_ui(!state.running, |ui| ui.add_sized(egui::vec2(150.0, 28.0), setup)).inner.clicked() {
+                start_setup(state, ui.ctx());
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let txt = if is_installed() { "Installed" } else { "NVIDIA GPU required" };
+                ui.label(RichText::new(txt).color(MUTED()).size(11.0));
+            });
+        });
+    }
 
     ui.add_space(8.0);
 
     // (The model picker sits inside the prompt box footer, next to the send
     // icon; Z-Image's LoRA picker is in the + menu there.)
-    if state.model.gated() {
+    if state.model.gated() && state.remote_host.is_none() {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -3590,7 +3702,9 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                             }
                         } else if !state.prompt.trim().is_empty() {
                             // The send button only appears once you start typing.
-                            let inst = is_installed();
+                            // On a Link host: what it has ready.
+                            let remote_ready = state.remote_host.as_ref().map(|h| remote_ready(state, h));
+                            let inst = remote_ready.as_ref().map_or_else(is_installed, |r| r.is_ok());
                             // Image-to-video needs a selected source *image*. After a
                             // video run the browser selects the newest output (a
                             // .webm), which ComfyUI can't use as the start frame.
@@ -3598,8 +3712,12 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                             let needs_img =
                                 state.family.is_video() && state.i2v && (current_image.is_none() || src_is_video);
                             let ready = inst && !needs_img;
+                            let not_ready = match &remote_ready {
+                                Some(Err(why)) => why.clone(),
+                                _ => "Run Setup Requirements first".to_string(),
+                            };
                             let tip = if !inst {
-                                "Run Setup Requirements first"
+                                not_ready.as_str()
                             } else if needs_img && src_is_video {
                                 "The selected file is a video — select an image to animate"
                             } else if needs_img {
@@ -3956,7 +4074,15 @@ fn model_selector(ui: &mut egui::Ui, state: &mut GenerateState) {
             // custom-checkpoint override.
             for &m in GenModel::all_for(state.family) {
                 let selected = state.checkpoint.is_none() && state.model == m;
-                if ui.selectable_label(selected, m.label()).clicked() {
+                let missing_on_host = match (&state.remote_host, &state.remote_catalog) {
+                    (Some(host), Some(cat)) if !cat.ready.contains(&m) => Some(host.clone()),
+                    _ => None,
+                };
+                let label = match &missing_on_host {
+                    Some(host) => RichText::new(format!("{}  ·  not set up on {host}", m.label())).color(MUTED()),
+                    None => RichText::new(m.label()),
+                };
+                if ui.selectable_label(selected, label).clicked() {
                     state.model = m;
                     state.checkpoint = None;
                     state.steps = m.default_steps();
@@ -4718,10 +4844,17 @@ fn start_generate(state: &mut GenerateState, ctx: &egui::Context, cur_image: Opt
         i2v,
         src_image: if i2v { cur_image.map(|p| p.to_path_buf()) } else { None },
         imported_workflow: state.imported_workflow.clone(),
+        out_dir: None,
+        remote: false,
     };
     let ctx = ctx.clone();
+    // Linked to a host sharing this kind of generation: it runs there.
+    let host = remote(state.family);
     std::thread::spawn(move || {
-        let ok = run_generate(job, &tx, &ctx, &cancel);
+        let ok = match host {
+            Some((peer, name)) => run_on_host(job, &peer, &name, &tx, &ctx, &cancel),
+            None => run_generate(job, &tx, &ctx, &cancel),
+        };
         let _ = tx.send(RunnerMsg::Done(ok));
         ctx.request_repaint();
     });
@@ -5583,6 +5716,12 @@ struct GenJob {
     /// An imported ComfyUI API graph to run verbatim (with prompt/negative/seed
     /// swapped in) instead of the built-in pipeline. `None` = built-in.
     imported_workflow: Option<String>,
+    /// Where the result is saved (`None`: this family's outputs folder).
+    out_dir: Option<PathBuf>,
+    /// A Link device's job (run here for another PC): ComfyUI's own copies of
+    /// its start image and result are removed once the result is fetched —
+    /// the other PC's pictures don't stay on this one.
+    remote: bool,
 }
 
 fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, cancel: &AtomicBool) -> bool {
@@ -5683,6 +5822,9 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
     // unified graph also needs *a* valid image for text-to-video (it's bypassed),
     // so upload a neutral blank in that case.
     let mut image_name: Option<String> = None;
+    // A Link device's start image, removed from ComfyUI's input folder when
+    // the job ends (however it ends).
+    let forget_input = ForgetComfyFile::new(&comfy, "input");
     let ltx2 = job.model == GenModel::Ltx2Distilled;
     if job.i2v {
         if let Some(src) = &job.src_image {
@@ -5690,6 +5832,9 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
             match upload_image(&agent, src) {
                 Ok(name) => {
                     send(format!("== Uploaded {name}"));
+                    if job.remote {
+                        forget_input.set("", &name);
+                    }
                     image_name = Some(name);
                 }
                 Err(e) => {
@@ -5872,6 +6017,11 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
     let filename = img0.get("filename").and_then(|v| v.as_str()).unwrap_or("");
     let subfolder = img0.get("subfolder").and_then(|v| v.as_str()).unwrap_or("");
     let kind = img0.get("type").and_then(|v| v.as_str()).unwrap_or("output");
+    // A Link device's result: ComfyUI's own copy goes once it's fetched.
+    let forget_output = ForgetComfyFile::new(&comfy, "output");
+    if job.remote {
+        forget_output.set(subfolder, filename);
+    }
 
     // 4 — fetch the bytes and save them into our outputs dir.
     status("Saving…");
@@ -5888,7 +6038,7 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
             return false;
         }
     };
-    let outdir = base.join("outputs").join(job.model.family().out_dir());
+    let outdir = job.out_dir.clone().unwrap_or_else(|| base.join("outputs").join(job.model.family().out_dir()));
     let _ = std::fs::create_dir_all(&outdir);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5920,6 +6070,44 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
     let _ = tx.send(RunnerMsg::Output(dest));
     status("Done");
     true
+}
+
+/// Deletes a file from ComfyUI's input or output folder when dropped, if one
+/// was named — a Link device's start image and result, which mustn't stay on
+/// this PC. Only plain names inside that folder are touched.
+struct ForgetComfyFile {
+    dir: PathBuf,
+    file: std::cell::RefCell<Option<PathBuf>>,
+}
+
+impl ForgetComfyFile {
+    fn new(comfy: &Path, kind: &str) -> ForgetComfyFile {
+        ForgetComfyFile { dir: comfy.join(kind), file: std::cell::RefCell::new(None) }
+    }
+
+    fn set(&self, subfolder: &str, name: &str) {
+        let plain = |s: &str| !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', ':']);
+        if !plain(name) {
+            return;
+        }
+        let mut path = self.dir.clone();
+        for part in subfolder.split(['/', '\\']).filter(|p| !p.is_empty()) {
+            if !plain(part) {
+                return;
+            }
+            path.push(part);
+        }
+        path.push(name);
+        *self.file.borrow_mut() = Some(path);
+    }
+}
+
+impl Drop for ForgetComfyFile {
+    fn drop(&mut self) {
+        if let Some(p) = self.file.borrow_mut().take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// Upload an image file to ComfyUI's input dir so a LoadImage node can reference
@@ -7063,6 +7251,8 @@ mod ltx2_resolution_tests {
             i2v,
             src_image: None,
             imported_workflow: None,
+            out_dir: None,
+            remote: false,
         }
     }
 
@@ -7120,6 +7310,8 @@ mod tests {
             i2v: false,
             src_image: None,
             imported_workflow: None,
+            out_dir: None,
+            remote: false,
         }
     }
 
@@ -7266,4 +7458,627 @@ mod tests {
         assert_eq!(embed_tokens(&state, false), "embedding:sdxl_style");
         assert_eq!(embed_tokens(&state, true), "");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Link: generating on another PC's GPU (Settings → Link).
+//
+// A receiver's job travels as its settings (`WireJob`) — never a workflow —
+// and the host builds the workflow itself with its built-in pipelines, runs
+// it on its own ComfyUI, and streams the result back; the receiver saves it
+// in its outputs folder like a job of its own. The receiver's pickers list
+// the host's models, LoRAs and embeddings (`Catalog`), and the host's LoRA
+// thumbnails are cached per host.
+// ---------------------------------------------------------------------------
+
+/// A generation job as it travels over Link: the settings of `GenJob`, with
+/// the start image as the call's file (`src`: its name).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WireJob {
+    model: GenModel,
+    prompt: String,
+    steps: i32,
+    guidance: f32,
+    width: i32,
+    height: i32,
+    seed: i64,
+    checkpoint: Option<String>,
+    loras: Vec<(String, f32)>,
+    pos_embeds: String,
+    neg_embeds: String,
+    negative: String,
+    frames: i32,
+    fps: i32,
+    i2v: bool,
+    src: Option<String>,
+}
+
+/// What a host has ready to generate with.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct Catalog {
+    /// ComfyUI is set up on the host.
+    installed: bool,
+    /// The built-in variants with every file in place.
+    ready: Vec<GenModel>,
+    checkpoints: Vec<(String, LoraBase)>,
+    loras: Vec<(String, LoraBase)>,
+    embeddings: Vec<(String, LoraBase)>,
+}
+
+/// A plain file name (a model / LoRA / embedding in the host's folders) —
+/// nothing that could reach outside them.
+fn plain_model_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', ':'])
+        && !name.chars().any(char::is_control)
+}
+
+/// The host this tab's jobs run on: linked to one that shares this kind of
+/// generation (and the owner wants that). (Peer, host name.)
+fn remote(family: GenFamily) -> Option<(Arc<crate::link::Peer>, String)> {
+    crate::link::remote_gen(family.is_video())
+}
+
+/// Each frame: follow Link — the host this tab runs on (if any) and its
+/// catalog, which the pickers list instead of this PC's files.
+fn sync_remote(state: &mut GenerateState, ctx: &egui::Context) {
+    match remote(state.family) {
+        Some((peer, name)) => {
+            let cache = crate::link::host_cache_dir(&peer.key);
+            *PICKER_HOST.lock().unwrap_or_else(|e| e.into_inner()) = Some((peer.clone(), cache));
+            state.remote_host = Some(name);
+            let cat = host_catalog(&peer, ctx);
+            let generation = CATALOG_GEN.load(Ordering::SeqCst);
+            if cat.is_some() && (state.remote_catalog.is_none() || generation != state.catalog_seen) {
+                state.remote_catalog = cat;
+                state.catalog_seen = generation;
+                refresh_loras(state, ctx);
+                refresh_embeddings(state, ctx);
+                refresh_checkpoints(state);
+            }
+        }
+        None => {
+            *PICKER_HOST.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            if state.remote_host.take().is_some() || state.remote_catalog.take().is_some() {
+                // Back to this PC's own files (listed again when a picker opens).
+                state.loras.clear();
+                state.embeddings.clear();
+                state.checkpoints.clear();
+                state.checkpoint = None;
+            }
+        }
+    }
+}
+
+/// Can the host run this tab's job? `Err` says why not.
+fn remote_ready(state: &GenerateState, host: &str) -> Result<(), String> {
+    let Some(cat) = &state.remote_catalog else {
+        return Err(match catalog_error() {
+            Some(e) => format!("Couldn't get {host}'s models: {e}"),
+            None => format!("Checking {host}'s models…"),
+        });
+    };
+    if !cat.installed {
+        return Err(format!("{host} hasn't set up generation (Setup Requirements there)"));
+    }
+    match &state.checkpoint {
+        Some(f) if !cat.checkpoints.iter().any(|(c, _)| c == f) => Err(format!("{host} doesn't have {f}")),
+        Some(_) => Ok(()),
+        None if cat.ready.contains(&state.model) => Ok(()),
+        None => Err(format!("{} isn't set up on {host}", state.model.label())),
+    }
+}
+
+/// Host side: is this job a video one? (`None`: not a job.)
+pub(crate) fn remote_is_video(body: &serde_json::Value) -> Option<bool> {
+    let job: WireJob = serde_json::from_value(body.get("job")?.clone()).ok()?;
+    Some(job.model.family().is_video())
+}
+
+/// Host side: what's set up here.
+pub(crate) fn remote_catalog() -> Result<serde_json::Value, String> {
+    let families =
+        [GenFamily::Flux, GenFamily::ZImage, GenFamily::Ltx, GenFamily::Wan, GenFamily::Sdxl, GenFamily::Anima, GenFamily::Krea2];
+    let ready = families
+        .iter()
+        .flat_map(|f| GenModel::all_for(*f).iter().copied())
+        .filter(|m| missing_files(*m, None).is_empty())
+        .collect();
+    let base_of = |path: &Path, sniff: fn(&Path) -> LoraBase| -> LoraBase {
+        if let Some(b) = SNIFF_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(path) {
+            return *b;
+        }
+        let b = sniff(path);
+        SNIFF_CACHE.lock().unwrap_or_else(|e| e.into_inner()).insert(path.to_path_buf(), b);
+        b
+    };
+    let loras_dir = comfy_base().join("ComfyUI").join("models").join("loras");
+    let catalog = Catalog {
+        installed: is_installed(),
+        ready,
+        checkpoints: scan_checkpoints().into_iter().map(|(f, p)| (f, base_of(&p, sniff_checkpoint_base))).collect(),
+        loras: scan_loras()
+            .into_iter()
+            .map(|f| {
+                let b = base_of(&loras_dir.join(&f), sniff_lora_base);
+                (f, b)
+            })
+            .collect(),
+        embeddings: scan_embeddings().into_iter().map(|(f, p)| (f, base_of(&p, sniff_embedding_base))).collect(),
+    };
+    serde_json::to_value(catalog).map_err(|e| e.to_string())
+}
+
+/// Host side: run a Link device's job with this PC's ComfyUI and models,
+/// streaming its log and progress, then the result.
+pub(crate) fn remote_run(call: &crate::link::Incoming, ctx: &egui::Context) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let wire: WireJob = serde_json::from_value(call.body.get("job").cloned().unwrap_or_default())
+        .map_err(|_| "Bad generation job".to_string())?;
+    // Only what the built-in pipelines take, within sane bounds.
+    let names_ok = wire.checkpoint.iter().all(|c| plain_model_name(c))
+        && wire.loras.len() <= 32
+        && wire.loras.iter().all(|(f, w)| plain_model_name(f) && w.is_finite() && w.abs() <= 10.0)
+        && [&wire.pos_embeds, &wire.neg_embeds].iter().all(|t| t.len() <= 4096 && !t.contains(['/', '\\']));
+    let sizes_ok = (64..=4096).contains(&wire.width)
+        && (64..=4096).contains(&wire.height)
+        && (1..=200).contains(&wire.steps)
+        && (1..=1000).contains(&wire.frames)
+        && (1..=120).contains(&wire.fps)
+        && wire.guidance.is_finite()
+        && (0.0..=50.0).contains(&wire.guidance)
+        && wire.prompt.len() <= 32_000
+        && wire.negative.len() <= 32_000;
+    if !names_ok || !sizes_ok {
+        return Err("That job's settings aren't allowed".into());
+    }
+    let dir = crate::link::job_dir("gen");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let job_name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // The start image, under its own extension.
+    let src_image = match (&wire.src, call.blobs.first()) {
+        (Some(name), Some((_, path))) if wire.i2v => {
+            let ext = Path::new(name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .filter(|e| e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+                .unwrap_or("png")
+                .to_ascii_lowercase();
+            // Its name in ComfyUI's input folder too: unique to this job.
+            let dest = dir.join(format!("link-{}-{job_name}.{ext}", std::process::id()));
+            std::fs::rename(path, &dest).map_err(|e| e.to_string())?;
+            Some(dest)
+        }
+        (_, _) if wire.i2v => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err("Image-to-video needs a start image".into());
+        }
+        _ => None,
+    };
+    let out = dir.join("out");
+    let job = GenJob {
+        model: wire.model,
+        prompt: wire.prompt,
+        steps: wire.steps,
+        guidance: wire.guidance,
+        width: wire.width,
+        height: wire.height,
+        seed: wire.seed,
+        checkpoint: wire.checkpoint,
+        loras: wire.loras,
+        pos_embeds: wire.pos_embeds,
+        neg_embeds: wire.neg_embeds,
+        negative: wire.negative,
+        frames: wire.frames,
+        fps: wire.fps,
+        i2v: wire.i2v,
+        src_image,
+        imported_workflow: None,
+        out_dir: Some(out),
+        remote: true,
+    };
+    let (tx, rx) = mpsc::channel();
+    let cancel = call.cancel_flag();
+    let ctx = ctx.clone();
+    let runner = std::thread::Builder::new()
+        .name("link-generate".into())
+        .spawn(move || {
+            let ok = run_generate(job, &tx, &ctx, &cancel);
+            let _ = tx.send(RunnerMsg::Done(ok));
+        })
+        .map_err(|e| e.to_string())?;
+    let mut ok = false;
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            RunnerMsg::Line(text) => {
+                call.event(json!({ "kind": "line", "text": text }));
+            }
+            RunnerMsg::Status(text) => {
+                call.event(json!({ "kind": "status", "text": text }));
+            }
+            RunnerMsg::Output(path) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                if let Err(e) = call.blob(&name, &path) {
+                    call.event(json!({ "kind": "line", "text": format!("ERROR: sending the result failed: {e}") }));
+                }
+                let _ = std::fs::remove_file(&path);
+            }
+            RunnerMsg::Done(done) => {
+                ok = done;
+                break;
+            }
+            RunnerMsg::Nodes(_) => {}
+        }
+    }
+    let _ = runner.join();
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(json!({ "ok": ok }))
+}
+
+/// Host side: the cached Civitai previews of LoRAs / embeddings a device's
+/// picker shows. Ones not fetched yet are fetched here for next time.
+pub(crate) fn remote_thumbs(call: &crate::link::Incoming, ctx: &egui::Context) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let embeddings = call.body.get("kind").and_then(serde_json::Value::as_str) == Some("embedding");
+    let files: Vec<String> = serde_json::from_value(call.body.get("files").cloned().unwrap_or_default())
+        .map_err(|_| "Bad request".to_string())?;
+    let files: Vec<String> = files.into_iter().filter(|f| plain_model_name(f)).take(2000).collect();
+    let dir = if embeddings { local_embedding_thumbs_dir() } else { local_lora_thumbs_dir() };
+    let mut none = Vec::new();
+    let mut missing = Vec::new();
+    for f in &files {
+        let stem = if embeddings { embed_stem(f) } else { f.trim_end_matches(".safetensors") };
+        let img = dir.join(format!("{stem}.img"));
+        if img.is_file() {
+            if call.blob(&format!("{stem}.img"), &img).is_err() {
+                break;
+            }
+            let gif = dir.join(format!("{stem}.gif"));
+            if gif.is_file() && call.blob(&format!("{stem}.gif"), &gif).is_err() {
+                break;
+            }
+        } else if dir.join(format!("{stem}.none")).exists() {
+            none.push(stem.to_string());
+        } else {
+            missing.push(f.clone());
+        }
+    }
+    if !missing.is_empty() {
+        if embeddings {
+            spawn_embedding_thumb_fetch(missing, ctx.clone(), false);
+        } else {
+            spawn_lora_thumb_fetch(missing, ctx.clone(), false);
+        }
+    }
+    Ok(json!({ "none": none }))
+}
+
+/// Host side: a LoRA's trigger words and training facts.
+pub(crate) fn remote_lora_info(call: &crate::link::Incoming) -> Result<serde_json::Value, String> {
+    let file = call.body.get("file").and_then(serde_json::Value::as_str).unwrap_or_default();
+    if !plain_model_name(file) {
+        return Err("Bad request".into());
+    }
+    let path = comfy_base().join("ComfyUI").join("models").join("loras").join(file);
+    let info = read_lora_info(&path);
+    Ok(serde_json::json!({ "triggers": info.triggers, "facts": info.facts }))
+}
+
+/// The ComfyUI server this process started has work queued or running (the
+/// app closing waits for it: the server stops with the process).
+pub(crate) fn server_busy_if_ours() -> bool {
+    let ours = SERVER.lock().map(|s| s.is_some()).unwrap_or(false);
+    ours && server_queue().is_some_and(|q| !queue_is_idle(&q))
+}
+
+/// Background host: stop the ComfyUI server this process started (to give
+/// its GPU memory back while nobody's generating).
+pub(crate) fn stop_server_if_ours() {
+    let ours = SERVER.lock().map(|s| s.is_some()).unwrap_or(false);
+    if ours && server_queue().is_none_or(|q| queue_is_idle(&q)) {
+        stop_server();
+    }
+}
+
+/// Receiver side: run `job` on the host, relaying its log and progress, and
+/// save the result in this PC's outputs folder.
+fn run_on_host(
+    job: GenJob,
+    peer: &Arc<crate::link::Peer>,
+    host: &str,
+    tx: &mpsc::Sender<RunnerMsg>,
+    ctx: &egui::Context,
+    cancel: &AtomicBool,
+) -> bool {
+    use crate::link::{BlobSrc, CallEvent};
+    use serde_json::Value;
+    let send = |s: String| {
+        let _ = tx.send(RunnerMsg::Line(s));
+        ctx.request_repaint();
+    };
+    let status = |s: String| {
+        let _ = tx.send(RunnerMsg::Status(s));
+        ctx.request_repaint();
+    };
+    if job.imported_workflow.is_some() {
+        send(format!(
+            "ERROR: imported workflows run on this PC only — clear it from the + menu to generate on {host}, \
+             or turn off \"Image and video generation\" in Settings → Link to run it here."
+        ));
+        return false;
+    }
+    let mut blobs = Vec::new();
+    let mut src = None;
+    if job.i2v {
+        let Some(path) = &job.src_image else {
+            send("ERROR: select an image to animate first".into());
+            return false;
+        };
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "start.png".into());
+        let blob = if crate::archive::is_entry(path) {
+            match crate::archive::read(path) {
+                Ok(data) => BlobSrc::Bytes { name: name.clone(), data },
+                Err(e) => {
+                    send(format!("ERROR: couldn't read the start image: {e}"));
+                    return false;
+                }
+            }
+        } else {
+            BlobSrc::File { name: name.clone(), path: path.clone() }
+        };
+        blobs.push(blob);
+        src = Some(name);
+    }
+    let family = job.model.family();
+    let wire = WireJob {
+        model: job.model,
+        prompt: job.prompt,
+        steps: job.steps,
+        guidance: job.guidance,
+        width: job.width,
+        height: job.height,
+        seed: job.seed,
+        checkpoint: job.checkpoint,
+        loras: job.loras,
+        pos_embeds: job.pos_embeds,
+        neg_embeds: job.neg_embeds,
+        negative: job.negative,
+        frames: job.frames,
+        fps: job.fps,
+        i2v: job.i2v,
+        src,
+    };
+    send(format!("== Generating on {host}"));
+    status(format!("Sending to {host}…"));
+    let body = serde_json::json!({ "job": wire });
+    let mut call = match peer.call("gen.run", body, blobs, &crate::link::temp_dir()) {
+        Ok(c) => c,
+        Err(e) => {
+            send(format!("ERROR: {host}: {e}"));
+            return false;
+        }
+    };
+    let outdir = comfy_base().join("outputs").join(family.out_dir());
+    let result = crate::link::finish_call(&mut call, &|| cancel.load(Ordering::SeqCst), &mut |ev| match ev {
+        CallEvent::Event(v) => {
+            let text = v.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
+            match v.get("kind").and_then(Value::as_str) {
+                Some("status") => status(text),
+                Some("line") => send(text),
+                _ => {}
+            }
+        }
+        CallEvent::Blob { name, path } => {
+            let _ = std::fs::create_dir_all(&outdir);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let ext = Path::new(&name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .filter(|e| e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+                .unwrap_or("png")
+                .to_ascii_lowercase();
+            let dest = (0..1000)
+                .map(|n| outdir.join(if n == 0 { format!("gen_{stamp}.{ext}") } else { format!("gen_{stamp}_{n}.{ext}") }))
+                .find(|p| !p.exists())
+                .unwrap_or_else(|| outdir.join(format!("gen_{stamp}.{ext}")));
+            match crate::move_file(&path, &dest) {
+                Ok(()) => {
+                    send(format!("== Saved {}", dest.display()));
+                    let _ = tx.send(RunnerMsg::Output(dest));
+                    ctx.request_repaint();
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&path);
+                    send(format!("ERROR: could not save the result: {e}"));
+                }
+            }
+        }
+        _ => {}
+    });
+    match result {
+        Ok(v) => v.get("ok").and_then(Value::as_bool).unwrap_or(false),
+        Err(e) => {
+            send(format!("ERROR: {host}: {e}"));
+            false
+        }
+    }
+}
+
+/// The host's catalog as last fetched, with the host it's from and when.
+static CATALOG: std::sync::Mutex<Option<(Vec<u8>, std::time::Instant, Catalog)>> = std::sync::Mutex::new(None);
+static CATALOG_FETCHING: AtomicBool = AtomicBool::new(false);
+/// Bumped whenever a catalog arrives (a tab showing an older one refreshes).
+static CATALOG_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The last failed fetch: from which host, when, and why (tried again after
+/// a while — not every frame).
+static CATALOG_ERR: std::sync::Mutex<Option<(Vec<u8>, std::time::Instant, String)>> = std::sync::Mutex::new(None);
+
+/// Why the open tab's host has no catalog, if fetching it failed.
+fn catalog_error() -> Option<String> {
+    let (peer, _) = picker_host()?;
+    CATALOG_ERR.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|(k, _, _)| *k == peer.key).map(|(_, _, e)| e.clone())
+}
+
+/// A catalog as the host sent it, read leniently: a model or base this
+/// version doesn't know is left out (or its base unknown) rather than the
+/// whole list failing, and a name that isn't a plain file name is dropped
+/// (it names a file in this PC's preview cache).
+fn parse_catalog(v: &serde_json::Value) -> Catalog {
+    let list = |k: &str| v.get(k).and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+    let named = |k: &str| -> Vec<(String, LoraBase)> {
+        list(k)
+            .into_iter()
+            .filter_map(|e| {
+                let (name, base) = serde_json::from_value::<(String, serde_json::Value)>(e).ok()?;
+                plain_model_name(&name).then(|| (name, serde_json::from_value(base).unwrap_or(LoraBase::Unknown)))
+            })
+            .collect()
+    };
+    Catalog {
+        installed: v.get("installed").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        ready: list("ready").into_iter().filter_map(|m| serde_json::from_value(m).ok()).collect(),
+        checkpoints: named("checkpoints"),
+        loras: named("loras"),
+        embeddings: named("embeddings"),
+    }
+}
+
+/// The host's catalog (fetched again in the background when it's a minute
+/// old, or from another host; `None` until the first one arrives). A failed
+/// fetch is tried again after 30 seconds, or on Refresh.
+fn host_catalog(peer: &Arc<crate::link::Peer>, ctx: &egui::Context) -> Option<Catalog> {
+    let cached = CATALOG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(k, _, _)| *k == peer.key)
+        .map(|(_, t, c)| (t.elapsed(), c.clone()));
+    let failed_lately = CATALOG_ERR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|(k, t, _)| *k == peer.key && t.elapsed() < std::time::Duration::from_secs(30));
+    let stale = CATALOG_STALE.load(Ordering::SeqCst)
+        || (!failed_lately && cached.as_ref().is_none_or(|(age, _)| *age > std::time::Duration::from_secs(60)));
+    if stale && !CATALOG_FETCHING.swap(true, Ordering::SeqCst) {
+        CATALOG_STALE.store(false, Ordering::SeqCst);
+        let peer = peer.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let fetched = peer
+                .call("gen.catalog", serde_json::json!({}), Vec::new(), &crate::link::temp_dir())
+                .and_then(|mut c| crate::link::finish_call(&mut c, &|| false, &mut |_| {}));
+            match fetched {
+                Ok(v) => {
+                    *CATALOG.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((peer.key.clone(), std::time::Instant::now(), parse_catalog(&v)));
+                    *CATALOG_ERR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    CATALOG_GEN.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(e) => {
+                    *CATALOG_ERR.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((peer.key.clone(), std::time::Instant::now(), e));
+                }
+            }
+            CATALOG_FETCHING.store(false, Ordering::SeqCst);
+            ctx.request_repaint();
+        });
+    }
+    cached.map(|(_, c)| c)
+}
+
+/// Fetch the catalog again on next use (a picker's Refresh).
+static CATALOG_STALE: AtomicBool = AtomicBool::new(false);
+
+fn refetch_catalog() {
+    CATALOG_STALE.store(true, Ordering::SeqCst);
+}
+
+/// The host the open Generate tab's pickers list (set each frame by the
+/// tab), with its thumbnail cache folder.
+static PICKER_HOST: std::sync::Mutex<Option<(Arc<crate::link::Peer>, PathBuf)>> = std::sync::Mutex::new(None);
+
+fn picker_host() -> Option<(Arc<crate::link::Peer>, PathBuf)> {
+    PICKER_HOST.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Ask the host for the previews of `files` (LoRAs, or embeddings) missing
+/// from its cache folder here. One request at a time per kind.
+fn spawn_remote_thumbs(embeddings: bool, files: Vec<String>, ctx: egui::Context) {
+    static BUSY: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+    let Some((peer, cache)) = picker_host() else { return };
+    let dir = cache.join(if embeddings { "embedding_thumbs" } else { "lora_thumbs" });
+    let want: Vec<String> = files
+        .into_iter()
+        .filter(|f| {
+            let stem = if embeddings { embed_stem(f) } else { f.trim_end_matches(".safetensors") };
+            !dir.join(format!("{stem}.img")).exists() && !dir.join(format!("{stem}.none")).exists()
+        })
+        .collect();
+    let busy = &BUSY[embeddings as usize];
+    if want.is_empty() || busy.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _ = std::fs::create_dir_all(&dir);
+        let body = serde_json::json!({ "kind": if embeddings { "embedding" } else { "lora" }, "files": want });
+        if let Ok(mut call) = peer.call("gen.thumbs", body, Vec::new(), &crate::link::temp_dir()) {
+            let done = crate::link::finish_call(&mut call, &|| false, &mut |ev| {
+                if let crate::link::CallEvent::Blob { name, path } = ev {
+                    if plain_model_name(&name) && (name.ends_with(".img") || name.ends_with(".gif")) {
+                        let _ = crate::move_file(&path, &dir.join(&name)).or_else(|_| std::fs::remove_file(&path));
+                    } else {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    ctx.request_repaint();
+                }
+            });
+            if let Ok(v) = done {
+                for stem in v.get("none").and_then(|n| n.as_array()).into_iter().flatten().filter_map(|s| s.as_str()) {
+                    if plain_model_name(stem) {
+                        let _ = std::fs::write(dir.join(format!("{stem}.none")), b"");
+                    }
+                }
+            }
+        }
+        busy.store(false, Ordering::SeqCst);
+        ctx.request_repaint();
+    });
+}
+
+/// LoRA details fetched from the host, by file (`None`: still on the way).
+static REMOTE_INFO: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Option<LoraInfo>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A host LoRA's details: cached, or fetched in the background (`None`
+/// meanwhile).
+fn remote_lora_info_cached(file: &str, ctx: &egui::Context) -> Option<LoraInfo> {
+    let mut map = REMOTE_INFO.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(v) = map.get(file) {
+        return v.clone();
+    }
+    let (peer, _) = picker_host()?;
+    map.insert(file.to_string(), None);
+    let file = file.to_string();
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let info = peer
+            .call("gen.lora_info", serde_json::json!({ "file": file }), Vec::new(), &crate::link::temp_dir())
+            .and_then(|mut c| crate::link::finish_call(&mut c, &|| false, &mut |_| {}))
+            .map(|v| LoraInfo {
+                triggers: serde_json::from_value(v.get("triggers").cloned().unwrap_or_default()).unwrap_or_default(),
+                facts: serde_json::from_value(v.get("facts").cloned().unwrap_or_default()).unwrap_or_default(),
+            })
+            .unwrap_or_else(|e| LoraInfo { triggers: Vec::new(), facts: vec![("Couldn't load".into(), e)] });
+        REMOTE_INFO.lock().unwrap_or_else(|e| e.into_inner()).insert(file, Some(info));
+        ctx.request_repaint();
+    });
+    None
 }

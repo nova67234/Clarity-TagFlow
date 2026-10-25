@@ -42,6 +42,8 @@ pub enum ViewerAction {
     CopyImage,
     /// Remove the background, saving a transparent-PNG cutout beside the original.
     RemoveBackground,
+    /// Send the image (with its .txt) to the Link device with this identity key.
+    SendTo(String),
 }
 
 /// A crop region as fractions (0..1) of the source image's width/height.
@@ -394,6 +396,7 @@ impl ZoomState {
         let mut want_copy = false;
         let mut want_spatial = false;
         let mut want_bgremove = false;
+        let mut want_send: Option<String> = None;
         egui::Popup::context_menu(&resp)
             .frame(menu_frame())
             .show(|ui| {
@@ -411,6 +414,13 @@ impl ZoomState {
             if menu_item(ui, egui::include_image!("../icons/copy.svg"), "Copy Image") {
                 want_copy = true;
                 ui.close();
+            }
+            // Link: send it to the other PC.
+            for (key, name) in crate::link::send_targets_now() {
+                if menu_item(ui, egui::include_image!("../icons/send.svg"), &format!("Send to {name}")) {
+                    want_send = Some(key);
+                    ui.close();
+                }
             }
             menu_sep(ui);
             if menu_item(ui, egui::include_image!("../icons/crop.svg"), "Crop Image") {
@@ -443,7 +453,9 @@ impl ZoomState {
             }
         });
         let mut action = ViewerAction::None;
-        if want_favorite {
+        if let Some(key) = want_send {
+            action = ViewerAction::SendTo(key);
+        } else if want_favorite {
             action = ViewerAction::ToggleFavorite;
         } else if want_copy {
             action = ViewerAction::CopyImage;

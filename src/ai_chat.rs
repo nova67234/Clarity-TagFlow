@@ -56,7 +56,8 @@ pub fn show(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::setting
     // way out: this view replaces the whole browser, and Settings only shows
     // the "Activate AI Chat" switch for an installed model (picking one that
     // isn't, or a download of many GB, would otherwise strand the user here).
-    if !crate::llm::BUILT_WITH_LLM || !llm.installed {
+    // A Link host answering for this PC makes it usable too.
+    if !llm.usable() {
         ui.vertical_centered(|ui| {
             ui.add_space(ui.available_height() * 0.4);
             let msg = if !crate::llm::BUILT_WITH_LLM {
@@ -1597,18 +1598,30 @@ fn chat_model_selector(
     llm: &mut LlmState,
     settings: &mut crate::settings::Settings,
 ) {
-    let installed: Vec<crate::llm::GemmaModel> =
-        crate::llm::GemmaModel::ALL.into_iter().filter(|m| m.installed()).collect();
-    if installed.is_empty() {
+    // Linked to a host that runs the chat: its model, shown (the host picks
+    // it); the thinking level still applies.
+    let remote = crate::link::remote_chat().map(|(_, host)| host);
+    let installed: Vec<crate::llm::GemmaModel> = if remote.is_some() {
+        Vec::new()
+    } else {
+        crate::llm::GemmaModel::ALL.into_iter().filter(|m| m.installed()).collect()
+    };
+    if installed.is_empty() && remote.is_none() {
         return;
     }
-    let thinks = llm.model.thinks();
+    let (label, thinks) = match &remote {
+        Some(_) => (
+            crate::link::remote_chat_model().unwrap_or_else(|| "Host model".to_string()),
+            crate::link::remote_chat_thinks(),
+        ),
+        None => (llm.model.label().to_string(), llm.model.thinks()),
+    };
     let menu_id = ui.id().with("chat_model_menu");
     let open = egui::Popup::is_id_open(ui.ctx(), menu_id);
 
     // "Gemma 4 31B" + a muted " Medium" when the model thinks.
     let mut job = egui::text::LayoutJob::default();
-    job.append(llm.model.label(), 0.0, egui::TextFormat::simple(egui::FontId::proportional(12.0), TEXT()));
+    job.append(&label, 0.0, egui::TextFormat::simple(egui::FontId::proportional(12.0), TEXT()));
     if thinks {
         job.append(
             settings.ai_gen.thinking.label(),
@@ -1621,7 +1634,11 @@ fn chat_model_selector(
     let (arrow, gap) = (14.0, 2.0);
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(galley.size().x + gap + arrow, 28.0), egui::Sense::click());
-    let resp = resp.on_hover_text("Model and thinking level").on_hover_cursor(egui::CursorIcon::PointingHand);
+    let tip = match &remote {
+        Some(host) => format!("Runs on {host} (Settings → Link) — thinking level"),
+        None => "Model and thinking level".to_string(),
+    };
+    let resp = resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
     if ui.is_rect_visible(rect) {
         let text_pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
         ui.painter().galley(text_pos, galley, TEXT());
@@ -1652,6 +1669,16 @@ fn chat_model_selector(
         .show(|ui| {
             ui.set_width(250.0);
             ui.spacing_mut().item_spacing.y = 2.0;
+            if let Some(host) = &remote {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(format!("{label} on {host}")).color(TEXT()).size(13.0));
+                ui.label(
+                    egui::RichText::new("Its model is picked on that PC. Settings → Link to run on this one.")
+                        .color(MUTED())
+                        .size(10.5),
+                );
+                ui.add_space(4.0);
+            }
             for m in installed {
                 if model_row(ui, m, llm.model == m) {
                     settings.ai_gemma_model = m;

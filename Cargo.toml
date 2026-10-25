@@ -77,6 +77,15 @@ unicode-segmentation = "1.13.3"
 # "Copy image" right-click action. Already in the tree via eframe, so pinning it
 # here as a direct dep adds no extra build cost.
 arboard = "3.6.1"
+# Link (Settings → Link): another PC on the local network uses this one's
+# models. Noise (XX, ChaCha20-Poly1305, BLAKE2s) encrypts every connection
+# end to end; SPAKE2 turns the host's short pairing code into a key without
+# letting anyone who records the traffic test guesses offline.
+snow = { version = "0.10", default-features = false, features = ["use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
+spake2 = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.2"
 # Local LLM for the AI Model tab (src/llm.rs): llama.cpp bindings running the
 # Gemma 4 vision model fully in-process (no server). The `mtmd` feature adds
 # llama.cpp's multimodal pipeline (image input via the mmproj projector).

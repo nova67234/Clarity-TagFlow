@@ -1168,6 +1168,10 @@ pub(crate) fn ensure_kill_on_exit_job() {
         type Handle = *mut c_void;
         const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
         const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+        // Lets a process started with CREATE_BREAKAWAY_FROM_JOB leave the job:
+        // Link's background host must outlive the app (src/link/background.rs).
+        // Everything else spawned stays in it.
+        const JOB_OBJECT_LIMIT_BREAKAWAY_OK: u32 = 0x0000_0800;
 
         #[repr(C)]
         struct BasicLimit {
@@ -1215,7 +1219,7 @@ pub(crate) fn ensure_kill_on_exit_job() {
                 return;
             }
             let mut info: ExtendedLimit = std::mem::zeroed();
-            info.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            info.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
             SetInformationJobObject(
                 job,
                 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,

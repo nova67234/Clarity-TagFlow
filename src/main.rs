@@ -132,6 +132,8 @@ mod generate;
 mod gif_info;
 mod left_browser;
 mod left_panel_settings;
+// Link (Settings → Link): another PC on the network uses this one's models.
+mod link;
 // Local AI model (Settings → AI Model): Gemma 4 vision via llama.cpp, fully
 // in-process. The module always compiles; the heavy bindings sit behind the
 // `llm` cargo feature.
@@ -166,6 +168,11 @@ fn main() -> eframe::Result {
     // %APPDATA%\Clarity TagFlow\crash reports (see src/crash.rs).
     crash::install();
 
+    // Link's background host: no window, just hosting (see src/link/background.rs).
+    if std::env::args().any(|a| a == link::background::FLAG) {
+        std::process::exit(link::background::run());
+    }
+
     // libVLC playback needs its DLLs + plugins beside the exe; build.rs stages
     // them there on Windows (libVLC finds the plugins relative to its own DLL).
 
@@ -186,7 +193,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Clarity TagFlow",
         options,
         Box::new(|cc| {
@@ -207,6 +214,7 @@ fn main() -> eframe::Result {
             install_fallback_fonts(&cc.egui_ctx);
 
             let mut app = ViewerApp::default();
+            app.link.set_ctx(cc.egui_ctx.clone());
             // Restore saved settings (if any) from eframe's persistent storage.
             if let Some(storage) = cc.storage
                 && let Some(saved) = eframe::get_value::<settings::Settings>(storage, settings::STORAGE_KEY) {
@@ -252,7 +260,11 @@ fn main() -> eframe::Result {
             }
             Ok(Box::new(app))
         }),
-    )
+    );
+    // Link: jobs another PC still has running here finish before the app
+    // exits (the window is already gone; its background copy has taken over).
+    link::finish_handover();
+    result
 }
 
 /// State of the zip password prompt (see `ViewerApp::show_zip_prompt`).
@@ -373,6 +385,8 @@ struct ViewerApp {
     /// Local AI model state (Settings → AI Model): setup download + the
     /// resident Gemma 4 inference worker.
     llm: llm::LlmState,
+    /// Link (Settings → Link): hosting this PC's models, or using another's.
+    link: link::LinkState,
 
     // Panel States
     right_state: right_details::RightPanelState,
@@ -476,6 +490,7 @@ impl Default for ViewerApp {
             stats: top_bar::SystemStats::default(),
             ftp: ftp::FtpState::default(),
             llm: llm::LlmState::default(),
+            link: link::LinkState::new(egui::Context::default()),
             right_state: right_details::RightPanelState::default(),
             settings: settings::Settings::default(),
             scan: scan::ScanState::default(),
@@ -1640,12 +1655,11 @@ impl ViewerApp {
             zoom::ViewerAction::Crop(frac) => self.crop_current(path, frac, ctx),
             zoom::ViewerAction::CopyImage => self.copy_current(path),
             zoom::ViewerAction::RemoveBackground => self.start_bgremove(path, ctx),
+            zoom::ViewerAction::SendTo(key) => self.link.send(&key, vec![path.to_path_buf()]),
             zoom::ViewerAction::None => {}
         }
     }
 
-    /// Re-scan the current folder and try to keep the same image selected. Used
-    /// after the extended-format toggle changes and after a Deep Scan moves files.
     /// `path` is gone (deleted from Deep Scan's review list): take it off the
     /// list shown and, under a generator view, the folder list waiting behind
     /// it.
@@ -1673,6 +1687,8 @@ impl ViewerApp {
         }
     }
 
+    /// Re-scan the current folder and try to keep the same image selected. Used
+    /// after the extended-format toggle changes and after a Deep Scan moves files.
     fn rescan_current_folder(&mut self) {
         if let Some(dir) = self.current_folder.clone() {
             self.restore_folder_list();
@@ -2021,6 +2037,29 @@ impl eframe::App for ViewerApp {
         }
 
         self.handle_dropped_files(ui.ctx());
+        // Link: follow its settings; its messages join the status line, and a
+        // browser showing the folder files just arrived in refreshes.
+        self.link.tick(&self.settings);
+        for n in self.link.take_notices() {
+            self.pending_toast = Some(match self.pending_toast.take() {
+                Some(prev) => format!("{prev}\n{n}"),
+                None => n,
+            });
+        }
+        for dir in self.link.take_received() {
+            if self.current_folder.as_deref().is_some_and(|c| same_dir(c, &dir)) {
+                self.rescan_current_folder();
+            }
+        }
+        // A model loaded only for Link devices goes when they haven't used
+        // it for 10 minutes (this PC's own chat keeps it while it's on).
+        if !self.settings.ai_chat
+            && !self.llm.running
+            && llm::worker_loaded()
+            && llm::remote_idle_for().is_some_and(|d| d > Duration::from_secs(600))
+        {
+            llm::release_shared_worker();
+        }
         // Kick off the launch update-check and drain its workers (badge + Updates tab).
         self.update.tick(ui.ctx());
         // Advance any in-flight background-removal job (download → inference → result).
@@ -2184,7 +2223,7 @@ impl eframe::App for ViewerApp {
             {
                 self.selected = if self.images.is_empty() { None } else { Some(self.images.len() - 1) };
             }
-            let tag_view = self.llm.tag_images && llm::BUILT_WITH_LLM && self.llm.installed;
+            let tag_view = self.llm.tag_images && self.llm.usable();
             let current = if tag_view { self.selected.map(|i| self.images[i].clone()) } else { None };
             self.llm.tag_target = current.clone();
             if let Some(path) = current {
@@ -2258,6 +2297,11 @@ impl eframe::App for ViewerApp {
                 }
             }
             left_browser::TileAction::Move(i) => self.move_at(i),
+            left_browser::TileAction::Send(i, key) => {
+                if let Some(p) = self.images.get(i).cloned() {
+                    self.link.send(&key, vec![p]);
+                }
+            }
             left_browser::TileAction::None => {}
         }
 
@@ -2380,7 +2424,9 @@ impl eframe::App for ViewerApp {
         self.llm.tag_images = self.settings.ai_tag_images;
         self.llm.params = self.settings.ai_gen;
         self.llm.set_model(self.settings.ai_gemma_model);
-        settings::show(ui.ctx(), &mut self.settings, &mut self.update, &mut self.ftp, &mut self.llm);
+        settings::show(ui.ctx(), &mut self.settings, &mut self.update, &mut self.ftp, &mut self.llm, &mut self.link);
+        // Files another PC offers over Link.
+        link::offer_prompt(ui.ctx(), &mut self.link);
 
         // The floating voice-sample recorder (its own always-on-top window,
         // usable while other apps are focused). A finished recording becomes
@@ -2500,6 +2546,9 @@ impl eframe::App for ViewerApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.right_state.save_pending_edit();
         self.detail_popup.save_edit();
+        // A Link host with background hosting on hands over to a background
+        // copy of the app.
+        self.link.on_exit(&self.settings);
     }
 }
 

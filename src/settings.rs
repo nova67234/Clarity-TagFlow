@@ -18,6 +18,7 @@ pub enum SettingsTab {
     General,
     Appearance,
     AiModel,
+    Link,
     Ftp,
     Updates,
 }
@@ -183,6 +184,9 @@ pub struct Settings {
     /// Pick the interface size from the monitor's resolution, so the app isn't
     /// tiny on large desktop screens running at 100% OS scaling.
     pub ui_scale_auto: bool,
+    /// Link (Settings → Link): host this PC's models for another PC, or use
+    /// another PC's (src/link.rs).
+    pub link: crate::link::LinkSettings,
 }
 
 /// The interface size steps offered in Settings > Appearance.
@@ -278,6 +282,7 @@ impl Default for Settings {
             dismissed_comfy_version: String::new(),
             ui_scale: 1.0,
             ui_scale_auto: true,
+            link: crate::link::LinkSettings::default(),
         }
     }
 }
@@ -285,13 +290,15 @@ impl Default for Settings {
 /// Render the settings window when it's open. Mutates `settings` in place; the
 /// title-bar close button dismisses it (so does clicking the gear again).
 /// `ftp` carries the FTP/FTPS tab's live state (password + connection test);
-/// `llm` the AI Model tab's (setup download + inference worker).
+/// `llm` the AI Model tab's (setup download + inference worker); `link` the
+/// Link tab's (the running host or receiver).
 pub fn show(
     ctx: &egui::Context,
     settings: &mut Settings,
     update: &mut crate::update::UpdateState,
     ftp: &mut crate::ftp::FtpState,
     llm: &mut crate::llm::LlmState,
+    link: &mut crate::link::LinkState,
 ) {
     if !settings.open {
         return;
@@ -352,6 +359,7 @@ pub fn show(
                     tab_button(ui, settings, SettingsTab::General, "General", false);
                     tab_button(ui, settings, SettingsTab::Appearance, "Appearance", false);
                     tab_button(ui, settings, SettingsTab::AiModel, "AI Model", false);
+                    tab_button(ui, settings, SettingsTab::Link, "Link", false);
                     tab_button(ui, settings, SettingsTab::Ftp, "FTP/FTPS", false);
                     // The Updates tab carries a small red dot when an update is waiting.
                     let update_waiting = update.badge(settings);
@@ -395,6 +403,7 @@ pub fn show(
                                 SettingsTab::General => general_tab(ui, settings),
                                 SettingsTab::Appearance => appearance_tab(ui, settings),
                                 SettingsTab::AiModel => ai_model_tab(ui, settings, llm),
+                                SettingsTab::Link => crate::link::settings_tab(ui, settings, link),
                                 SettingsTab::Ftp => ftp_tab(ui, settings, ftp),
                                 SettingsTab::Updates => crate::update::updates_tab(ui, update, settings),
                             });
@@ -753,6 +762,25 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
 fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm::LlmState) {
     llm.poll(ui.ctx());
 
+    // Linked to a host that runs the chat (Settings → Link).
+    if let Some((_, host)) = crate::link::remote_chat() {
+        section(ui, "Runs on another PC", |ui| {
+            let model = crate::link::remote_chat_model().unwrap_or_else(|| "its model".to_string());
+            ui.label(
+                egui::RichText::new(format!("The AI chat runs on {host}, with {model}"))
+                    .color(egui::Color32::from_rgb(46, 160, 67))
+                    .strong()
+                    .size(12.5),
+            );
+            hint(
+                ui,
+                "Through Link (Settings → Link → Use for). Your messages and pictures go \
+                 to that PC encrypted, and nothing of them is kept there. The models \
+                 below are this PC's own, used when Link is off.",
+            );
+        });
+    }
+
     section(ui, "Local model", |ui| {
         hint(
             ui,
@@ -889,7 +917,8 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
         });
     }
 
-    if llm.installed && crate::llm::BUILT_WITH_LLM {
+    let local = llm.installed && crate::llm::BUILT_WITH_LLM;
+    if llm.usable() {
         section(ui, "AI Chat", |ui| {
             row(
                 ui,
@@ -910,6 +939,9 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                     }
                 },
             );
+            if !local {
+                return;
+            }
             row_sep(ui);
             // Which inference engine this exe was built with — makes it
             // obvious when a CPU-only build is running instead of the Vulkan

@@ -36,6 +36,8 @@ pub enum TileAction {
     Delete(usize),
     /// Move this image (and its sidecar) to the Output folder.
     Move(usize),
+    /// Send this image (and its sidecar) to the Link device with this key.
+    Send(usize, String),
 }
 
 /// Render the left browser panel.
@@ -325,6 +327,13 @@ fn thumbnail_list(
                     if menu_item(ui, fav_icon, fav_label) {
                         favorites.toggle(&images[i]);
                         ui.close();
+                    }
+                    // Link: send it to the other PC.
+                    for (key, name) in crate::link::send_targets_now() {
+                        if menu_item(ui, egui::include_image!("../icons/send.svg"), &format!("Send to {name}")) {
+                            action = TileAction::Send(i, key);
+                            ui.close();
+                        }
                     }
                     // Zip entries are view-only — nothing ever moves out of or
                     // is deleted from an archive, so those rows don't appear.

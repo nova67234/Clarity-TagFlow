@@ -17,6 +17,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 
 use eframe::egui;
 
@@ -369,8 +370,31 @@ enum Cmd {
     /// `pinned` leading messages (the role-play / Krea 2 priming pair) are
     /// always kept; when the prompt outgrows the context, the oldest of the
     /// rest go. `detailed` = Detailed Vision: the newest image goes as the
-    /// full picture plus overlapping close-up sections.
+    /// full picture plus overlapping close-up sections. Replies on the
+    /// worker's own channel (the model tests use this).
+    #[cfg_attr(not(test), allow(dead_code))]
     Generate { msgs: Vec<CmdMsg>, params: GenParams, pinned: usize, detailed: bool },
+    /// The same, replying on `reply` — the app's chat and a Link device's
+    /// questions share one resident worker, each hearing its own reply.
+    /// `remote`: a Link device's question, with its own stop flag.
+    Ask {
+        msgs: Vec<CmdMsg>,
+        params: GenParams,
+        pinned: usize,
+        detailed: bool,
+        reply: Sender<Msg>,
+        remote: Option<RemoteFlags>,
+    },
+}
+
+/// A Link device's question: stopped by its own flag (never by this PC's
+/// Stop button, nor stopping this PC's reply), and its cut-off reported to
+/// it rather than through this PC's chat state.
+#[derive(Clone, Default)]
+#[cfg_attr(not(feature = "llm"), allow(dead_code))]
+struct RemoteFlags {
+    cancel: Arc<AtomicBool>,
+    cut_off: Arc<AtomicBool>,
 }
 
 /// A message streamed back from the inference worker.
@@ -388,21 +412,24 @@ enum Msg {
     ImageDetail { effective: Option<ImageDetail>, reason: Option<String> },
 }
 
-struct Worker {
+/// The resident inference worker, shared by the chat and Link's devices:
+/// one model in memory at a time.
+struct SharedWorker {
     tx: Sender<Cmd>,
-    rx: Receiver<Msg>,
+    model: GemmaModel,
+    detail: ImageDetail,
     /// The worker thread, handed on when this worker is dropped so the next
     /// one waits for it (see `RETIRED`).
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Worker threads that were let go (model switch, reset) and may still be
+/// Worker threads that were let go (model switch, unload) and may still be
 /// freeing their model. The next worker waits for them before sizing its GPU
 /// offload — otherwise it sees the old model's memory as taken and loads on
 /// the CPU only.
 static RETIRED: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(Vec::new());
 
-impl Drop for Worker {
+impl Drop for SharedWorker {
     fn drop(&mut self) {
         if let Some(t) = self.thread.take() {
             let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
@@ -410,6 +437,281 @@ impl Drop for Worker {
             retired.push(t);
         }
     }
+}
+
+static SHARED: std::sync::Mutex<Option<SharedWorker>> = std::sync::Mutex::new(None);
+
+/// The Image detail level the loaded worker reported (when it loaded for a
+/// Link device, the chat learns it from here).
+static DETAIL_REPORT: std::sync::Mutex<Option<(Option<ImageDetail>, Option<String>)>> = std::sync::Mutex::new(None);
+
+/// Link devices' questions running or queued on the worker right now, and
+/// when the last one ended.
+static REMOTE_BUSY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static REMOTE_LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Queue `cmd` on the resident worker, loading `model` at `detail` first
+/// when another one is loaded (that worker finishes the reply it's on, then
+/// frees its memory). A worker that has stopped (its model failed to load)
+/// is replaced.
+fn submit(ctx: &egui::Context, model: GemmaModel, detail: ImageDetail, cmd: Cmd) -> Result<(), String> {
+    if !BUILT_WITH_LLM {
+        return Err("This build was compiled without the AI feature (`llm`).".to_string());
+    }
+    let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    let same = |w: &SharedWorker| w.model == model && (!model.has_image_detail() || w.detail == detail);
+    if !shared.as_ref().is_some_and(same) {
+        *shared = None;
+        *DETAIL_REPORT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    let mut cmd = cmd;
+    for _ in 0..2 {
+        if shared.is_none() {
+            let Some((tx, thread)) = spawn_worker(ctx.clone(), model, detail) else {
+                return Err("The AI couldn't start".to_string());
+            };
+            *shared = Some(SharedWorker { tx, model, detail, thread: Some(thread) });
+        }
+        match shared.as_ref().map(|w| w.tx.send(cmd)) {
+            Some(Ok(())) => return Ok(()),
+            // That worker is gone: start a fresh one and try once more.
+            Some(Err(std::sync::mpsc::SendError(back))) => {
+                cmd = back;
+                *shared = None;
+            }
+            None => break,
+        }
+    }
+    Err("The AI worker stopped — try again.".to_string())
+}
+
+/// Unload the resident worker (its weights free once a reply in progress
+/// ends). The next question loads it again.
+pub(crate) fn release_shared_worker() {
+    *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *DETAIL_REPORT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Is a worker loaded?
+pub(crate) fn worker_loaded() -> bool {
+    SHARED.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+/// The chat model a Link host serves with (its own AI Model setting), when
+/// it's set up here.
+pub(crate) fn host_model_label() -> Option<String> {
+    let (model, _) = crate::link::host_llm()?;
+    (BUILT_WITH_LLM && model.installed()).then(|| model.label().to_string())
+}
+
+/// Counts a Link device's question as running, and when it ends.
+struct RemoteBusy;
+
+impl RemoteBusy {
+    fn start() -> RemoteBusy {
+        REMOTE_BUSY.fetch_add(1, Ordering::SeqCst);
+        RemoteBusy
+    }
+}
+
+impl Drop for RemoteBusy {
+    fn drop(&mut self) {
+        REMOTE_BUSY.fetch_sub(1, Ordering::SeqCst);
+        *REMOTE_LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    }
+}
+
+/// One message of a question as it travels over Link (its picture, if any,
+/// travels as a file named `attachment`).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WireMsg {
+    user: bool,
+    text: String,
+    #[serde(default)]
+    attachment: Option<String>,
+}
+
+/// Host side: answer a Link device's chat question with this PC's model (the
+/// one set in its AI Model tab), streaming the reply back as it's written.
+/// Runs on the resident worker, after any question already on it.
+pub(crate) fn serve_remote(call: &crate::link::Incoming, ctx: &egui::Context) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    if !BUILT_WITH_LLM {
+        return Err("The app on this PC was built without the AI".into());
+    }
+    let (model, detail) = crate::link::host_llm().ok_or("The AI isn't set up on this PC")?;
+    if !model.installed() {
+        return Err(format!("{} isn't set up on this PC", model.label()));
+    }
+    let msgs: Vec<WireMsg> =
+        serde_json::from_value(call.body.get("msgs").cloned().unwrap_or_default()).map_err(|_| "Bad question".to_string())?;
+    if msgs.is_empty() || msgs.len() > 400 {
+        return Err("Bad question".into());
+    }
+    let mut params: GenParams =
+        serde_json::from_value(call.body.get("params").cloned().unwrap_or_default()).unwrap_or_default();
+    // Keep a device from asking for more than the context holds.
+    params.max_tokens = params.max_tokens.clamp(1, 16_384);
+    params.temperature = params.temperature.clamp(0.0, 2.0);
+    params.top_k = params.top_k.clamp(1, 1000);
+    params.top_p = params.top_p.clamp(0.0, 1.0);
+    let pinned = (call.body.get("pinned").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize).min(msgs.len());
+    let detailed = call.body.get("detailed").and_then(serde_json::Value::as_bool).unwrap_or(false);
+
+    // The pictures, under their own extensions (the worker tells a video
+    // from an image by it), in a folder of their own.
+    let dir = crate::link::job_dir("ask");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mut cmd_msgs = Vec::with_capacity(msgs.len());
+    for (i, m) in msgs.into_iter().enumerate() {
+        let image = match m.attachment {
+            Some(name) => {
+                let Some((_, src)) = call.blobs.iter().find(|(n, _)| *n == name) else {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return Err("A picture went missing on the way".into());
+                };
+                let ext = std::path::Path::new(&name)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .filter(|e| e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+                    .unwrap_or("png")
+                    .to_ascii_lowercase();
+                let dest = dir.join(format!("{i}.{ext}"));
+                if let Err(e) = std::fs::rename(src, &dest) {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return Err(e.to_string());
+                }
+                Some(dest)
+            }
+            None => None,
+        };
+        cmd_msgs.push(CmdMsg { user: m.user, text: m.text, image });
+    }
+
+    let flags = RemoteFlags { cancel: call.cancel_flag(), cut_off: Arc::default() };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _busy = RemoteBusy::start();
+    let cmd = Cmd::Ask { msgs: cmd_msgs, params, pinned, detailed, reply: tx, remote: Some(flags.clone()) };
+    if let Err(e) = submit(ctx, model, detail, cmd) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
+    }
+    let result = loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(Msg::Status(text)) => {
+                call.event(json!({ "kind": "status", "text": text }));
+            }
+            Ok(Msg::Token(text)) => {
+                if !call.event(json!({ "kind": "token", "text": text })) {
+                    flags.cancel.store(true, Ordering::SeqCst);
+                }
+            }
+            Ok(Msg::ImageDetail { .. }) => {}
+            Ok(Msg::Done(r)) => break r,
+            // Still thinking (a Stop from the device reaches the worker
+            // through `flags.cancel` itself).
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Err("The AI stopped".to_string()),
+        }
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    result.map(|()| json!({ "cut_off": flags.cut_off.load(Ordering::SeqCst) }))
+}
+
+/// Receiver side: a Link host answers the chat. Sends the question (with its
+/// pictures) and relays the reply's progress and words as if the worker
+/// here were writing it.
+#[allow(clippy::too_many_arguments)]
+fn remote_ask(
+    peer: &Arc<crate::link::Peer>,
+    host: &str,
+    msgs: Vec<CmdMsg>,
+    params: GenParams,
+    pinned: usize,
+    detailed: bool,
+    tx: &Sender<Msg>,
+    ctx: &egui::Context,
+) {
+    use crate::link::{BlobSrc, CallEvent};
+    use serde_json::{json, Value};
+    let send = |m: Msg| {
+        let _ = tx.send(m);
+        ctx.request_repaint();
+    };
+    send(Msg::Status(format!("Sending to {host}…")));
+    let last = msgs.len().saturating_sub(1);
+    let mut blobs = Vec::new();
+    let mut wire = Vec::with_capacity(msgs.len());
+    for (i, m) in msgs.into_iter().enumerate() {
+        let mut text = m.text;
+        let mut attachment = None;
+        if let Some(path) = &m.image {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("png").to_ascii_lowercase();
+            let name = format!("{i}.{ext}");
+            let src = if crate::archive::is_entry(path) {
+                crate::archive::read(path).ok().map(|data| BlobSrc::Bytes { name: name.clone(), data })
+            } else {
+                path.is_file().then(|| BlobSrc::File { name: name.clone(), path: path.clone() })
+            };
+            match src {
+                Some(src) => {
+                    blobs.push(src);
+                    attachment = Some(name);
+                }
+                // An earlier turn's picture that's gone: left out with a
+                // note (as the worker here does); this turn's own fails.
+                None if i < last => {
+                    let what = if crate::is_video(path) { "video" } else { "image" };
+                    text = format!("[{what} no longer available]\n{text}");
+                }
+                None => {
+                    send(Msg::Done(Err(format!("Couldn't read {}", path.display()))));
+                    return;
+                }
+            }
+        }
+        wire.push(WireMsg { user: m.user, text, attachment });
+    }
+    let body = json!({ "msgs": wire, "params": params, "pinned": pinned, "detailed": detailed });
+    let mut call = match peer.call("llm.ask", body, blobs, &crate::link::temp_dir()) {
+        Ok(c) => c,
+        Err(e) => {
+            send(Msg::Done(Err(format!("{host}: {e}"))));
+            return;
+        }
+    };
+    let result = crate::link::finish_call(&mut call, &|| GEN_CANCEL.load(Ordering::SeqCst), &mut |ev| match ev {
+        CallEvent::Event(v) => {
+            let text = v.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
+            match v.get("kind").and_then(Value::as_str) {
+                Some("token") => send(Msg::Token(text)),
+                Some("status") => send(Msg::Status(format!("{text} ({host})"))),
+                _ => {}
+            }
+        }
+        CallEvent::Blob { path, .. } => {
+            let _ = std::fs::remove_file(path);
+        }
+        _ => {}
+    });
+    match result {
+        Ok(v) => {
+            if v.get("cut_off").and_then(Value::as_bool) == Some(true) {
+                GEN_CUT_OFF.store(true, Ordering::SeqCst);
+            }
+            send(Msg::Done(Ok(())));
+        }
+        Err(e) => send(Msg::Done(Err(format!("{host}: {e}")))),
+    }
+}
+
+/// How long since a Link device last used the worker (`None`: one is using
+/// it now, or none ever did).
+pub(crate) fn remote_idle_for() -> Option<std::time::Duration> {
+    if REMOTE_BUSY.load(Ordering::SeqCst) > 0 {
+        return None;
+    }
+    REMOTE_LAST.lock().unwrap_or_else(|e| e.into_inner()).map(|t| t.elapsed())
 }
 
 /// Who authored a chat message.
@@ -570,14 +872,10 @@ pub struct LlmState {
     pub memory: crate::memory::MemoryStore,
     /// The 3D memory map window (src/memory_map.rs).
     pub memory_map: crate::memory_map::MapState,
-    /// The variant the resident worker actually loaded — a mismatch drops
-    /// the worker so the next ask loads the newly selected model.
-    worker_model: GemmaModel,
     /// Image detail the user asked for (mirrors the persisted setting).
+    /// Changing it reloads the worker (the vision projector fixes it at load
+    /// time).
     pub image_detail: ImageDetail,
-    /// The level the resident worker was started with — changing the setting
-    /// reloads the worker (the vision projector fixes it at load time).
-    worker_detail: ImageDetail,
     /// What the loaded worker actually runs (`None` until it reports, or for
     /// models without the setting) and why it's lower than asked, if it is.
     pub detail_effective: Option<ImageDetail>,
@@ -606,7 +904,11 @@ pub struct LlmState {
     /// same checker as the generator prompt boxes.
     pub spell: crate::spellcheck::SpellcheckState,
 
-    worker: Option<Worker>,
+    /// The streaming reply's messages (from the resident worker, or relayed
+    /// from a Link host).
+    reply_rx: Option<Receiver<Msg>>,
+    /// The streaming reply is being answered by a Link host (its name).
+    pub remote_host: Option<String>,
 }
 
 impl Drop for LlmState {
@@ -617,7 +919,11 @@ impl Drop for LlmState {
         }
         // Nor decrypted album pictures in the temp folder.
         crate::roleplay::clear_album_temp();
-        clear_ai_temp();
+        // The AI's picture copies: unless Link devices' questions still
+        // running here need them (cleared after those, by Link).
+        if !crate::link::handing_over() {
+            clear_ai_temp();
+        }
     }
 }
 
@@ -650,7 +956,7 @@ fn ai_temp_subdir(name: &str) -> PathBuf {
 }
 
 /// Delete this run's temp picture copies (at exit).
-fn clear_ai_temp() {
+pub(crate) fn clear_ai_temp() {
     let _ = std::fs::remove_dir_all(ai_temp_dir());
 }
 
@@ -746,9 +1052,7 @@ impl Default for LlmState {
             ai_settings_tab: Default::default(),
             memory: crate::memory::MemoryStore::load(crate::memory::MemoryKind::Main),
             memory_map: Default::default(),
-            worker_model: GemmaModel::default(),
             image_detail: ImageDetail::default(),
-            worker_detail: ImageDetail::default(),
             detail_effective: None,
             detail_reason: None,
             detail_notice_done: false,
@@ -758,7 +1062,8 @@ impl Default for LlmState {
             tools_open: false,
             chats_open: false,
             spell: crate::spellcheck::SpellcheckState::default(),
-            worker: None,
+            reply_rx: None,
+            remote_host: None,
         }
     }
 }
@@ -806,9 +1111,15 @@ impl LlmState {
 
     /// Unload the resident worker; its Image detail report goes with it.
     fn drop_worker(&mut self) {
-        self.worker = None;
+        release_shared_worker();
         self.detail_effective = None;
         self.detail_reason = None;
+    }
+
+    /// The chat can answer: this build has the AI and its model is set up —
+    /// or a Link host answers for it.
+    pub fn usable(&self) -> bool {
+        (BUILT_WITH_LLM && self.installed) || crate::link::remote_chat().is_some()
     }
 
     /// AI Chat was deactivated: free the resident worker — and the model
@@ -828,7 +1139,7 @@ impl LlmState {
         if self.running {
             self.unload_when_done = true;
         } else {
-            self.worker = None;
+            release_shared_worker();
         }
     }
 
@@ -908,12 +1219,23 @@ impl LlmState {
                 self.download = None;
             }
 
+        // The loaded model's Image detail, reported when it loaded (perhaps
+        // for a Link device's question).
+        if let Some((effective, reason)) = DETAIL_REPORT.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            self.detail_effective = effective;
+            self.detail_reason = reason;
+        }
+        // A question waiting behind a Link device's: say so.
+        if self.running && self.status == "Starting…" && REMOTE_BUSY.load(Ordering::SeqCst) > 0 {
+            self.status = "Waiting — another PC is using the AI…".to_string();
+        }
+
         // Drain first, then act — acting (auto-speak) needs &mut self.
         let mut worker_msgs = Vec::new();
         let mut worker_died = false;
-        if let Some(w) = &self.worker {
+        if let Some(rx) = &self.reply_rx {
             loop {
-                match w.rx.try_recv() {
+                match rx.try_recv() {
                     Ok(m) => worker_msgs.push(m),
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -922,6 +1244,10 @@ impl LlmState {
                     }
                 }
             }
+        }
+        // The reply ended without a word (its worker stopped).
+        if worker_died && self.running && !worker_msgs.iter().any(|m| matches!(m, Msg::Done(_))) {
+            worker_msgs.push(Msg::Done(Err("The AI worker stopped — try again.".to_string())));
         }
         {
             for msg in worker_msgs {
@@ -1114,18 +1440,16 @@ impl LlmState {
                     }
                 }
             }
-            // A dead worker means the model failed to load (the error already
-            // arrived as a Done). Drop it so the next ask can start fresh.
-            if worker_died {
-                self.worker = None;
-                self.running = false;
-                self.gen_chat = None;
+            // The reply's channel closed: nothing more comes on it.
+            if worker_died || !self.running {
+                self.reply_rx = None;
+                self.remote_host = None;
             }
             // Chat was deactivated mid-reply; that reply is done now, so
             // release the worker and free the weights.
             if !self.running && self.unload_when_done {
                 self.unload_when_done = false;
-                self.worker = None;
+                release_shared_worker();
             }
         }
     }
@@ -1190,12 +1514,13 @@ impl LlmState {
         if self.running || (text.is_empty() && self.draft_image.is_none()) {
             return;
         }
-        if !BUILT_WITH_LLM {
+        let remote = crate::link::remote_chat().is_some();
+        if !BUILT_WITH_LLM && !remote {
             self.run_err =
                 Some("This build was compiled without the AI feature (`llm`).".to_string());
             return;
         }
-        if !self.installed {
+        if !self.installed && !remote {
             self.run_err = Some("Set up the model first (Settings → AI Model).".to_string());
             return;
         }
@@ -1433,9 +1758,14 @@ impl LlmState {
             pinned = 2;
         } else if self.roleplay.enabled {
             msgs.insert(0, CmdMsg { user: false, text: self.roleplay.ack(), image: None });
-            // High / Max thinking lifts the role-play "think briefly" rule.
-            let deep = self.model.thinks()
-                && matches!(self.params.thinking, ThinkLevel::High | ThinkLevel::Max);
+            // High / Max thinking lifts the role-play "think briefly" rule
+            // (the model that answers: a Link host's, when it runs there).
+            let thinks = if crate::link::remote_chat().is_some() {
+                crate::link::remote_chat_thinks()
+            } else {
+                self.model.thinks()
+            };
+            let deep = thinks && matches!(self.params.thinking, ThinkLevel::High | ThinkLevel::Max);
             msgs.insert(
                 0,
                 CmdMsg { user: true, text: self.roleplay.preamble_with(&self.rp_memory, deep), image: None },
@@ -1448,34 +1778,37 @@ impl LlmState {
             pinned = 2;
         }
 
-        // A different model was selected since the worker loaded — drop it so
-        // the fresh spawn below loads the new weights (the old ones free when
-        // the worker thread exits).
-        if self.worker.is_some()
-            && (self.worker_model != self.model
-                || (self.model.has_image_detail() && self.worker_detail != self.image_detail))
-        {
-            self.drop_worker();
-        }
-        if self.worker.is_none() {
-            self.worker = spawn_worker(ctx.clone(), self.model, self.image_detail);
-            self.worker_model = self.model;
-            self.worker_detail = self.image_detail;
-        }
         GEN_CANCEL.store(false, Ordering::SeqCst);
         GEN_CUT_OFF.store(false, Ordering::SeqCst);
-        match &self.worker {
-            Some(w)
-                if w
-                    .tx
-                    .send(Cmd::Generate {
-                        msgs,
-                        params: self.params,
-                        pinned,
-                        detailed: self.detailed_vision || self.krea_prompts,
-                    })
-                    .is_ok() =>
-            {
+        let detailed = self.detailed_vision || self.krea_prompts;
+        let (tx, rx) = std::sync::mpsc::channel();
+        // A Link host answers when this PC is linked to one sharing its
+        // chat; otherwise the resident worker (a different model selected
+        // since it loaded is swapped in first).
+        let asked = match crate::link::remote_chat() {
+            Some((peer, host)) => {
+                let ctx = ctx.clone();
+                let params = self.params;
+                self.remote_host = Some(host.clone());
+                std::thread::Builder::new()
+                    .name("ai-remote-ask".into())
+                    .spawn(move || remote_ask(&peer, &host, msgs, params, pinned, detailed, &tx, &ctx))
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
+            None => {
+                self.remote_host = None;
+                submit(
+                    ctx,
+                    self.model,
+                    self.image_detail,
+                    Cmd::Ask { msgs, params: self.params, pinned, detailed, reply: tx, remote: None },
+                )
+            }
+        };
+        match asked {
+            Ok(()) => {
+                self.reply_rx = Some(rx);
                 // The empty reply bubble the tokens stream into.
                 self.chats[self.active_chat]
                     .msgs
@@ -1491,9 +1824,9 @@ impl LlmState {
                 self.gen_started = Some(std::time::Instant::now());
                 self.gen_chat = Some(id);
             }
-            _ => {
-                self.worker = None;
-                self.run_err = Some("The AI worker stopped — try again.".to_string());
+            Err(e) => {
+                self.remote_host = None;
+                self.run_err = Some(e);
             }
         }
     }
@@ -1724,25 +2057,39 @@ fn speech_text(md: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(feature = "llm"))]
-fn spawn_worker(_ctx: egui::Context, _model: GemmaModel, _detail: ImageDetail) -> Option<Worker> {
+fn spawn_worker(
+    _ctx: egui::Context,
+    _model: GemmaModel,
+    _detail: ImageDetail,
+) -> Option<(Sender<Cmd>, std::thread::JoinHandle<()>)> {
     None
 }
 
+/// Start a worker for `model`; it loads on its first question, once any
+/// worker let go before it has freed its memory. (Every question it's given
+/// brings its own reply channel, so its own channel's receiver isn't kept.)
 #[cfg(feature = "llm")]
-fn spawn_worker(ctx: egui::Context, model: GemmaModel, detail: ImageDetail) -> Option<Worker> {
+fn spawn_worker(
+    ctx: egui::Context,
+    model: GemmaModel,
+    detail: ImageDetail,
+) -> Option<(Sender<Cmd>, std::thread::JoinHandle<()>)> {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
-    let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
+    let (msg_tx, _) = std::sync::mpsc::channel::<Msg>();
     let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
-    let thread = std::thread::spawn(move || {
-        // Let the previous model free its memory first (it stops once its
-        // command channel is gone, after any reply it's still writing).
-        let t0 = std::time::Instant::now();
-        while retired.iter().any(|t| !t.is_finished()) && t0.elapsed().as_secs() < 30 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        worker::run(cmd_rx, msg_tx, ctx, model, detail)
-    });
-    Some(Worker { tx: cmd_tx, rx: msg_rx, thread: Some(thread) })
+    let thread = std::thread::Builder::new()
+        .name("ai-worker".into())
+        .spawn(move || {
+            // Let the previous model free its memory first (it stops once its
+            // command channel is gone, after any reply it's still writing).
+            let t0 = std::time::Instant::now();
+            while retired.iter().any(|t| !t.is_finished()) && t0.elapsed().as_secs() < 30 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            worker::run(cmd_rx, msg_tx, ctx, model, detail)
+        })
+        .ok()?;
+    Some((cmd_tx, thread))
 }
 
 #[cfg(feature = "llm")]
@@ -1805,9 +2152,16 @@ mod worker {
     /// also keeps the old weights' GPU memory from crowding out the new load.
     static LOADED: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Worker body: load everything once, then serve Generate commands until
-    /// the UI side drops its sender. On a load failure the error is reported
-    /// as a `Done(Err)` and the thread exits (the UI respawns it on demand).
+    thread_local! {
+        /// The question being answered on this worker thread, when it's a
+        /// Link device's: `stopped` and the cut-off mark use its own flags.
+        static JOB: std::cell::RefCell<Option<super::RemoteFlags>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Worker body: load everything on the first question, then serve
+    /// questions until every sender is gone. Whoever asked first hears the
+    /// loading progress; on a load failure everyone waiting hears the error
+    /// and the thread exits (the next question starts a new worker).
     pub(super) fn run(
         rx: Receiver<Cmd>,
         tx: Sender<Msg>,
@@ -1815,24 +2169,89 @@ mod worker {
         model: super::GemmaModel,
         detail: super::ImageDetail,
     ) {
-        let send = |m: Msg| {
+        let base = |m: Msg| {
             let _ = tx.send(m);
             ctx.request_repaint();
         };
         // (A worker that panicked released everything while unwinding.)
         let _loaded = LOADED.lock().unwrap_or_else(|e| e.into_inner());
-        match load_and_serve(&rx, &send, model, detail) {
-            Ok(()) => {}
-            Err(e) => send(Msg::Done(Err(e))),
+        let Ok(first) = rx.recv() else { return };
+        let first_reply = match &first {
+            Cmd::Ask { reply, .. } => Some(reply.clone()),
+            Cmd::Generate { .. } => None,
+        };
+        let load_send = |m: Msg| {
+            if let Msg::ImageDetail { effective, reason } = &m {
+                *super::DETAIL_REPORT.lock().unwrap_or_else(|e| e.into_inner()) = Some((*effective, reason.clone()));
+            }
+            match &first_reply {
+                Some(r) => {
+                    let _ = r.send(m);
+                    ctx.request_repaint();
+                }
+                None => base(m),
+            }
+        };
+        let loaded = match load(&load_send, model, detail) {
+            Ok(l) => l,
+            Err(e) => {
+                load_send(Msg::Done(Err(e.clone())));
+                while let Ok(cmd) = rx.try_recv() {
+                    match cmd {
+                        Cmd::Ask { reply, .. } => {
+                            let _ = reply.send(Msg::Done(Err(e.clone())));
+                        }
+                        Cmd::Generate { .. } => base(Msg::Done(Err(e.clone()))),
+                    }
+                }
+                ctx.request_repaint();
+                return;
+            }
+        };
+        serve(&loaded, first, &base, &ctx);
+        while let Ok(cmd) = rx.recv() {
+            serve(&loaded, cmd, &base, &ctx);
         }
     }
 
-    fn load_and_serve(
-        rx: &Receiver<Cmd>,
-        send: &dyn Fn(Msg),
+    /// Everything a loaded worker keeps resident.
+    struct Loaded {
+        backend: LlamaBackend,
+        model: LlamaModel,
+        mtmd: MtmdContext,
+        template: llama_cpp_2::model::LlamaChatTemplate,
+        threads: i32,
         which: super::GemmaModel,
-        requested: super::ImageDetail,
-    ) -> Result<(), String> {
+        detail: super::ImageDetail,
+    }
+
+    /// Answer one question.
+    fn serve(l: &Loaded, cmd: Cmd, base: &dyn Fn(Msg), ctx: &egui::Context) {
+        match cmd {
+            Cmd::Generate { msgs, params, pinned, detailed } => {
+                let res = generate(
+                    &l.backend, &l.model, &l.mtmd, &l.template, l.threads, l.which, &msgs, pinned, detailed,
+                    l.detail, &params, base,
+                );
+                base(Msg::Done(res));
+            }
+            Cmd::Ask { msgs, params, pinned, detailed, reply, remote } => {
+                let send = |m: Msg| {
+                    let _ = reply.send(m);
+                    ctx.request_repaint();
+                };
+                JOB.with(|j| *j.borrow_mut() = remote);
+                let res = generate(
+                    &l.backend, &l.model, &l.mtmd, &l.template, l.threads, l.which, &msgs, pinned, detailed,
+                    l.detail, &params, &send,
+                );
+                JOB.with(|j| *j.borrow_mut() = None);
+                send(Msg::Done(res));
+            }
+        }
+    }
+
+    fn load(send: &dyn Fn(Msg), which: super::GemmaModel, requested: super::ImageDetail) -> Result<Loaded, String> {
         // GPU build on a machine with no Vulkan runtime: fail readably before
         // llama.cpp's first (delay-loaded, would-crash) Vulkan call.
         #[cfg(all(feature = "llm-vulkan", target_os = "windows"))]
@@ -1947,15 +2366,7 @@ mod worker {
             .map_err(|e| format!("Chat template: {e}"))?;
 
         send(Msg::Status("Ready".into()));
-
-        while let Ok(Cmd::Generate { msgs, params, pinned, detailed }) = rx.recv() {
-            let res = generate(
-                &backend, &model, &mtmd, &template, threads, which, &msgs, pinned, detailed,
-                detail, &params, send,
-            );
-            send(Msg::Done(res));
-        }
-        Ok(())
+        Ok(Loaded { backend, model, mtmd, template, threads, which, detail })
     }
 
     #[allow(clippy::too_many_arguments)] // threads the worker's resident state
@@ -2216,7 +2627,7 @@ mod worker {
         let mut ended = false;
         for i in 0..(answer_cap + think_cap + 192) {
             // The UI's Stop button: end the reply here, keeping what streamed.
-            if super::GEN_CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
+            if stopped() {
                 break;
             }
             // A forced thought-close feeds extra tokens, so also stop at the
@@ -2286,17 +2697,29 @@ mod worker {
         }
         // Not ended by the model (nor stopped by the user): the length cap
         // or the context's edge cut it off, maybe mid-line.
-        if !ended && !super::GEN_CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
-            super::GEN_CUT_OFF.store(true, std::sync::atomic::Ordering::SeqCst);
+        if !ended && !stopped() {
+            mark_cut_off();
         }
         Ok(())
     }
 
-    /// The chat's Stop button was pressed. Checked between the slow phases
-    /// before the first token too (loading, frames, sections, before the
-    /// prompt evaluation), not only between generated tokens.
+    /// The chat's Stop button was pressed (for a Link device's question: it
+    /// stopped it). Checked between the slow phases before the first token
+    /// too (loading, frames, sections, before the prompt evaluation), not
+    /// only between generated tokens.
     fn stopped() -> bool {
-        super::GEN_CANCEL.load(std::sync::atomic::Ordering::SeqCst)
+        JOB.with(|j| match &*j.borrow() {
+            Some(flags) => flags.cancel.load(std::sync::atomic::Ordering::SeqCst),
+            None => super::GEN_CANCEL.load(std::sync::atomic::Ordering::SeqCst),
+        })
+    }
+
+    /// The reply was cut off (Max reply length or the context's edge).
+    fn mark_cut_off() {
+        JOB.with(|j| match &*j.borrow() {
+            Some(flags) => flags.cut_off.store(true, std::sync::atomic::Ordering::SeqCst),
+            None => super::GEN_CUT_OFF.store(true, std::sync::atomic::Ordering::SeqCst),
+        })
     }
 
     /// One message's attachment for the vision encoder: its bitmaps, and the

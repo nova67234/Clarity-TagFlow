@@ -49,3 +49,48 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Run]
 Filename: "{app}\Clarity_TagFlow.exe"; Description: "Launch Clarity TagFlow"; Flags: nowait postinstall skipifsilent
+
+[Code]
+// Link (Settings -> Link) can keep a copy of the app hosting in the
+// background ("Clarity_TagFlow.exe --link-background"), which holds the
+// program open, and can start it at login (a Run entry).
+
+// Stop a running background host.
+procedure StopLinkBackgroundHost();
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' +
+    'Get-CimInstance Win32_Process | Where-Object { $_.Name -eq ''Clarity_TagFlow.exe'' -and ' +
+    '$_.CommandLine -like ''*--link-background*'' } | Invoke-CimMethod -MethodName Terminate | Out-Null; ' +
+    'Start-Sleep -Seconds 2"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+// Before the files are replaced: leave the marker that tells a copy closed
+// for the update not to start a background host (the app clears it when it
+// next starts; an app finishing another PC's job without its window sees it
+// and exits too), then stop one that's running. Runs before Setup looks for
+// programs using its files (CloseApplications).
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  LinkDir: String;
+begin
+  LinkDir := ExpandConstant('{userappdata}\Clarity TagFlow\tools\link');
+  if ForceDirectories(LinkDir) then
+    SaveStringToFile(LinkDir + '\installing', 'update', False);
+  StopLinkBackgroundHost();
+  Result := '';
+end;
+
+// Uninstalling (once confirmed, before the files go): no background host
+// left running, and no login entry left pointing at the removed program.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    StopLinkBackgroundHost();
+    RegDeleteValue(HKEY_CURRENT_USER, 'Software\Microsoft\Windows\CurrentVersion\Run', 'Clarity TagFlow Link');
+  end;
+end;
