@@ -1986,6 +1986,13 @@ impl LlmState {
             msgs.insert(0, CmdMsg { user: false, text: crate::krea_prompt::ACK.to_string(), image: None });
             msgs.insert(0, CmdMsg { user: true, text: crate::krea_prompt::BRIEF.to_string(), image: None });
             pinned = 2;
+            // Remember across chats recalls here too (nothing is saved): its
+            // note goes first, so the brief stays nearest the chat.
+            if let Some([note, ack]) = self.memory_note() {
+                msgs.insert(0, ack);
+                msgs.insert(0, note);
+                pinned = 4;
+            }
         } else if self.roleplay.enabled {
             msgs.insert(0, CmdMsg { user: false, text: self.roleplay.ack(), image: None });
             // High / Max thinking lifts the role-play "think briefly" rule

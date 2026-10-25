@@ -1174,25 +1174,28 @@ fn receiver_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings, link
     section(ui, "Host", |ui| {
         row(ui, "Address", Some("Shown on the host: Settings → Link → Host."), |ui| {
             let busy = matches!(status, Some(client::Status::Connecting | client::Status::Retrying { .. } | client::Status::Connected));
-            if busy {
-                if ui.button("Disconnect").clicked() {
-                    link.disconnect();
+            // The address, with Connect / Disconnect under it on the right.
+            ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                crate::settings::pill_field(
+                    ui,
+                    130.0,
+                    egui::TextEdit::singleline(&mut settings.link.host_addr).hint_text("192.168.1.23"),
+                );
+                if busy {
+                    if ui.button("Disconnect").clicked() {
+                        link.disconnect();
+                    }
+                } else if ui.button("Connect").clicked() {
+                    let target = addr::with_port(&settings.link.host_addr, settings.link.port);
+                    // A remembered host at that address reconnects without a code.
+                    let t = trust::Trust::load(&link_dir());
+                    match t.hosts.iter().find(|h| addr_matches(&h.addr, &target)) {
+                        Some(h) => link.connect_known(h.key.clone(), target),
+                        None => link.connect_to(&target, None),
+                    }
                 }
-            } else if ui.button("Connect").clicked() {
-                let target = addr::with_port(&settings.link.host_addr, settings.link.port);
-                // A remembered host at that address reconnects without a code.
-                let t = trust::Trust::load(&link_dir());
-                match t.hosts.iter().find(|h| addr_matches(&h.addr, &target)) {
-                    Some(h) => link.connect_known(h.key.clone(), target),
-                    None => link.connect_to(&target, None),
-                }
-            }
-            ui.add(
-                egui::TextEdit::singleline(&mut settings.link.host_addr)
-                    .desired_width(130.0)
-                    .margin(egui::Margin::symmetric(8, 5))
-                    .hint_text("192.168.1.23"),
-            );
+            });
         });
         // On this network.
         ui.horizontal(|ui| {
@@ -1269,12 +1272,10 @@ fn receiver_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings, link
                 status_line(ui, TEXT(), &format!("{host} doesn't know this PC yet — enter the code it shows"));
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut link.code_input)
-                            .desired_width(110.0)
-                            .margin(egui::Margin::symmetric(8, 5))
-                            .font(egui::TextStyle::Monospace)
-                            .hint_text("123 456"),
+                    let resp = crate::settings::pill_field(
+                        ui,
+                        110.0,
+                        egui::TextEdit::singleline(&mut link.code_input).hint_text("123 456"),
                     );
                     let code = crypto::normalize_code(&link.code_input);
                     let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));

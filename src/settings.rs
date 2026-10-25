@@ -308,13 +308,16 @@ pub fn show(
     // One fixed window size for every tab (clamped only to the screen so it
     // still fits small displays) — the size never follows a tab's content.
     let (win_w, win_h) = settings_window_size(ctx.content_rect());
+    // The sections, cards and rows the tabs draw (here, in Link and in
+    // Updates) take the Find Issues look while this window is drawn.
+    FRESH.set(true);
     egui::Window::new("Settings")
         .id(egui::Id::new("settings_window"))
         .title_bar(false) // custom header inside (matches the other popups)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .frame(window_frame())
+        .frame(fresh_window_frame())
         .fixed_size(egui::vec2(win_w, win_h))
         .show(ctx, |ui| {
 
@@ -339,21 +342,23 @@ pub fn show(
                 // --- Sidebar ---
                 ui.vertical(|ui| {
                     ui.set_width(136.0);
+                    // The title as Find Issues has it: bold, a muted icon
+                    // beside it.
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.spacing_mut().item_spacing.x = 10.0;
                         ui.add(
                             egui::Image::new(egui::include_image!("../icons/settings.svg"))
-                                .fit_to_exact_size(egui::vec2(20.0, 20.0))
-                                .tint(TEXT()),
+                                .fit_to_exact_size(egui::vec2(17.0, 17.0))
+                                .tint(crate::theme::icon_tint(MUTED())),
                         );
-                        ui.heading(egui::RichText::new("Settings").color(TEXT()).strong().size(17.0));
+                        ui.label(egui::RichText::new("Settings").color(TEXT()).font(bold(19.0)));
                     });
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
                     // The underline beneath the title (as in the design sketch).
                     let w = ui.available_width() - 10.0;
                     let (line, _) = ui.allocate_exact_size(egui::vec2(w, 1.0), egui::Sense::hover());
-                    ui.painter().hline(line.x_range(), line.center().y, egui::Stroke::new(1.0, EDGE()));
-                    ui.add_space(10.0);
+                    ui.painter().hline(line.x_range(), line.center().y, egui::Stroke::new(1.0, hairline()));
+                    ui.add_space(12.0);
 
                     ui.spacing_mut().item_spacing.y = 4.0;
                     tab_button(ui, settings, SettingsTab::General, "General", false);
@@ -417,9 +422,10 @@ pub fn show(
             ui.painter().vline(
                 rect.left() + 144.0,
                 rect.y_range(),
-                egui::Stroke::new(1.0, EDGE()),
+                egui::Stroke::new(1.0, hairline()),
             );
         });
+    FRESH.set(false);
 
     settings.open = !want_close;
 }
@@ -976,11 +982,10 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("Voice").color(TEXT()).size(12.5));
                 ui.add_space(2.0);
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut settings.ai_voice_style)
-                        .desired_width(f32::INFINITY)
-                        .margin(egui::Margin::symmetric(8, 6))
-                        .hint_text(crate::voice::DEFAULT_STYLE),
+                let resp = pill_field(
+                    ui,
+                    f32::INFINITY,
+                    egui::TextEdit::singleline(&mut settings.ai_voice_style).hint_text(crate::voice::DEFAULT_STYLE),
                 );
                 if resp.changed() {
                     llm.voice.style.clone_from(&settings.ai_voice_style);
@@ -1038,10 +1043,10 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                 });
                 if !settings.ai_voice_ref_audio.is_empty() {
                     ui.add_space(4.0);
-                    let resp = ui.add(
+                    let resp = pill_field(
+                        ui,
+                        f32::INFINITY,
                         egui::TextEdit::singleline(&mut settings.ai_voice_ref_text)
-                            .desired_width(f32::INFINITY)
-                            .margin(egui::Margin::symmetric(8, 6))
                             .hint_text("Type exactly what is said in the recording"),
                     );
                     if resp.changed() {
@@ -1120,12 +1125,10 @@ fn ftp_tab(ui: &mut egui::Ui, settings: &mut Settings, ftp: &mut crate::ftp::Ftp
 
     section(ui, "Server", |ui| {
         let field = |ui: &mut egui::Ui, value: &mut String, hint_text: &str, password: bool| {
-            ui.add(
-                egui::TextEdit::singleline(value)
-                    .password(password)
-                    .desired_width(ROW_CONTROL_W - 10.0)
-                    .margin(egui::Margin::symmetric(8, 5))
-                    .hint_text(hint_text),
+            pill_field(
+                ui,
+                ROW_CONTROL_W - 10.0,
+                egui::TextEdit::singleline(value).password(password).hint_text(hint_text),
             )
         };
 
@@ -1219,18 +1222,22 @@ fn tab_button(ui: &mut egui::Ui, settings: &mut Settings, tab: SettingsTab, labe
 /// red dot. True when clicked.
 pub(crate) fn side_tab(ui: &mut egui::Ui, selected: bool, label: &str, badge: bool) -> bool {
     let text_color = if selected { egui::Color32::WHITE } else { TEXT() };
+    let fresh = fresh();
     let resp = ui
         .scope(|ui| {
             ui.spacing_mut().button_padding = egui::vec2(12.0, 6.0);
-            let mut btn = egui::Button::new(egui::RichText::new(label).color(text_color).strong())
-                .corner_radius(egui::CornerRadius::same(10))
+            let text = egui::RichText::new(label).color(text_color);
+            let text = if fresh { text.font(bold(13.0)) } else { text.strong() };
+            let mut btn = egui::Button::new(text)
+                // Fresh: a full pill, like Find Issues' buttons.
+                .corner_radius(egui::CornerRadius::same(if fresh { 16 } else { 10 }))
                 // Flat rows in every state: light Glass strokes all buttons by
                 // default, which outlined the quiet tabs. Only the selected row
                 // should stand out (accent fill below).
                 .stroke(egui::Stroke::NONE)
                 .min_size(egui::vec2(ui.available_width() - 10.0, 32.0));
             if selected {
-                btn = btn.fill(crate::theme::ACCENT1());
+                btn = btn.fill(if fresh { crate::theme::selection_outline() } else { crate::theme::ACCENT1() });
             } else {
                 // Quiet row: no fill until the theme's hover styling kicks in.
                 btn = btn.fill(egui::Color32::TRANSPARENT);
@@ -1255,22 +1262,38 @@ pub(crate) fn side_tab(ui: &mut egui::Ui, selected: bool, label: &str, badge: bo
 /// typically [`row`]s separated by [`row_sep`] hairlines.
 pub(crate) fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(4.0);
-    ui.label(egui::RichText::new(title.to_uppercase()).color(MUTED()).strong().size(11.0));
-    ui.add_space(5.0);
+    if fresh() {
+        // Small, bold and spaced out, as over Find Issues' cards.
+        ui.label(
+            egui::RichText::new(title.to_uppercase()).color(MUTED()).font(bold(9.5)).extra_letter_spacing(1.1),
+        );
+        ui.add_space(8.0);
+    } else {
+        ui.label(egui::RichText::new(title.to_uppercase()).color(MUTED()).strong().size(11.0));
+        ui.add_space(5.0);
+    }
     card(ui, add);
 }
 
 /// A [`section`]'s rounded card without the header line.
 pub(crate) fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::new()
-        .fill(PANEL())
-        .stroke(egui::Stroke::new(1.0, EDGE()))
-        .corner_radius(egui::CornerRadius::same(12))
-        .inner_margin(egui::Margin::symmetric(12, 10))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add(ui);
-        });
+    let frame = if fresh() {
+        egui::Frame::new()
+            .fill(card_fill())
+            .stroke(egui::Stroke::new(1.0, hairline()))
+            .corner_radius(egui::CornerRadius::same(18))
+            .inner_margin(egui::Margin::same(16))
+    } else {
+        egui::Frame::new()
+            .fill(PANEL())
+            .stroke(egui::Stroke::new(1.0, EDGE()))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(egui::Margin::symmetric(12, 10))
+    };
+    frame.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        add(ui);
+    });
     ui.add_space(14.0);
 }
 
@@ -1284,10 +1307,19 @@ pub(crate) fn row(ui: &mut egui::Ui, label: &str, sub: Option<&str>, control: im
         let text_w = ui.available_width() - ROW_CONTROL_W;
         ui.vertical(|ui| {
             ui.set_width(text_w);
-            ui.label(egui::RichText::new(label).color(TEXT()).size(13.0));
-            if let Some(s) = sub {
-                ui.add_space(1.0);
-                ui.label(egui::RichText::new(s).color(MUTED()).size(10.5));
+            if fresh() {
+                // A bold label over a muted line, as in Find Issues.
+                ui.label(egui::RichText::new(label).color(TEXT()).font(bold(13.5)));
+                if let Some(s) = sub {
+                    ui.add_space(3.0);
+                    ui.label(egui::RichText::new(s).color(MUTED()).size(12.0));
+                }
+            } else {
+                ui.label(egui::RichText::new(label).color(TEXT()).size(13.0));
+                if let Some(s) = sub {
+                    ui.add_space(1.0);
+                    ui.label(egui::RichText::new(s).color(MUTED()).size(10.5));
+                }
             }
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control);
@@ -1358,10 +1390,16 @@ fn override_pill(ui: &mut egui::Ui, enabled: &mut bool, rgb: &mut [u8; 3], theme
 
 /// The hairline between two [`row`]s of a card.
 pub(crate) fn row_sep(ui: &mut egui::Ui) {
-    ui.add_space(7.0);
+    let fresh = fresh();
+    let gap = if fresh { 11.0 } else { 7.0 };
+    ui.add_space(gap);
     let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-    ui.painter().hline(r.x_range(), r.center().y, egui::Stroke::new(1.0, EDGE()));
-    ui.add_space(7.0);
+    if fresh {
+        ui.painter().hline((r.left() + 4.0)..=(r.right() - 4.0), r.center().y, egui::Stroke::new(1.0, hairline()));
+    } else {
+        ui.painter().hline(r.x_range(), r.center().y, egui::Stroke::new(1.0, EDGE()));
+    }
+    ui.add_space(gap);
 }
 
 /// A macOS-style sliding toggle switch. Clicking flips `on`; the knob and
@@ -1395,7 +1433,83 @@ fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 /// A small muted explanatory line, shown under a control.
 pub(crate) fn hint(ui: &mut egui::Ui, text: &str) {
     ui.add_space(2.0);
-    ui.label(egui::RichText::new(text).color(MUTED()).size(11.0));
+    ui.label(egui::RichText::new(text).color(MUTED()).size(if fresh() { 12.0 } else { 11.0 }));
+}
+
+/// A one-line text box as Find Issues' folder field has it: a sunk pill,
+/// ringed in the accent colour while it's being typed in. `width` may be
+/// `f32::INFINITY` (all there is).
+pub(crate) fn pill_field(ui: &mut egui::Ui, width: f32, edit: egui::TextEdit<'_>) -> egui::Response {
+    let h = 32.0;
+    let w = if width.is_finite() { width } else { ui.available_width() };
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+    // The pill goes under the text: its slot is taken first, filled in once
+    // the field says whether it has focus.
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let inner = rect.shrink2(egui::vec2(14.0, 0.0));
+    let resp = ui.put(
+        inner,
+        edit.frame(egui::Frame::NONE)
+            .margin(egui::Margin::ZERO)
+            .font(egui::FontId::proportional(13.0))
+            // Explicit: the Light theme's widget text is white (for its blue
+            // buttons), which made typed text white on a light field.
+            .text_color(TEXT())
+            .vertical_align(egui::Align::Center)
+            .desired_width(inner.width()),
+    );
+    let ring = if resp.has_focus() { crate::theme::selection_outline() } else { egui::Color32::TRANSPARENT };
+    ui.painter().set(
+        bg,
+        egui::epaint::RectShape::new(rect, h / 2.0, well_fill(), egui::Stroke::new(1.0, ring), egui::StrokeKind::Inside),
+    );
+    resp
+}
+
+/// Find Issues' folder field and list: sunk below the cards (darker in dark
+/// themes, greyer in light ones).
+fn well_fill() -> egui::Color32 {
+    if crate::theme::is_light() {
+        FLOAT().lerp_to_gamma(TEXT(), 0.07)
+    } else {
+        FLOAT().lerp_to_gamma(egui::Color32::BLACK, 0.28)
+    }
+}
+
+thread_local! {
+    /// The Settings window is being drawn: [`section`], [`card`], [`row`],
+    /// [`row_sep`], [`hint`] and [`side_tab`] take the Find Issues look
+    /// (src/scan.rs). The other popups that use them keep theirs.
+    static FRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn fresh() -> bool {
+    FRESH.get()
+}
+
+/// Draw `f` with the Find Issues look, as the Settings window is (for other
+/// popups in that style: Create Backup).
+pub(crate) fn fresh_look<R>(f: impl FnOnce() -> R) -> R {
+    let was = FRESH.replace(true);
+    let out = f();
+    FRESH.set(was);
+    out
+}
+
+/// Ubuntu Medium — the app's real bold face (`strong()` only brightens).
+pub(crate) fn bold(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name("bold".into()))
+}
+
+/// Find Issues' cards: the window's colour lifted a little toward the text
+/// colour (lighter in dark themes, a touch greyer in light ones).
+fn card_fill() -> egui::Color32 {
+    FLOAT().lerp_to_gamma(TEXT(), 0.035)
+}
+
+/// Find Issues' card outlines and dividers.
+fn hairline() -> egui::Color32 {
+    TEXT().gamma_multiply(0.08)
 }
 
 /// The Settings (and AI Settings) window's content size for a screen of
@@ -1425,6 +1539,16 @@ pub(crate) fn window_frame() -> egui::Frame {
             spread: 0,
             color: egui::Color32::from_black_alpha(150),
         })
+}
+
+/// The Settings window's frame, as Find Issues has it: rounder, a softer,
+/// deeper shadow and a hairline edge. Same margins as [`window_frame`], so
+/// [`settings_window_size`] holds.
+pub(crate) fn fresh_window_frame() -> egui::Frame {
+    window_frame()
+        .corner_radius(egui::CornerRadius::same(24))
+        .stroke(egui::Stroke::new(1.0, hairline()))
+        .shadow(egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: egui::Color32::from_black_alpha(150) })
 }
 
 #[cfg(test)]

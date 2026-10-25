@@ -33,7 +33,9 @@
 //! (it worked from the old memory, and would write back what they just
 //! removed). Switching memory off, Clear all and Start fresh drop everything
 //! waiting. Role play, Krea 2 prompts and Tag images pin briefs of their
-//! own, and what's said in them is never read.
+//! own, and what's said in them is never read. Krea 2 prompts still recall:
+//! its brief comes with the memory note, so prompts can follow the user's
+//! taste.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -69,6 +71,11 @@ const MAX_PENDING: usize = 8;
 const PASS_REPLY: usize = 1536;
 /// The model's side of the pinned memory note.
 const NOTE_ACK: &str = "Understood.";
+/// Ends the memory note in a chat that recalls but isn't saved (Krea 2
+/// prompts).
+const RECALL_ONLY: &str = "
+Right now you're writing image prompts: use what you remember (like                            the user's taste in subjects, styles or colours) only where it fits the                            prompt asked for. Nothing said here is saved to your memory.
+";
 
 /// What the memory is doing, for the chat and AI Settings.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -541,7 +548,14 @@ impl LlmState {
     /// What's said now may go into memory: it's on, and no conversation mode
     /// with a brief of its own is.
     pub(super) fn memory_wanted(&self) -> bool {
-        self.memory_on() && !self.krea_prompts && !self.roleplay.enabled && !self.tag_images
+        self.memory_recalled() && !self.krea_prompts
+    }
+
+    /// Replies now may use the memory: it's on, and neither role play (it
+    /// has its own diary) nor Tag images is. Krea 2 prompts recall but never
+    /// save.
+    pub(super) fn memory_recalled(&self) -> bool {
+        self.memory_on() && !self.roleplay.enabled && !self.tag_images
     }
 
     /// Stop the pass in flight and drop everything waiting for one, so
@@ -577,11 +591,12 @@ impl LlmState {
     /// The memory note for the next reply in the active chat, when there is
     /// one: the user's turn and the model's acknowledgement, to pin before
     /// the history. Remembers which topics it showed (their stored titles go
-    /// to the chat's pass).
+    /// to the chat's pass, when what's said now is saved).
     pub(super) fn memory_note(&mut self) -> Option<[CmdMsg; 2]> {
-        if !self.memory_wanted() {
+        if !self.memory_recalled() {
             return None;
         }
+        let saved = self.memory_wanted();
         // What's being said: the newest message counts most. Long ones count
         // by their start (the matching runs on the UI thread).
         const QUERY_CHARS: usize = 2000;
@@ -600,12 +615,15 @@ impl LlmState {
             (memory::head_chars(reply, QUERY_CHARS), 0.3),
         ];
         let this_chat = self.mem_pass.summary_chat == Some(chat.id);
-        let (note, shown) = self.memory.chat_brief(&query, this_chat)?;
+        let (mut note, shown) = self.memory.chat_brief(&query, this_chat)?;
+        if !saved {
+            note.push_str(RECALL_ONLY);
+        }
         if debug() {
             eprintln!("[memory] note, ~{} tokens:\n{note}", memory::approx_tokens(&note));
         }
         let chat = &mut self.chats[self.active_chat];
-        for topic in shown {
+        for topic in shown.into_iter().filter(|_| saved) {
             if chat.memory_topics.len() < 24 && !chat.memory_topics.contains(&topic) {
                 chat.memory_topics.push(topic);
             }

@@ -235,7 +235,7 @@ fn memory_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
                     ui,
                     &format!(
                         "{status} A chat is read once you leave it or it has been quiet for 3 minutes, \
-                         while the model is loaded. Role play, Krea 2 prompts and Tag images never are."
+                         while the model is loaded. Role play, Krea 2 prompts and Tag images never are                          (Krea 2 prompts still use what's remembered)."
                     ),
                 );
             }

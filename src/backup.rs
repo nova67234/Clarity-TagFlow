@@ -21,6 +21,7 @@ use egui::{Color32, RichText};
 use zip::write::SimpleFileOptions;
 use zip::{AesMode, CompressionMethod};
 
+use crate::scan::Pill;
 use crate::theme::*;
 
 /// Green flash on the Create button on click (matches Tag Manager settings Save).
@@ -223,9 +224,10 @@ impl BackupState {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .frame(window_frame());
+            .frame(crate::settings::fresh_window_frame());
 
-        window.show(ctx, |ui| {
+        // Sections, rows and fields in the Find Issues look, as in Settings.
+        crate::settings::fresh_look(|| window.show(ctx, |ui| {
             // Fix BOTH min and max width. `set_width` alone leaves the max at the
             // auto-sized window's infinite available width, so `available_width()`
             // stays infinite — and the `desired_width(INFINITY)` fields below then
@@ -233,21 +235,17 @@ impl BackupState {
             // panics on the next launch. Capping max keeps every width finite.
             ui.set_width(380.0);
             ui.set_max_width(380.0);
-            // TextEdit fill comes from extreme_bg_color — FIELD so the name/
-            // password boxes read as inputs against the section cards. The input
-            // outline lives in `text_field` (scoped), NOT here: a dialog-wide
-            // bg_stroke would outline every button too.
-            ui.visuals_mut().extreme_bg_color = FIELD();
 
-            // Custom title row (Civitai-style): backup icon + phase title + close.
+            // Custom title row (Find Issues-style): a muted backup icon, the
+            // phase title in bold, close.
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.spacing_mut().item_spacing.x = TITLE_GAP;
                 ui.add(
                     egui::Image::new(egui::include_image!("../icons/backup.svg"))
-                        .fit_to_exact_size(egui::vec2(20.0, 20.0))
-                        .tint(TEXT()),
+                        .fit_to_exact_size(egui::vec2(TITLE_ICON, TITLE_ICON))
+                        .tint(crate::theme::icon_tint(MUTED())),
                 );
-                ui.heading(RichText::new(window_title).color(TEXT()).strong().size(17.0));
+                ui.label(RichText::new(window_title).color(TEXT()).font(crate::settings::bold(19.0)));
                 // No close while a backup runs — it must be cancelled, not orphaned.
                 if running.is_none() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -265,7 +263,7 @@ impl BackupState {
                     });
                 }
             });
-            ui.add_space(12.0);
+            ui.add_space(5.0);
 
             if let Some(prog) = &running {
                 Self::running_body(ui, prog);
@@ -274,7 +272,7 @@ impl BackupState {
             } else if let Phase::Done(outcome) = &self.phase {
                 close_requested |= done_body(ui, outcome);
             }
-        });
+        }));
 
         // Dismissed via an in-dialog Cancel/Close button.
         if close_requested {
@@ -317,9 +315,7 @@ impl BackupState {
             ui.label(RichText::new(err).color(Color32::from_rgb(235, 110, 110)).size(12.0));
         }
 
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(10.0);
+        ui.add_space(20.0);
 
         // Buttons flash a colour on click, then fire their action once the flash
         // has lingered for `FLASH` (green = Create/start, red = Cancel/close) —
@@ -330,12 +326,12 @@ impl BackupState {
         let do_cancel = self.cancel_flash.is_some_and(|t| t.elapsed() >= FLASH);
 
         footer_row(ui, |ui| {
-            let create = footer_button(ui, "Create", create_flashing.then_some(FLASH_GREEN));
+            let create = footer_button(ui, "Create", Pill::Accent, create_flashing.then_some(FLASH_GREEN));
             if create.clicked() && self.create_flash.is_none() && !cancel_flashing {
                 self.create_flash = Some(Instant::now());
             }
             ui.add_space(8.0);
-            let cancel = footer_button(ui, "Cancel", cancel_flashing.then_some(FLASH_RED));
+            let cancel = footer_button(ui, "Cancel", Pill::Outline, cancel_flashing.then_some(FLASH_RED));
             if cancel.clicked() && self.cancel_flash.is_none() && !create_flashing {
                 self.cancel_flash = Some(Instant::now());
             }
@@ -427,36 +423,30 @@ impl BackupState {
 
         crate::settings::section(ui, "Progress", |ui| {
             let label = prog.label.lock().unwrap().clone();
-            ui.label(RichText::new(label).color(MUTED()).size(12.0));
-            ui.add_space(8.0);
-
-            let w = ui.available_width();
             let total = prog.total.load(Relaxed);
-            if total == 0 {
-                ui.add(egui::ProgressBar::new(0.0).animate(true).desired_width(w));
-            } else {
-                let cur = prog.current.load(Relaxed);
-                let frac = (cur as f32 / total as f32).clamp(0.0, 1.0);
-                ui.add(
-                    egui::ProgressBar::new(frac)
-                        .text(format!("{cur} / {total}"))
-                        .desired_width(w),
-                );
-            }
+            let cur = prog.current.load(Relaxed);
+            // The label, the count on the right, and Find Issues' thin bar.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(label).color(MUTED()).size(12.0));
+                if total > 0 {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(format!("{cur} / {total}")).color(TEXT()).size(12.0));
+                    });
+                }
+            });
+            ui.add_space(10.0);
+            let frac = (total > 0).then(|| (cur as f32 / total as f32).clamp(0.0, 1.0));
+            crate::scan::progress_bar(ui, frac, egui::Id::new("backup_progress"));
         });
 
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(10.0);
+        ui.add_space(20.0);
         footer_row(ui, |ui| {
             let cancelling = prog.cancel.load(Relaxed);
             let btn_label = if cancelling { "Cancelling…" } else { "Cancel" };
-            ui.add_enabled_ui(!cancelling, |ui| {
-                if footer_button(ui, btn_label, None).clicked() {
-                    prog.cancel.store(true, Relaxed);
-                    prog.set_label("Cancelling…".into());
-                }
-            });
+            if crate::scan::pill(ui, btn_label, Pill::Outline, None, !cancelling).clicked() && !cancelling {
+                prog.cancel.store(true, Relaxed);
+                prog.set_label("Cancelling…".into());
+            }
         });
     }
 }
@@ -529,9 +519,7 @@ fn done_body(ui: &mut egui::Ui, outcome: &Outcome) -> bool {
         }
     }
 
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(10.0);
+    ui.add_space(20.0);
     let mut close = false;
     footer_row(ui, |ui| {
         if accent_button(ui, "Close").clicked() {
@@ -547,15 +535,23 @@ fn done_body(ui: &mut egui::Ui, outcome: &Outcome) -> bool {
 
 /// Dialog sub-header: a muted one-line description under the window title bar
 /// (which already shows the dialog name, so there's no title duplicated here).
+/// Lined up under the title's text, past its icon (as in Find Issues).
 fn header(ui: &mut egui::Ui, subtitle: &str) {
-    ui.label(RichText::new(subtitle).color(MUTED()).size(11.0));
-    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.add_space(TITLE_ICON + TITLE_GAP);
+        ui.label(RichText::new(subtitle).color(MUTED()).size(12.5));
+    });
+    ui.add_space(18.0);
 }
+
+/// The title row's icon size and the gap after it.
+const TITLE_ICON: f32 = 17.0;
+const TITLE_GAP: f32 = 10.0;
 
 /// A small muted explanatory line, shown under a control.
 fn hint(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(4.0);
-    ui.label(RichText::new(text).color(MUTED()).size(11.0));
+    ui.add_space(6.0);
+    ui.label(RichText::new(text).color(MUTED()).size(12.0));
 }
 
 /// A label : value row, used in the result summary.
@@ -566,30 +562,13 @@ fn kv(ui: &mut egui::Ui, key: &str, value: &str) {
     });
 }
 
-/// A footer button — 90×32, radius 10. Plain themed style (so it keeps the app's
-/// default hover glow); pass `flash = Some(color)` to tint it for a click-flash.
-/// A single-line text field styled like the Civitai popup's (rounded 10px corners,
-/// roomier 10×8 padding, fills the available width).
+/// A single-line text field: Find Issues' sunk pill, the full width.
 fn text_field(ui: &mut egui::Ui, value: &mut String, hint: &str, password: bool) {
-    ui.scope(|ui| {
-        // The dialog rounds all widgets to 4px for the square checkboxes; round the
-        // text fields back up to match Civitai. No outline in any state — the
-        // fields read as flat wells, like the buttons.
-        let r = egui::CornerRadius::same(10);
-        let v = ui.visuals_mut();
-        v.widgets.inactive.corner_radius = r;
-        v.widgets.hovered.corner_radius = r;
-        v.widgets.active.corner_radius = r;
-        v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-        v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-        ui.add(
-            egui::TextEdit::singleline(value)
-                .password(password)
-                .desired_width(f32::INFINITY)
-                .margin(egui::Margin::symmetric(10, 8))
-                .hint_text(hint),
-        );
-    });
+    crate::settings::pill_field(
+        ui,
+        f32::INFINITY,
+        egui::TextEdit::singleline(value).password(password).hint_text(hint),
+    );
 }
 
 /// The right-aligned footer button row. Allocated at a FIXED 380×32 — a bare
@@ -599,25 +578,21 @@ fn text_field(ui: &mut egui::Ui, value: &mut String, hint: &str, password: bool)
 /// leaving a big dead gap above the buttons.
 fn footer_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     ui.allocate_ui_with_layout(
-        egui::vec2(DIALOG_WIDTH, 32.0),
+        egui::vec2(DIALOG_WIDTH, 36.0),
         egui::Layout::right_to_left(egui::Align::Center),
         add,
     );
 }
 
-fn footer_button(ui: &mut egui::Ui, label: &str, flash: Option<Color32>) -> egui::Response {
-    let text = if flash.is_some() { Color32::WHITE } else { TEXT() };
-    let mut btn = egui::Button::new(RichText::new(label).color(text).size(14.0))
-        .corner_radius(egui::CornerRadius::same(10));
-    if let Some(color) = flash {
-        btn = btn.fill(color);
-    }
-    ui.add_sized([90.0, 32.0], btn)
+/// A footer button: Find Issues' pill. Pass `flash = Some(color)` to fill
+/// it for a click-flash.
+fn footer_button(ui: &mut egui::Ui, label: &str, kind: Pill, flash: Option<Color32>) -> egui::Response {
+    crate::scan::pill(ui, label, kind, flash, true)
 }
 
-/// The result screen's Close button — same footer style, no flash.
+/// The result screen's Close button — the accent pill, no flash.
 fn accent_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    footer_button(ui, label, None)
+    footer_button(ui, label, Pill::Accent, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -937,21 +912,6 @@ fn write_zip(
     let end = file.stream_position().map_err(|e| e.to_string())?;
     file.set_len(end).map_err(|e| e.to_string())?;
     Ok(WriteResult::Written { written, failed })
-}
-
-/// A themed frame for the dialog body (matches the Civitai settings popup).
-fn window_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(FLOAT())
-        .corner_radius(egui::CornerRadius::same(16))
-        .inner_margin(egui::Margin::same(18))
-        .stroke(egui::Stroke::new(1.0, EDGE()))
-        .shadow(egui::epaint::Shadow {
-            offset: [0, 6],
-            blur: 20,
-            spread: 0,
-            color: egui::Color32::from_black_alpha(150),
-        })
 }
 
 #[cfg(test)]

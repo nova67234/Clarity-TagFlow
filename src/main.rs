@@ -2607,6 +2607,13 @@ pub(crate) fn popup_drag_strip(ui: &mut egui::Ui, strip_h: f32) {
     // clipped to the window's clip rect, so the overshoot is harmless.
     let mut rect = ui.max_rect().expand(64.0);
     rect.min.y = ui.max_rect().min.y + strip_h;
+    // ...but not past the window as drawn: a window that hugs its content
+    // keeps its largest size as its max rect (and clip rect), so a popup that
+    // got shorter left the shield over whatever was below it, taking those
+    // clicks. Last frame's window rect bounds it.
+    if let Some(window) = ui.ctx().memory(|m| m.area_rect(ui.layer_id().id)) {
+        rect = rect.intersect(window);
+    }
     ui.interact(rect, ui.id().with("popup_drag_shield"), egui::Sense::drag());
 }
 
