@@ -583,57 +583,39 @@ pub fn show(
                     ).on_hover_text("Menu");
 
                     // The fully functional Dropdown
+                    // In the Settings dropdowns' style: a rounded list, the
+                    // current view tinted with a tick.
                     egui::Popup::menu(&menu_resp)
                         .align(egui::RectAlign::BOTTOM_END)
-                        .frame(
-                            egui::Frame::new()
-                                .fill(FLOAT())
-                                .corner_radius(egui::CornerRadius::same(22))
-                                .inner_margin(egui::Margin::same(12))
-                                .stroke(egui::Stroke::new(1.0, EDGE())),
-                        )
+                        .gap(6.0)
+                        .frame(crate::settings::dropdown_frame())
                         .show(|ui| {
-                            ui.set_min_width(160.0);
+                            ui.set_width(176.0);
+                            ui.spacing_mut().item_spacing.y = 3.0;
 
-                            // Tweak visuals slightly so the menu looks good in dark mode
-                            let radius = egui::CornerRadius::same(6);
-                            ui.visuals_mut().widgets.inactive.corner_radius = radius;
-                            ui.visuals_mut().widgets.hovered.corner_radius = radius;
-                            ui.visuals_mut().widgets.active.corner_radius = radius;
-
-                            if ui
-                                .selectable_label(state.view == RightView::Details, "Details & Actions")
-                                .clicked()
+                            if crate::settings::dropdown_option(ui, "Details & Actions", None, None, state.view == RightView::Details).clicked()
                             {
                                 state.view = RightView::Details;
                                 ui.close(); // Fixed deprecation
                             }
-                            if ui
-                                .selectable_label(state.view == RightView::Civitai, "Civitai Resources")
-                                .clicked()
+                            if crate::settings::dropdown_option(ui, "Civitai Resources", None, None, state.view == RightView::Civitai).clicked()
                             {
                                 state.view = RightView::Civitai;
                                 ui.close();
                             }
-                            if ui
-                                .selectable_label(state.view == RightView::TagManager, "Tag Manager")
-                                .clicked()
+                            if crate::settings::dropdown_option(ui, "Tag Manager", None, None, state.view == RightView::TagManager).clicked()
                             {
                                 state.view = RightView::TagManager;
                                 ui.close(); // Fixed deprecation
                             }
-                            if ui
-                                .selectable_label(state.view == RightView::Downloader, "Downloader")
-                                .clicked()
+                            if crate::settings::dropdown_option(ui, "Downloader", None, None, state.view == RightView::Downloader).clicked()
                             {
                                 state.view = RightView::Downloader;
                                 ui.close();
                             }
                             // Pixal3D — Linux/Windows only (hidden on macOS).
                             #[cfg(not(target_os = "macos"))]
-                            if ui
-                                .selectable_label(state.view == RightView::Pixal3D, "Pixal3D")
-                                .clicked()
+                            if crate::settings::dropdown_option(ui, "Pixal3D", None, None, state.view == RightView::Pixal3D).clicked()
                             {
                                 state.view = RightView::Pixal3D;
                                 ui.close();
@@ -652,7 +634,7 @@ pub fn show(
                                         | RightView::Generate
                                         | RightView::ZImage
                                 );
-                                if ui.selectable_label(t2i_active, "Text to Image").clicked() {
+                                if crate::settings::dropdown_option(ui, "Text to Image", None, None, t2i_active).clicked() {
                                     if !t2i_active {
                                         state.view = RightView::Sdxl;
                                     }
@@ -665,7 +647,7 @@ pub fn show(
                             #[cfg(not(target_os = "macos"))]
                             {
                                 let t2v_active = matches!(state.view, RightView::Ltx | RightView::Wan);
-                                if ui.selectable_label(t2v_active, "Text to Video").clicked() {
+                                if crate::settings::dropdown_option(ui, "Text to Video", None, None, t2v_active).clicked() {
                                     if !t2v_active {
                                         state.view = RightView::Ltx;
                                     }

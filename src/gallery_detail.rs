@@ -548,19 +548,21 @@ fn right_column(
             let menu_resp = ui
                 .add(egui::Button::image(menu_icon).frame(false).sense(egui::Sense::click_and_drag()))
                 .on_hover_text("Switch view");
+            // The right panel's view menu, in the Settings dropdowns' style.
             egui::Popup::menu(&menu_resp)
                 .align(egui::RectAlign::BOTTOM_END)
+                .gap(6.0)
+                .frame(crate::settings::dropdown_frame())
                 .show(|ui| {
-                    ui.set_min_width(160.0);
-                    if ui
-                        .selectable_label(popup.view == PopupView::Details, "Details & Actions")
+                    ui.set_width(176.0);
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    if crate::settings::dropdown_option(ui, "Details & Actions", None, None, popup.view == PopupView::Details)
                         .clicked()
                     {
                         popup.view = PopupView::Details;
                         ui.close();
                     }
-                    if ui
-                        .selectable_label(popup.view == PopupView::Civitai, "Civitai Resources")
+                    if crate::settings::dropdown_option(ui, "Civitai Resources", None, None, popup.view == PopupView::Civitai)
                         .clicked()
                     {
                         popup.view = PopupView::Civitai;

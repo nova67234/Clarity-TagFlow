@@ -598,17 +598,15 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             "Layout",
             Some("Gallery hides the panels and shows the folder as a grid."),
             |ui| {
-                let label = match settings.layout {
-                    Layout::Panels => "Panels",
-                    Layout::Gallery => "Gallery",
-                };
-                egui::ComboBox::from_id_salt("layout_combo")
-                    .width(130.0)
-                    .selected_text(label)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut settings.layout, Layout::Panels, "Panels");
-                        ui.selectable_value(&mut settings.layout, Layout::Gallery, "Gallery");
-                    });
+                layout_dropdown(
+                    ui,
+                    "layout",
+                    &mut settings.layout,
+                    &[
+                        (Layout::Panels, LayoutIcon::Panels, "Panels", "Browser, viewer & tags"),
+                        (Layout::Gallery, LayoutIcon::Gallery, "Gallery", "Full-window image grid"),
+                    ],
+                );
             },
         );
         row_sep(ui);
@@ -618,29 +616,32 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             Some("Makes text, icons and panels bigger. Auto picks a size from your monitor's resolution."),
             |ui| {
                 let pct = |v: f32| format!("{}%", (v * 100.0).round() as i32);
-                let label = if settings.ui_scale_auto {
-                    format!("Auto ({})", pct(auto_ui_scale(ui.ctx())))
+                // `None` is Auto. A size from before the steps (not one of
+                // them) stays listed, so the pill shows it.
+                let mut choice = if settings.ui_scale_auto {
+                    None
                 } else {
-                    pct(settings.ui_scale)
+                    let step = UI_SCALE_STEPS.into_iter().find(|s| (settings.ui_scale - s).abs() < 0.001);
+                    Some(step.unwrap_or(settings.ui_scale))
                 };
-                egui::ComboBox::from_id_salt("ui_scale_combo")
-                    .width(130.0)
-                    .selected_text(label)
-                    .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_label(settings.ui_scale_auto, format!("Auto ({})", pct(auto_ui_scale(ui.ctx()))))
-                            .clicked()
-                        {
-                            settings.ui_scale_auto = true;
+                let auto = format!("Auto ({})", pct(auto_ui_scale(ui.ctx())));
+                let mut sizes: Vec<f32> = UI_SCALE_STEPS.to_vec();
+                if let Some(v) = choice.filter(|v| !UI_SCALE_STEPS.contains(v)) {
+                    sizes.push(v);
+                    sizes.sort_by(f32::total_cmp);
+                }
+                let labels: Vec<String> = sizes.iter().map(|&v| pct(v)).collect();
+                let mut options = vec![(None, auto.as_str(), None, None)];
+                options.extend(sizes.iter().zip(&labels).map(|(&v, l)| (Some(v), l.as_str(), None, None)));
+                if pill_dropdown(ui, "ui_scale", &mut choice, &options) {
+                    match choice {
+                        None => settings.ui_scale_auto = true,
+                        Some(v) => {
+                            settings.ui_scale_auto = false;
+                            settings.ui_scale = v;
                         }
-                        for step in UI_SCALE_STEPS {
-                            let selected = !settings.ui_scale_auto && (settings.ui_scale - step).abs() < 0.001;
-                            if ui.selectable_label(selected, pct(step)).clicked() {
-                                settings.ui_scale_auto = false;
-                                settings.ui_scale = step;
-                            }
-                        }
-                    });
+                    }
+                }
             },
         );
         row_sep(ui);
@@ -649,23 +650,20 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             "Colour theme",
             Some("Space and Aurora are animated; Glass is translucent. Applies instantly."),
             |ui| {
-                let label = match settings.theme {
-                    Theme::Dark => "Dark",
-                    Theme::Light => "Light",
-                    Theme::Space => "Space",
-                    Theme::Aurora => "Aurora",
-                    Theme::Glass => "Glass",
-                };
-                egui::ComboBox::from_id_salt("theme_combo")
-                    .width(130.0)
-                    .selected_text(label)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut settings.theme, Theme::Dark, "Dark");
-                        ui.selectable_value(&mut settings.theme, Theme::Light, "Light");
-                        ui.selectable_value(&mut settings.theme, Theme::Space, "Space");
-                        ui.selectable_value(&mut settings.theme, Theme::Aurora, "Aurora");
-                        ui.selectable_value(&mut settings.theme, Theme::Glass, "Glass");
-                    });
+                // Each theme's dot: its surface, or the colour it's known by.
+                let dot = |r, g, b| Some(egui::Color32::from_rgb(r, g, b));
+                pill_dropdown(
+                    ui,
+                    "theme",
+                    &mut settings.theme,
+                    &[
+                        (Theme::Dark, "Dark", dot(40, 40, 43), None),
+                        (Theme::Light, "Light", dot(240, 241, 244), None),
+                        (Theme::Space, "Space", dot(38, 36, 92), None),
+                        (Theme::Aurora, "Aurora", dot(235, 130, 175), None),
+                        (Theme::Glass, "Glass", dot(110, 150, 200), None),
+                    ],
+                );
             },
         );
     });
@@ -717,14 +715,12 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
                 "Panels",
                 Some("Dark is the classic glass; Light is frosted white."),
                 |ui| {
-                    let label = if settings.glass_light { "Light" } else { "Dark" };
-                    egui::ComboBox::from_id_salt("glass_light_combo")
-                        .width(130.0)
-                        .selected_text(label)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut settings.glass_light, false, "Dark");
-                            ui.selectable_value(&mut settings.glass_light, true, "Light");
-                        });
+                    pill_dropdown(
+                        ui,
+                        "glass_light",
+                        &mut settings.glass_light,
+                        &[(false, "Dark", None, None), (true, "Light", None, None)],
+                    );
                 },
             );
             row_sep(ui);
@@ -742,19 +738,16 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
                 "Backdrop",
                 Some("An optional animation over the background colour."),
                 |ui| {
-                    let label = match settings.glass_backdrop {
-                        Backdrop::Solid => "Solid",
-                        Backdrop::Starfield => "Starfield",
-                        Backdrop::Aurora => "Aurora glow",
-                    };
-                    egui::ComboBox::from_id_salt("glass_backdrop_combo")
-                        .width(130.0)
-                        .selected_text(label)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut settings.glass_backdrop, Backdrop::Solid, "Solid");
-                            ui.selectable_value(&mut settings.glass_backdrop, Backdrop::Starfield, "Starfield");
-                            ui.selectable_value(&mut settings.glass_backdrop, Backdrop::Aurora, "Aurora glow");
-                        });
+                    pill_dropdown(
+                        ui,
+                        "glass_backdrop",
+                        &mut settings.glass_backdrop,
+                        &[
+                            (Backdrop::Solid, "Solid", None, None),
+                            (Backdrop::Starfield, "Starfield", None, None),
+                            (Backdrop::Aurora, "Aurora glow", None, None),
+                        ],
+                    );
                 },
             );
         });
@@ -897,18 +890,15 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                      can't take it. Changing it reloads the model on the next question.",
                 ),
                 |ui| {
-                    egui::ComboBox::from_id_salt("ai_image_detail")
-                        .width(130.0)
-                        .selected_text(settings.ai_image_detail.label())
-                        .show_ui(ui, |ui| {
-                            for level in crate::llm::ImageDetail::ALL {
-                                let text = format!("{} ({} tokens)", level.label(), level.tokens());
-                                if ui.selectable_label(settings.ai_image_detail == level, text).clicked() {
-                                    settings.ai_image_detail = level;
-                                    llm.set_image_detail(level);
-                                }
-                            }
-                        });
+                    let levels = crate::llm::ImageDetail::ALL;
+                    let notes: Vec<String> = levels.iter().map(|l| format!("{} tokens", l.tokens())).collect();
+                    let options: Vec<_> =
+                        levels.iter().zip(&notes).map(|(&l, note)| (l, l.label(), None, Some(note.as_str()))).collect();
+                    let mut level = settings.ai_image_detail;
+                    if pill_dropdown(ui, "ai_image_detail", &mut level, &options) {
+                        settings.ai_image_detail = level;
+                        llm.set_image_detail(level);
+                    }
                 },
             );
             // The level actually running, when the GPU check lowered it.
@@ -1549,6 +1539,361 @@ pub(crate) fn fresh_window_frame() -> egui::Frame {
         .corner_radius(egui::CornerRadius::same(24))
         .stroke(egui::Stroke::new(1.0, hairline()))
         .shadow(egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: egui::Color32::from_black_alpha(150) })
+}
+
+// ---------------------------------------------------------------------------
+// Dropdowns: a pill that opens a rounded list under it
+// ---------------------------------------------------------------------------
+
+/// The pill a dropdown shows when closed (wide enough for the longest
+/// option, inside a row's control column).
+const DROP_W: f32 = 176.0;
+const DROP_H: f32 = 34.0;
+/// A list with more to show than names (the Layout list's lines, notes) is
+/// wider than its pill; it opens leftward, under the row's description.
+const WIDE_LIST_W: f32 = 214.0;
+
+/// Which little diagram a [`layout_dropdown`] option shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LayoutIcon {
+    /// Three columns: browser, viewer, tags.
+    Panels,
+    /// A grid of tiles.
+    Gallery,
+}
+
+/// The Layout picker: a pill showing the current layout with an outline of
+/// it, opening a list where each layout has a small diagram, its name and a
+/// line on what it is. True when the choice changed.
+pub(crate) fn layout_dropdown<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    current: &mut T,
+    options: &[(T, LayoutIcon, &str, &str)], // (value, diagram, name, line)
+) -> bool {
+    let Some(&(_, icon, title, _)) = options.iter().find(|o| o.0 == *current).or(options.first()) else {
+        return false;
+    };
+    let id = egui::Id::new(("settings_dropdown", id_salt));
+    let resp = dropdown_pill(ui, id, |p, rect, ink| {
+        let glyph = egui::Rect::from_center_size(egui::pos2(rect.left() + 21.0, rect.center().y), egui::vec2(15.0, 12.0));
+        paint_layout_glyph(p, glyph, icon, ink);
+        p.text(
+            egui::pos2(rect.left() + 37.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            title,
+            egui::FontId::proportional(13.0),
+            TEXT(),
+        );
+    });
+
+    let mut changed = false;
+    dropdown_list(&resp, id, WIDE_LIST_W, |ui| {
+        for &(value, icon, title, line) in options {
+            let selected = *current == value;
+            let (rect, item) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::click());
+            let item = item.on_hover_cursor(egui::CursorIcon::PointingHand);
+            if ui.is_rect_visible(rect) {
+                let p = ui.painter();
+                paint_option_card(p, rect, 11, selected, item.hovered());
+                let badge = egui::Rect::from_center_size(egui::pos2(rect.left() + 24.0, rect.center().y), egui::vec2(30.0, 22.0));
+                paint_layout_badge(p, badge, icon, selected);
+                let x = rect.left() + 48.0;
+                let title_ink = if selected { TEXT() } else { TEXT().gamma_multiply(0.9) };
+                p.text(egui::pos2(x, rect.top() + 15.0), egui::Align2::LEFT_CENTER, title, bold(12.5), title_ink);
+                p.text(
+                    egui::pos2(x, rect.top() + 30.5),
+                    egui::Align2::LEFT_CENTER,
+                    line,
+                    egui::FontId::proportional(11.0),
+                    MUTED(),
+                );
+                if selected {
+                    paint_checkmark(p, egui::pos2(rect.right() - 16.0, rect.center().y), drop_accent_ink());
+                }
+            }
+            if item.clicked() {
+                changed |= *current != value;
+                *current = value;
+                ui.close();
+            }
+        }
+    });
+    changed
+}
+
+/// A dropdown in the same style for a plain list ("Interface size", "Colour
+/// theme"). An option's colour, when it has one, shows as a dot before its
+/// name; its note ("280 tokens"), when it has one, shows muted at the end of
+/// its row in the list, while the pill shows just the name. True when the
+/// choice changed.
+pub(crate) fn pill_dropdown<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    current: &mut T,
+    options: &[(T, &str, Option<egui::Color32>, Option<&str>)], // (value, name, dot, note)
+) -> bool {
+    let Some(&(_, label, dot, _)) = options.iter().find(|o| o.0 == *current).or(options.first()) else {
+        return false;
+    };
+    let id = egui::Id::new(("settings_dropdown", id_salt));
+    let resp = dropdown_pill(ui, id, |p, rect, _| {
+        let mut x = rect.left() + 15.0;
+        if let Some(c) = dot {
+            paint_dot(p, egui::pos2(rect.left() + 19.0, rect.center().y), c);
+            x = rect.left() + 32.0;
+        }
+        p.text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.0), TEXT());
+    });
+
+    let mut changed = false;
+    let width = if options.iter().any(|o| o.3.is_some()) { WIDE_LIST_W } else { DROP_W };
+    dropdown_list(&resp, id, width, |ui| {
+        for &(value, label, dot, note) in options {
+            let item = dropdown_option(ui, label, dot, note, *current == value);
+            if item.clicked() {
+                changed |= *current != value;
+                *current = value;
+                ui.close();
+            }
+        }
+    });
+    changed
+}
+
+/// The closed dropdown: a sunk pill (the pill text fields' well) with
+/// `content` painted inside and a chevron that turns up while it's open, the
+/// pill then ringed in the accent colour with a soft halo. `content` gets
+/// the colour for icons (the accent while open).
+fn dropdown_pill(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    content: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
+) -> egui::Response {
+    let open = egui::Popup::is_id_open(ui.ctx(), id);
+    let t = ui.ctx().animate_bool(id.with("chevron"), open);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(DROP_W, DROP_H), egui::Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let r = DROP_H / 2.0;
+        let hot = resp.hovered() || resp.has_focus();
+        if t > 0.01 {
+            p.rect_stroke(rect, r, egui::Stroke::new(3.0 * t, drop_accent().gamma_multiply(0.18 * t)), egui::StrokeKind::Outside);
+        }
+        let fill = if open {
+            sunk_deeper(well_fill())
+        } else if hot {
+            well_fill().lerp_to_gamma(TEXT(), 0.04)
+        } else {
+            well_fill()
+        };
+        let edge = if open {
+            drop_accent_ink().gamma_multiply(0.65)
+        } else if hot {
+            TEXT().gamma_multiply(0.18)
+        } else {
+            hairline()
+        };
+        p.rect_filled(rect, r, fill);
+        p.rect_stroke(rect, r, egui::Stroke::new(1.0_f32, edge), egui::StrokeKind::Inside);
+        let ink = if open { drop_accent_ink() } else { MUTED() };
+        content(p, rect, ink);
+        paint_chevron(p, egui::pos2(rect.right() - 17.0, rect.center().y), t, ink);
+    }
+    resp
+}
+
+/// The open list: a rounded panel under the pill's right end, its options
+/// `width` wide; a click outside closes it.
+fn dropdown_list(resp: &egui::Response, id: egui::Id, width: f32, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Popup::menu(resp)
+        .id(id)
+        .align(egui::RectAlign::BOTTOM_END)
+        .gap(6.0)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .frame(dropdown_frame())
+        .show(|ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing.y = 3.0;
+            add(ui);
+        });
+}
+
+/// The open list's rounded panel (also for menus in this style that open
+/// from an icon: the right panel's view menu).
+pub(crate) fn dropdown_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(popover_fill())
+        .corner_radius(egui::CornerRadius::same(16))
+        .inner_margin(egui::Margin::same(6))
+        .stroke(egui::Stroke::new(1.0_f32, TEXT().gamma_multiply(0.1)))
+        .shadow(egui::epaint::Shadow { offset: [0, 12], blur: 32, spread: 0, color: egui::Color32::from_black_alpha(150) })
+}
+
+/// One row of a dropdown list: an optional colour dot, the name, an
+/// optional muted note at the end, and a tick on the chosen one.
+pub(crate) fn dropdown_option(
+    ui: &mut egui::Ui,
+    label: &str,
+    dot: Option<egui::Color32>,
+    note: Option<&str>,
+    selected: bool,
+) -> egui::Response {
+    let (rect, item) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
+    let item = item.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        paint_option_card(p, rect, 10, selected, item.hovered());
+        let mut x = rect.left() + 11.0;
+        if let Some(c) = dot {
+            paint_dot(p, egui::pos2(rect.left() + 15.0, rect.center().y), c);
+            x = rect.left() + 27.0;
+        }
+        let ink = if selected { TEXT() } else { TEXT().gamma_multiply(0.88) };
+        p.text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(12.5), ink);
+        if let Some(note) = note {
+            p.text(
+                egui::pos2(rect.right() - 30.0, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                note,
+                egui::FontId::proportional(11.5),
+                MUTED(),
+            );
+        }
+        if selected {
+            paint_checkmark(p, egui::pos2(rect.right() - 14.0, rect.center().y), drop_accent_ink());
+        }
+    }
+    item
+}
+
+/// An option's background: an accent-tinted card with a fine accent edge
+/// when it's the chosen one, a faint one under the pointer.
+fn paint_option_card(p: &egui::Painter, rect: egui::Rect, radius: u8, selected: bool, hovered: bool) {
+    let r = egui::CornerRadius::same(radius);
+    if selected {
+        p.rect_filled(rect, r, drop_accent().gamma_multiply(0.18));
+        p.rect_stroke(
+            rect,
+            r,
+            egui::Stroke::new(1.0_f32, drop_accent_ink().gamma_multiply(0.38)),
+            egui::StrokeKind::Inside,
+        );
+    } else if hovered {
+        p.rect_filled(rect, r, TEXT().gamma_multiply(0.05));
+    }
+}
+
+/// A theme's colour dot, ringed so a dark one shows on a dark list.
+fn paint_dot(p: &egui::Painter, c: egui::Pos2, colour: egui::Color32) {
+    p.circle_filled(c, 4.5, colour);
+    p.circle_stroke(c, 4.5, egui::Stroke::new(1.0_f32, TEXT().gamma_multiply(0.25)));
+}
+
+/// The 30 × 22 layout preview in the Layout list.
+fn paint_layout_badge(p: &egui::Painter, rect: egui::Rect, kind: LayoutIcon, selected: bool) {
+    let (bg, edge) = if selected {
+        (drop_accent().gamma_multiply(0.22), drop_accent_ink().gamma_multiply(0.45))
+    } else if crate::theme::is_light() {
+        (TEXT().gamma_multiply(0.06), hairline())
+    } else {
+        (egui::Color32::from_black_alpha(95), hairline())
+    };
+    let r6 = egui::CornerRadius::same(6);
+    p.rect_filled(rect, r6, bg);
+    p.rect_stroke(rect, r6, egui::Stroke::new(1.0_f32, edge), egui::StrokeKind::Inside);
+
+    let inner = rect.shrink2(egui::vec2(5.0, 4.0));
+    let (main, side) = if selected {
+        (drop_accent_ink(), drop_accent().gamma_multiply(0.85))
+    } else {
+        (MUTED(), MUTED().gamma_multiply(0.65))
+    };
+    let r1 = egui::CornerRadius::same(1);
+    match kind {
+        LayoutIcon::Panels => {
+            // Browser · viewer · tags.
+            let left = egui::Rect::from_min_size(inner.min, egui::vec2(4.0, inner.height()));
+            let mid = egui::Rect::from_min_size(
+                egui::pos2(inner.left() + 5.5, inner.top()),
+                egui::vec2(inner.width() - 11.0, inner.height()),
+            );
+            let right = egui::Rect::from_min_size(egui::pos2(inner.right() - 4.0, inner.top()), egui::vec2(4.0, inner.height()));
+            p.rect_filled(left, r1, side);
+            p.rect_filled(mid, r1, main);
+            p.rect_filled(right, r1, side);
+        }
+        LayoutIcon::Gallery => {
+            // Three by two tiles.
+            let gap = 1.5;
+            let w = (inner.width() - gap * 2.0) / 3.0;
+            let h = (inner.height() - gap) / 2.0;
+            for row in 0..2 {
+                for col in 0..3 {
+                    let at = egui::pos2(inner.left() + col as f32 * (w + gap), inner.top() + row as f32 * (h + gap));
+                    p.rect_filled(egui::Rect::from_min_size(at, egui::vec2(w, h)), r1, main);
+                }
+            }
+        }
+    }
+}
+
+/// The 15 × 12 outline of the current layout, in the closed pill.
+fn paint_layout_glyph(p: &egui::Painter, rect: egui::Rect, kind: LayoutIcon, colour: egui::Color32) {
+    let stroke = egui::Stroke::new(1.3_f32, colour);
+    p.rect_stroke(rect, egui::CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+    match kind {
+        LayoutIcon::Panels => {
+            for x in [rect.left() + rect.width() * 0.28, rect.right() - rect.width() * 0.28] {
+                p.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], stroke);
+            }
+        }
+        LayoutIcon::Gallery => {
+            let c = rect.center();
+            p.line_segment([egui::pos2(c.x, rect.top()), egui::pos2(c.x, rect.bottom())], stroke);
+            p.line_segment([egui::pos2(rect.left(), c.y), egui::pos2(rect.right(), c.y)], stroke);
+        }
+    }
+}
+
+/// A chevron that turns from pointing down (`t` = 0, closed) to up (1, open).
+fn paint_chevron(p: &egui::Painter, c: egui::Pos2, t: f32, colour: egui::Color32) {
+    let dy = 2.2 * (1.0 - 2.0 * t);
+    let stroke = egui::Stroke::new(1.6_f32, colour);
+    let mid = egui::pos2(c.x, c.y + dy);
+    p.line_segment([egui::pos2(c.x - 4.0, c.y - dy), mid], stroke);
+    p.line_segment([mid, egui::pos2(c.x + 4.0, c.y - dy)], stroke);
+}
+
+/// The chosen option's tick.
+fn paint_checkmark(p: &egui::Painter, c: egui::Pos2, colour: egui::Color32) {
+    let stroke = egui::Stroke::new(1.8_f32, colour);
+    let (a, b, d) = (egui::pos2(c.x - 4.5, c.y + 0.2), egui::pos2(c.x - 1.2, c.y + 3.4), egui::pos2(c.x + 4.8, c.y - 3.2));
+    p.line_segment([a, b], stroke);
+    p.line_segment([b, d], stroke);
+}
+
+/// The dropdowns' accent: the theme's (its blue, Aurora's pink).
+fn drop_accent() -> egui::Color32 {
+    crate::theme::selection_outline()
+}
+
+/// The accent for ticks, icons and edges: a lighter tint of it on dark
+/// surfaces, the accent itself on light ones.
+fn drop_accent_ink() -> egui::Color32 {
+    if crate::theme::is_light() { drop_accent() } else { drop_accent().lerp_to_gamma(egui::Color32::WHITE, 0.25) }
+}
+
+/// The open list's panel: a little below the window in dark themes, the
+/// window's own white in light ones.
+fn popover_fill() -> egui::Color32 {
+    if crate::theme::is_light() { FLOAT() } else { FLOAT().lerp_to_gamma(egui::Color32::BLACK, 0.18) }
+}
+
+/// The pill while its list is open: sunk a little deeper.
+fn sunk_deeper(c: egui::Color32) -> egui::Color32 {
+    if crate::theme::is_light() { c.lerp_to_gamma(TEXT(), 0.04) } else { c.lerp_to_gamma(egui::Color32::BLACK, 0.15) }
 }
 
 #[cfg(test)]
