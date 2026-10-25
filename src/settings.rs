@@ -5,7 +5,7 @@
 use eframe::egui;
 
 use crate::left_panel_settings::MediaFilter;
-use crate::theme::{Backdrop, Theme, EDGE, MUTED, PANEL, TEXT};
+use crate::theme::{Backdrop, Theme, EDGE, FLOAT, MUTED, PANEL, TEXT};
 
 /// Key under which the settings are saved in eframe's persistent storage.
 pub const STORAGE_KEY: &str = "clarity_tagflow_settings";
@@ -126,8 +126,8 @@ pub struct Settings {
     /// The custom AI-chat text colour (sRGB), used when the switch above is on.
     pub ai_chat_text: [u8; 3],
     /// Custom tint for the icons in the AI chat's conversation area (copy,
-    /// retry, listen, edit, …). The chats side panel, the composer (message
-    /// box), and icons elsewhere in the app keep the theme's tint.
+    /// retry, listen, edit, …). The composer (message box) and icons
+    /// elsewhere in the app keep the theme's tint.
     pub ai_chat_icon_enabled: bool,
     /// The custom AI-chat icon colour (sRGB), used when the switch above is on.
     pub ai_chat_icon: [u8; 3],
@@ -300,7 +300,7 @@ pub fn show(
     let mut want_close = false;
     // One fixed window size for every tab (clamped only to the screen so it
     // still fits small displays) — the size never follows a tab's content.
-    let win_h = (ctx.content_rect().height() - 160.0).clamp(320.0, 540.0);
+    let (win_w, win_h) = settings_window_size(ctx.content_rect());
     egui::Window::new("Settings")
         .id(egui::Id::new("settings_window"))
         .title_bar(false) // custom header inside (matches the other popups)
@@ -308,7 +308,7 @@ pub fn show(
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .frame(window_frame())
-        .fixed_size(egui::vec2(530.0, win_h))
+        .fixed_size(egui::vec2(win_w, win_h))
         .show(ctx, |ui| {
 
             // Pill-ish inputs everywhere (text fields, buttons, combos) — the
@@ -666,16 +666,20 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             "Text colour",
             Some("Your messages and the AI's replies. Pick a colour to override the theme."),
             |ui| {
-                override_pill(ui, &mut settings.ai_chat_text_enabled, &mut settings.ai_chat_text, TEXT());
+                // The colour the chat uses without an override (near-black
+                // over Glass's Aurora glow, else the theme's text).
+                let theme_col = crate::theme::chat_aurora_ink().unwrap_or(TEXT());
+                override_pill(ui, &mut settings.ai_chat_text_enabled, &mut settings.ai_chat_text, theme_col);
             },
         );
         row_sep(ui);
         row(
             ui,
             "Icon colour",
-            Some("Conversation icons only — the side panel and message box keep the theme's."),
+            Some("Conversation icons only — the message box keeps the theme's."),
             |ui| {
-                override_pill(ui, &mut settings.ai_chat_icon_enabled, &mut settings.ai_chat_icon, crate::theme::icon_tint(TEXT()));
+                let theme_col = crate::theme::chat_aurora_ink().unwrap_or(crate::theme::icon_tint(TEXT()));
+                override_pill(ui, &mut settings.ai_chat_icon_enabled, &mut settings.ai_chat_icon, theme_col);
             },
         );
         row_sep(ui);
@@ -853,7 +857,10 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                 ui,
                 "Image detail",
                 Some(
-                    "How closely the AI reads each picture. Higher levels catch small                      text, jewelry and eye colour, but replies start slower and need                      more GPU memory — the AI lowers the level itself when the GPU                      can't take it. Changing it reloads the model on the next question.",
+                    "How closely the AI reads each picture. Higher levels catch small \
+                     text, jewelry and eye colour, but replies start slower and need \
+                     more GPU memory — the AI lowers the level itself when the GPU \
+                     can't take it. Changing it reloads the model on the next question.",
                 ),
                 |ui| {
                     egui::ComboBox::from_id_salt("ai_image_detail")
@@ -889,7 +896,7 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                 "Activate AI Chat",
                 Some(
                     "Swaps the main view for a full-window chat with the model — \
-                     attach images with the +, switch conversations with the tabs. \
+                     attach images with the +, switch conversations with Chats. \
                      The first question loads the model and can take a minute; \
                      switching off frees the model from memory.",
                 ),
@@ -1269,20 +1276,25 @@ fn color_pill(ui: &mut egui::Ui, rgb: &mut [u8; 3]) -> bool {
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    egui::Popup::from_toggle_button_response(&resp).show(|ui| {
-        // The picker's saturation square / hue bar are sized by `slider_width`;
-        // the default leaves them much narrower than the U8/RGB header row, so
-        // the popup showed a big empty gap on the right. Widen them to fill it.
-        ui.spacing_mut().slider_width = 260.0;
-        if egui::widgets::color_picker::color_picker_color32(
-            ui,
-            &mut col,
-            egui::widgets::color_picker::Alpha::Opaque,
-        ) {
-            *rgb = [col.r(), col.g(), col.b()];
-            changed = true;
-        }
-    });
+    // Closes on a click outside only: egui's default closes a popup on ANY
+    // click, inside it too, so clicking in the colour square or the hue bar,
+    // or into a number field to type a value, shut the picker at once.
+    egui::Popup::from_toggle_button_response(&resp)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            // The picker's saturation square / hue bar are sized by `slider_width`;
+            // the default leaves them much narrower than the U8/RGB header row, so
+            // the popup showed a big empty gap on the right. Widen them to fill it.
+            ui.spacing_mut().slider_width = 260.0;
+            if egui::widgets::color_picker::color_picker_color32(
+                ui,
+                &mut col,
+                egui::widgets::color_picker::Alpha::Opaque,
+            ) {
+                *rgb = [col.r(), col.g(), col.b()];
+                changed = true;
+            }
+        });
     changed
 }
 
@@ -1354,11 +1366,24 @@ pub(crate) fn hint(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).color(MUTED()).size(11.0));
 }
 
+/// The Settings (and AI Settings) window's content size for a screen of
+/// `screen`: 530 × up to 540, but never bigger than the screen — at a large
+/// interface size on a small display the old 320-point minimum ran the
+/// window off the bottom of the screen.
+pub(crate) fn settings_window_size(screen: egui::Rect) -> (f32, f32) {
+    // The frame's 18-point margins plus a little room on each side.
+    let room = |side: f32| (side - 48.0).max(200.0);
+    let w = 530.0_f32.min(room(screen.width()));
+    let h = (screen.height() - 160.0).clamp(320.0, 540.0).min(room(screen.height()));
+    (w, h)
+}
+
 /// A themed frame for the settings window body (matches the Civitai / Backup
-/// popups: rounded-16 card with a soft drop shadow).
+/// popups: rounded-16 card with a soft drop shadow). Opaque in every theme
+/// ([`FLOAT`]), so the Glass theme's panels and text don't show through it.
 pub(crate) fn window_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(PANEL())
+        .fill(FLOAT())
         .corner_radius(egui::CornerRadius::same(16))
         .inner_margin(egui::Margin::same(18))
         .stroke(egui::Stroke::new(1.0, EDGE()))
@@ -1368,4 +1393,21 @@ pub(crate) fn window_frame() -> egui::Frame {
             spread: 0,
             color: egui::Color32::from_black_alpha(150),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::settings_window_size;
+    use eframe::egui;
+
+    /// The Settings window (plus its 36-point frame) always fits the screen;
+    /// on a normal one it keeps its usual 530 × 540.
+    #[test]
+    fn settings_window_fits_the_screen() {
+        let screen = |w: f32, h: f32| egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h));
+        assert_eq!(settings_window_size(screen(1600.0, 900.0)), (530.0, 540.0));
+        // 1366 × 768 at 250%: 546 × 307 points.
+        let (w, h) = settings_window_size(screen(546.4, 307.2));
+        assert!(w + 36.0 <= 546.4 && h + 36.0 <= 307.2, "{w} × {h}");
+    }
 }

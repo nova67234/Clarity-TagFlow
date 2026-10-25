@@ -434,6 +434,22 @@ pub fn PANEL() -> Color32 {
     palette().panel
 }
 
+/// Fill for surfaces that float over the UI: windows, popups, menus and
+/// tooltips. The same as [`PANEL`], except in the Glass themes, where the
+/// panel fill is translucent and a floating window showed the panels and text
+/// beneath it through its own content. There it is the panel tint laid over
+/// the Glass background colour, flattened to an opaque colour: a floating
+/// window looks like the glass panels while nothing beneath shows through.
+#[allow(non_snake_case)]
+pub fn FLOAT() -> Color32 {
+    float_fill(palette(), glass_config().0)
+}
+
+/// [`FLOAT`] for palette `p` over the Glass background colour `glass_bg`.
+fn float_fill(p: &Palette, glass_bg: Color32) -> Color32 {
+    if p.glass { glass_bg.blend(p.panel) } else { p.panel }
+}
+
 #[allow(non_snake_case)]
 pub fn FIELD() -> Color32 {
     palette().field
@@ -521,7 +537,9 @@ pub fn apply(ctx: &egui::Context) {
         egui::Visuals::light()
     };
     v.panel_fill = p.bg;
-    v.window_fill = p.panel;
+    // egui's own windows, popups, menus and tooltips (combo-box lists, the
+    // colour picker) are opaque even in the Glass themes — see FLOAT.
+    v.window_fill = float_fill(p, glass_config().0);
     v.extreme_bg_color = p.field; // text-edit background
     v.override_text_color = Some(p.text);
     // Selection highlight follows the theme accent, but Aurora uses its pink so
@@ -565,7 +583,7 @@ pub fn apply(ctx: &egui::Context) {
         v.override_text_color = None;
         v.widgets.noninteractive.fg_stroke.color = ink;
 
-        ctx.set_visuals(v);
+        set_visuals(ctx, v);
         return;
     }
 
@@ -615,7 +633,23 @@ pub fn apply(ctx: &egui::Context) {
         v.widgets.noninteractive.fg_stroke.color = p.text;
     }
 
-    ctx.set_visuals(v);
+    set_visuals(ctx, v);
+}
+
+/// Install `v` as egui's visuals whatever theme the OS is in. egui keeps a
+/// dark and a light style and picks one from the OS setting each frame, so
+/// `Context::set_visuals` (which writes only the slot in use right now) left
+/// the other one at egui's defaults: on Windows in light mode the app's
+/// widgets came up in stock light colours from the first frame (the OS theme
+/// isn't known yet when the saved theme is applied at startup), and switching
+/// the OS between light and dark changed the app's look until a theme was
+/// picked again. Both slots get the app's visuals, and egui is told which
+/// one the palette is.
+fn set_visuals(ctx: &egui::Context, v: egui::Visuals) {
+    let theme = if v.dark_mode { egui::Theme::Dark } else { egui::Theme::Light };
+    ctx.set_visuals_of(egui::Theme::Dark, v.clone());
+    ctx.set_visuals_of(egui::Theme::Light, v);
+    ctx.set_theme(theme);
 }
 
 /// Cheap integer hash → `[0, 1)`. Used to give each star a stable random
@@ -849,6 +883,37 @@ mod tests {
                 assert_eq!(GLASS_LIGHT_ON.load(Ordering::Relaxed), light);
             }
         }
+    }
+
+    /// The app's visuals hold whatever the OS theme: egui picks its dark or
+    /// light style from the OS, and both carry the palette.
+    #[test]
+    fn visuals_ignore_the_os_theme() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        for os in [egui::Theme::Dark, egui::Theme::Light] {
+            let v = &ctx.style_of(os).visuals;
+            assert_eq!(v.window_fill, FLOAT(), "{os:?}");
+            assert_eq!(v.extreme_bg_color, FIELD(), "{os:?}");
+        }
+    }
+
+    /// Windows and popups never let what's beneath them show through: their
+    /// fill is opaque in every theme, the panel colour where that's already
+    /// opaque, and in Glass exactly what a panel looks like over the
+    /// background colour.
+    #[test]
+    fn floating_surfaces_are_opaque() {
+        let bg = Color32::from_rgb(40, 20, 90);
+        for p in [&DARK, &LIGHT, &SPACE, &AURORA, &GLASS, &GLASS_LIGHT] {
+            let f = float_fill(p, bg);
+            assert_eq!(f.a(), 255, "{f:?}");
+            if !p.glass {
+                assert_eq!(f, p.panel);
+            }
+        }
+        assert_eq!(float_fill(&GLASS, bg), bg.blend(GLASS.panel));
+        assert_ne!(float_fill(&GLASS, bg), float_fill(&GLASS, Color32::BLACK), "follows the background colour");
     }
 
     #[test]

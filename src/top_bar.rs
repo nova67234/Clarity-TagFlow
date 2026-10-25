@@ -907,7 +907,7 @@ fn menu_row(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
 /// popups, but with the softer rounded-22 corners of the gallery detail view.
 fn popup_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(PANEL())
+        .fill(FLOAT())
         .corner_radius(CornerRadius::same(22))
         .inner_margin(egui::Margin::same(18))
         .stroke(Stroke::new(1.0, EDGE()))

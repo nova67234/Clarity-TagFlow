@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use crate::theme::{EDGE, FIELD, MUTED, PANEL, TEXT};
+use crate::theme::{EDGE, FIELD, FLOAT, MUTED, PANEL, TEXT};
 
 const USER_AGENT: &str = "Clarity TagFlow (Civitai resource lookup)";
 const API_PING: &str = "https://civitai.com/api/v1/models?limit=1";
@@ -321,8 +321,16 @@ pub fn show(
     let mut any_active = false;
     for d in &mut state.downloads {
         // Drain into a Vec first so the `&d.rx` borrow ends before we mutate `d`.
+        let mut gone = false;
         let msgs: Vec<DlMsg> = match &d.rx {
-            Some(rx) => std::iter::from_fn(|| rx.try_recv().ok()).collect(),
+            Some(rx) => std::iter::from_fn(|| match rx.try_recv() {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    gone = e == mpsc::TryRecvError::Disconnected;
+                    None
+                }
+            })
+            .collect(),
             None => Vec::new(),
         };
         for msg in msgs {
@@ -350,6 +358,13 @@ pub fn show(
                 }
             }
         }
+        // The worker ended without Done/Error (it panicked): fail the row
+        // instead of showing its last % with a 150 ms repaint forever.
+        if gone && d.rx.is_some() {
+            d.rx = None;
+            d.ok = false;
+            d.status = "Failed: the download stopped unexpectedly".into();
+        }
         if d.rx.is_some() {
             any_active = true;
         }
@@ -361,8 +376,18 @@ pub fn show(
     // Drain worker messages.
     if let Some(rx) = &state.rx {
         let mut done = None;
-        while let Ok(CivMsg::Done(res)) = rx.try_recv() {
-            done = Some(res);
+        let mut gone = false;
+        loop {
+            match rx.try_recv() {
+                Ok(CivMsg::Done(res)) => done = Some(res),
+                Err(mpsc::TryRecvError::Empty) => break,
+                // The worker ended without a result: it panicked (a cancelled
+                // worker is never polled — cancelling also drops `rx`).
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    gone = true;
+                    break;
+                }
+            }
         }
         if let Some(res) = done {
             let resolved = resolve(ui.ctx(), *res);
@@ -372,6 +397,11 @@ pub fn show(
             } else {
                 state.result = Some(resolved);
             }
+            state.rx = None;
+        } else if gone {
+            // Otherwise "Loading Civitai data…" stayed up, repainting every
+            // 150 ms, until another image was selected.
+            state.status = "Couldn't load Civitai data for this image.".into();
             state.rx = None;
         } else {
             ui.ctx().request_repaint_after(Duration::from_millis(150));
@@ -750,7 +780,7 @@ fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
         .placed_centered(ctx)
         .frame(
             egui::Frame::new()
-                .fill(PANEL())
+                .fill(FLOAT())
                 .corner_radius(egui::CornerRadius::same(16))
                 .inner_margin(egui::Margin::same(18))
                 .stroke(egui::Stroke::new(1.0, EDGE()))
@@ -925,7 +955,7 @@ fn folders_popup(ctx: &egui::Context, state: &mut CivitaiState) {
         .placed_centered(ctx)
         .frame(
             egui::Frame::new()
-                .fill(PANEL())
+                .fill(FLOAT())
                 .corner_radius(egui::CornerRadius::same(16))
                 .inner_margin(egui::Margin::same(18))
                 .stroke(egui::Stroke::new(1.0, EDGE()))
@@ -1106,10 +1136,13 @@ fn run_download(
         .tls_config(native_tls_config())
         .max_redirects(10)
         .http_status_as_error(false)
-        // No global/body timeout — model files are large; only bound setup phases.
+        // No global/body timeout — model files are large; only bound setup
+        // phases, plus a per-read stall limit (a stall then resumes, below).
+        // Not `recv_response`: ureq 3.3 also applies it to the body, cutting
+        // reads off 30 s after the headers (then 1 s per read) — see net.rs.
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_send_request(Some(Duration::from_secs(15)))
-        .timeout_recv_response(Some(Duration::from_secs(30)))
+        .timeout_recv_body(Some(Duration::from_secs(30)))
         .build()
         .into();
 
@@ -1189,8 +1222,11 @@ fn run_download(
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return send_err(format!("cannot create folder: {e}"));
     }
-    let dest = unique_path(&dir, &sanitize_filename(&name));
-    let tmp = dest.with_extension("part");
+    // Reserve the target before writing (see `PartReservation`): another
+    // download with the same file name now gets "name (1)" instead of this
+    // one's temp, and every early return below deletes the partial temp.
+    let mut target = PartReservation::new(&dir, &sanitize_filename(&name));
+    let (dest, tmp) = (target.dest.clone(), target.part.clone());
     let mut out = match std::fs::File::create(&tmp) {
         Ok(f) => f,
         Err(e) => return send_err(format!("cannot write file: {e}")),
@@ -1269,6 +1305,7 @@ fn run_download(
     if let Err(e) = std::fs::rename(&tmp, &dest) {
         return send_err(format!("could not finalize: {e}"));
     }
+    target.done = true;
     let _ = tx.send(DlMsg::Done(dest));
     ctx.request_repaint();
 }
@@ -1324,9 +1361,12 @@ fn sanitize_filename(name: &str) -> String {
 }
 
 /// A non-clashing path in `dir`, appending " (n)" before the extension if needed.
-fn unique_path(dir: &Path, name: &str) -> std::path::PathBuf {
+/// `taken` also rules out names that don't exist on disk yet but are spoken
+/// for (a download still writing its `.part`).
+fn unique_path(dir: &Path, name: &str, taken: impl Fn(&Path) -> bool) -> std::path::PathBuf {
+    let free = |p: &Path| !p.exists() && !taken(p);
     let base = dir.join(name);
-    if !base.exists() {
+    if free(&base) {
         return base;
     }
     let (stem, ext) = match name.rfind('.') {
@@ -1335,11 +1375,49 @@ fn unique_path(dir: &Path, name: &str) -> std::path::PathBuf {
     };
     for i in 1..100_000 {
         let cand = dir.join(format!("{stem} ({i}){ext}"));
-        if !cand.exists() {
+        if free(&cand) {
             return cand;
         }
     }
     base
+}
+
+/// `.part` temps of the model downloads running in this process. `unique_path`
+/// only sees finished files, so two downloads with the same file name used to
+/// pick the same target and write into one temp — interleaving into a corrupt
+/// file that the first to finish renamed into place as "Saved".
+static ACTIVE_PARTS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// A download's reserved target: the final path and its `<name>.part` temp
+/// (appended, so `x.safetensors` and `x.ckpt` no longer share `x.part`).
+/// Dropping it releases the name and deletes the temp unless `done`, so a
+/// failed attempt leaves no half-written file. A `.part` left by quitting
+/// mid-download isn't registered, so the next attempt reuses that name
+/// rather than drifting to "name (1)" (which would no longer show as installed).
+struct PartReservation {
+    dest: std::path::PathBuf,
+    part: std::path::PathBuf,
+    done: bool,
+}
+
+impl PartReservation {
+    fn new(dir: &Path, name: &str) -> Self {
+        // Pick + register under one lock, so two workers can't pick the same name.
+        let mut active = ACTIVE_PARTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dest = unique_path(dir, name, |p| active.contains(&crate::net::part_path(p)));
+        let part = crate::net::part_path(&dest);
+        active.push(part.clone());
+        Self { dest, part, done: false }
+    }
+}
+
+impl Drop for PartReservation {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = std::fs::remove_file(&self.part);
+        }
+        ACTIVE_PARTS.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| *p != self.part);
+    }
 }
 
 /// A download target category — Civitai resources are routed to a per-type folder
@@ -1581,7 +1659,8 @@ fn save_civitai_key(key: &str) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&path, crate::secret::protect(trimmed));
+    // Owner-only on Linux/macOS, where `protect` is just obfuscation.
+    let _ = crate::secret::write_private(&path, crate::secret::protect(trimmed));
 }
 
 fn api_pill(ui: &mut egui::Ui, api: u8) {
@@ -2095,31 +2174,82 @@ fn sized_video_url(url: &str, width: u32) -> String {
     parts.join("/")
 }
 
+/// A preview's still image bytes, plus the small mp4 of a video-only one.
+pub(crate) type PreviewMedia = (Vec<u8>, Option<Vec<u8>>);
+
+/// Why a by-hash preview lookup gave no verdict (nothing to cache).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreviewFail {
+    /// Civitai can't be reached or won't answer for now (offline, a timeout,
+    /// blocked or rate-limited, a server error, a captive portal's page
+    /// instead of JSON): the rest of a batch would fail the same way — stop.
+    Offline,
+    /// Just this lookup went wrong (another 4xx, the preview image failing to
+    /// download): skip it and go on with the rest.
+    Item,
+}
+
+/// Sort a failed by-hash request: 404 is Civitai's own "not there"
+/// (`Ok(None)`); transport failures, 401/403/451 (blocked — Cloudflare, a
+/// region), 429 and server errors mean Civitai is unavailable; any other
+/// status is about this one request.
+fn by_hash_failure(e: &ureq::Error) -> Result<Option<PreviewMedia>, PreviewFail> {
+    match e {
+        ureq::Error::StatusCode(404) => Ok(None),
+        ureq::Error::StatusCode(401 | 403 | 429 | 451) => Err(PreviewFail::Offline),
+        ureq::Error::StatusCode(code) if *code >= 500 => Err(PreviewFail::Offline),
+        ureq::Error::StatusCode(_) => Err(PreviewFail::Item),
+        _ => Err(PreviewFail::Offline),
+    }
+}
+
 /// First preview (~200px render) of the Civitai model version matching a file
-/// hash — used by the Generate panels for LoRA thumbnails. Returns the raw
-/// downloaded still bytes (a small JPEG), or None when the hash isn't on
-/// Civitai. Some LoRAs (video models especially) ship *only* video previews;
-/// those return the first video's poster frame as the still, plus the CDN's
-/// small transcoded mp4 so the caller can build an animated GIF thumbnail.
-pub(crate) fn preview_media_by_hash(sha256: &str) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+/// hash — used by the Generate panels for LoRA thumbnails. `Ok(Some(..))` holds
+/// the raw downloaded still bytes (a small JPEG). `Ok(None)` is Civitai's own
+/// answer that the hash isn't there (404) or has no preview — safe to cache.
+/// `Err` means no answer and must not be cached as "not on Civitai"; its
+/// [`PreviewFail`] says whether a batch should stop (Civitai unavailable) or
+/// skip just this file. Some LoRAs (video models especially) ship *only*
+/// video previews; those return the first video's poster frame as the still,
+/// plus the CDN's small transcoded mp4 so the caller can build an animated
+/// GIF thumbnail.
+pub(crate) fn preview_media_by_hash(sha256: &str) -> Result<Option<PreviewMedia>, PreviewFail> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .tls_config(native_tls_config())
         .timeout_global(Some(Duration::from_secs(20)))
         .build()
         .into();
     let url = format!("https://civitai.com/api/v1/model-versions/by-hash/{sha256}");
-    let data = get_json(&agent, &url)?;
-    let images = data.get("images")?.as_array()?;
+    // Not via get_json, which folds every failure into None: only a 404 means
+    // "not on Civitai"; anything else is a failed lookup.
+    let mut resp = match agent
+        .get(&url)
+        .header("User-Agent", USER_AGENT)
+        .header("Accept", "application/json")
+        .call()
+    {
+        Ok(r) => r,
+        Err(e) => return by_hash_failure(&e),
+    };
+    let data: serde_json::Value = resp
+        .body_mut()
+        .read_to_string()
+        .ok()
+        .and_then(|body| serde_json::from_str(&body).ok())
+        .ok_or(PreviewFail::Offline)?;
+    let Some(images) = data.get("images").and_then(|v| v.as_array()) else { return Ok(None) };
     let is_video = |i: &&serde_json::Value| i.get("type").and_then(|t| t.as_str()) == Some("video");
+    let url_of = |i: &serde_json::Value| i.get("url").and_then(|u| u.as_str()).map(str::to_string);
     if let Some(img) = images.iter().find(|i| !is_video(i)) {
-        let img_url = img.get("url")?.as_str()?;
-        return Some((get_bytes(&agent, &sized_image_url(img_url, 200))?, None));
+        let Some(img_url) = url_of(img) else { return Ok(None) };
+        let still = get_bytes(&agent, &sized_image_url(&img_url, 200)).ok_or(PreviewFail::Item)?;
+        return Ok(Some((still, None)));
     }
     // Video-only previews: poster still (always) + the small mp4 (best-effort).
-    let vid_url = images.iter().find(is_video)?.get("url")?.as_str()?;
-    let still = get_bytes(&agent, &poster_image_url(vid_url, 200))?;
-    let mp4 = get_bytes(&agent, &sized_video_url(vid_url, 200));
-    Some((still, mp4))
+    let Some(vid_url) = images.iter().find(is_video).and_then(url_of) else { return Ok(None) };
+    let still = get_bytes(&agent, &poster_image_url(&vid_url, 200)).ok_or(PreviewFail::Item)?;
+    let mp4 = get_bytes(&agent, &sized_video_url(&vid_url, 200));
+    Ok(Some((still, mp4)))
 }
 
 /// Decode downloaded preview bytes into a `ColorImage`, downscaled so its longest
@@ -2606,11 +2736,9 @@ fn label_value_block(metadata: &str, label: &str) -> Option<String> {
 /// 8-char AutoV1 hash is left as-is.
 fn autov2(hash: &str) -> String {
     let h = hash.trim().to_lowercase();
-    if h.len() > 10 {
-        h[..10].to_string()
-    } else {
-        h
-    }
+    // By chars, not bytes: `Hashes: {…}` values are untrusted JSON, and slicing
+    // a non-ASCII one at byte 10 panicked the lookup worker.
+    h.chars().take(10).collect()
 }
 
 /// Extract maximal hex runs, normalised to AutoV2-length (≤12) lowercase hashes.
@@ -2816,5 +2944,64 @@ mod embed_parse_tests {
 
         // The LoRA from the prompt tag is still captured by name.
         assert!(tasks.iter().any(|t| t.kind == ItemType::Lora));
+    }
+}
+
+#[cfg(test)]
+mod download_target_tests {
+    use super::{autov2, PartReservation};
+
+    #[test]
+    fn autov2_clips_by_chars() {
+        assert_eq!(autov2(" 30866692653C "), "3086669265");
+        // Untrusted `Hashes:` values: 11 two-byte chars used to panic at byte 10.
+        assert_eq!(autov2("ééééééééééé"), "éééééééééé");
+    }
+
+    #[test]
+    fn concurrent_downloads_never_share_a_temp() {
+        let dir = std::env::temp_dir().join(format!("ctf_civitai_parts_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let a = PartReservation::new(&dir, "x.safetensors");
+        let b = PartReservation::new(&dir, "x.safetensors");
+        let c = PartReservation::new(&dir, "x.ckpt");
+        assert_eq!((a.dest.clone(), a.part.clone()), (dir.join("x.safetensors"), dir.join("x.safetensors.part")));
+        assert_eq!(b.dest, dir.join("x (1).safetensors"), "a name still downloading is taken");
+        assert_eq!(c.part, dir.join("x.ckpt.part"), "same stem, own temp");
+
+        // A failed attempt deletes its temp and frees the name.
+        std::fs::write(&a.part, b"partial").unwrap();
+        drop(a);
+        assert!(!dir.join("x.safetensors.part").exists());
+        let again = PartReservation::new(&dir, "x.safetensors");
+        assert_eq!(again.dest, dir.join("x.safetensors"));
+
+        // A temp left by quitting mid-download doesn't push the retry to "(1)".
+        std::fs::write(dir.join("y.bin.part"), b"stale").unwrap();
+        assert_eq!(PartReservation::new(&dir, "y.bin").dest, dir.join("y.bin"));
+
+        drop((b, c, again));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod preview_fail_tests {
+    use super::{by_hash_failure, PreviewFail};
+
+    /// Only "Civitai unavailable" stops a thumbnail batch; a failure about one
+    /// file lets the batch go on, and a 404 is a cacheable "not there".
+    #[test]
+    fn by_hash_failures_are_sorted() {
+        let sort = |e: ureq::Error| by_hash_failure(&e).map(|found| found.is_some());
+        assert_eq!(sort(ureq::Error::StatusCode(404)), Ok(false));
+        assert_eq!(sort(ureq::Error::StatusCode(429)), Err(PreviewFail::Offline));
+        assert_eq!(sort(ureq::Error::StatusCode(503)), Err(PreviewFail::Offline));
+        assert_eq!(sort(ureq::Error::StatusCode(400)), Err(PreviewFail::Item));
+        assert_eq!(sort(ureq::Error::StatusCode(403)), Err(PreviewFail::Offline), "blocked");
+        assert_eq!(sort(ureq::Error::StatusCode(451)), Err(PreviewFail::Offline), "blocked in a region");
+        assert_eq!(sort(ureq::Error::HostNotFound), Err(PreviewFail::Offline));
     }
 }

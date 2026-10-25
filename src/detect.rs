@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use eframe::egui;
 use egui::Color32;
@@ -96,6 +96,7 @@ pub fn enabled() -> bool {
 
 pub fn toggle() {
     ENABLED.fetch_xor(true, Ordering::Relaxed);
+    retry_failed();
 }
 
 /// Whether the age overlay is currently shown ("Detect Age"). Independent of
@@ -108,6 +109,17 @@ pub fn age_enabled() -> bool {
 
 pub fn toggle_age() {
     AGE_ENABLED.fetch_xor(true, Ordering::Relaxed);
+    retry_failed();
+}
+
+/// Turning an overlay off and on again is the retry: forget which images
+/// failed and any failed model download, so they get another go.
+fn retry_failed() {
+    if let Ok(mut st) = inner().lock() {
+        st.errors.clear();
+        st.age_errors.clear();
+        st.download_error = None;
+    }
 }
 
 /// Loaded ONNX sessions, kept across jobs so repeat detections are instant.
@@ -121,6 +133,8 @@ const AGE_COLOR: Color32 = Color32::from_rgb(90, 200, 245);
 
 /// Finished detections per image path.
 type DetCache = HashMap<PathBuf, Arc<Vec<Detection>>>;
+/// Failed detections per image path: why, shown in the overlay.
+type ErrCache = HashMap<PathBuf, String>;
 /// An in-flight detection job: the image path + its result channel.
 type DetJob = Option<(PathBuf, Receiver<Result<Vec<Detection>, String>>)>;
 /// A blocking detector: image path in, detections out.
@@ -132,6 +146,12 @@ struct Inner {
     cache: DetCache,
     /// Finished age results per image path.
     age_cache: DetCache,
+    /// Region / age failures (model load, inference, an undecodable image),
+    /// kept per image: one bad file fails only itself instead of stopping
+    /// detection for every image until a restart. Toggling an overlay
+    /// clears them ([`retry_failed`]).
+    errors: ErrCache,
+    age_errors: ErrCache,
     /// The in-flight region job, one at a time.
     job: DetJob,
     /// The in-flight age job, one at a time (independent of the region job).
@@ -139,8 +159,10 @@ struct Inner {
     /// The in-flight model download, when the models aren't installed yet
     /// (one catalog entry covers both overlays' models).
     download: Option<crate::ai_models::DownloadHandle>,
-    /// Last error (model load / inference / download), shown in the overlay.
-    error: Option<String>,
+    /// A failed model download, shown while an overlay still lacks its
+    /// models — retried when the overlay is toggled, not every frame
+    /// against a dead connection.
+    download_error: Option<String>,
 }
 
 fn inner() -> &'static Mutex<Inner> {
@@ -185,55 +207,44 @@ fn drive(kind: Kind, path: &Path, ctx: &egui::Context) -> (Option<Arc<Vec<Detect
         Ok(g) => g,
         Err(_) => return (None, Some("Detection state poisoned".into())),
     };
-    let Inner { cache, age_cache, job, age_job, download, error } = &mut *st;
+    let Inner { cache, age_cache, errors, age_errors, job, age_job, download, download_error } = &mut *st;
 
     // Absorb finished inference jobs (both kinds, so either overlay keeps the
     // other's results fresh too).
-    let absorb = |job: &mut DetJob, cache: &mut DetCache, error: &mut Option<String>| {
-        if let Some((job_path, rx)) = job
-            && let Ok(result) = rx.try_recv() {
-                let job_path = job_path.clone();
-                *job = None;
-                match result {
-                    Ok(dets) => {
-                        *error = None;
-                        cache.insert(job_path, Arc::new(dets));
-                    }
-                    Err(e) => *error = Some(e),
-                }
-            }
-    };
-    absorb(job, cache, error);
-    absorb(age_job, age_cache, error);
+    absorb(job, cache, errors);
+    absorb(age_job, age_cache, age_errors);
 
     // Absorb a finished model download.
     if let Some(dl) = &download
         && dl.done() {
             if !dl.ok() {
-                *error = Some(dl.error().unwrap_or_else(|| "Model download failed".into()));
+                *download_error = Some(dl.error().unwrap_or_else(|| "Model download failed".into()));
             }
             *download = None;
         }
 
-    // Route to this overlay's cache / job / models / worker.
-    let (cache, job, ready, work): (&mut DetCache, &mut DetJob, bool, DetectFn) = match kind {
-        Kind::Regions => (cache, job, installed(), detect_file),
-        Kind::Age => (age_cache, age_job, installed_age(), detect_age_file),
+    // Route to this overlay's cache / failures / job / models / worker.
+    let (cache, errors, job, ready, work): (&mut DetCache, &mut ErrCache, &mut DetJob, bool, DetectFn) = match kind {
+        Kind::Regions => (cache, errors, job, installed(), detect_file),
+        Kind::Age => (age_cache, age_errors, age_job, installed_age(), detect_age_file),
     };
 
     if let Some(dets) = cache.get(path) {
         return (Some(Arc::clone(dets)), None);
     }
-    if let Some(e) = &error {
+    if let Some(e) = errors.get(path) {
         return (None, Some(format!("Detection failed: {e}")));
     }
 
     // Models missing → kick off (or report) the shared catalog download.
     if !ready {
+        if let Some(e) = download_error.as_ref() {
+            return (None, Some(format!("Detection failed: {e} — toggle the overlay to retry")));
+        }
         if download.is_none() {
             *download = crate::ai_models::start_model_download(FOLDER);
             if download.is_none() {
-                *error = Some("No catalog entry for the detection models".into());
+                *download_error = Some("No catalog entry for the detection models".into());
             }
         }
         let pct = download.as_ref().map(|d| d.pct()).unwrap_or(0);
@@ -260,6 +271,42 @@ fn drive(kind: Kind, path: &Path, ctx: &egui::Context) -> (Option<Arc<Vec<Detect
         Kind::Age => "Estimating age…",
     };
     (None, Some(verb.into()))
+}
+
+/// Take a finished job's result into `cache` (or its failure into `errors`)
+/// and free the job slot.
+fn absorb(job: &mut DetJob, cache: &mut DetCache, errors: &mut ErrCache) {
+    let Some((job_path, rx)) = job else { return };
+    let result = match rx.try_recv() {
+        Ok(result) => result,
+        Err(mpsc::TryRecvError::Empty) => return,
+        // The worker died without answering (a panic in a decoder or the
+        // model): fail its image — waiting on it kept the slot taken forever,
+        // so no other image could start a job.
+        Err(mpsc::TryRecvError::Disconnected) => Err("the detector stopped unexpectedly".into()),
+    };
+    let job_path = job_path.clone();
+    *job = None;
+    match result {
+        Ok(dets) => {
+            cache.insert(job_path, Arc::new(dets));
+        }
+        Err(e) => {
+            errors.insert(job_path, e);
+        }
+    }
+}
+
+/// Lock a loaded-model slot. A job that panicked while holding it poisoned
+/// the lock, which used to fail every later detection until a restart; drop
+/// the sessions it held instead (they reload on next use) and carry on.
+fn lock_models<T>(slot: &Mutex<Option<T>>) -> MutexGuard<'_, Option<T>> {
+    slot.lock().unwrap_or_else(|poisoned| {
+        slot.clear_poison();
+        let mut guard = poisoned.into_inner();
+        *guard = None;
+        guard
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -319,7 +366,7 @@ fn run_detector(
 fn detect_file(path: &Path) -> Result<Vec<Detection>, String> {
     let img = crate::tagger::load_rgb_on_white(path)?;
 
-    let mut guard = SESSIONS.lock().map_err(|_| "Session lock poisoned".to_string())?;
+    let mut guard = lock_models(&SESSIONS);
     ensure_sessions(&mut guard)?;
     let sessions = guard.as_mut().expect("just loaded");
 
@@ -344,7 +391,7 @@ fn detect_age_file(path: &Path) -> Result<Vec<Detection>, String> {
 
     // Face boxes first (DETECTORS[0] is the face model).
     let faces = {
-        let mut guard = SESSIONS.lock().map_err(|_| "Session lock poisoned".to_string())?;
+        let mut guard = lock_models(&SESSIONS);
         ensure_sessions(&mut guard)?;
         let sessions = guard.as_mut().expect("just loaded");
         run_detector(&mut sessions[0], &DETECTORS[0], &img)?
@@ -353,7 +400,7 @@ fn detect_age_file(path: &Path) -> Result<Vec<Detection>, String> {
         return Ok(Vec::new());
     }
 
-    let mut guard = AGE_SESSION.lock().map_err(|_| "Age session lock poisoned".to_string())?;
+    let mut guard = lock_models(&AGE_SESSION);
     if guard.is_none() {
         let model = crate::tagger::resolve(FOLDER, "age.onnx")
             .ok_or_else(|| "age.onnx missing — re-download Region Detection".to_string())?;
@@ -551,6 +598,36 @@ fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A job whose worker died frees the slot with a failure for its own
+    /// image; a failure stays with that image only.
+    #[test]
+    fn dead_or_failed_jobs_free_the_slot() {
+        let (mut cache, mut errors) = (DetCache::new(), ErrCache::new());
+
+        let (tx, rx) = mpsc::channel();
+        drop(tx); // the worker panicked: no answer, ever
+        let mut job: DetJob = Some((PathBuf::from("dead.png"), rx));
+        absorb(&mut job, &mut cache, &mut errors);
+        assert!(job.is_none());
+        assert!(errors.contains_key(Path::new("dead.png")));
+
+        let (tx, rx) = mpsc::channel();
+        let mut job: DetJob = Some((PathBuf::from("ok.png"), rx));
+        absorb(&mut job, &mut cache, &mut errors);
+        assert!(job.is_some(), "still running");
+        tx.send(Ok(Vec::new())).unwrap();
+        absorb(&mut job, &mut cache, &mut errors);
+        assert!(job.is_none() && cache.contains_key(Path::new("ok.png")));
+
+        let (tx, rx) = mpsc::channel();
+        let mut job: DetJob = Some((PathBuf::from("bad.png"), rx));
+        tx.send(Err("Read image: bad".into())).unwrap();
+        absorb(&mut job, &mut cache, &mut errors);
+        assert!(job.is_none());
+        assert_eq!(errors.get(Path::new("bad.png")).map(String::as_str), Some("Read image: bad"));
+        assert!(!errors.contains_key(Path::new("ok.png")));
+    }
 
     /// End-to-end pipeline check on a real image with an obvious face + person.
     /// Skips (passes) when the models aren't installed, so CI stays green.

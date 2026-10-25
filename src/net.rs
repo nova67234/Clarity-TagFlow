@@ -25,6 +25,15 @@ pub enum Note<'a> {
 /// MSVC — see Cargo.toml). Certificates validate against the OS store (with
 /// AIA intermediate fetching) rather than ureq's bundled webpki roots — see
 /// civitai.rs for the CDN incomplete-chain failure this avoids.
+///
+/// Timeouts: ureq 3 sets none, so a stalled connection blocked forever and the
+/// retry/resume loop never ran. ureq 3.3 restarts a phase's limit on every
+/// read, but ALSO cuts a phase off at the previous phase's end plus *that*
+/// phase's limit (checked against a local test server). So `send_request`
+/// doubles as the cap on waiting for the response headers, `recv_body` is a
+/// per-read stall limit that never caps a long download's total time, and
+/// `recv_response` must stay unset: it would cut the body off that long after
+/// the headers (then allow 1 s per read).
 pub fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .tls_config(
@@ -34,6 +43,9 @@ pub fn agent() -> ureq::Agent {
                 .build(),
         )
         .max_redirects(10)
+        .timeout_connect(Some(std::time::Duration::from_secs(30)))
+        .timeout_send_request(Some(std::time::Duration::from_secs(60)))
+        .timeout_recv_body(Some(std::time::Duration::from_secs(60)))
         .build()
         .into()
 }
@@ -67,8 +79,9 @@ pub fn download(
 }
 
 /// `model.safetensors` → `model.safetensors.part`: the extension is appended,
-/// not replaced, so same-stem files can't clobber each other's temps.
-fn part_path(dest: &Path) -> PathBuf {
+/// not replaced, so same-stem files can't clobber each other's temps. (Also
+/// the temp name of the Civitai and booru/stock downloaders.)
+pub(crate) fn part_path(dest: &Path) -> PathBuf {
     let mut name = dest.file_name().map(|n| n.to_os_string()).unwrap_or_default();
     name.push(".part");
     dest.with_file_name(name)
@@ -87,21 +100,34 @@ fn fetch_into(
 ) -> Result<(), String> {
     let have = std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
 
-    let mut req = agent.get(url);
+    // Error statuses come back as responses (not `Err`), so a 416's
+    // Content-Range can be read below.
+    let mut req = agent.get(url).config().http_status_as_error(false).build();
     if !bearer.is_empty() {
         req = req.header("Authorization", &format!("Bearer {bearer}"));
     }
     if have > 0 {
         req = req.header("Range", &format!("bytes={have}-"));
     }
-    let resp = match req.call() {
-        Ok(r) => r,
-        // 416: the requested range starts at/after the end — the .part already
-        // holds the whole file (the previous attempt died between the last
-        // byte and the rename). Nothing left to fetch.
-        Err(ureq::Error::StatusCode(416)) if have > 0 => return Ok(()),
-        Err(e) => return Err(e.to_string()),
-    };
+    let resp = req.call().map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    if status == 416 && have > 0 {
+        // The requested range starts at/after the end. The .part holds the
+        // whole file (the previous attempt died between the last byte and
+        // the rename) only if it's exactly as long as the file; one that's
+        // longer — the upstream file was replaced by a smaller one — or that
+        // the server won't size is stale, and renaming it would install a
+        // corrupt file. Drop it and fetch from zero (no Range, so no repeat).
+        let size = resp.headers().get("Content-Range").and_then(|v| v.to_str().ok());
+        if part_is_complete(have, size) {
+            return Ok(());
+        }
+        std::fs::remove_file(tmp).map_err(|e| e.to_string())?;
+        return fetch_into(agent, url, bearer, tmp, notify);
+    }
+    if status >= 400 {
+        return Err(ureq::Error::StatusCode(status).to_string());
+    }
 
     let resumed = resp.status() == 206;
     let body_len: u64 = resp
@@ -138,4 +164,34 @@ fn fetch_into(
         return Err(format!("connection lost at {got} of {total} bytes"));
     }
     Ok(())
+}
+
+/// Whether a 416 for a `.part` of `have` bytes means the part is already the
+/// complete file: the server's `Content-Range: bytes */<size>` equals `have`.
+fn part_is_complete(have: u64, content_range: Option<&str>) -> bool {
+    content_range
+        .map(|s| s.trim().to_ascii_lowercase())
+        .and_then(|s| s.strip_prefix("bytes */").and_then(|n| n.trim().parse::<u64>().ok()))
+        == Some(have)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appends_part_extension() {
+        assert_eq!(part_path(Path::new("m/x.safetensors")), Path::new("m/x.safetensors.part"));
+        assert_ne!(part_path(Path::new("x.safetensors")), part_path(Path::new("x.ckpt")));
+    }
+
+    #[test]
+    fn range_not_satisfiable_means_complete_only_at_exact_size() {
+        assert!(part_is_complete(1000, Some("bytes */1000")));
+        assert!(part_is_complete(1000, Some(" Bytes */1000 ")));
+        // An over-long stale part, or a 416 that doesn't say the size: restart.
+        assert!(!part_is_complete(1500, Some("bytes */1000")));
+        assert!(!part_is_complete(1000, None));
+        assert!(!part_is_complete(1000, Some("bytes 0-999/1000")));
+    }
 }

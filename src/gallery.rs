@@ -206,7 +206,7 @@ pub fn search_pill(
     let resp = win
         .frame(
             egui::Frame::new()
-                .fill(PANEL())
+                .fill(FLOAT())
                 // Half the pill height → fully rounded ends, like the mock.
                 .corner_radius(CornerRadius::same((pill_h / 2.0) as u8))
                 .inner_margin(Margin::symmetric(16, 8))
@@ -248,7 +248,7 @@ pub fn search_pill(
                         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                         .align(egui::RectAlign::TOP)
                         .gap(12.0)
-                        .frame(crate::card_frame(22))
+                        .frame(crate::float_card_frame(22))
                         .width(232.0)
                         .show(|ui| {
                             let before = settings.media_filter;

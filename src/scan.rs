@@ -21,7 +21,7 @@ use crate::backup::{FLASH, FLASH_GREEN, FLASH_RED};
 
 use eframe::egui;
 
-use crate::theme::{ACCENT1, EDGE, FIELD, MUTED, PANEL, TEXT};
+use crate::theme::{ACCENT1, EDGE, FIELD, FLOAT, MUTED, TEXT};
 
 const CORRUPTED_FOLDER: &str = "corrupted_files";
 const DUPLICATES_FOLDER: &str = "duplicates";
@@ -73,6 +73,9 @@ pub struct ScanState {
     rx: Option<Receiver<Msg>>,
     /// Set true once after a scan finishes so the app can refresh the browser.
     pub finished_tick: bool,
+    /// Files deleted from the review list, for the app to take off the
+    /// browser's list (taken by `main.rs` each frame).
+    pub deleted: Vec<PathBuf>,
     /// Anchor for the window — the Find Issues button's bottom-right, captured
     /// when opened. The window is right-aligned to it (drops down, extends left).
     anchor_pos: Option<egui::Pos2>,
@@ -99,6 +102,7 @@ impl Default for ScanState {
             cancel: Arc::new(AtomicBool::new(false)),
             rx: None,
             finished_tick: false,
+            deleted: Vec::new(),
             anchor_pos: None,
             just_opened: false,
             start_flash: None,
@@ -134,7 +138,18 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
     // Drain background messages every frame — even while the window is minimised
     // (closed), so a backgrounded scan keeps progressing and finishes.
     if let Some(rx) = &state.rx {
-        let drained: Vec<Msg> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        // A worker that died (a panic) hangs up without a Done; `try_recv().ok()`
+        // read that as "no message yet", leaving the scan "running" forever.
+        let mut died = false;
+        let drained: Vec<Msg> = std::iter::from_fn(|| match rx.try_recv() {
+            Ok(m) => Some(m),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                died = true;
+                None
+            }
+        })
+        .collect();
         for m in drained {
             match m {
                 Msg::Log(l) => state.push_log(l),
@@ -165,6 +180,14 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
                     };
                 }
             }
+        }
+        if died && state.running {
+            state.running = false;
+            state.rx = None;
+            state.progress = 0.0;
+            state.finished_tick = true; // it may have moved files before it stopped
+            state.status = "Failed: the scan stopped unexpectedly.".to_string();
+            state.push_log("ERROR: the scan stopped unexpectedly.");
         }
         ctx.request_repaint_after(Duration::from_millis(100));
     }
@@ -325,8 +348,27 @@ pub fn show(ctx: &egui::Context, state: &mut ScanState) {
             if let Some(i) = to_delete
                 && i < state.corrupt_files.len() {
                     let (p, _) = state.corrupt_files.remove(i);
-                    match std::fs::remove_file(&p) {
-                        Ok(_) => state.push_log(format!("Deleted: {}", file_name(&p))),
+                    // One already gone (deleted in the browser meanwhile)
+                    // counts as deleted — unless its folder is unreachable
+                    // too (an unplugged drive). Either way it leaves the
+                    // browser's list.
+                    let gone = |e: &std::io::Error| {
+                        e.kind() == std::io::ErrorKind::NotFound && p.parent().is_some_and(Path::is_dir)
+                    };
+                    match std::fs::remove_file(&p).or_else(|e| if gone(&e) { Ok(()) } else { Err(e) }) {
+                        Ok(()) => {
+                            state.deleted.push(p.clone());
+                            state.push_log(format!("Deleted: {}", file_name(&p)));
+                            // Its tags go too, like the browser's Delete — unless
+                            // another file there still uses that .txt.
+                            let txt = p.with_extension("txt");
+                            if txt.is_file() && !sidecar_in_use(&txt) {
+                                match std::fs::remove_file(&txt) {
+                                    Ok(_) => state.push_log(format!("Deleted: {}", file_name(&txt))),
+                                    Err(e) => state.push_log(format!("ERROR deleting {}: {e}", file_name(&txt))),
+                                }
+                            }
+                        }
                         Err(e) => state.push_log(format!("ERROR deleting {}: {e}", file_name(&p))),
                     }
                 }
@@ -542,12 +584,16 @@ fn open_in_default(path: &Path) {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        // `start` uses the file's default association; CREATE_NO_WINDOW avoids a
-        // console flash.
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", &path.to_string_lossy()])
-            .creation_flags(0x0800_0000)
-            .spawn();
+        // Explorer opens a file with its default association. Not `cmd /C
+        // start`: Rust quotes an argument only when it has spaces, so a `&` in
+        // a file name reached cmd as a command separator (`x&calc&.png` ran
+        // calc). Explorer runs nothing from its arguments; the path goes as
+        // one quoted argument (Windows names can't contain `"`) so a comma in
+        // a name isn't read as an Explorer switch separator.
+        let mut quoted = std::ffi::OsString::from("\"");
+        quoted.push(path.as_os_str());
+        quoted.push("\"");
+        let _ = std::process::Command::new("explorer").raw_arg(quoted).spawn();
     }
     #[cfg(target_os = "macos")]
     {
@@ -573,7 +619,7 @@ fn footer_button(ui: &mut egui::Ui, label: &str, fill: Option<egui::Color32>) ->
 
 fn window_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(PANEL())
+        .fill(FLOAT())
         .corner_radius(egui::CornerRadius::same(16))
         .inner_margin(egui::Margin::same(14))
         .stroke(egui::Stroke::new(1.0, EDGE()))
@@ -661,7 +707,11 @@ fn run_scan(dir: PathBuf, scan_dupes: bool, tx: Sender<Msg>, cancel: Arc<AtomicB
         }
         prog(i as f32 / total as f32, format!("Scanning {} / {}", i + 1, images.len()));
 
-        match validate_image(p) {
+        // A decoder that panics on a damaged file marks that file corrupt
+        // instead of killing the whole scan.
+        let checked = std::panic::catch_unwind(|| validate_image(p))
+            .unwrap_or_else(|_| Err("The decoder crashed on this file".to_string()));
+        match checked {
             // Corrupt files are NOT moved — they're listed for review (the UI logs
             // each one and offers Delete / Fix per file).
             Ok(()) => valid.push(p.clone()),
@@ -792,22 +842,57 @@ fn validate_image(p: &Path) -> Result<(), String> {
 }
 
 /// Move `file` into `dest` with a name prefix, de-duplicating the target name.
-/// Returns true on success.
+/// Its tag sidecar (`.txt`) goes along under the same new name, so a moved
+/// duplicate doesn't leave orphaned tags behind — copied rather than moved
+/// when another file still uses that `.txt` (`cat.png` + `cat.jpg` share
+/// `cat.txt`). Returns true if `file` moved.
 fn move_into(file: &Path, dest: &Path, prefix: &str, log: &impl Fn(String)) -> bool {
     let base = file_name(file);
-    let target = unique_target(dest, &format!("{prefix}{base}"));
-    if let Err(e) = std::fs::rename(file, &target) {
-        // rename fails across volumes; fall back to copy+delete.
-        match std::fs::copy(file, &target).and_then(|_| std::fs::remove_file(file)) {
-            Ok(_) => true,
-            Err(_) => {
-                log(format!("ERROR: could not move {base}: {e}"));
-                false
-            }
-        }
-    } else {
-        true
+    let txt = file.with_extension("txt");
+    let has_txt = txt.is_file();
+    let target = unique_target(dest, &format!("{prefix}{base}"), has_txt);
+    if let Err(e) = move_file(file, &target) {
+        log(format!("ERROR: could not move {base}: {e}"));
+        return false;
     }
+    if has_txt {
+        let txt_target = target.with_extension("txt");
+        let done = if sidecar_in_use(&txt) {
+            std::fs::copy(&txt, &txt_target).map(|_| ())
+        } else {
+            move_file(&txt, &txt_target)
+        };
+        if let Err(e) = done {
+            log(format!("ERROR: could not move {}: {e}", file_name(&txt)));
+        }
+    }
+    true
+}
+
+/// `rename`, falling back to copy + delete (rename fails across volumes) —
+/// the browser's Move helper: the copy lands under a temporary name first and
+/// a failed copy or delete leaves neither a half-written file nor a duplicate.
+fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    crate::move_file(from, to)
+}
+
+/// Whether another image or video in `txt`'s folder uses it as its tag
+/// sidecar (`cat.png` and `cat.jpg` both use `cat.txt`) — then the `.txt`
+/// must stay. The same rule as the browser's Delete / Move: every type the
+/// app reads a .txt for counts (a `cat.npz` latent cache doesn't), and names
+/// compare ignoring case on every OS (`Dog.JPG` uses `dog.txt` on Windows,
+/// macOS and a Linux exFAT drive; elsewhere keeping the .txt is harmless). A
+/// folder that can't be read counts as in use (keeping a `.txt` is the safe
+/// side). Call it once the image itself has moved or gone.
+pub(crate) fn sidecar_in_use(txt: &Path) -> bool {
+    let (Some(dir), Some(stem)) = (txt.parent(), txt.file_stem()) else { return true };
+    let Ok(entries) = std::fs::read_dir(dir) else { return true };
+    entries.flatten().any(|e| {
+        let p = e.path();
+        !e.file_type().is_ok_and(|t| t.is_dir())
+            && p.file_stem().is_some_and(|s| crate::same_name(s, stem))
+            && crate::has_sidecar_extension(&p)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +900,9 @@ fn move_into(file: &Path, dest: &Path, prefix: &str, log: &impl Fn(String)) -> b
 // ---------------------------------------------------------------------------
 
 /// Recursively collect regular files, skipping our own quarantine folders.
+/// Symlinks (and Windows junctions) are neither followed nor listed: a file
+/// reached two ways counted as its own duplicate, and moving "the copy" moved
+/// the real file.
 fn gather_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -822,13 +910,16 @@ fn gather_files(dir: &Path) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(&d) else { continue };
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_dir() {
+            // The entry's own type: unlike `Path::is_dir`/`is_file`, it doesn't
+            // follow a link to what it points at.
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if name.eq_ignore_ascii_case(CORRUPTED_FOLDER) || name.eq_ignore_ascii_case(DUPLICATES_FOLDER) {
                     continue;
                 }
                 stack.push(p);
-            } else if p.is_file() {
+            } else if kind.is_file() {
                 out.push(p);
             }
         }
@@ -847,17 +938,22 @@ fn file_name(p: &Path) -> String {
 /// Trim a decoder error to its first line so the list stays readable.
 fn short_err(s: &str) -> String {
     let first = s.lines().next().unwrap_or(s).trim();
-    if first.len() > 80 {
-        format!("{}…", &first[..80])
-    } else {
-        first.to_string()
+    // Cut after 80 characters, not bytes: byte 80 can fall inside a
+    // multi-byte character (a localized OS error message), and slicing there
+    // panicked — killing the scan worker.
+    match first.char_indices().nth(80) {
+        Some((i, _)) => format!("{}…", &first[..i]),
+        None => first.to_string(),
     }
 }
 
-/// A non-clashing path in `dest` for `name`, appending " (n)" if needed.
-fn unique_target(dest: &Path, name: &str) -> PathBuf {
+/// A non-clashing path in `dest` for `name`, appending " (n)" if needed. With
+/// `with_txt`, the name's `.txt` sibling must be free too (a tag sidecar
+/// follows the file there).
+fn unique_target(dest: &Path, name: &str, with_txt: bool) -> PathBuf {
+    let free = |p: &Path| !p.exists() && (!with_txt || !p.with_extension("txt").exists());
     let base = dest.join(name);
-    if !base.exists() {
+    if free(&base) {
         return base;
     }
     let (stem, ext) = match name.rfind('.') {
@@ -866,7 +962,7 @@ fn unique_target(dest: &Path, name: &str) -> PathBuf {
     };
     for i in 1..100_000 {
         let cand = dest.join(format!("{stem} ({i}){ext}"));
-        if !cand.exists() {
+        if free(&cand) {
             return cand;
         }
     }
@@ -1078,5 +1174,110 @@ mod fast_hash_tests {
         for p in [small, big_a, big_b] {
             let _ = std::fs::remove_file(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh, empty scratch folder for one test.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("clarity_scan_test_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn read(p: PathBuf) -> String {
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+    }
+
+    #[test]
+    fn short_err_cuts_on_a_char_boundary() {
+        // 3-byte characters: byte 80 falls inside one, which used to panic.
+        let jp = "指定されたファイルが見つかりません。".repeat(6);
+        let cut = short_err(&jp);
+        assert_eq!(cut.chars().count(), 81);
+        assert!(cut.ends_with('…') && jp.starts_with(cut.trim_end_matches('…')));
+        assert_eq!(short_err(&"x".repeat(100)), format!("{}…", "x".repeat(80)));
+        assert_eq!(short_err("  short\nsecond line"), "short");
+    }
+
+    #[test]
+    fn dead_worker_ends_the_scan() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Msg::Log("Gathering files…".into())).unwrap();
+        drop(tx); // the worker panicked before its Done
+        let mut state = ScanState { running: true, rx: Some(rx), ..Default::default() };
+        show(&ctx, &mut state);
+        assert!(!state.running && state.rx.is_none() && state.finished_tick);
+        assert!(state.status.starts_with("Failed"), "{}", state.status);
+        assert_eq!(state.log.first().map(String::as_str), Some("Gathering files…"));
+
+        // A worker that finished normally hangs up right after its Done.
+        let (tx, rx) = mpsc::channel();
+        tx.send(Msg::Done(Summary::default())).unwrap();
+        drop(tx);
+        let mut state = ScanState { running: true, rx: Some(rx), ..Default::default() };
+        show(&ctx, &mut state);
+        assert!(!state.running && state.status.starts_with("Done"), "{}", state.status);
+    }
+
+    #[test]
+    fn duplicate_takes_its_tags_along() {
+        let dir = scratch("dupes");
+        let dup = dir.join(DUPLICATES_FOLDER);
+        std::fs::create_dir_all(&dup).unwrap();
+        for (name, body) in [("b.png", "img"), ("b.txt", "b tags"), ("c.png", "img"), ("c.jpg", "jpg"), ("c.txt", "c tags")] {
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+        // Left by an earlier scan: the next "dup_1_b" must not land on it.
+        std::fs::write(dup.join("dup_1_b.txt"), "earlier tags").unwrap();
+        let errors = std::cell::RefCell::new(Vec::new());
+        let log = |s: String| errors.borrow_mut().push(s);
+
+        assert!(move_into(&dir.join("b.png"), &dup, "dup_1_", &log));
+        assert!(!dir.join("b.png").exists() && !dir.join("b.txt").exists());
+        assert_eq!(read(dup.join("dup_1_b (1).png")), "img");
+        assert_eq!(read(dup.join("dup_1_b (1).txt")), "b tags");
+        assert_eq!(read(dup.join("dup_1_b.txt")), "earlier tags");
+
+        // c.jpg still uses c.txt, so the moved c.png gets a copy.
+        assert!(move_into(&dir.join("c.png"), &dup, "dup_2_", &log));
+        assert_eq!(read(dir.join("c.txt")), "c tags");
+        assert_eq!(read(dup.join("dup_2_c.png")), "img");
+        assert_eq!(read(dup.join("dup_2_c.txt")), "c tags");
+        assert!(errors.borrow().is_empty(), "{:?}", errors.borrow());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sidecar_in_use_sees_other_files() {
+        let dir = scratch("users");
+        for name in ["cat.png", "cat.txt", "Dog.JPG", "dog.txt", "solo.txt", "folder.txt", "latent.npz", "latent.txt"] {
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        assert!(sidecar_in_use(&dir.join("cat.txt")));
+        assert!(sidecar_in_use(&dir.join("dog.txt"))); // any case, on every OS
+        assert!(!sidecar_in_use(&dir.join("solo.txt")));
+        assert!(!sidecar_in_use(&dir.join("latent.txt"))); // not a file that reads a .txt
+        assert!(!sidecar_in_use(&dir.join("folder.txt"))); // a folder isn't a user
+        assert!(sidecar_in_use(&dir.join("missing").join("x.txt"))); // can't tell: keep it
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_does_not_follow_symlinks() {
+        let dir = scratch("links");
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real").join("img.png"), "img").unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("linked")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real").join("img.png"), dir.join("a_link.png")).unwrap();
+        assert_eq!(gather_files(&dir), [dir.join("real").join("img.png")]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

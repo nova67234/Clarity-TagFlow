@@ -42,6 +42,31 @@ pub fn unprotect(stored: &str) -> String {
         .unwrap_or_default()
 }
 
+/// `std::fs::write` for a file that holds a [`protect`]ed secret. Off Windows
+/// `protect` is only XOR obfuscation, so other users must not be able to read
+/// the file: it is created owner-only (0600), and an existing one is narrowed
+/// to 0600 before the new secret goes in (`mode` only applies to a new file).
+/// On Windows the DPAPI ciphertext is useless to other accounts anyway.
+pub fn write_private<P: AsRef<std::path::Path>, C: AsRef<[u8]>>(path: P, contents: C) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(contents.as_ref())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
@@ -205,5 +230,23 @@ pub fn unprotect_bytes(stored: &[u8]) -> Option<Vec<u8>> {
     match stored.strip_prefix(BYTES_MAGIC) {
         Some(ct) => imp::decrypt(ct),
         None => Some(stored.to_vec()),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn secret_files_are_owner_only() {
+        let path = std::env::temp_dir().join(format!("ctf_secret_{}.dat", std::process::id()));
+        // An existing world-readable file (as saved before this) is narrowed too.
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        super::write_private(&path, "enc:v1:00").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "enc:v1:00");
+        let _ = std::fs::remove_file(&path);
     }
 }

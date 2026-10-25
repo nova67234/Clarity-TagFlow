@@ -32,8 +32,9 @@ pub fn window(ctx: &egui::Context, llm: &mut LlmState, settings: &mut Settings) 
         return;
     }
     let mut want_close = ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !llm.memory_map.open;
-    // Same fixed size rule as the main Settings window.
-    let win_h = (ctx.content_rect().height() - 160.0).clamp(320.0, 540.0);
+    // Same fixed size rule as the main Settings window (kept on the screen
+    // at large interface sizes).
+    let (win_w, win_h) = crate::settings::settings_window_size(ctx.content_rect());
     egui::Window::new("AI Settings")
         .id(egui::Id::new("ai_settings_window"))
         .title_bar(false)
@@ -41,7 +42,7 @@ pub fn window(ctx: &egui::Context, llm: &mut LlmState, settings: &mut Settings) 
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .frame(crate::settings::window_frame())
-        .fixed_size(egui::vec2(530.0, win_h))
+        .fixed_size(egui::vec2(win_w, win_h))
         .show(ctx, |ui| {
             let radius = egui::CornerRadius::same(10);
             let visuals = ui.visuals_mut();

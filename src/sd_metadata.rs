@@ -155,11 +155,19 @@ fn first_non_blank<'a>(map: &'a BTreeMap<String, String>, keys: &[&str]) -> Opti
 // PNG text chunks (tEXt / zTXt / iTXt)
 // ---------------------------------------------------------------------------
 
+/// Cap on the text ALL of one PNG's zTXt/iTXt chunks may inflate to, together.
+/// Real metadata (an A1111 block, a ComfyUI workflow) is a few MB at most, but
+/// zlib expands up to ~1000:1, so a small crafted PNG could otherwise inflate
+/// to gigabytes — on the UI thread, as soon as the image is selected. The
+/// budget is shared so many small chunks under distinct keywords can't add up.
+const MAX_INFLATED_TEXT: usize = 16 * 1024 * 1024; // 16 MiB
+
 /// Parse all PNG text chunks into a keyword → text map. Mirrors the Java
 /// `PngTextChunks.readAllTextChunks`.
 fn read_png_text_chunks(bytes: &[u8]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let mut pos = 8; // skip the 8-byte signature
+    let mut inflate_budget = MAX_INFLATED_TEXT;
 
     while pos + 8 <= bytes.len() {
         let len = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
@@ -171,8 +179,8 @@ fn read_png_text_chunks(bytes: &[u8]) -> BTreeMap<String, String> {
 
         match kind {
             b"tEXt" => parse_text(data, &mut out),
-            b"zTXt" => parse_ztext(data, &mut out),
-            b"iTXt" => parse_itext(data, &mut out),
+            b"zTXt" => parse_ztext(data, &mut out, &mut inflate_budget),
+            b"iTXt" => parse_itext(data, &mut out, &mut inflate_budget),
             b"IEND" => break,
             _ => {}
         }
@@ -195,7 +203,7 @@ fn parse_text(data: &[u8], out: &mut BTreeMap<String, String>) {
 }
 
 /// `zTXt`: keyword \0 compression_method zlib(text).
-fn parse_ztext(data: &[u8], out: &mut BTreeMap<String, String>) {
+fn parse_ztext(data: &[u8], out: &mut BTreeMap<String, String>, budget: &mut usize) {
     let Some(nul) = data.iter().position(|&b| b == 0) else { return };
     if nul == 0 || nul + 2 > data.len() {
         return;
@@ -204,13 +212,13 @@ fn parse_ztext(data: &[u8], out: &mut BTreeMap<String, String>) {
     if data[nul + 1] != 0 {
         return; // only deflate (method 0) is defined
     }
-    if let Some(text) = inflate(&data[nul + 2..]) {
+    if let Some(text) = inflate(&data[nul + 2..], budget) {
         out.insert(keyword, latin1(&text));
     }
 }
 
 /// `iTXt`: keyword \0 compFlag compMethod langTag \0 transKeyword \0 text(UTF-8).
-fn parse_itext(data: &[u8], out: &mut BTreeMap<String, String>) {
+fn parse_itext(data: &[u8], out: &mut BTreeMap<String, String>, budget: &mut usize) {
     let Some(nul1) = data.iter().position(|&b| b == 0) else { return };
     if nul1 == 0 {
         return;
@@ -234,7 +242,7 @@ fn parse_itext(data: &[u8], out: &mut BTreeMap<String, String>) {
     }
     let raw = &data[p..];
     let text = if comp_flag == 1 && comp_method == 0 {
-        inflate(raw).map(|b| String::from_utf8_lossy(&b).into_owned())
+        inflate(raw, budget).map(|b| String::from_utf8_lossy(&b).into_owned())
     } else {
         Some(String::from_utf8_lossy(raw).into_owned())
     };
@@ -248,12 +256,18 @@ fn latin1(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| b as char).collect()
 }
 
-/// zlib-inflate, returning `None` on failure.
-fn inflate(compressed: &[u8]) -> Option<Vec<u8>> {
-    let mut decoder = flate2::read::ZlibDecoder::new(compressed);
+/// zlib-inflate, returning `None` on failure. Inflates at most `budget` bytes
+/// (a stream that would exceed it is dropped, not truncated). Whatever was
+/// inflated is deducted from `budget` even when the stream turns out corrupt
+/// or too big, so no number of chunks can push the total work past the cap.
+fn inflate(compressed: &[u8], budget: &mut usize) -> Option<Vec<u8>> {
+    let decoder = flate2::read::ZlibDecoder::new(compressed);
     let mut out = Vec::new();
-    decoder.read_to_end(&mut out).ok()?;
-    Some(out)
+    // One byte past the budget tells "exactly at the limit" from "over it".
+    let ok = decoder.take(*budget as u64 + 1).read_to_end(&mut out).is_ok();
+    let over = out.len() > *budget;
+    *budget = budget.saturating_sub(out.len());
+    (ok && !over).then_some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -419,7 +433,7 @@ fn format_a1111(raw: &str) -> String {
     }
 
     // The parameter line begins at "\nSteps:". Without it, show the text as-is.
-    let Some(idx_steps) = index_of_ignore_case(&s, "\nsteps:") else {
+    let Some(idx_steps) = ci_find(&s, "\nsteps:") else {
         return s;
     };
     let pre = s[..idx_steps].trim().to_string();
@@ -498,12 +512,12 @@ fn format_a1111(raw: &str) -> String {
 
 /// Split prompt vs "Negative prompt:" (newline-prefixed form preferred).
 fn split_negative(pre: &str) -> (String, String) {
-    if let Some(idx) = index_of_ignore_case(pre, "\nnegative prompt:") {
+    if let Some(idx) = ci_find(pre, "\nnegative prompt:") {
         let prompt = pre[..idx].trim().to_string();
         let neg = pre[idx + "\nNegative prompt:".len()..].trim();
         return (prompt, strip_leading_colon(neg));
     }
-    if let Some(idx) = index_of_ignore_case(pre, "negative prompt:")
+    if let Some(idx) = ci_find(pre, "negative prompt:")
         && idx > 0 {
             let prompt = pre[..idx].trim().to_string();
             let neg = pre[idx + "Negative prompt:".len()..].trim();
@@ -537,16 +551,11 @@ fn parse_params(params: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Case-insensitive substring search returning a byte index into `haystack`.
-fn index_of_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
-    haystack.to_lowercase().find(&needle.to_lowercase())
-}
-
 /// True when `raw` looks like a genuine A1111 parameter block (it carries the
 /// `Steps:` key). Lets `read` distinguish a real `parameters` chunk from an empty
 /// or prompt-only one before preferring it over a ComfyUI node graph.
 fn has_steps_anchor(raw: &str) -> bool {
-    index_of_ignore_case(raw, "steps:").is_some()
+    ci_find(raw, "steps:").is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -1483,9 +1492,13 @@ fn a1111_field(raw: &str, key: &str) -> Option<String> {
 }
 
 /// Case-insensitive substring search that returns a **byte index valid in the
-/// original** `haystack`. Unlike [`index_of_ignore_case`] it only folds ASCII, so
-/// the index never lands mid-multibyte-character (safe for slicing prompts that
-/// contain Unicode).
+/// original** `haystack`. It only folds ASCII, so the index never lands
+/// mid-multibyte-character (safe for slicing prompts that contain Unicode).
+/// Full `to_lowercase()` must not be used for this: some characters change
+/// byte length when lowercased (İ, ẞ, the Kelvin/Ohm/Angstrom signs), so an
+/// index found in the lowercased copy is off in the original — slicing there
+/// panicked ("not a char boundary") on the UI thread when such an image was
+/// selected.
 fn ci_find(haystack: &str, needle: &str) -> Option<usize> {
     haystack.to_ascii_lowercase().find(&needle.to_ascii_lowercase())
 }
@@ -1666,5 +1679,79 @@ pub(crate) mod drop_import_tests {
         let out = extract_and_strip_loras("a cat <lora:Foo:0.8> on a mat <lora:Bar Baz:0.5>", &mut m);
         assert_eq!(out, "a cat  on a mat");
         assert_eq!(m.loras, vec![("Foo".to_string(), 0.8), ("Bar Baz".to_string(), 0.5)]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Characters whose lowercase has a different UTF-8 length (Kelvin sign
+    /// U+212A → `k`, ẞ → ß, İ → i̇, Ohm/Angstrom signs) once shifted the anchor
+    /// index found in a lowercased copy, so slicing the original panicked.
+    #[test]
+    fn case_folds_that_change_length_do_not_break_slicing() {
+        assert_eq!(
+            format_a1111("lamp 2700\u{212A}\nNegative prompt: 低质量\nSteps: 20"),
+            "lamp 2700\u{212A}\n\nNegative Prompt:\n低质量\n\nParameters:\n  \u{2022} Steps: 20"
+        );
+        assert_eq!(
+            format_a1111("photo, \u{1E9E}\nNegative prompt: x 😀\nSteps: 20"),
+            "photo, \u{1E9E}\n\nNegative Prompt:\nx 😀\n\nParameters:\n  \u{2022} Steps: 20"
+        );
+        // These didn't panic before, but the shifted index cut the text in the
+        // wrong place (a "\nS" left in the prompt, an "eps: 5" key).
+        assert_eq!(
+            format_a1111("\u{130}\u{130} cat\nNegative prompt: é\nSteps: 5"),
+            "\u{130}\u{130} cat\n\nNegative Prompt:\né\n\nParameters:\n  \u{2022} Steps: 5"
+        );
+        assert_eq!(
+            format_a1111("\u{2126}\u{212B} lamp negative prompt: 😀 x\nSteps: 7"),
+            "\u{2126}\u{212B} lamp\n\nNegative Prompt:\n😀 x\n\nParameters:\n  \u{2022} Steps: 7"
+        );
+    }
+
+    fn png_with_chunks(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let mut png = vec![137, 80, 78, 71, 13, 10, 26, 10];
+        for (kind, data) in chunks {
+            png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            png.extend_from_slice(*kind);
+            png.extend_from_slice(data);
+            png.extend_from_slice(&[0; 4]); // CRC — not checked by the reader
+        }
+        png
+    }
+
+    fn zlib(text: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(text).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// `zTXt` chunk data: keyword, NUL, compression method 0, zlib stream.
+    fn ztxt(keyword: &str, text: &[u8]) -> Vec<u8> {
+        let mut data = keyword.as_bytes().to_vec();
+        data.extend_from_slice(&[0, 0]);
+        data.extend(zlib(text));
+        data
+    }
+
+    #[test]
+    fn compressed_text_shares_one_inflate_budget() {
+        // Two chunks of just over half the cap: the first fits, the second
+        // would push the file past it and is dropped instead of inflated.
+        let half = vec![b'a'; MAX_INFLATED_TEXT / 2 + 1];
+        let mut itxt = b"parameters\0\x01\x00\0\0".to_vec(); // compressed iTXt, no lang/translation
+        itxt.extend(zlib(b"a cat\nSteps: 20"));
+        let png = png_with_chunks(&[
+            (b"iTXt", itxt),
+            (b"zTXt", ztxt("first", &half)),
+            (b"zTXt", ztxt("second", &half)),
+        ]);
+        let map = read_png_text_chunks(&png);
+        assert_eq!(map.get("parameters").map(String::as_str), Some("a cat\nSteps: 20"));
+        assert_eq!(map.get("first").map(String::len), Some(half.len()));
+        assert!(!map.contains_key("second"), "over-budget chunk must be dropped");
     }
 }

@@ -134,7 +134,7 @@ pub fn show(
                         // Push it clear of the gear/panel edge so it sits in the
                         // gutter beside the left browser rather than overlapping it.
                         .gap(34.0)
-                        .frame(crate::card_frame(22))
+                        .frame(crate::float_card_frame(22))
                         .width(232.0)
                         .show(|ui| {
                             crate::left_panel_settings::panel(ui, media_filter);
@@ -294,7 +294,11 @@ fn thumbnail_list(
                     egui::vec2(tw, th),
                 );
 
-                let id = ui.id().with(("thumb", i));
+                // Keyed by file, not list position: if the list shifts while a
+                // tile's right-click menu is open (a crop or background removal
+                // inserts its result), the menu must stay with the file it was
+                // opened on, not act on whatever now sits at that position.
+                let id = ui.id().with(("thumb", &images[i]));
 
                 // Sense both buttons: left-click selects, right-click opens the
                 // tile menu below.

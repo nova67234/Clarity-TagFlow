@@ -355,7 +355,7 @@ pub fn same_tag(a: &str, b: &str) -> bool {
 
 /// Write `tag` the way `existing` writes theirs: underscores or spaces
 /// between words, and all lowercase when they all are.
-fn styled_like(existing: &[String], tag: &str) -> String {
+pub(crate) fn styled_like(existing: &[String], tag: &str) -> String {
     let words = |t: &&String| t.trim().contains([' ', '_']);
     let underscores = existing.iter().filter(words).filter(|t| t.contains('_') && !t.contains(' ')).count();
     let spaces = existing.iter().filter(words).filter(|t| t.contains(' ') && !t.contains('_')).count();

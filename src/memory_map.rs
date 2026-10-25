@@ -427,10 +427,23 @@ pub fn window(ctx: &egui::Context, llm: &mut crate::llm::LlmState) {
         crate::roleplay::remove_album_picture(&image);
     }
     if let Some(q) = ask {
-        llm.draft = q;
+        add_question(&mut llm.draft, &q);
         map.open = false;
     }
     llm.memory_map = map;
+}
+
+/// "Ask about this" puts its question in the chat box without throwing away
+/// what's typed there: an empty draft becomes the question, anything else
+/// gets it on a new line after it.
+fn add_question(draft: &mut String, question: &str) {
+    if draft.trim().is_empty() {
+        *draft = question.to_string();
+    } else {
+        draft.truncate(draft.trim_end().len());
+        draft.push('\n');
+        draft.push_str(question);
+    }
 }
 
 impl MapState {
@@ -1097,6 +1110,20 @@ mod tests {
         for a in ANCHORS {
             assert!(depth_in_brain(a).is_some(), "anchor {a:?} is outside the brain");
         }
+    }
+
+    /// "Ask about this" never clobbers a typed draft.
+    #[test]
+    fn ask_keeps_the_draft() {
+        let mut draft = String::new();
+        add_question(&mut draft, "What do you remember?");
+        assert_eq!(draft, "What do you remember?");
+        let mut draft = " \n".to_string();
+        add_question(&mut draft, "Q?");
+        assert_eq!(draft, "Q?");
+        let mut draft = "Half a thought \n".to_string();
+        add_question(&mut draft, "Q?");
+        assert_eq!(draft, "Half a thought\nQ?");
     }
 
     /// The cloud is the same every run (seeded) and fills its quota.

@@ -508,24 +508,57 @@ impl ModelManager {
     }
 
     fn start_download(&mut self, idx: usize) {
-        let info = self.entries[idx].info;
-        let shared = Arc::new(Progress::default());
-        shared.set_label("Connecting…".to_string());
-        self.entries[idx].progress = Some(shared.clone());
+        self.entries[idx].progress = Some(spawn_download(self.entries[idx].info));
         self.entries[idx].status = Status::Downloading;
+    }
+}
 
+/// Model downloads in flight, process-wide, by model folder. The Settings
+/// Download button, this tab and the first-use downloads (the mic, Spatial
+/// Scene, …) don't know about each other, and two transfers of one file
+/// write the same `.part` and race to rename it — which can leave a corrupt
+/// model that counts as installed. A second request joins the running
+/// download (and shows its progress) instead.
+static IN_FLIGHT: Mutex<Vec<(&'static str, Arc<Progress>)>> = Mutex::new(Vec::new());
+
+/// The running download of `folder`, or a fresh one registered for it
+/// (`true`: the caller starts it).
+fn claim(folder: &'static str) -> (Arc<Progress>, bool) {
+    let mut running = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, p)) = running.iter().find(|(f, _)| *f == folder) {
+        return (p.clone(), false);
+    }
+    let p = Arc::new(Progress::default());
+    p.set_label("Connecting…".to_string());
+    running.push((folder, p.clone()));
+    (p, true)
+}
+
+fn release(folder: &str) {
+    IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).retain(|(f, _)| *f != folder);
+}
+
+/// Download `info`'s files on a background thread (or join the download of
+/// them already running), returning the progress to poll.
+fn spawn_download(info: &'static ModelInfo) -> Arc<Progress> {
+    let (shared, start) = claim(info.folder);
+    if start {
         let files: Vec<(String, String)> =
             info.files.iter().map(|(n, u)| (n.to_string(), u.to_string())).collect();
-        let folder = info.folder.to_string();
-
+        let folder = info.folder;
+        let worker = shared.clone();
         std::thread::spawn(move || {
-            if let Err(e) = download_all(&files, &folder, &shared) {
-                shared.finish_err(e);
-            } else {
-                shared.finish_ok();
+            let res = download_all(&files, folder, &worker);
+            // Off the list before it reports done, so a retry after a
+            // failure starts a new download.
+            release(folder);
+            match res {
+                Ok(()) => worker.finish_ok(),
+                Err(e) => worker.finish_err(e),
             }
         });
     }
+    shared
 }
 
 // ---------------------------------------------------------------------------
@@ -559,24 +592,12 @@ impl DownloadHandle {
     }
 }
 
-/// Start downloading the catalog model in `folder` on a background thread,
-/// returning a handle to poll. `None` if no catalog entry has that folder.
+/// Start downloading the catalog model in `folder` on a background thread
+/// (or join its download already running), returning a handle to poll.
+/// `None` if no catalog entry has that folder.
 pub fn start_model_download(folder: &str) -> Option<DownloadHandle> {
     let info = CATALOG.iter().find(|m| m.folder == folder)?;
-    let shared = Arc::new(Progress::default());
-    shared.set_label("Connecting…".to_string());
-    let files: Vec<(String, String)> =
-        info.files.iter().map(|(n, u)| (n.to_string(), u.to_string())).collect();
-    let folder = info.folder.to_string();
-    let worker = shared.clone();
-    std::thread::spawn(move || {
-        if let Err(e) = download_all(&files, &folder, &worker) {
-            worker.finish_err(e);
-        } else {
-            worker.finish_ok();
-        }
-    });
-    Some(DownloadHandle { progress: shared })
+    Some(DownloadHandle { progress: spawn_download(info) })
 }
 
 /// A small rounded status pill: translucent tinted fill with matching text,
@@ -637,4 +658,26 @@ fn download_all(files: &[(String, String)], folder: &str, prog: &Progress) -> Re
         .map_err(|e| format!("{name}: {e}"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A second request for a model that's already downloading joins that
+    /// download (same progress) instead of starting a second transfer.
+    #[test]
+    fn one_download_per_model() {
+        let (a, started) = claim("test-in-flight-a");
+        let (b, again) = claim("test-in-flight-a");
+        assert!(started && !again, "the second request must not start another download");
+        assert!(Arc::ptr_eq(&a, &b), "it shows the running download's progress");
+        let (_, other) = claim("test-in-flight-b");
+        assert!(other, "another model downloads on its own");
+        release("test-in-flight-a");
+        release("test-in-flight-b");
+        let (c, fresh) = claim("test-in-flight-a");
+        assert!(fresh && !Arc::ptr_eq(&a, &c), "once it ended, a retry starts afresh");
+        release("test-in-flight-a");
+    }
 }

@@ -235,7 +235,7 @@ impl Source {
             Source::Pixabay => "comma-separated words to skip (matched against the tags)",
             Source::Wallhaven => "comma-separated tags to exclude from the search",
             Source::Gelbooru | Source::Safebooru | Source::Danbooru => {
-                "comma-separated tags to skip"
+                "comma-separated tags or words to skip (gore also skips blood_and_gore)"
             }
         }
     }
@@ -1787,7 +1787,7 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
                 log(format!("Skipped zip file: {}", post.file_url));
                 continue;
             }
-            if is_blacklisted(&post.raw_tags, &cfg.blacklist) {
+            if is_blacklisted(&post.raw_tags, &cfg.blacklist, true) {
                 log(format!("Skipped (blacklisted): {}", post.md5));
                 continue;
             }
@@ -1805,6 +1805,10 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
             }
 
             let file_name = format!("{}.{}", post.md5, ext);
+            if !is_plain_file_name(&file_name) {
+                log(format!("Skipped (bad file name): {file_name}"));
+                continue;
+            }
             let img_path = cfg.output_dir.join(&file_name);
             let txt_path = cfg.output_dir.join(format!("{}.txt", post.md5));
 
@@ -1823,9 +1827,10 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
                     }
                     continue;
                 }
+                // (download_file already removed its .part; `img_path` itself
+                // was never written, so anything there isn't ours to delete.)
                 Err(e) => {
                     log(format!("Error downloading {}: {e}", post.md5));
-                    let _ = std::fs::remove_file(&img_path);
                     continue;
                 }
             }
@@ -1906,9 +1911,14 @@ fn run_download(cfg: WorkerCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx:
 /// fails on every HTTPS call, which on a worker thread looked like a silent
 /// no-op. `http_status_as_error(false)` lets us inspect 4xx/5xx ourselves.
 /// Only the request-setup phases are bounded (DNS, connect, send, response
-/// headers) — those are blocking calls that can't see the cancel flag; the
-/// body is intentionally uncapped since it streams in 64 KB chunks that poll
-/// the cancel flag themselves.
+/// headers) — those are blocking calls that can't see the cancel flag. The
+/// body's total time is intentionally uncapped since it streams in 64 KB
+/// chunks that poll the cancel flag themselves; it only gets a per-read stall
+/// limit (`recv_body`), as a read that never returns can't see the flag
+/// either. `recv_response` must stay unset: ureq 3.3 also applies it to the
+/// body, cutting reads off 20 s after the headers (then allowing 1 s per
+/// read), which failed long video downloads on any brief stall.
+/// `send_request` still bounds the wait for the headers (see net.rs `agent`).
 fn make_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .tls_config(
@@ -1924,7 +1934,7 @@ fn make_agent() -> ureq::Agent {
         .timeout_resolve(Some(Duration::from_secs(10)))
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_send_request(Some(Duration::from_secs(15)))
-        .timeout_recv_response(Some(Duration::from_secs(20)))
+        .timeout_recv_body(Some(Duration::from_secs(20)))
         .build()
         .into()
 }
@@ -2207,7 +2217,7 @@ fn run_download_src(cfg: SrcCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx
             // Tag strings (boorus) and captions (Pexels alt) both honour the
             // blacklist; Wallhaven excludes at the query level instead.
             if let Some(tags) = &item.tags
-                && is_blacklisted(tags, &cfg.blacklist)
+                && is_blacklisted(tags, &cfg.blacklist, cfg.source.is_booru())
             {
                 log(format!("Skipped (blacklisted): {}", item.stem));
                 continue;
@@ -2225,6 +2235,10 @@ fn run_download_src(cfg: SrcCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx
             }
 
             let file_name = format!("{}.{}", item.stem, item.ext);
+            if !is_plain_file_name(&file_name) {
+                log(format!("Skipped (bad file name): {file_name}"));
+                continue;
+            }
             let dest = cfg.output_dir.join(&file_name);
             if dest.exists() {
                 log(format!("Skipped (file exists): {file_name}"));
@@ -2241,9 +2255,10 @@ fn run_download_src(cfg: SrcCfg, tx: Sender<DlMsg>, cancel: Arc<AtomicBool>, ctx
                     }
                     continue;
                 }
+                // (download_file already removed its .part; `dest` itself was
+                // never written, so anything there isn't ours to delete.)
                 Err(e) => {
                     log(format!("Error downloading {}: {e}", item.stem));
-                    let _ = std::fs::remove_file(&dest);
                     continue;
                 }
             }
@@ -2425,6 +2440,13 @@ fn fetch_items(
             sleep_cancellable(wait, cancel);
             continue;
         }
+        // Past page 1 the query is known good, so a 400 means this feed ran
+        // out: Pixabay answers a page beyond its last (or its 500-hit cap) with
+        // 400 "page is out of valid range". End just this feed — treated as
+        // fatal, it also abandoned the next one (videos after photos).
+        if status == 400 && page > 1 {
+            return Some(Vec::new());
+        }
 
         log(format!("Error: API returned status {status}."));
         return None;
@@ -2497,9 +2519,16 @@ fn fetch_page(
 }
 
 /// Stream a file to `dest`, honouring cancellation. Returns `Ok(true)` on
-/// success, `Ok(false)` on a non-success status (partial file removed).
+/// success, `Ok(false)` on a non-success status or a cancel.
 /// `referer` is the source's homepage — many CDNs 403 a hotlink without a
 /// matching Referer / Origin.
+///
+/// The body goes to `<dest>.part`, renamed into place only once complete
+/// (ureq errors on a body cut short of its length). Written straight to
+/// `dest`, a run killed mid-file — the app closed — left a truncated image
+/// under its real name, which the next run's "file exists" check skipped and
+/// logged as downloaded, for good. The `.part` is removed on any failure; one
+/// left by a killed run is simply overwritten next time.
 fn download_file(
     agent: &ureq::Agent,
     file_url: &str,
@@ -2523,23 +2552,39 @@ fn download_file(
         return Ok(false);
     }
 
-    let mut file = std::fs::File::create(dest).map_err(|e| e.to_string())?;
-    let mut reader = resp.body_mut().as_reader();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        if cancel.load(Ordering::SeqCst) {
-            drop(file);
-            let _ = std::fs::remove_file(dest);
-            return Ok(false);
+    let part = crate::net::part_path(dest);
+    let streamed = (|| -> Result<bool, String> {
+        let mut file = std::fs::File::create(&part).map_err(|e| e.to_string())?;
+        let mut reader = resp.body_mut().as_reader();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return Ok(false);
+            }
+            let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Ok(true);
+            }
+            use std::io::Write;
+            file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         }
-        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        use std::io::Write;
-        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+    })(); // `file` is closed here — Windows can't rename or delete an open file.
+    let result = match streamed {
+        Ok(true) => std::fs::rename(&part, dest).map(|_| true).map_err(|e| e.to_string()),
+        other => other,
+    };
+    if !matches!(result, Ok(true)) {
+        let _ = std::fs::remove_file(&part);
     }
-    Ok(true)
+    result
+}
+
+/// True when `name` is one plain file name. Stems and extensions come from the
+/// API's JSON or file URL (md5, file_ext, …); one carrying `..` or a separator
+/// would have put the file — and its `.txt` sidecar, possibly over a curated
+/// one — outside the output folder.
+fn is_plain_file_name(name: &str) -> bool {
+    Path::new(name).file_name() == Some(std::ffi::OsStr::new(name))
 }
 
 fn sleep_cancellable(total_ms: u64, cancel: &AtomicBool) {
@@ -2586,13 +2631,38 @@ fn build_final_tags(user_tags: &str, img: bool, gif: bool, vid: bool) -> String 
     tags.join(" ").trim().to_string()
 }
 
-fn is_blacklisted(raw_tags: &str, blacklist: &str) -> bool {
+/// Whether any comma-separated `blacklist` entry matches (case-insensitively).
+/// `whole_tags`: `raw_tags` is a booru's space-separated tag list, and an
+/// entry matches a tag when it's the whole tag or whole words of it — "gore"
+/// skips gore, gore_(xyz) and blood_and_gore, "male" skips male_focus but
+/// not female, "ai" skips ai_generated but not hair, chair or aiming, and
+/// "ass" not assassin (a plain substring test dropped all of those). Spaces
+/// in an entry stand for the tags' underscores ("long hair" is long_hair).
+/// Otherwise (Pexels / Pixabay caption text) an entry matches anywhere in it.
+fn is_blacklisted(raw_tags: &str, blacklist: &str, whole_tags: bool) -> bool {
     let tags_lower = raw_tags.to_lowercase();
     blacklist
         .split(',')
         .map(|b| b.trim().to_lowercase())
         .filter(|b| !b.is_empty())
-        .any(|b| tags_lower.contains(&b))
+        .any(|b| {
+            if whole_tags {
+                let b = b.split_whitespace().collect::<Vec<_>>().join("_");
+                tags_lower.split_whitespace().any(|t| has_words(t, &b))
+            } else {
+                tags_lower.contains(&b)
+            }
+        })
+}
+
+/// `entry` occurs in `tag` as whole words: it starts where a word starts (the
+/// tag's start, or after a `_`, `-`, `(` or other non-alphanumeric
+/// character) and ends where one ends.
+fn has_words(tag: &str, entry: &str) -> bool {
+    let boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
+    tag.match_indices(entry).any(|(i, m)| {
+        boundary(tag[..i].chars().next_back()) && boundary(tag[i + m.len()..].chars().next())
+    })
 }
 
 fn format_gelbooru_tags(raw: &str) -> String {
@@ -2852,7 +2922,8 @@ fn save_config(cfg: &SavedConfig) {
         wallhaven_opts: cfg.wallhaven_opts.clone(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&on_disk) {
-        let _ = std::fs::write(config_path(), json);
+        // Owner-only on Linux/macOS, where `protect` is just obfuscation.
+        let _ = crate::secret::write_private(config_path(), json);
     }
 }
 
@@ -2936,5 +3007,38 @@ fn append_download_log(md5: &str, set: &mut HashSet<String>) {
     let list: Vec<&String> = set.iter().collect();
     if let Ok(json) = serde_json::to_string(&list) {
         let _ = std::fs::write(download_log_path(), json);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn booru_blacklist_matches_whole_tags() {
+        let tags = "1girl female long_hair Chair tail blood_and_gore";
+        assert!(!is_blacklisted(tags, "male", true), "\"male\" must not match \"female\"");
+        assert!(!is_blacklisted(tags, "ai, air, ail", true), "nor the middle of chair / long_hair / tail");
+        assert!(is_blacklisted(tags, "male, FEMALE", true), "whole tags, case-insensitive");
+        assert!(is_blacklisted(tags, " chair ", true));
+        assert!(is_blacklisted(tags, "gore", true), "a word of a tag: blood_and_gore");
+        assert!(is_blacklisted(tags, "hair", true), "long_hair");
+        assert!(is_blacklisted(tags, "long hair", true), "spaces for underscores");
+        assert!(is_blacklisted("male_focus", "male", true), "a tag's first word");
+        assert!(is_blacklisted("pokemon_(creature)", "creature", true));
+        assert!(!is_blacklisted("assassin aiming category", "ass, ai, cat", true), "only whole words");
+        assert!(is_blacklisted("gore_(series)", "gore", true));
+        assert!(!is_blacklisted(tags, " , ", true), "blank entries never match");
+        // Caption text (Pexels/Pixabay) still matches anywhere.
+        assert!(is_blacklisted("Red flowers, garden", "flower", false));
+    }
+
+    #[test]
+    fn api_supplied_file_names_must_stay_in_the_folder() {
+        assert!(is_plain_file_name("0123abcd.jpg"));
+        assert!(is_plain_file_name("pexels-video-42.mp4"));
+        assert!(!is_plain_file_name("../../dataset/img001.jpg"));
+        assert!(!is_plain_file_name("abc.com/photos/1/x"));
+        assert!(!is_plain_file_name("/abs.png"));
     }
 }

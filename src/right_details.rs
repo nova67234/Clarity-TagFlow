@@ -150,6 +150,9 @@ pub struct RightPanelState {
     /// The sidecar exists but couldn't be read. Editing is blocked so the
     /// empty box can never be saved over the real tags.
     tags_error: Option<String>,
+    /// A message for the app's status toast — an edit that couldn't be saved
+    /// when the panel moved on (taken by `main.rs` each frame).
+    pub notice: Option<String>,
     /// Artist/character tags for the current image (looked up by md5 from the
     /// shared tag_roles.json), so the tag box can colour artist orange / char green.
     tag_roles: TagRoles,
@@ -230,6 +233,7 @@ impl Default for RightPanelState {
             loaded_tags: String::new(),
             tags_encoding: crate::sidecar::Encoding::Utf8,
             tags_error: None,
+            notice: None,
             tag_roles: TagRoles::default(),
             roles_cache: None,
             sd_metadata: None,
@@ -276,12 +280,64 @@ impl RightPanelState {
     }
 
     /// Tags were written to `image`'s .txt from outside the panel (the AI
-    /// chat's Tag images mode): show them, as saved.
+    /// chat's Tag images mode, the gallery popup): show them, as saved.
     pub fn tags_written(&mut self, image: &Path, text: &str) {
         if self.last_path.as_deref() == Some(image) {
             self.current_tags = text.to_string();
             self.loaded_tags = text.to_string();
             self.tags_error = None;
+        }
+    }
+
+    /// `image` is about to be moved: an unsaved edit of its tags is written
+    /// first, so it travels with the .txt — saved afterwards (on the next
+    /// frame's selection change) it went to the old path and left a stray
+    /// .txt behind. False when that save failed (don't move then).
+    pub fn save_before_move(&mut self, image: &Path) -> bool {
+        if !self.unsaved_edit(image) {
+            return true;
+        }
+        let ok = save_tags(self, image);
+        if ok {
+            self.is_editing = false;
+        }
+        ok
+    }
+
+    /// `image` was deleted: drop an unsaved edit of its tags rather than
+    /// write it back afterwards (which recreated the deleted image's .txt).
+    pub fn discard_edit_of(&mut self, image: &Path) {
+        if self.last_path.as_deref() == Some(image) {
+            self.current_tags.clone_from(&self.loaded_tags);
+            self.is_editing = false;
+        }
+    }
+
+    /// Write an unsaved Details edit to disk (the app is closing).
+    pub fn save_pending_edit(&mut self) {
+        save_on_leave(self);
+    }
+}
+
+/// The panel is leaving an image with an unsaved edit (another image, another
+/// view, the app closing): save it, or say why it wasn't — the image is gone
+/// (moved or deleted elsewhere: writing would only leave a .txt with no
+/// image) or the write failed. Zip entries are view-only and never written.
+fn save_on_leave(state: &mut RightPanelState) {
+    if state.is_editing
+        && state.current_tags != state.loaded_tags
+        && let Some(prev) = state.last_path.clone()
+        && !crate::archive::is_entry(&prev)
+    {
+        if !prev.exists() {
+            let name = prev.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            eprintln!("[tags] {} is gone — its tag edit wasn't saved", prev.display());
+            state.notice = Some(format!("The tag edit of {name} wasn't saved — the image is gone"));
+            // Nor left in the buffer, where the Tag Manager or AI tagging
+            // would take it for the image's tags.
+            state.current_tags.clone_from(&state.loaded_tags);
+        } else if !save_tags(state, &prev) {
+            edit_not_saved(state, &prev);
         }
     }
 }
@@ -298,13 +354,7 @@ pub fn show_tag_panel(
     // An unsaved edit from the Details view is saved first, so the AI and the
     // Tag Manager never work from text that isn't on disk.
     if state.is_editing {
-        if state.current_tags != state.loaded_tags
-            && let Some(prev) = state.last_path.clone()
-            && !crate::archive::is_entry(&prev)
-            && !save_tags(state, &prev)
-        {
-            eprintln!("[tags] couldn't save the edit to {}", sidecar_txt(&prev).display());
-        }
+        save_on_leave(state);
         state.is_editing = false;
     }
     sync_selection(state, current_image, ui.ctx());
@@ -333,6 +383,14 @@ pub enum RightPanelAction {
     MoveCurrent,
 }
 
+/// An edit of `image` couldn't be saved as the panel moved on: say so (it
+/// used to vanish with only a console line).
+fn edit_not_saved(state: &mut RightPanelState, image: &Path) {
+    let name = image.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    eprintln!("[tags] couldn't save the edit to {}", sidecar_txt(image).display());
+    state.notice = Some(format!("Couldn't save the tag edit of {name}"));
+}
+
 /// Write the edited tags of `image` to its sidecar, in the encoding it was
 /// read with. An empty edit on an image with no sidecar writes nothing (no
 /// stray empty `.txt` files). True on success.
@@ -352,21 +410,29 @@ fn save_tags(state: &mut RightPanelState, image: &Path) -> bool {
     ok
 }
 
+/// Re-read `image`'s tags from disk before an edit starts, so the edit begins
+/// from the file as it is now — another view (the gallery popup, the Tag
+/// Manager) or another program may have changed it since it was loaded, and
+/// saving the stale text would undo that. A read failure keeps what's shown.
+fn reload_tags(state: &mut RightPanelState, image: &Path) {
+    if let Ok(sc) = crate::sidecar::read(&sidecar_txt(image)) {
+        state.current_tags = sc.text;
+        state.loaded_tags.clone_from(&state.current_tags);
+        state.tags_encoding = sc.encoding;
+        state.tags_error = None;
+    }
+}
+
 /// Load the newly selected image's tags (and kick off its metadata) when the
 /// selection changes, saving an unsaved edit of the image being left first.
 /// Shared by the right panel and the AI chat's Tag images view.
 fn sync_selection(state: &mut RightPanelState, current_image: Option<&Path>, ctx: &egui::Context) {
     if state.last_path.as_deref() != current_image {
         // Leaving an image mid-edit (clicking another thumbnail, arrow keys)
-        // saves the edit instead of silently dropping it.
-        if state.is_editing
-            && state.current_tags != state.loaded_tags
-            && let Some(prev) = state.last_path.clone()
-            && !crate::archive::is_entry(&prev)
-            && !save_tags(state, &prev)
-        {
-            eprintln!("[tags] couldn't save the edit to {}", sidecar_txt(&prev).display());
-        }
+        // saves the edit instead of silently dropping it — unless the image
+        // itself is gone (moved or deleted elsewhere): saving then would only
+        // leave a .txt with no image.
+        save_on_leave(state);
         state.last_path = current_image.map(|p| p.to_path_buf());
         state.is_editing = false;
         state.show_delete_confirm = false; // Reset delete prompt when navigating away
@@ -466,6 +532,14 @@ pub fn show(
 
     // 1. Sync the text box state when the selected image changes.
     sync_selection(state, current_image, ui.ctx());
+    // An edit is saved when the menu switches away from Details (as the Tag
+    // images view does): the Tag Manager, AI tagging and Add All then work
+    // from the file, and the edit isn't left behind in the buffer for them
+    // to overwrite.
+    if state.view != RightView::Details && state.is_editing {
+        save_on_leave(state);
+        state.is_editing = false;
+    }
 
     let mut action = RightPanelAction::None;
 
@@ -513,7 +587,7 @@ pub fn show(
                         .align(egui::RectAlign::BOTTOM_END)
                         .frame(
                             egui::Frame::new()
-                                .fill(PANEL())
+                                .fill(FLOAT())
                                 .corner_radius(egui::CornerRadius::same(22))
                                 .inner_margin(egui::Margin::same(12))
                                 .stroke(egui::Stroke::new(1.0, EDGE())),
@@ -780,6 +854,9 @@ pub fn show(
                                     }
 
                                     if ui.add_enabled(!read_only, edit_btn).clicked() {
+                                        if !state.is_editing {
+                                            reload_tags(state, img_path);
+                                        }
                                         if state.showing_meta {
                                             // The metadata view is read-only. Clicking
                                             // Edit Text here drops to the .txt tags view
@@ -891,8 +968,19 @@ pub fn show(
                                                     )
                                                     .clicked()
                                                 {
-                                                    state.showing_meta = !state.showing_meta;
-                                                    state.is_editing = false; // leave edit mode on switch
+                                                    // Leave edit mode on switch — saving the
+                                                    // edit first (it used to be dropped on the
+                                                    // next image change). A failed save stays
+                                                    // in edit mode with the red flash.
+                                                    let saved = !state.is_editing
+                                                        || state.current_tags == state.loaded_tags
+                                                        || save_tags(state, img_path);
+                                                    if saved {
+                                                        state.showing_meta = !state.showing_meta;
+                                                        state.is_editing = false;
+                                                    } else {
+                                                        state.save_flash = Some((Instant::now(), false));
+                                                    }
                                                 }
                                             },
                                         );
@@ -1708,7 +1796,7 @@ pub(crate) fn delete_confirm_dialog(
         .resizable(false)
         .collapsible(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO) // Anchor directly in the middle of the screen
-        .frame(card_frame(22)) // match the rest of the UI (PANEL() fill, radius 22, shadow)
+        .frame(crate::float_card_frame(22)) // match the rest of the UI (radius 22, shadow; opaque fill)
         .show(ctx, |ui| {
             ui.set_max_width(260.0); // Stop it from stretching too wide
 

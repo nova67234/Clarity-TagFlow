@@ -124,7 +124,8 @@ impl RoleplayState {
         }
         if let Ok(json) = serde_json::to_string(self) {
             let _ = std::fs::create_dir_all(crate::tagger::models_root());
-            let _ = std::fs::write(store_path(), crate::secret::protect(&json));
+            // Owner-only on Linux/macOS, where `protect` is just obfuscation.
+            let _ = crate::secret::write_private(store_path(), crate::secret::protect(&json));
         }
     }
 
@@ -155,9 +156,9 @@ impl RoleplayState {
         let name = format!("img_{n:03}.{ext}");
 
         let bytes = std::fs::read(src).map_err(|e| format!("read image: {e}"))?;
-        std::fs::write(dir.join(format!("{name}.enc")), crate::secret::protect_bytes(&bytes))
+        crate::secret::write_private(dir.join(format!("{name}.enc")), crate::secret::protect_bytes(&bytes))
             .map_err(|e| format!("save image: {e}"))?;
-        std::fs::write(
+        crate::secret::write_private(
             dir.join(format!("img_{n:03}.txt.enc")),
             crate::secret::protect_bytes(why.as_bytes()),
         )
@@ -175,7 +176,8 @@ impl RoleplayState {
         let dir = album_temp_dir();
         std::fs::create_dir_all(&dir).ok()?;
         let tmp = dir.join(&name);
-        std::fs::write(&tmp, bytes).ok()?;
+        // The decrypted picture: owner-only on Linux/macOS (a shared /tmp).
+        crate::secret::write_private(&tmp, bytes).ok()?;
         Some(tmp)
     }
 

@@ -56,6 +56,8 @@ pub fn read_text_lossy(txt: &Path) -> String {
 }
 
 /// Write `text` to `txt` in `encoding` (Windows-1252 is written as UTF-8).
+/// The file is replaced in one step (see [`replace_file`]), never truncated
+/// in place.
 pub fn write(txt: &Path, text: &str, encoding: Encoding) -> std::io::Result<()> {
     let bytes: Vec<u8> = match encoding {
         Encoding::Utf8 | Encoding::Windows1252 => text.as_bytes().to_vec(),
@@ -71,7 +73,118 @@ pub fn write(txt: &Path, text: &str, encoding: Encoding) -> std::io::Result<()> 
             b
         }
     };
-    std::fs::write(txt, bytes)
+    replace_file(txt, &bytes)
+}
+
+/// Replace `path`'s contents with `bytes`: they go to a temporary file in
+/// the same folder, which is then renamed over `path`. A crash mid-write
+/// leaves the old file (plus a stray `.tmp`), where truncating in place left
+/// an empty or half-written `.txt`. On failure the temporary file is removed
+/// and `path` is untouched.
+///
+/// An existing file is written in place, the old way, where a replace can't
+/// work: it has other hard links (a rename would split it from them, and
+/// they'd keep the old tags), the folder allows writing the file but not
+/// creating one next to it, or the rename is refused (on Windows, another
+/// program holding the `.txt` open without delete sharing).
+fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    // A symlinked sidecar: replace the file it points at and keep the link
+    // (renaming over the link would swap it for a plain file).
+    let path = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path)?,
+        _ => path.to_path_buf(),
+    };
+    let existing = std::fs::metadata(&path).ok();
+    // A read-only sidecar stays as it is, as with the in-place write (a
+    // rename would replace it anyway).
+    if existing.as_ref().is_some_and(|m| m.permissions().readonly()) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the file is read-only"));
+    }
+    let is_file = existing.as_ref().is_some_and(std::fs::Metadata::is_file);
+    #[cfg(unix)]
+    if is_file && existing.as_ref().is_some_and(|m| std::os::unix::fs::MetadataExt::nlink(m) > 1) {
+        return write_in_place(&path, bytes);
+    }
+    let (tmp, mut file) = match create_temp(&path, existing.as_ref()) {
+        Ok(created) => created,
+        Err(_) if is_file => return write_in_place(&path, bytes),
+        Err(e) => return Err(e),
+    };
+    let written = file.write_all(bytes);
+    drop(file);
+    if let Err(e) = written {
+        // Out of space, most likely — writing in place would fail the same
+        // way, after cutting the old file short. Leave it as it is.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    match rename_over(&tmp, &path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            if is_file { write_in_place(&path, bytes) } else { Err(e) }
+        }
+    }
+}
+
+/// Overwrite an existing file's contents where it is: the new bytes first,
+/// then the file cut to their length, so it's never left empty.
+fn write_in_place(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.write_all(bytes)?;
+    file.set_len(bytes.len() as u64)
+}
+
+/// A new, empty file next to `path` (the same folder, so the rename stays on
+/// one volume) under a name no other write is using, carrying over what the
+/// in-place write kept: the Unix permission bits, or the Windows hidden /
+/// system attributes.
+fn create_temp(path: &Path, existing: Option<&std::fs::Metadata>) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let name = file_name(path);
+    let mut tries = 0;
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_file_name(format!(".{name}.{}-{n}.tmp", std::process::id()));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(windows)]
+        if let Some(m) = existing {
+            use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+            const HIDDEN_SYSTEM: u32 = 0x2 | 0x4;
+            opts.attributes(m.file_attributes() & HIDDEN_SYSTEM);
+        }
+        match opts.open(&tmp) {
+            Ok(file) => {
+                if cfg!(unix) && let Some(m) = existing {
+                    let _ = file.set_permissions(m.permissions());
+                }
+                return Ok((tmp, file));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 100 => tries += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `std::fs::rename`, retried for a moment on Windows: an antivirus scan or
+/// the search indexer can hold the just-written file open briefly, failing
+/// the rename with "access denied" / a sharing violation.
+fn rename_over(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+            Err(e) if cfg!(windows) && tries < 5 && matches!(e.raw_os_error(), Some(5 | 32 | 33)) => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
 }
 
 /// Decode sidecar bytes: UTF-16 by BOM, UTF-8 (with or without BOM), else
@@ -246,6 +359,93 @@ mod tests {
         assert_eq!((s.text.as_str(), s.encoding, s.existed), ("1girl, 猫", Encoding::Utf16Le, true));
         let missing = read(&dir.join("none.txt")).unwrap();
         assert!(!missing.existed && missing.text.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh, empty scratch folder for one test.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("clarity_sidecar_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Temporary files a write left behind in `dir`.
+    fn leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn write_replaces_the_whole_file_in_its_encoding() {
+        let dir = scratch("replace");
+        let p = dir.join("a.txt");
+        std::fs::write(&p, "a much longer original caption, with, many, tags").unwrap();
+        write(&p, "1girl, 猫", Encoding::Utf16Le).unwrap();
+        let utf16: Vec<u8> = [0xFF, 0xFE].into_iter().chain("1girl, 猫".encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        assert_eq!(std::fs::read(&p).unwrap(), utf16);
+        write(&p, "bom", Encoding::Utf8Bom).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"\xEF\xBB\xBFbom");
+        write(&dir.join("new.txt"), "fresh", Encoding::Windows1252).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("new.txt")).unwrap(), "fresh");
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_write_leaves_the_old_file_and_no_temp() {
+        let dir = scratch("fail");
+        // A folder in the way: the final rename fails.
+        std::fs::create_dir_all(dir.join("taken.txt")).unwrap();
+        assert!(write(&dir.join("taken.txt"), "x", Encoding::Utf8).is_err());
+        assert!(dir.join("taken.txt").is_dir());
+        // A read-only sidecar is left alone, as the in-place write did.
+        let ro = dir.join("ro.txt");
+        std::fs::write(&ro, "keep").unwrap();
+        let original = std::fs::metadata(&ro).unwrap().permissions();
+        let mut read_only = original.clone();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&ro, read_only).unwrap();
+        assert!(write(&ro, "x", Encoding::Utf8).is_err());
+        assert_eq!(std::fs::read_to_string(&ro).unwrap(), "keep");
+        std::fs::set_permissions(&ro, original).unwrap();
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_keeps_a_symlink_and_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("link");
+        std::fs::write(dir.join("shared.txt"), "old").unwrap();
+        std::fs::set_permissions(dir.join("shared.txt"), std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(dir.join("shared.txt"), dir.join("a.txt")).unwrap();
+        write(&dir.join("a.txt"), "new", Encoding::Utf8).unwrap();
+        assert!(std::fs::symlink_metadata(dir.join("a.txt")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(dir.join("shared.txt")).unwrap(), "new");
+        let mode = std::fs::metadata(dir.join("shared.txt")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sidecar with another hard link is written in place: both names keep
+    /// showing the same (new) tags.
+    #[cfg(unix)]
+    #[test]
+    fn write_keeps_hard_links_together() {
+        let dir = scratch("hardlink");
+        std::fs::write(dir.join("a.txt"), "a much longer old caption").unwrap();
+        std::fs::hard_link(dir.join("a.txt"), dir.join("b.txt")).unwrap();
+        write(&dir.join("a.txt"), "new", Encoding::Utf8).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "new");
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

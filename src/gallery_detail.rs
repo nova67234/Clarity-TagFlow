@@ -35,10 +35,32 @@ enum DetailMsg {
 pub struct DetailPopup {
     pub open: bool,
     view: PopupView,
-    index: Option<usize>,
     path: Option<PathBuf>,
     /// Sidecar `.txt` tags (editable).
     tags: String,
+    /// `tags` as last read from / written to disk — an edit is unsaved while
+    /// the two differ (saved when the popup pages on, closes or moves).
+    loaded_tags: String,
+    /// How the sidecar was encoded (ANSI / UTF-16 files are read and written
+    /// back the same way, through `sidecar`).
+    tags_encoding: crate::sidecar::Encoding,
+    /// The sidecar exists but couldn't be read: editing is off, so the empty
+    /// box can't be saved over the real tags.
+    tags_error: Option<String>,
+    /// The last tags this popup wrote, for the app to show in the right
+    /// panel (taken by `main.rs` each frame).
+    pub saved: Option<(PathBuf, String)>,
+    /// A message for the app's status line — an edit that couldn't be saved
+    /// as the popup paged on, or was dropped because its image is gone
+    /// (taken by `main.rs` each frame).
+    pub notice: Option<String>,
+    /// Why the last save failed, shown under the tag box until a save works
+    /// or the popup moves on.
+    save_error: Option<String>,
+    /// A close (or Move) was stopped by a failed save: the next one drops the
+    /// edit and goes ahead, so a .txt that can't be written can't keep the
+    /// popup from closing.
+    close_blocked: bool,
     /// Embedded SD generation metadata, if any (read-only, formatted for display).
     metadata: Option<String>,
     /// The raw (unformatted) metadata, handed to the Civitai panel so its
@@ -93,9 +115,15 @@ impl Default for DetailPopup {
         Self {
             open: false,
             view: PopupView::Details,
-            index: None,
             path: None,
             tags: String::new(),
+            loaded_tags: String::new(),
+            tags_encoding: crate::sidecar::Encoding::Utf8,
+            tags_error: None,
+            saved: None,
+            notice: None,
+            save_error: None,
+            close_blocked: false,
             metadata: None,
             metadata_raw: None,
             meta_loaded: false,
@@ -120,19 +148,41 @@ impl Default for DetailPopup {
 }
 
 impl DetailPopup {
-    /// Open the popup for `path` (the image at `index` in the folder list),
-    /// loading its tags, metadata and details once. The details-card metadata
-    /// (full decode + colour palette) loads on a background thread; everything
-    /// read here synchronously is cheap (sidecar txt, embedded text chunks,
-    /// the mtime-cached roles map).
-    pub fn open_for(&mut self, index: usize, path: &Path, ctx: &egui::Context) {
+    /// Open the popup for `path`, loading its tags, metadata and details once.
+    /// The details-card metadata (full decode + colour palette) loads on a
+    /// background thread; everything read here synchronously is cheap
+    /// (sidecar txt, embedded text chunks, the mtime-cached roles map).
+    pub fn open_for(&mut self, path: &Path, ctx: &egui::Context) {
+        // Paging on (arrow keys, another tile) saves an unsaved tag edit of
+        // the image being left, as the right panel does — it used to be
+        // dropped. One that can't be saved is reported, not lost silently.
+        if self.open && !self.save_edit() {
+            let name = self.path.as_deref().map(crate::file_label).unwrap_or_default();
+            let why = self.save_error.take().map(|e| format!(" — {e}")).unwrap_or_default();
+            self.notice = Some(format!("Couldn't save the tag edit of {name}{why}"));
+        }
+        self.save_error = None;
+        self.close_blocked = false;
         self.open = true;
         // `self.view` is intentionally left alone: the popup reopens on whichever
         // view (Details / Civitai) was selected last.
-        self.index = Some(index);
         self.path = Some(path.to_path_buf());
-        let txt = right_details::sidecar_txt(path);
-        self.tags = std::fs::read_to_string(&txt).unwrap_or_default();
+        // Through `sidecar`, like the right panel: ANSI / UTF-16 sidecars and
+        // ones inside a mounted zip read too, instead of showing empty — an
+        // empty box that Edit → Save then wrote over the real tags.
+        match crate::sidecar::read(&right_details::sidecar_txt(path)) {
+            Ok(sc) => {
+                self.tags = sc.text;
+                self.tags_encoding = sc.encoding;
+                self.tags_error = None;
+            }
+            Err(e) => {
+                self.tags.clear();
+                self.tags_encoding = crate::sidecar::Encoding::Utf8;
+                self.tags_error = Some(e);
+            }
+        }
+        self.loaded_tags.clone_from(&self.tags);
         self.metadata = None;
         self.metadata_raw = None;
         self.meta_loaded = false;
@@ -191,15 +241,88 @@ impl DetailPopup {
     pub fn playing_video(&self) -> Option<&Path> {
         self.video_player.as_ref().and(self.video_path.as_deref())
     }
+
+    /// Save an unsaved tag edit (paging on, closing, Move, the app exiting).
+    /// True when there was nothing to save or the save worked. An image
+    /// that's gone (moved or deleted elsewhere) isn't written for — that
+    /// would leave a lone .txt — and the dropped edit is reported.
+    pub fn save_edit(&mut self) -> bool {
+        if !self.editing || self.tags == self.loaded_tags {
+            return true;
+        }
+        let Some(path) = self.path.clone() else { return true };
+        if !path.exists() {
+            self.notice = Some(format!(
+                "The tag edit of {} wasn't saved — the image is gone",
+                crate::file_label(&path)
+            ));
+            self.tags.clone_from(&self.loaded_tags);
+            self.editing = false;
+            return true;
+        }
+        let ok = self.write_tags(&path);
+        if ok {
+            self.editing = false;
+        }
+        ok
+    }
+
+    /// `path` is about to be moved (from the browser, say, with the popup
+    /// open on it): an unsaved edit of its tags is saved first, so it travels
+    /// with the .txt. False when that save failed (don't move then).
+    pub fn save_before_move(&mut self, path: &Path) -> bool {
+        self.path.as_deref() != Some(path) || self.save_edit()
+    }
+
+    /// `path` was deleted: drop an unsaved edit of its tags (saving it later
+    /// would only report the image gone).
+    pub fn discard_edit_of(&mut self, path: &Path) {
+        if self.path.as_deref() == Some(path) {
+            self.tags.clone_from(&self.loaded_tags);
+            self.editing = false;
+        }
+    }
+
+    /// Write the tag box to `path`'s sidecar in the encoding it was read
+    /// with. Nothing is written over a sidecar that couldn't be read, and an
+    /// empty box for an image without a .txt creates none.
+    fn write_tags(&mut self, path: &Path) -> bool {
+        if self.tags_error.is_some() {
+            self.save_error = Some("its .txt couldn't be read".to_string());
+            return false;
+        }
+        let txt = right_details::sidecar_txt(path);
+        if !txt.exists() && self.tags.trim().is_empty() {
+            self.loaded_tags.clone_from(&self.tags);
+            self.save_error = None;
+            self.close_blocked = false;
+            return true;
+        }
+        match crate::sidecar::write(&txt, &self.tags, self.tags_encoding) {
+            Ok(()) => {
+                self.loaded_tags.clone_from(&self.tags);
+                self.saved = Some((path.to_path_buf(), self.tags.clone()));
+                self.save_error = None;
+                self.close_blocked = false;
+                true
+            }
+            Err(e) => {
+                self.save_error = Some(e.to_string());
+                false
+            }
+        }
+    }
 }
 
-/// What the popup asks the app to do after it closes.
+/// What the popup asks the app to do after it closes. Files are named by
+/// path: a list position remembered while the popup was open could name
+/// another file by the time the action ran.
 pub enum DetailAction {
     None,
     /// Move this image to a folder the user picks.
-    Move(usize),
+    Move(PathBuf),
     /// Delete this image.
-    Delete(usize),
+    Delete(PathBuf),
     /// A viewer right-click action (favorite / crop / copy / remove-bg) for `path`,
     /// applied by the app exactly like the centre viewer's.
     Viewer(crate::zoom::ViewerAction, PathBuf),
@@ -252,7 +375,6 @@ pub fn show(
         popup.open = false;
         return DetailAction::None;
     };
-    let index = popup.index;
 
     let mut action = DetailAction::None;
     let mut want_close = false;
@@ -322,7 +444,6 @@ pub fn show(
                             popup,
                             civitai,
                             &path,
-                            index,
                             *confirm_before_delete,
                             &mut action,
                             &mut want_close,
@@ -345,16 +466,45 @@ pub fn show(
                 if popup.skip_delete_confirm {
                     *confirm_before_delete = false;
                 }
-                if let Some(i) = index {
-                    action = DetailAction::Delete(i);
-                    want_close = true;
-                }
+                // The edit goes with the image.
+                popup.editing = false;
+                action = DetailAction::Delete(path.clone());
+                want_close = true;
             }
             Some(false) => popup.show_delete_confirm = false,
             None => {}
         }
     }
 
+    // Closing saves an unsaved tag edit (it used to be dropped). A failed
+    // save keeps the popup open with the error under the tag box, and stops
+    // a Move. Closing (or Move) again tries once more — a lock held by an
+    // antivirus or sync app has often cleared by then — and if that fails
+    // too, drops the edit (saying so) and goes ahead: a .txt that can't be
+    // written mustn't keep the popup from closing.
+    if want_close && !matches!(action, DetailAction::Delete(_)) {
+        if popup.close_blocked {
+            if !popup.save_edit() {
+                let why = popup.save_error.take().map(|e| format!(" — {e}")).unwrap_or_default();
+                popup.notice =
+                    Some(format!("The tag edit of {} wasn't saved{why}", crate::file_label(&path)));
+                popup.tags.clone_from(&popup.loaded_tags);
+                popup.editing = false;
+            }
+            popup.close_blocked = false;
+            popup.save_error = None;
+        } else if !popup.save_edit() {
+            popup.save_flash = Some((Instant::now(), false));
+            popup.close_blocked = true;
+            // The error shows in the Details view.
+            popup.view = PopupView::Details;
+            popup.showing_meta = false;
+            want_close = false;
+            if matches!(action, DetailAction::Move(_)) {
+                action = DetailAction::None;
+            }
+        }
+    }
     if want_close {
         popup.open = false;
         // Stop playback right away (don't wait a frame for the early return).
@@ -371,7 +521,6 @@ fn right_column(
     popup: &mut DetailPopup,
     civitai: &mut crate::civitai::CivitaiState,
     path: &Path,
-    index: Option<usize>,
     confirm_before_delete: bool,
     action: &mut DetailAction,
     want_close: &mut bool,
@@ -430,7 +579,7 @@ fn right_column(
 
     match popup.view {
         PopupView::Details => {
-            details_content(ui, popup, path, index, confirm_before_delete, action, want_close)
+            details_content(ui, popup, path, confirm_before_delete, action, want_close)
         }
         PopupView::Civitai => {
             if popup.meta_loaded {
@@ -457,7 +606,6 @@ fn details_content(
     ui: &mut egui::Ui,
     popup: &mut DetailPopup,
     path: &Path,
-    index: Option<usize>,
     confirm_before_delete: bool,
     action: &mut DetailAction,
     want_close: &mut bool,
@@ -468,7 +616,7 @@ fn details_content(
         .frame(egui::Frame::NONE.inner_margin(egui::Margin::ZERO))
         .show_inside(ui, |ui| {
             ui.add_space(6.0);
-            actions_row(ui, popup, path, index, confirm_before_delete, action, want_close);
+            actions_row(ui, popup, path, confirm_before_delete, action, want_close);
             ui.add_space(10.0);
             right_details::image_details_section(ui, &popup.meta);
         });
@@ -508,13 +656,40 @@ fn details_content(
                             )
                             .clicked()
                         {
-                            popup.showing_meta = !popup.showing_meta;
-                            popup.editing = false; // leave edit mode on switch
+                            // Leave edit mode on switch — saving the edit
+                            // first (it used to be dropped).
+                            if popup.save_edit() {
+                                popup.showing_meta = !popup.showing_meta;
+                                popup.editing = false;
+                            } else {
+                                popup.save_flash = Some((Instant::now(), false));
+                            }
                         }
                     });
                 }
             });
             ui.add_space(6.0);
+            if let Some(e) = popup.tags_error.as_ref().filter(|_| !popup.showing_meta) {
+                ui.label(
+                    egui::RichText::new(format!("{e} — editing is off so the file isn't overwritten."))
+                        .color(egui::Color32::from_rgb(210, 70, 70))
+                        .size(12.0),
+                );
+                ui.add_space(4.0);
+            }
+            if let Some(e) = popup.save_error.as_ref().filter(|_| popup.editing && !popup.showing_meta) {
+                let hint = if popup.close_blocked {
+                    " Close or Move again to try once more, then drop the edit."
+                } else {
+                    ""
+                };
+                ui.label(
+                    egui::RichText::new(format!("Couldn't save the tags — {e}.{hint}"))
+                        .color(egui::Color32::from_rgb(210, 70, 70))
+                        .size(12.0),
+                );
+                ui.add_space(4.0);
+            }
             tags_box_fill(ui, popup);
         });
 }
@@ -524,7 +699,6 @@ fn actions_row(
     ui: &mut egui::Ui,
     popup: &mut DetailPopup,
     path: &Path,
-    index: Option<usize>,
     confirm_before_delete: bool,
     action: &mut DetailAction,
     want_close: &mut bool,
@@ -575,22 +749,21 @@ fn actions_row(
         ) {
             edit_btn = edit_btn.fill(fill);
         }
-        if ui.add_sized(size, edit_btn).clicked() {
+        // Images inside a mounted zip are view-only, and so is a sidecar that
+        // couldn't be read (the empty box must never be saved over it).
+        let read_only = crate::archive::is_entry(path) || popup.tags_error.is_some();
+        let edit_btn = edit_btn.min_size(size);
+        if ui.add_enabled(!read_only, edit_btn).clicked() {
             if popup.showing_meta {
                 // The metadata view is read-only. Clicking Edit Text here drops
-                // to the .txt tags view, creating the sidecar file if it doesn't
-                // exist yet, and enters edit mode.
-                let txt = right_details::sidecar_txt(path);
-                if !txt.exists() {
-                    let _ = std::fs::write(&txt, &popup.tags);
-                }
+                // to the .txt tags view in edit mode; the sidecar is only
+                // created when something is actually saved.
                 popup.showing_meta = false;
                 popup.editing = true;
                 popup.edit_flash_start = Some(Instant::now());
                 popup.save_flash = None;
             } else if popup.editing {
-                let txt = right_details::sidecar_txt(path);
-                let ok = std::fs::write(&txt, &popup.tags).is_ok();
+                let ok = popup.write_tags(path);
                 if ok {
                     popup.editing = false; // saved — back to view mode
                 }
@@ -602,25 +775,26 @@ fn actions_row(
             }
         }
 
-        if ui.add_sized(size, egui::Button::new(label("Move"))).clicked()
-            && let Some(i) = index {
-                *action = DetailAction::Move(i);
-                *want_close = true;
-            }
+        if ui.add_enabled(!read_only, egui::Button::new(label("Move")).min_size(size)).clicked() {
+            // An unsaved edit is saved on close, before the move.
+            *action = DetailAction::Move(path.to_path_buf());
+            *want_close = true;
+        }
 
         let del = egui::Button::new(label("Delete").color(egui::Color32::WHITE))
-            .fill(egui::Color32::from_rgb(180, 40, 40));
-        if ui.add_sized(size, del).clicked()
-            && let Some(i) = index {
-                // Confirm first, unless confirmations are disabled.
-                if confirm_before_delete {
-                    popup.show_delete_confirm = true;
-                    popup.skip_delete_confirm = false; // fresh checkbox
-                } else {
-                    *action = DetailAction::Delete(i);
-                    *want_close = true;
-                }
+            .fill(egui::Color32::from_rgb(180, 40, 40))
+            .min_size(size);
+        if ui.add_enabled(!read_only, del).clicked() {
+            // Confirm first, unless confirmations are disabled.
+            if confirm_before_delete {
+                popup.show_delete_confirm = true;
+                popup.skip_delete_confirm = false; // fresh checkbox
+            } else {
+                popup.editing = false; // the edit goes with the image
+                *action = DetailAction::Delete(path.to_path_buf());
+                *want_close = true;
             }
+        }
     });
 }
 
@@ -786,7 +960,7 @@ fn draw_image(
 
 fn window_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(PANEL())
+        .fill(FLOAT())
         .corner_radius(egui::CornerRadius::same(22))
         .inner_margin(egui::Margin::same(18))
         .stroke(egui::Stroke::new(1.0, EDGE()))

@@ -205,7 +205,8 @@ fn write_json<T: serde::Serialize>(path: &std::path::Path, value: &T) {
         return;
     }
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, stored).is_ok() && std::fs::rename(&tmp, path).is_err() {
+    // Owner-only on Linux/macOS (the rename keeps the mode).
+    if crate::secret::write_private(&tmp, stored).is_ok() && std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
 }

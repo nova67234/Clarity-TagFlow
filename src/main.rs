@@ -17,10 +17,12 @@ const IMAGE_EXTENSIONS: &[&str] = &[
 
 /// "Extended" image extensions decoded via the heavier pure-Rust crates: AVIF
 /// (avif-parse + rav1d), HEIC/HEIF (heic), and camera raw — DNG, Sony ARW,
-/// Canon CR2 and Nikon NEF — (zenraw). Only recognised when the user enables them in Settings
-/// AND the app was built with the `avif` feature. Defined only in such builds so
-/// a stale persisted setting can't make a normal build list files it can't decode.
-#[cfg(feature = "avif")]
+/// Canon CR2 and Nikon NEF — (zenraw). Only listed when the user enables them in
+/// Settings AND the app was built with the `avif` feature (`is_image` and
+/// `is_extended_extension` check both, so a stale persisted setting can't make a
+/// normal build list files it can't decode). Such a file owns its `.txt` in
+/// every build, though (`has_sidecar_extension`): deleting `cat.png` must not
+/// take the `cat.txt` that `cat.heic` still uses.
 const EXTENDED_IMAGE_EXTENSIONS: &[&str] = &["avif", "heic", "heif", "dng", "arw", "cr2", "nef"];
 
 /// True when `ext` (without the dot, any case) is one of the heavy "extended"
@@ -224,6 +226,7 @@ fn main() -> eframe::Result {
             set(app.settings.theme);
             app.last_theme = app.settings.theme;
             app.last_glass_light = app.settings.glass_light;
+            app.last_glass_bg = app.settings.glass_bg;
             apply_theme(&cc.egui_ctx);
             // Optional: open a folder passed on the command line (e.g. "Open
             // with"), falling back to the Input folder from the last session.
@@ -341,6 +344,10 @@ struct ViewerApp {
     /// Last-applied Glass dark/light panel mode — a palette change that doesn't
     /// change `theme`, so it needs its own re-apply tracking.
     last_glass_light: bool,
+    /// The Glass background colour the visuals were last applied with: the
+    /// opaque fill of egui's own popups (combo lists, tooltips) is the glass
+    /// tint over it, so picking a new colour re-applies them.
+    last_glass_bg: [u8; 3],
     /// Last-applied media-type filter (Filter tab), so we re-filter the browser
     /// only when the user actually changes it.
     last_media_filter: left_panel_settings::MediaFilter,
@@ -383,6 +390,9 @@ struct ViewerApp {
     /// (is_zimage, count) of the gen list currently shown, so switching between the
     /// Flux/Z-Image tabs or a new render refreshes the browser.
     flux_sig: (u8, usize),
+    /// The list shown is LTX/Wan's (folder images + videos), whose selection
+    /// indexes the folder list — not a text-to-image tab's output list.
+    flux_combine: bool,
     /// The "Create Backup" dialog (top bar).
     backup: backup::BackupState,
     /// Tag Manager view state, shown in the right panel when selected from its
@@ -431,6 +441,12 @@ struct ViewerApp {
     bg_job: Option<BgRemoveJob>,
     /// Transient status/result message for background removal (text, hide-time).
     bg_toast: Option<(String, f64)>,
+    /// A message for the status overlay from code with no `Context` at hand
+    /// (a failed move or delete); `drive_bg_job` shows it on the next frame.
+    pending_toast: Option<String>,
+    /// That message on show (text, hide-time) — its own line in the overlay,
+    /// so a background-removal status running at the same time can't hide it.
+    notice: Option<(String, f64)>,
     /// Screen rect of the centre (image) panel, captured each frame so overlays
     /// can be positioned over the image rather than the whole window.
     last_center_rect: Option<egui::Rect>,
@@ -448,6 +464,7 @@ impl Default for ViewerApp {
             last_extended_formats: settings::Settings::default().enable_extended_formats,
             last_theme: Theme::default(),
             last_glass_light: false,
+            last_glass_bg: [0; 3],
             last_media_filter: left_panel_settings::MediaFilter::default(),
             filtered: Vec::new(),
             selected: None,
@@ -467,6 +484,7 @@ impl Default for ViewerApp {
             flux_active: false,
             images_backup: None,
             flux_sig: (0, 0),
+            flux_combine: false,
             backup: backup::BackupState::default(),
             tag_manager: tag_manager::TagManagerState::default(),
             // Separate large-decode gates: the viewer gets a dedicated permit so
@@ -486,6 +504,8 @@ impl Default for ViewerApp {
             scene3d: scene3d::Scene3D::new(),
             bg_job: None,
             bg_toast: None,
+            pending_toast: None,
+            notice: None,
             last_center_rect: None,
             update: update::UpdateState::default(),
         }
@@ -595,6 +615,7 @@ impl ViewerApp {
     /// the browser and viewer. Also forgets the remembered Input folder so the
     /// next launch starts empty, and unmounts any open zip archive.
     fn clear_folder(&mut self) {
+        self.restore_folder_list();
         archive::close();
         self.images.clear();
         self.current_folder = None;
@@ -607,6 +628,7 @@ impl ViewerApp {
     /// Replace the browser contents with the (already opened) zip archive's
     /// media entries — virtual paths served from memory by `src/archive.rs`.
     fn load_zip_entries(&mut self, zip_path: &std::path::Path, mut entries: Vec<PathBuf>) {
+        self.restore_folder_list();
         entries.retain(|p| is_media(p));
         entries.sort();
         self.images = entries;
@@ -620,6 +642,7 @@ impl ViewerApp {
 
     /// Replace the browser contents with all images found directly in `dir`.
     fn load_folder(&mut self, dir: &std::path::Path) {
+        self.restore_folder_list();
         archive::close(); // a real folder replaces any mounted zip
         self.images = images_in_dir(dir);
         self.current_folder = Some(dir.to_path_buf());
@@ -647,6 +670,7 @@ impl ViewerApp {
     }
 
     fn add_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        self.restore_folder_list();
         let first_new = self.images.len();
         for path in paths {
             if !self.images.contains(&path) {
@@ -811,6 +835,24 @@ impl ViewerApp {
             && now >= *until {
                 self.bg_toast = None;
             }
+        if let Some((_, until)) = &self.notice
+            && now >= *until {
+                self.notice = None;
+            }
+        let fresh: Vec<String> =
+            [self.pending_toast.take(), self.right_state.notice.take(), self.detail_popup.notice.take()]
+                .into_iter()
+                .flatten()
+                .collect();
+        if !fresh.is_empty() {
+            // Messages arriving together, or while one is still on show, are
+            // listed together (the last few) rather than replacing it.
+            let mut lines: Vec<String> = self.notice.take().map(|(old, _)| old.lines().map(str::to_string).collect()).unwrap_or_default();
+            lines.extend(fresh);
+            let keep = lines.len().saturating_sub(3);
+            self.notice = Some((lines[keep..].join("\n"), now + 6.0));
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(6.1));
+        }
 
         // Result of this frame's polling, applied after the &mut borrow ends.
         let mut done: Option<Result<PathBuf, String>> = None;
@@ -863,6 +905,23 @@ impl ViewerApp {
     /// Insert a derived image (`dest`) just beneath its source in the browser and
     /// select it; if it's already listed, just select it. Mirrors `crop_current`.
     fn insert_derived(&mut self, src: &std::path::Path, dest: PathBuf) {
+        // A crop / cutout can reuse a deleted file's name: don't let it
+        // inherit that file's cached heart.
+        self.favorites.forget(&dest);
+        // A crop of a folder image under LTX/Wan joins the stashed folder list
+        // too, or it vanished on the view's next refresh and on leaving it.
+        if self.flux_active
+            && let Some((stash, sel)) = &mut self.images_backup
+            && !stash.contains(&dest)
+            && let Some(at) = stash.iter().position(|p| p == src).map(|i| i + 1)
+        {
+            stash.insert(at, dest.clone());
+            if let Some(s) = sel.as_mut()
+                && *s >= at
+            {
+                *s += 1;
+            }
+        }
         if let Some(i) = self.images.iter().position(|p| p == &dest) {
             self.selected = Some(i);
             self.update_filtered();
@@ -882,13 +941,15 @@ impl ViewerApp {
     /// Floating top-centre overlay showing background-removal progress / result.
     fn paint_bg_status(&self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
-        let (text, busy) = if let Some(job) = &self.bg_job {
-            (job.status.clone(), true)
-        } else if let Some((msg, until)) = &self.bg_toast {
-            if now < *until { (msg.clone(), false) } else { return }
+        let status = if let Some(job) = &self.bg_job {
+            Some((job.status.clone(), true))
         } else {
-            return;
+            self.bg_toast.as_ref().filter(|(_, until)| now < *until).map(|(msg, _)| (msg.clone(), false))
         };
+        let notice = self.notice.as_ref().filter(|(_, until)| now < *until).map(|(msg, _)| msg.clone());
+        if status.is_none() && notice.is_none() {
+            return;
+        }
         let mut area = egui::Area::new(egui::Id::new("bg_status_overlay")).interactable(false);
         // Centre over the image panel if we know its rect; else fall back to the
         // window centre.
@@ -899,12 +960,17 @@ impl ViewerApp {
         area
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if busy {
-                            ui.add(egui::Spinner::new().size(16.0));
-                        }
-                        ui.label(text);
-                    });
+                    if let Some((text, busy)) = &status {
+                        ui.horizontal(|ui| {
+                            if *busy {
+                                ui.add(egui::Spinner::new().size(16.0));
+                            }
+                            ui.label(text.as_str());
+                        });
+                    }
+                    if let Some(notice) = &notice {
+                        ui.label(notice.as_str());
+                    }
                 });
             });
     }
@@ -932,7 +998,39 @@ impl ViewerApp {
         self.selected = Some(self.filtered[pos as usize]);
     }
 
-    /// Delete the selected image and its `.txt` sidecar, then fix up the list.
+    /// A generator view shows its own list while the folder list waits in
+    /// `images_backup`. Anything that changes the folder list (opening a
+    /// folder or zip, dropping files) puts it back first and works on it —
+    /// the view stashes it again, changed, on the next frame. Changing the
+    /// shown list instead was undone when the view closed (the old folder's
+    /// list came back under the new folder's name).
+    fn restore_folder_list(&mut self) {
+        if self.flux_active {
+            #[cfg(not(target_os = "macos"))]
+            self.remember_input_selection();
+            if let Some((imgs, sel)) = self.images_backup.take() {
+                self.images = imgs;
+                self.selected = sel;
+            }
+            self.flux_active = false;
+        }
+    }
+
+    /// Leaving LTX/Wan's list: a folder image picked there becomes the
+    /// folder selection (found by path — a crop inserted into the shown list
+    /// shifts positions), so the folder view — and LTX/Wan again later — come
+    /// back to it.
+    #[cfg(not(target_os = "macos"))]
+    fn remember_input_selection(&mut self) {
+        if self.flux_combine
+            && let Some((stash, sel)) = &mut self.images_backup
+            && let Some(picked) = self.selected.and_then(|i| self.images.get(i))
+            && let Some(i) = stash.iter().position(|p| p == picked)
+        {
+            *sel = Some(i);
+        }
+    }
+
     /// While the Generate (Flux) view is open, show the session's generated images
     /// in the browser + viewer; restore the real folder list when it closes.
     fn sync_flux_browser(&mut self, in_flux: bool) {
@@ -965,6 +1063,12 @@ impl ViewerApp {
                     right_details::RightView::Ltx | right_details::RightView::Wan
                 );
                 let sig = (tab, gen_list.len());
+                // Outputs moved or deleted from the browser stay gone (the
+                // generator still lists them). Checked only when the list is
+                // rebuilt, not every frame.
+                let rebuild = !self.flux_active || self.flux_sig != sig;
+                let gen_list: Vec<PathBuf> =
+                    if rebuild { gen_list.into_iter().filter(|p| p.exists()).collect() } else { gen_list };
                 if !self.flux_active {
                     // Entering: stash the folder list.
                     self.images_backup = Some((std::mem::take(&mut self.images), self.selected.take()));
@@ -983,6 +1087,7 @@ impl ViewerApp {
                     self.update_filtered();
                     self.flux_active = true;
                     self.flux_sig = sig;
+                    self.flux_combine = combine;
                 } else if self.flux_sig != sig {
                     // Switched gen tab or a new output arrived — refresh + select newest.
                     if combine {
@@ -994,12 +1099,13 @@ impl ViewerApp {
                         // end); otherwise keep whatever input image is selected.
                         if self.images.len() > orig_len {
                             self.selected = Some(self.images.len() - 1);
-                        } else if self.selected.is_some_and(|i| i >= self.images.len()) {
+                        } else if !self.flux_combine || self.selected.is_some_and(|i| i >= self.images.len()) {
                             // Coming from a text-to-image tab, `selected` indexed
-                            // THAT tab's output list, which can be longer than this
-                            // one — fall back to the stashed folder selection (an
-                            // index into `orig`, so always valid here) instead of
-                            // letting the stale index panic the next frame.
+                            // THAT tab's output list — out of range here (a panic
+                            // the next frame) or, worse, in range and naming some
+                            // other folder image, which LTX/Wan then animated.
+                            // Fall back to the stashed folder selection (an index
+                            // into `orig`, so always valid here).
                             self.selected = self
                                 .images_backup
                                 .as_ref()
@@ -1008,14 +1114,17 @@ impl ViewerApp {
                                 .or(if self.images.is_empty() { None } else { Some(0) });
                         }
                     } else {
+                        self.remember_input_selection();
                         self.images = gen_list;
                         self.selected = if self.images.is_empty() { None } else { Some(self.images.len() - 1) };
                     }
                     self.update_filtered();
                     self.flux_sig = sig;
+                    self.flux_combine = combine;
                 }
             } else if self.flux_active {
                 // Leaving: restore the real folder list.
+                self.remember_input_selection();
                 if let Some((imgs, sel)) = self.images_backup.take() {
                     self.images = imgs;
                     self.selected = sel;
@@ -1053,22 +1162,72 @@ impl ViewerApp {
             std::path::PathBuf::from(out)
         };
         // Moving into the folder the image already lives in would only drop it
-        // from the list — treat it as a no-op instead.
-        if img_path.parent() == Some(target_dir.as_path()) {
+        // from the list — treat it as a no-op instead. Compared as resolved
+        // paths: an Output path typed in another case, or through a link, is
+        // the same folder.
+        if img_path.parent().is_some_and(|dir| same_dir(dir, &target_dir)) {
             return;
         }
-        let _ = std::fs::create_dir_all(&target_dir);
-        let txt_path = right_details::sidecar_txt(&img_path);
-
-        if let Some(file_name) = img_path.file_name() {
-            let _ = std::fs::rename(&img_path, target_dir.join(file_name));
+        let name = file_label(&img_path);
+        if let Err(e) = std::fs::create_dir_all(&target_dir) {
+            self.pending_toast = Some(format!("Couldn't move {name} — {e}"));
+            return;
         }
-        if txt_path.exists()
-            && let Some(txt_name) = txt_path.file_name() {
-                let _ = std::fs::rename(&txt_path, target_dir.join(txt_name));
+        // An unsaved tag edit of this image goes into its .txt first, so it
+        // moves with it (saved afterwards it left a stray .txt behind).
+        if !self.right_state.save_before_move(&img_path) || !self.detail_popup.save_before_move(&img_path) {
+            self.pending_toast = Some(format!("Couldn't save the tag edit of {name}, so it wasn't moved"));
+            return;
+        }
+        self.release_file(&img_path);
+        // Never replace a file already in the target folder: a same-named
+        // image (or .txt) there gets this one renamed beside it instead.
+        let Some(dest) = move_destination(&img_path, &target_dir) else {
+            self.pending_toast = Some(format!("Couldn't move {name} — no free name in the folder"));
+            return;
+        };
+        if let Err(e) = move_file(&img_path, &dest) {
+            self.pending_toast = Some(format!("Couldn't move {name} — {e}"));
+            return;
+        }
+        // The .txt goes along — copied instead when another file here shares
+        // it (cat.png and cat.jpg both read cat.txt). If it can't follow, the
+        // image goes back, so the two are never separated.
+        let txt_path = right_details::sidecar_txt(&img_path);
+        if txt_path.exists() {
+            let dest_txt = right_details::sidecar_txt(&dest);
+            let moved = if shares_sidecar(&img_path) {
+                std::fs::copy(&txt_path, &dest_txt).map(|_| ())
+            } else {
+                move_file(&txt_path, &dest_txt)
+            };
+            if let Err(e) = moved {
+                let undo = move_file(&dest, &img_path);
+                self.pending_toast = Some(match undo {
+                    Ok(()) => format!("Couldn't move the tags of {name}, so it stayed — {e}"),
+                    Err(_) => format!("Moved {name} but not its tags — {e}"),
+                });
+                if undo.is_ok() {
+                    return;
+                }
             }
+        }
 
         self.remove_image_at(idx);
+    }
+
+    /// Let go of `path` before it's moved or deleted: stop the centre player
+    /// when it's playing that file (VLC holds it open, so on Windows the
+    /// move/delete failed) and the browser's tile previews (they restart on
+    /// the next frame for the tiles still listed).
+    fn release_file(&mut self, path: &std::path::Path) {
+        if self.last_video_path.as_deref() == Some(path) {
+            self.video_player = None;
+            self.last_video_path = None;
+        }
+        if is_video(path) {
+            self.video_previews.set_enabled(false);
+        }
     }
 
     /// Show the password prompt for `path` (a `.zip`). The archive is opened
@@ -1107,7 +1266,7 @@ impl ViewerApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .frame(
                     egui::Frame::new()
-                        .fill(PANEL())
+                        .fill(FLOAT())
                         .corner_radius(CornerRadius::same(16))
                         .inner_margin(Margin::same(18))
                         .stroke(Stroke::new(1.0, EDGE()))
@@ -1213,7 +1372,13 @@ impl ViewerApp {
     /// Remove image `idx`, re-filter the browser, and clamp the selection to a
     /// still-valid index (or clear it when the list is now empty).
     fn remove_image_at(&mut self, idx: usize) {
-        self.images.remove(idx);
+        let removed = self.images.remove(idx);
+        // Whatever is created at this path later is hashed afresh.
+        self.favorites.forget(&removed);
+        // Under LTX/Wan the folder images shown are copies of the stashed
+        // folder list: drop it there too, or it reappears on the next refresh
+        // and when the view closes.
+        self.drop_from_stash(&removed);
         self.update_filtered();
         self.selected = if self.images.is_empty() {
             None
@@ -1481,8 +1646,36 @@ impl ViewerApp {
 
     /// Re-scan the current folder and try to keep the same image selected. Used
     /// after the extended-format toggle changes and after a Deep Scan moves files.
+    /// `path` is gone (deleted from Deep Scan's review list): take it off the
+    /// list shown and, under a generator view, the folder list waiting behind
+    /// it.
+    fn remove_path(&mut self, path: &std::path::Path) {
+        if let Some(i) = self.images.iter().position(|p| p == path) {
+            self.remove_image_at(i);
+        } else {
+            self.favorites.forget(path);
+            self.drop_from_stash(path);
+        }
+    }
+
+    /// Drop `path` from the folder list stashed behind a generator view.
+    fn drop_from_stash(&mut self, path: &std::path::Path) {
+        if self.flux_active
+            && let Some((stash, sel)) = &mut self.images_backup
+            && let Some(j) = stash.iter().position(|p| p == path)
+        {
+            stash.remove(j);
+            *sel = match *sel {
+                Some(s) if s > j => Some(s - 1),
+                Some(s) if s == j => (!stash.is_empty()).then(|| j.min(stash.len() - 1)),
+                other => other,
+            };
+        }
+    }
+
     fn rescan_current_folder(&mut self) {
         if let Some(dir) = self.current_folder.clone() {
+            self.restore_folder_list();
             let keep = self.selected.and_then(|i| self.images.get(i).cloned());
             self.images = images_in_dir(&dir);
             // Try to keep the same image selected across the re-scan.
@@ -1509,17 +1702,39 @@ impl ViewerApp {
             return;
         }
         let txt_path = right_details::sidecar_txt(&img_path);
+        let name = file_label(&img_path);
 
-        // Stop the embedded player when it's this file, so VLC releases it
-        // before the delete (other tiles' deletes leave playback alone).
-        if self.last_video_path.as_deref() == Some(img_path.as_path()) {
-            self.video_player = None;
-            self.last_video_path = None;
+        // Stop the embedded player (and tile previews) when it's this file,
+        // so VLC releases it before the delete (other tiles' deletes leave
+        // playback alone).
+        self.release_file(&img_path);
+
+        // If the file can't be deleted (in use, read-only), its tags and its
+        // place in the list stay too. One that's already gone (deleted in
+        // Explorer) counts as deleted — but not when its whole folder is
+        // unreachable (an unplugged drive, a dropped network share also say
+        // "not found"): the file is still there.
+        match std::fs::remove_file(&img_path) {
+            Ok(()) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && img_path.parent().is_some_and(std::path::Path::is_dir) => {}
+            Err(e) => {
+                self.pending_toast = Some(format!("Couldn't delete {name} — {e}"));
+                return;
+            }
         }
-
-        let _ = std::fs::remove_file(&img_path);
-        if txt_path.exists() {
-            let _ = std::fs::remove_file(&txt_path);
+        // An unsaved tag edit of the deleted image is dropped, not written
+        // back afterwards (that recreated its .txt).
+        self.right_state.discard_edit_of(&img_path);
+        self.detail_popup.discard_edit_of(&img_path);
+        // A .txt another file here still reads (cat.png and cat.jpg share
+        // cat.txt) is kept for that file.
+        if txt_path.exists()
+            && !shares_sidecar(&img_path)
+            && let Err(e) = std::fs::remove_file(&txt_path)
+        {
+            self.pending_toast = Some(format!("Deleted {name} but not its tags — {e}"));
         }
 
         self.remove_image_at(idx);
@@ -1878,7 +2093,7 @@ impl eframe::App for ViewerApp {
             // open, so it must be re-pointed explicitly).
             if self.settings.layout == settings::Layout::Gallery && self.detail_popup.open
                 && let Some(i) = self.selected {
-                    self.detail_popup.open_for(i, &self.images[i], ui.ctx());
+                    self.detail_popup.open_for(&self.images[i], ui.ctx());
                 }
         }
 
@@ -2004,7 +2219,7 @@ impl eframe::App for ViewerApp {
                 // Select the clicked tile (accent ring + arrow-key anchor) and
                 // open its detail popup.
                 self.selected = Some(i);
-                self.detail_popup.open_for(i, &self.images[i], ui.ctx());
+                self.detail_popup.open_for(&self.images[i], ui.ctx());
             }
             // Floating search/filter pill (bottom-right corner, movable).
             if gallery::search_pill(ui.ctx(), &mut self.search, &mut self.settings) {
@@ -2189,21 +2404,35 @@ impl eframe::App for ViewerApp {
         // preference first so a clip the popup starts picks it up (the centre
         // viewer only pushes it when it is itself playing a video).
         video::set_loop(self.settings.loop_video);
-        match gallery_detail::show(
+        let detail_action = gallery_detail::show(
             ui.ctx(),
             &mut self.detail_popup,
             &mut self.viewer,
             &mut self.right_state.civitai,
             &mut self.favorites,
             &mut self.settings.confirm_before_delete,
-        ) {
-            gallery_detail::DetailAction::Move(i) => {
-                self.selected = Some(i);
-                self.move_selected();
+        );
+        // Tags the popup saved show in the right panel too — before its Move
+        // runs, or the panel's own older unsaved edit would be saved over them
+        // (and a later save there or in the Tag Manager would undo them).
+        if let Some((path, text)) = self.detail_popup.saved.take() {
+            self.right_state.tags_written(&path, &text);
+        }
+        match detail_action {
+            // Found again by path: the list can shift while the popup is open
+            // (a crop or background removal inserts its result, a rescan…),
+            // and a remembered position then named another file.
+            gallery_detail::DetailAction::Move(path) => {
+                if let Some(i) = self.images.iter().position(|p| *p == path) {
+                    self.selected = Some(i);
+                    self.move_selected();
+                }
             }
-            gallery_detail::DetailAction::Delete(i) => {
-                self.selected = Some(i);
-                self.delete_selected();
+            gallery_detail::DetailAction::Delete(path) => {
+                if let Some(i) = self.images.iter().position(|p| *p == path) {
+                    self.selected = Some(i);
+                    self.delete_selected();
+                }
             }
             // Viewer right-click actions, handled exactly like the centre viewer.
             gallery_detail::DetailAction::Viewer(va, path) => {
@@ -2220,6 +2449,10 @@ impl eframe::App for ViewerApp {
         // Deep Scan window. When a scan finishes it may have moved files out of
         // the current folder, so refresh the browser list once.
         scan::show(ui.ctx(), &mut self.scan);
+        // Files deleted from Deep Scan's review list leave the browser too.
+        for path in std::mem::take(&mut self.scan.deleted) {
+            self.remove_path(&path);
+        }
         if self.scan.finished_tick {
             self.scan.finished_tick = false;
             self.rescan_current_folder();
@@ -2233,9 +2466,13 @@ impl eframe::App for ViewerApp {
         // derives every widget colour from the palette it reads. Applying before
         // the flag lands bakes the stale palette into the visuals permanently
         // (e.g. dark glass stuck with the light theme's blue toggles).
-        if self.settings.theme != self.last_theme || self.settings.glass_light != self.last_glass_light {
+        if self.settings.theme != self.last_theme
+            || self.settings.glass_light != self.last_glass_light
+            || self.settings.glass_bg != self.last_glass_bg
+        {
             self.last_theme = self.settings.theme;
             self.last_glass_light = self.settings.glass_light;
+            self.last_glass_bg = self.settings.glass_bg;
             set_glass_config(self.settings.glass_bg, self.settings.glass_backdrop, self.settings.glass_light);
             set(self.settings.theme);
             apply(ui.ctx());
@@ -2256,6 +2493,13 @@ impl eframe::App for ViewerApp {
     /// Persist settings to eframe's storage (called periodically and on exit).
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, settings::STORAGE_KEY, &self.settings);
+    }
+
+    /// Closing the app saves a tag edit still open in the Details panel or
+    /// the gallery popup, as moving to another image does — it was lost.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.right_state.save_pending_edit();
+        self.detail_popup.save_edit();
     }
 }
 
@@ -2576,6 +2820,13 @@ fn install_fallback_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// [`card_frame`] for something floating over the UI (a popup, a dialog):
+/// the same card with the opaque [`FLOAT`] fill, so in the Glass theme the
+/// panels and text beneath it don't show through.
+pub(crate) fn float_card_frame(radius: u8) -> egui::Frame {
+    card_frame(radius).fill(FLOAT())
+}
+
 /// A rounded panel with the PANEL() fill, faint edge, and a soft drop shadow.
 pub(crate) fn card_frame(radius: u8) -> egui::Frame {
     egui::Frame::new()
@@ -2801,6 +3052,124 @@ fn contains_words(haystack: &str, needle: &str) -> bool {
     })
 }
 
+/// `path`'s file name, for messages.
+pub(crate) fn file_label(path: &std::path::Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Where `img` lands when moved into `dir`: its own name when neither that
+/// nor the matching `.txt` is taken there, else `name_2.ext`, `name_3.ext`, …
+/// A move must never replace a file already in the folder (`rename` does,
+/// silently, on every platform), and the image and its .txt keep matching
+/// names.
+fn move_destination(img: &std::path::Path, dir: &std::path::Path) -> Option<PathBuf> {
+    let stem = img.file_stem()?.to_string_lossy().into_owned();
+    let ext = img.extension().map(|e| e.to_string_lossy().into_owned());
+    (1..10_000).find_map(|n| {
+        let base = if n == 1 { stem.clone() } else { format!("{stem}_{n}") };
+        let file = dir.join(match &ext {
+            Some(e) => format!("{base}.{e}"),
+            None => base.clone(),
+        });
+        (!file.exists() && !stem_taken(dir, &base)).then_some(file)
+    })
+}
+
+/// A file named `base` exists in `dir` as a .txt or as any type that reads
+/// one: then `base` is taken for a moved image — another image with that
+/// name (an untagged 0001.jpg) would start reading the moved one's .txt.
+/// Checked name by name (a few dozen lookups) rather than by listing the
+/// folder, which took seconds for a big Output folder on a network drive.
+fn stem_taken(dir: &std::path::Path, base: &str) -> bool {
+    // Case-sensitive file systems: the extension's other usual spelling.
+    let both_cases = !cfg!(any(windows, target_os = "macos"));
+    std::iter::once("txt")
+        .chain(IMAGE_EXTENSIONS.iter().copied())
+        .chain(VIDEO_EXTENSIONS.iter().copied())
+        .chain(EXTENDED_IMAGE_EXTENSIONS.iter().copied())
+        .any(|ext| {
+            dir.join(format!("{base}.{ext}")).exists()
+                || (both_cases && dir.join(format!("{base}.{}", ext.to_ascii_uppercase())).exists())
+        })
+}
+
+/// Two file names (or stems) that may be one file: compared ignoring case
+/// (Unicode, `Éclair` = `éclair`) on every OS — Windows and macOS ignore
+/// case, and so does Linux on an exFAT, NTFS or network drive. Used only
+/// where a false match is harmless: a .txt kept or copied, a free name
+/// skipped.
+pub(crate) fn same_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    a == b || a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+}
+
+/// `a` and `b` are the same folder, as the file system resolves them (case,
+/// links); compared as written when either can't be resolved.
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// A file that reads a `.txt` sidecar: every image and video type the app
+/// knows, whether or not it lists it right now (AVIF / HEIC / raw count even
+/// with extended formats off — they still own their .txt).
+pub(crate) fn has_sidecar_extension(p: &std::path::Path) -> bool {
+    let Some(ext) = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) else {
+        return false;
+    };
+    IMAGE_EXTENSIONS.contains(&ext.as_str())
+        || VIDEO_EXTENSIONS.contains(&ext.as_str())
+        || EXTENDED_IMAGE_EXTENSIONS.contains(&ext.as_str())
+}
+
+/// Move a file, falling back to copy-then-delete where `rename` can't (the
+/// target is on another drive). The copy goes to a temporary name and is
+/// renamed into place only once complete, so a copy that fails part-way (a
+/// full disk, a drive pulled) leaves no truncated file under the real name;
+/// and if the original can't be removed after the copy, the copy is removed
+/// again, so a failed move leaves no duplicate.
+pub(crate) fn move_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    if to.exists() {
+        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "the target exists"));
+    }
+    // A temporary name nothing there has (a user's own `photo.png.part` is
+    // never overwritten).
+    let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let part = (0..100)
+        .map(|n| to.with_file_name(format!(".{name}.{}-{n}.part", std::process::id())))
+        .find(|p| !p.exists())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free temporary name"))?;
+    let copied = std::fs::copy(from, &part).and_then(|_| std::fs::rename(&part, to));
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    std::fs::remove_file(from).inspect_err(|_| {
+        let _ = std::fs::remove_file(to);
+    })
+}
+
+/// Another media file in `img`'s folder reads the same `.txt` (same name,
+/// different extension — `cat.png` and `cat.jpg` both use `cat.txt`), so the
+/// .txt must stay when `img` is moved or deleted.
+fn shares_sidecar(img: &std::path::Path) -> bool {
+    let (Some(dir), Some(stem)) = (img.parent(), img.file_stem()) else { return false };
+    // A folder that can't be read: keep the .txt (the safe side).
+    let Ok(entries) = std::fs::read_dir(dir) else { return true };
+    // Names compare ignoring case (see `same_name`): keeping a .txt that
+    // turns out not to be shared is harmless, losing a shared one isn't.
+    entries.flatten().map(|e| e.path()).any(|p| {
+        p != img
+            && p.file_stem().is_some_and(|s| same_name(s, stem))
+            && has_sidecar_extension(&p)
+            && p.is_file()
+    })
+}
+
 /// Where a crop of `src` is saved: `<name>_crop.png` next to the original, with a
 /// ` (n)` suffix if that already exists. Mirrors ViewerPanel.resolveCropDestination.
 fn crop_destination(src: &std::path::Path) -> PathBuf {
@@ -2849,6 +3218,88 @@ mod cf_dib_tests {
     }
 }
 
+
+#[cfg(test)]
+mod file_op_tests {
+    use super::{move_destination, move_file, same_dir, shares_sidecar};
+    use std::fs;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ctf_file_ops_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Moving never replaces a file in the target folder: a taken image name
+    /// — or a taken .txt name — moves the pair to the next free `_N` name.
+    #[test]
+    fn move_destination_never_replaces() {
+        let dir = scratch("dest");
+        let img = std::path::Path::new("/somewhere/0001.png");
+        assert_eq!(move_destination(img, &dir), Some(dir.join("0001.png")));
+        fs::write(dir.join("0001.png"), b"x").unwrap();
+        assert_eq!(move_destination(img, &dir), Some(dir.join("0001_2.png")));
+        fs::write(dir.join("0001_2.txt"), b"tags").unwrap();
+        assert_eq!(move_destination(img, &dir), Some(dir.join("0001_3.png")));
+        // Another image with that stem (an untagged 0001_3.jpg) would start
+        // reading the moved image's 0001_3.txt: that name is taken too.
+        fs::write(dir.join("0001_3.jpg"), b"y").unwrap();
+        assert_eq!(move_destination(img, &dir), Some(dir.join("0001_4.png")));
+        // Files that don't read a .txt don't take a name.
+        fs::write(dir.join("0001_4.json"), b"{}").unwrap();
+        assert_eq!(move_destination(img, &dir), Some(dir.join("0001_4.png")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn move_file_moves_and_refuses_to_overwrite() {
+        let dir = scratch("move");
+        let (a, b) = (dir.join("a.png"), dir.join("b.png"));
+        fs::write(&a, b"one").unwrap();
+        move_file(&a, &b).unwrap();
+        assert!(!a.exists());
+        assert_eq!(fs::read(&b).unwrap(), b"one");
+        // A missing source is an error, and nothing appears at the target —
+        // nor a leftover temporary copy.
+        assert!(move_file(&a, &dir.join("c.png")).is_err());
+        assert!(!dir.join("c.png").exists());
+        let names: Vec<_> = fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(names, [std::ffi::OsString::from("b.png")]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_dir_resolves_paths() {
+        let dir = scratch("samedir");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        assert!(same_dir(&dir, &dir.join("sub").join("..")));
+        assert!(!same_dir(&dir, &dir.join("sub")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `cat.png` and `cat.jpg` both read `cat.txt`; a lone image owns its own.
+    #[test]
+    fn a_shared_sidecar_is_detected() {
+        let dir = scratch("share");
+        for f in ["cat.png", "cat.jpg", "cat.txt", "dog.png", "dog.txt", "dog.json", "owl.png", "owl.heic", "owl.txt"] {
+            fs::write(dir.join(f), b"x").unwrap();
+        }
+        assert!(shares_sidecar(&dir.join("cat.png")));
+        assert!(shares_sidecar(&dir.join("cat.jpg")));
+        assert!(!shares_sidecar(&dir.join("dog.png")), "only media files count");
+        // A HEIC reads its .txt even in a build (or with a setting) that
+        // doesn't list it.
+        assert!(shares_sidecar(&dir.join("owl.png")));
+        // A folder that can't be read keeps the .txt.
+        assert!(shares_sidecar(&dir.join("missing").join("x.png")));
+        // Names compare ignoring case, on every OS (a Linux exFAT drive too).
+        fs::write(dir.join("Éclair.png"), b"x").unwrap();
+        fs::write(dir.join("éclair.jpg"), b"x").unwrap();
+        assert!(shares_sidecar(&dir.join("éclair.jpg")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
 
 #[cfg(test)]
 mod viewer_review_tests {

@@ -106,6 +106,16 @@ impl DictationState {
         }
     }
 
+    /// Stop a recording and throw it away (AI Chat was switched off): the
+    /// mic is released now and the transcript never reaches the draft. The
+    /// worker sees the stop, and its result goes nowhere.
+    pub fn cancel(&mut self) {
+        if self.rx.take().is_some() {
+            self.stop.store(true, Relaxed);
+            self.started = None;
+        }
+    }
+
     /// Drive the state each frame; returns the finished transcript, if any.
     pub fn poll(&mut self, ctx: &egui::Context) -> Option<String> {
         if let Some(d) = &self.download

@@ -235,8 +235,18 @@ pub struct VoiceState {
     pub rec: Recorder,
 }
 
+/// Delete the worker's synthesized clips (`clarity_omnivoice_{0,1}.wav` in
+/// the temp folder, see WORKER_PY): spoken chat replies. At exit, and at
+/// startup in case a crash skipped that.
+fn clear_clips() {
+    for n in 0..2 {
+        let _ = std::fs::remove_file(std::env::temp_dir().join(format!("clarity_omnivoice_{n}.wav")));
+    }
+}
+
 impl Default for VoiceState {
     fn default() -> Self {
+        clear_clips();
         Self {
             installed: installed(),
             setting_up: false,
@@ -266,6 +276,7 @@ impl Drop for VoiceState {
         if let Some(mut e) = self.engine.take() {
             let _ = e.child.kill();
         }
+        clear_clips();
     }
 }
 
@@ -627,11 +638,28 @@ impl Recorder {
         let repaint = ctx.clone();
         std::thread::spawn(move || {
             let res = record_loopback(&stop, &level);
-            let _ = tx.send(res);
+            // Nobody listening: the popup was closed mid-recording (see
+            // `close`), so this sample must not be left behind either.
+            if let Err(mpsc::SendError(Ok(path))) = tx.send(res) {
+                let _ = std::fs::remove_file(path);
+            }
             repaint.request_repaint();
         });
         self.recording = true;
         self.started = Some(std::time::Instant::now());
+    }
+
+    /// Close the popup. A recording still running is stopped and thrown
+    /// away: nothing polls the recorder while it's closed, so it used to run
+    /// on to the 30 s cap and pop up as the new voice sample (replacing the
+    /// old one and clearing its transcript) the next time the popup opened.
+    pub fn close(&mut self) {
+        self.open = false;
+        if self.recording {
+            self.stop.store(true, Relaxed);
+            self.recording = false;
+            self.rx = None;
+        }
     }
 
     pub fn seconds(&self) -> u64 {
@@ -827,8 +855,10 @@ pub fn recorder_window(ctx: &egui::Context, voice: &mut VoiceState) {
                             egui::Stroke::new(1.0, EDGE()),
                         )
                     };
+                    // Opaque: in the Glass theme PANEL is see-through, and
+                    // this window has nothing of the app behind it.
                     egui::Frame::new()
-                        .fill(PANEL())
+                        .fill(crate::theme::FLOAT())
                         .corner_radius(radius)
                         .inner_margin(egui::Margin::symmetric(12, 10))
                         .stroke(stroke)
@@ -981,7 +1011,7 @@ pub fn recorder_window(ctx: &egui::Context, voice: &mut VoiceState) {
                                 egui::Rect::from_center_size(crect.center(), egui::vec2(15.0, 15.0)),
                             );
                         if cresp.clicked() {
-                            voice.rec.open = false;
+                            voice.rec.close();
                         }
                     });
 
@@ -993,7 +1023,7 @@ pub fn recorder_window(ctx: &egui::Context, voice: &mut VoiceState) {
                 });
 
             if ctx.input(|i| i.viewport().close_requested()) {
-                voice.rec.open = false;
+                voice.rec.close();
             }
         },
     );

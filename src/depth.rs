@@ -11,7 +11,11 @@
 //! weights live in an external `model.onnx_data` sidecar next to `model.onnx`).
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
+use eframe::egui;
 use image::imageops::FilterType;
 use image::RgbImage;
 use ort::session::builder::GraphOptimizationLevel;
@@ -154,10 +158,118 @@ fn preprocess(img: &RgbImage) -> Vec<f32> {
     data
 }
 
-/// One-shot depth job for a background thread: load the model and estimate.
-/// Designed to be the body of a `std::thread::spawn`, mirroring
-/// [`crate::tagger::run_job`].
-pub fn run_depth_job(model: PathBuf, image: PathBuf) -> Result<DepthMap, String> {
-    let mut est = DepthEstimator::load(&model)?;
-    est.estimate(&image)
+/// How long the worker stays up — keeping the model loaded — with nothing to
+/// do. After that it ends, freeing the session; the next request reloads it.
+const IDLE_UNLOAD: Duration = Duration::from_secs(120);
+
+/// A finished estimate: the image it's for, and its depth map or an error.
+pub type DepthResult = (PathBuf, Result<DepthMap, String>);
+
+/// Depth estimation for the Spatial Scene, off the UI thread: a single worker
+/// that keeps the model loaded between images and only ever runs the newest
+/// request. (A thread with a fresh ~370 MB session per image used to pile up
+/// when paging through images, several running at once.)
+pub struct DepthWorker {
+    shared: Arc<Shared>,
+    tx: Sender<DepthResult>,
+    rx: Receiver<DepthResult>,
+}
+
+struct Request {
+    model: PathBuf,
+    image: PathBuf,
+    ctx: egui::Context,
+}
+
+#[derive(Default)]
+struct Shared {
+    state: Mutex<State>,
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct State {
+    /// The newest request not started yet. A newer one replaces it, so an
+    /// image paged past is never estimated.
+    next: Option<Request>,
+    /// Whether the worker thread is up (it ends after [`IDLE_UNLOAD`]).
+    running: bool,
+}
+
+impl Default for DepthWorker {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self { shared: Arc::default(), tx, rx }
+    }
+}
+
+impl DepthWorker {
+    /// Ask for `image`'s depth map, replacing any request not started yet;
+    /// `ctx` is repainted when the result is ready.
+    pub fn request(&self, model: PathBuf, image: PathBuf, ctx: &egui::Context) {
+        let mut st = self.shared.state.lock().unwrap();
+        st.next = Some(Request { model, image, ctx: ctx.clone() });
+        if st.running {
+            self.shared.wake.notify_one();
+        } else {
+            st.running = true;
+            let shared = Arc::clone(&self.shared);
+            let tx = self.tx.clone();
+            std::thread::spawn(move || worker_loop(&shared, &tx));
+        }
+    }
+
+    /// The next finished estimate, if any.
+    pub fn try_recv(&self) -> Option<DepthResult> {
+        self.rx.try_recv().ok()
+    }
+}
+
+fn worker_loop(shared: &Shared, tx: &Sender<DepthResult>) {
+    // The loaded model (and which file it came from), kept between requests.
+    let mut loaded: Option<(PathBuf, DepthEstimator)> = None;
+    while let Some(req) = next_request(shared) {
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if !matches!(&loaded, Some((m, _)) if *m == req.model) {
+                loaded = None; // free the old session before loading another
+                loaded = Some((req.model.clone(), DepthEstimator::load(&req.model)?));
+            }
+            let (_, est) = loaded.as_mut().expect("loaded above");
+            est.estimate(&req.image)
+        }));
+        // A panic (say, in a decoder) mustn't end the worker and leave the
+        // viewer on "Generating depth…": report it, reload the model next time.
+        let result = run.unwrap_or_else(|_| {
+            loaded = None;
+            Err("Depth estimation crashed".to_string())
+        });
+        {
+            // Paging away and back may have asked for this same image again.
+            let mut st = shared.state.lock().unwrap();
+            if st.next.as_ref().is_some_and(|n| n.image == req.image && n.model == req.model) {
+                st.next = None;
+            }
+        }
+        if tx.send((req.image, result)).is_err() {
+            return; // the viewer is gone
+        }
+        req.ctx.request_repaint();
+    }
+}
+
+/// Wait for the next request; `None` after [`IDLE_UNLOAD`] without one (the
+/// thread then ends, dropping the model).
+fn next_request(shared: &Shared) -> Option<Request> {
+    let mut st = shared.state.lock().unwrap();
+    loop {
+        if let Some(req) = st.next.take() {
+            return Some(req);
+        }
+        let (guard, wait) = shared.wake.wait_timeout(st, IDLE_UNLOAD).unwrap();
+        st = guard;
+        if wait.timed_out() && st.next.is_none() {
+            st.running = false;
+            return None;
+        }
+    }
 }

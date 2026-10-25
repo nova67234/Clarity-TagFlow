@@ -20,8 +20,9 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use eframe::egui;
 
-/// Set by the chat's Stop button; the worker's token loop checks it between
-/// tokens and ends the reply early (the partial text stays in the bubble).
+/// Set by the chat's Stop button; the worker checks it between tokens (and
+/// between the slow steps before the first one) and ends the reply early
+/// (the partial text stays in the bubble).
 /// A single static works because only one generation runs at a time — same
 /// scheme as the text-to-image view's cancel flag.
 static GEN_CANCEL: AtomicBool = AtomicBool::new(false);
@@ -475,6 +476,9 @@ pub struct LlmState {
     /// The chat receiving the streaming reply, by id (survives chat
     /// switching/deletion while a reply streams in).
     gen_chat: Option<u64>,
+    /// The streaming reply was asked as role play (its control lines are
+    /// handled on Done by this, not by the live toggle).
+    pub gen_roleplay: bool,
     next_chat_id: u64,
     /// The input pill's draft text and attached image.
     pub draft: String,
@@ -613,11 +617,85 @@ impl Drop for LlmState {
         }
         // Nor decrypted album pictures in the temp folder.
         crate::roleplay::clear_album_temp();
+        clear_ai_temp();
     }
+}
+
+/// Where this run of the app keeps the AI worker's temp copies of the user's
+/// pictures: Detailed Vision's close-up sections (`tiles_*`) and sampled video
+/// frames (`frames_*`), one folder per image or clip, cached for the session.
+/// One folder per running copy of the app (by process id): two copies working
+/// on the same picture never share a folder, nor delete each other's.
+fn ai_temp_dir() -> PathBuf {
+    ai_temp_root().join(std::process::id().to_string())
+}
+
+fn ai_temp_root() -> PathBuf {
+    std::env::temp_dir().join("clarity_tagflow_ai")
+}
+
+/// A file in each run's [`ai_temp_dir`], rewritten whenever the run uses it:
+/// its age says how long ago that copy of the app last used its folder.
+const AI_TEMP_IN_USE: &str = "in_use";
+
+/// `name`'s folder in [`ai_temp_dir`] (created by the caller), marking the
+/// run's folder as in use.
+#[cfg_attr(not(feature = "llm"), allow(dead_code))] // only the AI worker makes copies
+fn ai_temp_subdir(name: &str) -> PathBuf {
+    let dir = ai_temp_dir();
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(dir.join(AI_TEMP_IN_USE), b"");
+    }
+    dir.join(name)
+}
+
+/// Delete this run's temp picture copies (at exit).
+fn clear_ai_temp() {
+    let _ = std::fs::remove_dir_all(ai_temp_dir());
+}
+
+/// At startup, delete the picture copies crashed runs left: other runs'
+/// folders not used for an hour (a copy of the app still running marks its
+/// folder each time it uses it), and what older builds kept straight in the
+/// temp folder. On a thread of its own — the temp folder can hold many
+/// thousands of entries, and listing them held up the app's start.
+fn clear_stale_ai_temp() {
+    let stale = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(3600))
+    };
+    let _ = std::thread::Builder::new().name("ai-temp-cleanup".into()).spawn(move || {
+        let own = std::process::id().to_string();
+        for entry in std::fs::read_dir(ai_temp_root()).into_iter().flatten().flatten() {
+            if entry.file_name().to_string_lossy() == own {
+                continue;
+            }
+            let dir = entry.path();
+            let marker = dir.join(AI_TEMP_IN_USE);
+            if stale(if marker.exists() { &marker } else { &dir }) {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+        for entry in std::fs::read_dir(std::env::temp_dir()).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let legacy_dir = name.starts_with("clarity_tagflow_ai_tiles_") || name.starts_with("clarity_tagflow_ai_frames_");
+            if legacy_dir && stale(&entry.path()) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            } else if name == "clarity_tagflow_llm_input.png" && stale(&entry.path()) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    });
 }
 
 impl Default for LlmState {
     fn default() -> Self {
+        // Picture copies a crashed run left in the temp folder.
+        clear_stale_ai_temp();
         let (video_poster_tx, video_poster_rx) = std::sync::mpsc::channel();
         // Role play's memories have their own store; an older diary kept in
         // the role-play file moves into it the first time.
@@ -631,6 +709,7 @@ impl Default for LlmState {
             chats: vec![Chat { id: 0, msgs: Vec::new() }],
             active_chat: 0,
             gen_chat: None,
+            gen_roleplay: false,
             next_chat_id: 1,
             draft: String::new(),
             draft_image: None,
@@ -737,6 +816,15 @@ impl LlmState {
     /// reply finishes (see `unload_when_done`). The next activation reloads
     /// the model on its first ask.
     pub fn unload(&mut self) {
+        // Voice and mic stop with the chat: their Stop controls are in it,
+        // and nothing polls them while it's hidden — a clip still being
+        // synthesized would play when the chat is next shown, and dictation
+        // would record on and drop its transcript into the draft later.
+        self.voice.stop();
+        if let Some(mut c) = self.tts.take() {
+            let _ = c.kill();
+        }
+        self.dictate.cancel();
         if self.running {
             self.unload_when_done = true;
         } else {
@@ -838,7 +926,10 @@ impl LlmState {
         {
             for msg in worker_msgs {
                 match msg {
-                    Msg::Status(s) => self.status = s,
+                    // Once Stop is pressed, keep saying so: the worker's later
+                    // progress lines would read as if the reply carried on.
+                    Msg::Status(s) if !(self.running && GEN_CANCEL.load(Ordering::SeqCst)) => self.status = s,
+                    Msg::Status(_) => {}
                     Msg::ImageDetail { effective, reason } => {
                         self.detail_effective = effective;
                         self.detail_reason = reason;
@@ -884,8 +975,17 @@ impl LlmState {
                             }
                         // Role play: a finished reply may end in control lines
                         // (diary entries, keep/show a picture) — pull them out
-                        // of the visible text and act on them.
-                        if res.is_ok() && self.roleplay.enabled {
+                        // of the visible text and act on them. Whether it's a
+                        // role-play reply was settled when it was asked (the
+                        // Tools menu may have switched modes since), and, as
+                        // with Tag images below, only a reply the model ended
+                        // itself is acted on: a stopped, cut-off or failed one
+                        // may end mid-line ("MEMORY: Peter is allergic to"),
+                        // so its control lines are only hidden.
+                        let stopped = GEN_CANCEL.load(Ordering::SeqCst);
+                        let cut_off = GEN_CUT_OFF.load(Ordering::SeqCst);
+                        if self.gen_roleplay {
+                            let complete = res.is_ok() && !stopped && !cut_off;
                             let mut directives = None;
                             let mut last_user_image = None;
                             if let Some(chat) = self
@@ -905,7 +1005,7 @@ impl LlmState {
                                     directives = Some(crate::roleplay::extract_directives(&mut m.text));
                                 }
                             }
-                            if let Some(d) = directives {
+                            if let Some(d) = directives.filter(|_| complete) {
                                 // Into role play's own memory store, filed
                                 // under the category the line names.
                                 for mem in d.memories {
@@ -942,8 +1042,6 @@ impl LlmState {
                         // the user stopped, one cut off at Max reply length
                         // or one that failed may have a line cut short, so
                         // its edits are dropped, and the note says why.
-                        let stopped = GEN_CANCEL.load(Ordering::SeqCst);
-                        let cut_off = GEN_CUT_OFF.load(Ordering::SeqCst);
                         let tagging = self.tag_images;
                         if let Some(chat) = self
                             .gen_chat
@@ -993,8 +1091,10 @@ impl LlmState {
                             }
                         }
                         // Auto-speak: read the finished reply aloud (after the
-                        // diary lines are gone, so they're never spoken).
-                        if res.is_ok() && self.auto_speak {
+                        // diary lines are gone, so they're never spoken) —
+                        // unless AI Chat was switched off meanwhile: nothing
+                        // would be on screen to stop it with.
+                        if res.is_ok() && self.auto_speak && !self.unload_when_done {
                             let target = self
                                 .gen_chat
                                 .and_then(|id| self.chats.iter().find(|c| c.id == id))
@@ -1183,6 +1283,9 @@ impl LlmState {
             return;
         }
         chat.msgs.truncate(msg_index);
+        let id = chat.id;
+        self.close_cut_editor(id, msg_index);
+        let chat = &self.chats[self.active_chat];
         if chat.msgs.last().map(|m| m.role) != Some(ChatRole::User) {
             return;
         }
@@ -1225,9 +1328,22 @@ impl LlmState {
         }
         chat.msgs.truncate(msg_index + 1);
         chat.msgs[msg_index].text = text;
+        let id = chat.id;
+        self.close_cut_editor(id, msg_index + 1);
         self.run_err = None;
         self.status = "Starting…".to_string();
         self.begin_generation(ctx);
+    }
+
+    /// Chat `chat_id` was cut back to its first `len` messages: an editor
+    /// open on a message that's gone closes. Left open it would reappear on
+    /// whatever lands at that index next (the next message sent), showing
+    /// the old text, and Enter would overwrite that message with it.
+    fn close_cut_editor(&mut self, chat_id: u64, len: usize) {
+        if self.editing.is_some_and(|(id, i)| id == chat_id && i >= len) {
+            self.editing = None;
+            self.edit_draft.clear();
+        }
     }
 
     /// Generate a reply to the active chat's history (which must end with a
@@ -1308,6 +1424,7 @@ impl LlmState {
         // history — it never slides out of the window, so the character (and
         // everything in the diary) survives arbitrarily long sessions.
         let mut pinned = 0;
+        self.gen_roleplay = !self.krea_prompts && self.roleplay.enabled;
         if self.krea_prompts {
             // The Krea 2 brief is pinned the same way (the tools menu keeps
             // it and role play mutually exclusive).
@@ -1450,13 +1567,17 @@ impl LlmState {
             use std::io::Write as _;
             use std::os::windows::process::CommandExt as _;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            // The text goes in as UTF-8 and is read back as UTF-8 explicitly:
+            // [Console]::In decodes with the console code page, which turned
+            // "é" into "Ã©" and curly quotes or "…" into junk.
             let child = std::process::Command::new("powershell")
                 .args([
                     "-NoProfile",
                     "-Command",
                     "Add-Type -AssemblyName System.Speech; \
                      $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
-                     $s.Speak([Console]::In.ReadToEnd())",
+                     $r = New-Object System.IO.StreamReader([Console]::OpenStandardInput(), [System.Text.Encoding]::UTF8); \
+                     $s.Speak($r.ReadToEnd())",
                 ])
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
@@ -1676,6 +1797,14 @@ mod worker {
             .with_n_ctx(NonZeroU32::new(N_CTX))
     }
 
+    /// Held by a worker for as long as it has llama.cpp loaded. llama-cpp-2
+    /// allows one backend at a time, and a worker the chat has just replaced
+    /// (another model, or Image detail changed during a reply) is still
+    /// freeing its weights when the next one starts — which then failed with
+    /// "BackendAlreadyInitialized". The new worker waits here instead, which
+    /// also keeps the old weights' GPU memory from crowding out the new load.
+    static LOADED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Worker body: load everything once, then serve Generate commands until
     /// the UI side drops its sender. On a load failure the error is reported
     /// as a `Done(Err)` and the thread exits (the UI respawns it on demand).
@@ -1690,6 +1819,8 @@ mod worker {
             let _ = tx.send(m);
             ctx.request_repaint();
         };
+        // (A worker that panicked released everything while unwinding.)
+        let _loaded = LOADED.lock().unwrap_or_else(|e| e.into_inner());
         match load_and_serve(&rx, &send, model, detail) {
             Ok(()) => {}
             Err(e) => send(Msg::Done(Err(e))),
@@ -1842,6 +1973,10 @@ mod worker {
         params: &super::GenParams,
         send: &dyn Fn(Msg),
     ) -> Result<(), String> {
+        // Stop pressed while the model was still loading: nothing to do.
+        if stopped() {
+            return Ok(());
+        }
         // A fresh context per turn: cheap next to the resident weights, and it
         // guarantees no KV-cache state leaks — the whole (capped) history is
         // re-evaluated, which is what makes multi-turn chat work.
@@ -1849,11 +1984,6 @@ mod worker {
             .new_context(backend, context_params(threads, batch_for(detail)))
             .map_err(|e| format!("Create context: {e}"))?;
 
-        // The media marker tells the tokenizer where an image's tokens go;
-        // bitmaps are matched to markers in order of appearance, so each
-        // message with an image gets a marker and its bitmap is pushed in the
-        // same sequence (matches llama.cpp's mtmd-cli).
-        let marker = llama_cpp_2::mtmd::mtmd_default_marker();
         // Each turn keeps its own bitmaps, so trimming old turns below drops
         // their images along with their text.
         let mut turns: Vec<(bool, String, Vec<MtmdBitmap>)> = Vec::new();
@@ -1863,45 +1993,25 @@ mod worker {
             .then(|| msgs.iter().rposition(|m| m.image.as_deref().is_some_and(|p| !crate::is_video(p))))
             .flatten();
         for (mi, m) in msgs.iter().enumerate() {
-            let mut text = m.text.clone();
-            let mut bitmaps: Vec<MtmdBitmap> = Vec::new();
-            if let Some(path) = &m.image {
-                if crate::is_video(path) {
-                    // A video becomes a handful of evenly-sampled frames, each
-                    // its own vision input, labelled with its timestamp so the
-                    // model can reason about order and motion.
-                    send(Msg::Status("Reading the video…".into()));
-                    let frames = video_frames(path)?;
-                    use std::fmt::Write as _;
-                    let mut header =
-                        format!("This is a video, shown as {} sampled frames:\n", frames.len());
-                    for (ms, frame) in &frames {
-                        bitmaps.push(load_bitmap(mtmd, frame)?);
-                        let _ = writeln!(header, "Frame at {}: {marker}", fmt_timestamp(*ms));
+            let (text, bitmaps) = match &m.image {
+                None => (m.text.clone(), Vec::new()),
+                Some(path) => match read_media(mtmd, path, &m.text, tile_at == Some(mi), detail, send) {
+                    Ok(read) => read,
+                    Err(_) if stopped() => return Ok(()),
+                    // An attachment from an earlier turn that can't be read
+                    // any more (moved or deleted since it was sent) is left
+                    // out, with a note that it was there: failing on it would
+                    // fail every later message of the chat, until newer
+                    // images pushed it out of the history. Only this turn's
+                    // own attachment fails the reply.
+                    Err(e) if mi + 1 < msgs.len() => {
+                        eprintln!("[ai] left out an earlier attachment ({}): {e}", path.display());
+                        let what = if crate::is_video(path) { "video" } else { "image" };
+                        (format!("[{what} no longer available]\n{}", m.text), Vec::new())
                     }
-                    text = format!("{header}{text}");
-                } else if let Some(tiles) =
-                    (tile_at == Some(mi)).then(|| detail_sections(mtmd, path, detail)).flatten()
-                {
-                    // The full picture first (the layout), then the labelled
-                    // close-ups (the detail) — like a video's frames.
-                    send(Msg::Status("Reading the image in detail…".into()));
-                    use std::fmt::Write as _;
-                    bitmaps.push(load_bitmap(mtmd, path)?);
-                    let mut header = format!("{marker}\n{DETAIL_GUIDE}\n");
-                    for (label, tile) in tiles {
-                        bitmaps.push(tile);
-                        let _ = writeln!(header, "{label} section: {marker}");
-                    }
-                    text = format!("{header}{text}");
-                } else {
-                    send(Msg::Status("Reading the image…".into()));
-                    bitmaps.push(load_bitmap(mtmd, path)?);
-                    if !text.contains(marker) {
-                        text = format!("{marker}\n{text}");
-                    }
-                }
-            }
+                    Err(e) => return Err(e),
+                },
+            };
             turns.push((m.user, text, bitmaps));
         }
 
@@ -2032,6 +2142,12 @@ mod worker {
                 start += 1;
             }
         };
+        // Last chance to stop before the prompt evaluation, which runs to the
+        // end once started (minutes for a long chat on a model partly on the
+        // CPU — llama-cpp-2 evaluates all chunks in one call).
+        if stopped() {
+            return Ok(());
+        }
         let mut n_past = chunks
             .eval_chunks(mtmd, &context, 0, 0, batch_for(detail) as i32, true)
             .map_err(|e| format!("Evaluate prompt: {e}"))?;
@@ -2136,9 +2252,7 @@ mod worker {
                 break;
             }
             let was_thinking = thought_open(&raw);
-            let piece = model
-                .token_to_piece(token, &mut decoder, false, None)
-                .map_err(|e| format!("Decode token: {e}"))?;
+            let piece = token_text(model, token, &mut decoder)?;
             if !piece.is_empty() {
                 raw.push_str(&piece);
                 send(Msg::Token(piece));
@@ -2176,6 +2290,111 @@ mod worker {
             super::GEN_CUT_OFF.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         Ok(())
+    }
+
+    /// The chat's Stop button was pressed. Checked between the slow phases
+    /// before the first token too (loading, frames, sections, before the
+    /// prompt evaluation), not only between generated tokens.
+    fn stopped() -> bool {
+        super::GEN_CANCEL.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// One message's attachment for the vision encoder: its bitmaps, and the
+    /// message `text` with their media markers put in. `tiled` = Detailed
+    /// Vision cuts this one into close-up sections.
+    fn read_media(
+        mtmd: &MtmdContext,
+        path: &Path,
+        text: &str,
+        tiled: bool,
+        detail: super::ImageDetail,
+        send: &dyn Fn(Msg),
+    ) -> Result<(String, Vec<MtmdBitmap>), String> {
+        // The media marker tells the tokenizer where an image's tokens go;
+        // bitmaps are matched to markers in order of appearance, so each
+        // message with an image gets a marker and its bitmap is pushed in the
+        // same sequence (matches llama.cpp's mtmd-cli).
+        let marker = llama_cpp_2::mtmd::mtmd_default_marker();
+        let mut text = text.to_string();
+        let mut bitmaps: Vec<MtmdBitmap> = Vec::new();
+        if stopped() {
+            return Err("Stopped".to_string());
+        }
+        if crate::is_video(path) {
+            // A video becomes a handful of evenly-sampled frames, each
+            // its own vision input, labelled with its timestamp so the
+            // model can reason about order and motion.
+            send(Msg::Status("Reading the video…".into()));
+            let frames = video_frames(path)?;
+            use std::fmt::Write as _;
+            let mut header =
+                format!("This is a video, shown as {} sampled frames:\n", frames.len());
+            for (ms, frame) in &frames {
+                if stopped() {
+                    return Err("Stopped".to_string());
+                }
+                bitmaps.push(load_bitmap(mtmd, frame)?);
+                let _ = writeln!(header, "Frame at {}: {marker}", fmt_timestamp(*ms));
+            }
+            text = format!("{header}{text}");
+        } else if let Some(tiles) = tiled.then(|| detail_sections(mtmd, path, detail)).flatten() {
+            // The full picture first (the layout), then the labelled
+            // close-ups (the detail) — like a video's frames.
+            send(Msg::Status("Reading the image in detail…".into()));
+            use std::fmt::Write as _;
+            bitmaps.push(load_bitmap(mtmd, path)?);
+            let mut header = format!("{marker}\n{DETAIL_GUIDE}\n");
+            for (label, tile) in tiles {
+                bitmaps.push(tile);
+                let _ = writeln!(header, "{label} section: {marker}");
+            }
+            text = format!("{header}{text}");
+        } else {
+            send(Msg::Status("Reading the image…".into()));
+            bitmaps.push(load_bitmap(mtmd, path)?);
+            if !text.contains(marker) {
+                text = format!("{marker}\n{text}");
+            }
+        }
+        Ok((text, bitmaps))
+    }
+
+    /// A sampled token's text. llama-cpp-2's `token_to_piece` decodes into a
+    /// buffer exactly the size of this token's bytes and ignores "output
+    /// full", so a character whose first bytes came with the previous token
+    /// (an emoji split 3+1, CJK one byte per token) didn't fit and was lost —
+    /// from the bubble, the saved reply and the history. So the raw bytes are
+    /// decoded here. A token that renders as nothing (a control token that
+    /// doesn't end the turn) is an empty piece: llama-cpp-2 reports it as an
+    /// error, which used to fail the whole reply.
+    fn token_text(
+        model: &LlamaModel,
+        token: llama_cpp_2::token::LlamaToken,
+        decoder: &mut encoding_rs::Decoder,
+    ) -> Result<String, String> {
+        use llama_cpp_2::TokenToStringError as E;
+        let bytes = match model.token_to_piece_bytes(token, 8, false, None) {
+            // Longer than 8 bytes: the error carries the size needed.
+            Err(E::InsufficientBufferSpace(n)) => {
+                model.token_to_piece_bytes(token, n.unsigned_abs() as usize, false, None)
+            }
+            other => other,
+        };
+        match bytes {
+            Ok(bytes) => Ok(decode_piece(decoder, &bytes)),
+            Err(E::UnknownTokenType) => Ok(String::new()),
+            Err(e) => Err(format!("Decode token: {e}")),
+        }
+    }
+
+    /// Decode one token's bytes. An unfinished character waits in `decoder`
+    /// for the next piece, so the buffer is sized for these bytes plus what
+    /// the decoder still holds.
+    pub(super) fn decode_piece(decoder: &mut encoding_rs::Decoder, bytes: &[u8]) -> String {
+        let room = decoder.max_utf8_buffer_length(bytes.len()).unwrap_or(bytes.len() + 4);
+        let mut out = String::with_capacity(room);
+        let _ = decoder.decode_to_string(bytes, &mut out, false);
+        out
     }
 
     /// A per-reply sampler seed from the clock (no RNG crate needed).
@@ -2271,7 +2490,7 @@ mod worker {
             && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
                 d.as_secs().hash(&mut h);
             }
-        let dir = std::env::temp_dir().join(format!("clarity_tagflow_ai_frames_{:016x}", h.finish()));
+        let dir = super::ai_temp_subdir(&format!("frames_{:016x}", h.finish()));
 
         // Frames are named {index:02}_{timestamp ms}.png, so a name sort is
         // playback order and the label survives the cache round-trip.
@@ -2288,10 +2507,18 @@ mod worker {
                 })
                 .collect()
         };
-        let cached = list(&dir);
-        if !cached.is_empty() {
-            return Ok(cached);
+        // A set is only trusted once complete: the marker is written after
+        // the last frame, so an extraction cut short (the app quit mid-write,
+        // a full disk) is redone instead of reused — a truncated frame would
+        // fail every send of the clip.
+        let complete = dir.join("complete");
+        if complete.exists() {
+            let cached = list(&dir);
+            if !cached.is_empty() {
+                return Ok(cached);
+            }
         }
+        let _ = std::fs::remove_dir_all(&dir);
 
         let frames = crate::video::capture_frames(path, MAX_VIDEO_FRAMES, VIDEO_FRAME_EDGE);
         if frames.is_empty() {
@@ -2306,6 +2533,7 @@ mod worker {
             rgba.save_with_format(dir.join(format!("{i:02}_{ms}.png")), image::ImageFormat::Png)
                 .map_err(|e| format!("Save frame: {e}"))?;
         }
+        std::fs::write(&complete, b"").map_err(|e| format!("Frame cache: {e}"))?;
         Ok(list(&dir))
     }
 
@@ -2751,7 +2979,7 @@ mod worker {
             && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
                 d.as_secs().hash(&mut hsh);
             }
-        let dir = std::env::temp_dir().join(format!("clarity_tagflow_ai_tiles_{:016x}", hsh.finish()));
+        let dir = super::ai_temp_subdir(&format!("tiles_{:016x}", hsh.finish()));
         let tiles: Vec<(&'static str, PathBuf)> = labels
             .iter()
             .enumerate()
@@ -2772,6 +3000,10 @@ mod worker {
         let (th, step_y) = span(h, rows);
         std::fs::create_dir_all(&dir).map_err(|e| format!("Tile cache: {e}"))?;
         for (i, (_, out)) in tiles.iter().enumerate() {
+            // Stop pressed: the missing sections are cut next time.
+            if stopped() {
+                return Err("Stopped".to_string());
+            }
             let (cx, cy) = (i as u32 % cols, i as u32 / cols);
             let x = ((cx as f32 * step_x).round() as u32).min(w - tw);
             let y = ((cy as f32 * step_y).round() as u32).min(h - th);
@@ -2808,23 +3040,27 @@ mod worker {
             .ok()
     }
 
-    /// Load an image for the vision pipeline. llama.cpp's own loader (stb)
-    /// covers jpg/png/bmp/gif; anything else (webp, tiff, …) is decoded with
-    /// the `image` crate and handed over as a temp PNG.
+    /// Load an image for the vision pipeline. The file is always read here,
+    /// never opened by llama.cpp: its loader uses plain `fopen`, which on
+    /// Windows can't open a path outside the ANSI code page (a user folder
+    /// like "José" or a CJK name, and %TEMP% lives under it). llama.cpp's
+    /// decoder (stb) covers jpg/png/bmp/gif; anything else (webp, tiff, …) is
+    /// decoded with the `image` crate and handed over as pixels.
     fn load_bitmap(mtmd: &MtmdContext, path: &Path) -> Result<MtmdBitmap, String> {
         // llama.cpp's loader ignores the EXIF "rotate this" flag phones put
         // on portraits — only an upright-stored file may take the fast path.
         let upright = crate::image_cache::exif_orientation(path)
             == image::metadata::Orientation::NoTransforms;
-        if upright && let Ok(bmp) = MtmdBitmap::from_file(mtmd, &path.to_string_lossy(), false) {
+        if upright
+            && let Ok(bytes) = std::fs::read(path)
+            && let Ok(bmp) = MtmdBitmap::from_buffer(mtmd, &bytes, false)
+        {
             return Ok(bmp);
         }
-        let img = crate::image_cache::open_oriented(path).map_err(|e| format!("Read image: {e}"))?;
-        let tmp = std::env::temp_dir().join("clarity_tagflow_llm_input.png");
-        img.to_rgb8()
-            .save_with_format(&tmp, image::ImageFormat::Png)
-            .map_err(|e| format!("Convert image: {e}"))?;
-        MtmdBitmap::from_file(mtmd, &tmp.to_string_lossy(), false)
+        let img = crate::image_cache::open_oriented(path)
+            .map_err(|e| format!("Read image: {e}"))?
+            .to_rgb8();
+        MtmdBitmap::from_image_data(img.width(), img.height(), img.as_raw())
             .map_err(|e| format!("Load image: {e}"))
     }
 }
@@ -3892,6 +4128,22 @@ mod tests {
         assert_eq!(at(3000, 4500, ImageDetail::High), Some(2), "High: tall 2 down");
         assert_eq!(at(3600, 3600, ImageDetail::Maximum), None, "Maximum: no tiles");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Streamed text keeps characters split across tokens (no model needed):
+    /// an emoji split 3+1, CJK one byte per token, an invalid byte.
+    #[test]
+    fn token_pieces_keep_split_characters() {
+        let stream = |pieces: &[&[u8]]| -> String {
+            let mut decoder = encoding_rs::UTF_8.new_decoder();
+            pieces.iter().map(|p| worker::decode_piece(&mut decoder, p)).collect()
+        };
+        let text = "Great job 😊 see you";
+        let (b, i) = (text.as_bytes(), text.find('😊').unwrap());
+        assert_eq!(stream(&[&b[..i + 3], &b[i + 3..]]), text);
+        let cjk: Vec<&[u8]> = "中文字".as_bytes().chunks(1).collect();
+        assert_eq!(stream(&cjk[..]), "中文字");
+        assert_eq!(stream(&[&b"a\xFFb"[..], &b""[..], &b"c"[..]]), "a\u{FFFD}bc");
     }
 
     /// Writes the Detailed Vision sections of one tests/example photo to

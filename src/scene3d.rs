@@ -16,17 +16,36 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use eframe::egui;
 use three_d::*;
 
 use crate::theme::MUTED;
 
+/// A file's (modified time, size), to notice it being rewritten in place.
+type Stamp = (SystemTime, u64);
+
+/// How long a rewritten GLB must sit unmodified before it's reloaded, so a
+/// file Python is still writing is never read half-done.
+const SETTLE: Duration = Duration::from_secs(1);
+
+/// How often the shown file is checked for a rewrite. The viewer repaints
+/// every frame while it's orbited, and a `metadata` call a frame is a file
+/// system round trip each time (slow on a network drive).
+const STAMP_CHECK: Duration = Duration::from_millis(500);
+
 /// UI-facing handle. Owns the shared render state and tracks which file is loaded.
 pub struct Scene3D {
     inner: Arc<Mutex<Inner>>,
     /// Path currently loaded (or attempted), so we only reload on change.
     loaded_path: Option<PathBuf>,
+    /// That file's stamp when its load began. Pixal3D names outputs
+    /// `{stem}_{seed}.glb`, so a fixed-seed re-run overwrites the shown file
+    /// under the same path — a changed stamp is what triggers the reload.
+    loaded_stamp: Option<Stamp>,
+    /// When that stamp may next be checked (see [`STAMP_CHECK`]).
+    next_stamp_check: std::time::Instant,
     /// Set if reading/parsing the GLB failed (shown instead of the viewport).
     load_err: Option<String>,
     /// Receives the parsed CPU model from the background loader thread.
@@ -51,6 +70,10 @@ struct Inner {
     gpu: Option<Gpu>,
     /// Background clear colour for the viewport (RGBA, linear-ish).
     bg: [f32; 4],
+    /// The GPU upload (or GL setup) failed: shown instead of the spinner, which
+    /// would otherwise wait — and repaint every frame — for a model that's
+    /// never coming. Cleared when the next load starts.
+    upload_err: Option<String>,
 }
 
 struct Gpu {
@@ -82,8 +105,11 @@ impl Scene3D {
                 needs_framing: false,
                 gpu: None,
                 bg: [0.0; 4],
+                upload_err: None,
             })),
             loaded_path: None,
+            loaded_stamp: None,
+            next_stamp_check: std::time::Instant::now(),
             load_err: None,
             loader: None,
         }
@@ -95,10 +121,31 @@ impl Scene3D {
         // When the target file changes, kick off a background load. Reading +
         // decoding the GLB (4K PBR textures, ~1M triangles) is heavy, so it runs
         // off the UI thread; the UI shows a spinner and stays responsive.
-        if glb_path.map(Path::to_path_buf) != self.loaded_path {
+        let path_changed = glb_path.map(Path::to_path_buf) != self.loaded_path;
+        // Same path, new contents (a fixed-seed re-run overwrote it): reload too,
+        // once the write has settled.
+        let mut rewritten = false;
+        let now = std::time::Instant::now();
+        if !path_changed
+            && self.loader.is_none()
+            && let Some(p) = glb_path
+            && now >= self.next_stamp_check
+        {
+            self.next_stamp_check = now + STAMP_CHECK;
+            match rewrite_wait(self.loaded_stamp, file_stamp(p), SystemTime::now()) {
+                Some(wait) if wait.is_zero() => rewritten = true,
+                // Still being written: look again once it may have settled.
+                Some(wait) => ui.ctx().request_repaint_after(wait.max(STAMP_CHECK)),
+                None => {}
+            }
+        }
+        if path_changed || rewritten {
             self.loaded_path = glb_path.map(Path::to_path_buf);
+            self.loaded_stamp = glb_path.and_then(file_stamp);
+            self.next_stamp_check = now + STAMP_CHECK;
             self.load_err = None;
             self.loader = None;
+            self.inner.lock().unwrap().upload_err = None;
             if let Some(p) = glb_path {
                 self.loader = Some(spawn_loader(p.to_path_buf(), ui.ctx().clone()));
             }
@@ -137,10 +184,14 @@ impl Scene3D {
 
         // Nothing renderable yet (first load in progress): spinner, and keep the
         // frame loop alive so we poll the loader and animate the spinner.
-        let (has_model, has_pending) = {
+        let (has_model, has_pending, upload_err) = {
             let inner = self.inner.lock().unwrap();
-            (inner.has_model, inner.pending_cpu.is_some())
+            (inner.has_model, inner.pending_cpu.is_some(), inner.upload_err.clone())
         };
+        if let Some(err) = upload_err {
+            placeholder(ui, &err);
+            return;
+        }
         if !has_model && !has_pending {
             spinner(ui, "Loading 3D model…");
             ui.ctx().request_repaint();
@@ -191,6 +242,26 @@ impl Scene3D {
     }
 }
 
+/// The file's stamp, or `None` if it can't be read (missing, mid-replace).
+fn file_stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// Whether the shown file, loaded at stamp `loaded`, was rewritten and is safe
+/// to reload: `None` = unchanged (or unreadable right now — keep what's shown),
+/// `Some(ZERO)` = reload now, `Some(wait)` = still being written, check again
+/// after `wait`.
+fn rewrite_wait(loaded: Option<Stamp>, current: Option<Stamp>, now: SystemTime) -> Option<Duration> {
+    let current = current?;
+    if Some(current) == loaded {
+        return None;
+    }
+    // A modified time in the future (clock skew) counts as settled.
+    let age = now.duration_since(current.0).unwrap_or(SETTLE);
+    Some(SETTLE.saturating_sub(age))
+}
+
 /// Read + parse a GLB on a background thread, returning a channel that yields the
 /// CPU model (or an error). Wakes the UI via `request_repaint` when done.
 fn spawn_loader(path: PathBuf, ctx: egui::Context) -> Receiver<Result<CpuModel, String>> {
@@ -213,7 +284,14 @@ impl Inner {
         if self.gpu.is_none() {
             let ctx = match Context::from_gl_context(gl.clone()) {
                 Ok(c) => c,
-                Err(_) => return,
+                Err(e) => {
+                    // Nothing can render on this GL context: report it rather
+                    // than retrying (and repainting) every frame. A new load
+                    // clears this and tries again.
+                    self.pending_cpu = None;
+                    self.upload_err = Some(format!("3D viewer unavailable on this GPU: {e}"));
+                    return;
+                }
             };
             // Image-based lighting: Pixal3D models are fully metallic, so their
             // colour comes from environment reflections — with no environment they
@@ -256,6 +334,7 @@ impl Inner {
                     eprintln!("[scene3d] GLB GPU upload failed: {e}");
                     gpu.model = None;
                     self.has_model = false;
+                    self.upload_err = Some(format!("Couldn't upload the model to the GPU: {e}"));
                 }
             }
         }
@@ -387,5 +466,43 @@ fn clear_color() -> [f32; 4] {
         [0.93, 0.93, 0.95, 1.0]
     } else {
         [0.07, 0.07, 0.09, 1.0]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn unchanged_or_unreadable_file_keeps_the_model() {
+        let stamp = (at(100), 42);
+        assert_eq!(rewrite_wait(Some(stamp), Some(stamp), at(500)), None);
+        // Missing for a moment (being replaced): keep showing the loaded model.
+        assert_eq!(rewrite_wait(Some(stamp), None, at(500)), None);
+    }
+
+    /// The reported bug: a fixed-seed re-run overwrote the same path and the
+    /// viewer kept the old mesh. A new mtime or size must trigger a reload.
+    #[test]
+    fn rewritten_file_reloads_once_settled() {
+        let loaded = (at(100), 42);
+        assert_eq!(rewrite_wait(Some(loaded), Some((at(200), 42)), at(205)), Some(Duration::ZERO));
+        assert_eq!(rewrite_wait(Some(loaded), Some((at(100), 99)), at(205)), Some(Duration::ZERO));
+        // A file whose load never got a stamp (unreadable then) loads once readable.
+        assert_eq!(rewrite_wait(None, Some(loaded), at(205)), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn file_still_being_written_waits() {
+        let loaded = (at(100), 42);
+        let written = SystemTime::UNIX_EPOCH + Duration::from_millis(200_000);
+        let now = written + Duration::from_millis(300);
+        assert_eq!(rewrite_wait(Some(loaded), Some((written, 7)), now), Some(Duration::from_millis(700)));
+        // A modified time in the future (clock skew) doesn't stall the reload.
+        assert_eq!(rewrite_wait(Some(loaded), Some((at(300), 7)), at(200)), Some(Duration::ZERO));
     }
 }

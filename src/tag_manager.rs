@@ -242,6 +242,12 @@ pub fn show(
         state.tagger = done.tagger;
         state.tagger_folder = done.folder;
         match done.result {
+            // The image was moved or deleted while the tagger ran: writing
+            // now would leave a .txt with no image behind.
+            Ok(_) if !crate::archive::is_entry(&done.image) && !done.image.exists() => {
+                state.status_msg = "The image was moved or deleted — tags not saved".to_string();
+                state.status_is_error = true;
+            }
             Ok(new_tags) => {
                 // Drop blacklisted tags (comma/newline separated in settings).
                 let blacklist = parse_tags(&state.settings.blacklist);
@@ -249,10 +255,15 @@ pub fn show(
                 if let Some(mut existing) = read_sidecar(&done.image) {
                     let mut fresh: HashSet<String> = HashSet::new();
                     let mut added = 0;
+                    // Taggers name tags with underscores ("long_hair"): one the
+                    // file already has as "long hair" isn't added again, and new
+                    // ones are written the way the file writes its tags.
+                    let style = existing.clone();
                     for t in new_tags {
-                        let blocked = blacklist.iter().any(|b| b.eq_ignore_ascii_case(&t));
-                        let dup = existing.iter().any(|e| e.eq_ignore_ascii_case(&t));
+                        let blocked = blacklist.iter().any(|b| crate::ai_tagging::same_tag(b, &t));
+                        let dup = existing.iter().any(|e| crate::ai_tagging::same_tag(e, &t));
                         if !blocked && !dup {
+                            let t = crate::ai_tagging::styled_like(&style, &t);
                             fresh.insert(t.clone());
                             existing.push(t);
                             added += 1;
@@ -1131,7 +1142,10 @@ fn add_tags_reporting_dups(tags: &mut Vec<String>, draft: &str) -> (bool, Vec<St
 
 /// Shared Enter / Add-button handler: add the draft's tags, save on change,
 /// and flash any chips that were already present. Returns whether the draft
-/// was consumed (something added or duplicates flagged).
+/// was acted on (something added or duplicates flagged). It's cleared only
+/// once its tags are saved: a refused save (the .txt changed on disk, or
+/// can't be read or written) keeps it, so trying again is one Enter away
+/// instead of retyping it.
 fn commit_draft(
     state: &mut TagManagerState,
     tags: &mut Vec<String>,
@@ -1140,9 +1154,11 @@ fn commit_draft(
 ) -> bool {
     let before = tags.len();
     let (changed, dups) = add_tags_reporting_dups(tags, &state.draft);
+    let mut saved = true;
     if changed {
         let added = tags.len() - before;
-        if save(state, path, tags, current_tags) {
+        saved = save(state, path, tags, current_tags);
+        if saved {
             set_change_status(state, "Added", added, tags.len());
         }
     }
@@ -1150,11 +1166,11 @@ fn commit_draft(
     if had_dups {
         state.dup_flash = Some((dups.into_iter().collect(), Instant::now()));
     }
-    let consumed = changed || had_dups;
-    if consumed {
+    let acted = changed || had_dups;
+    if acted && saved {
         state.draft.clear();
     }
-    consumed
+    acted
 }
 
 /// Serialize tags back to the comma-separated sidecar form.
@@ -1167,18 +1183,46 @@ fn serialize_tags(tags: &[String]) -> String {
 /// (see `sidecar::apply_tags`), so captions keep their sentences. False —
 /// with an error status, nothing written — when the existing sidecar can't
 /// be read.
+///
+/// `tags` is the shown list (parsed from `current_tags`) with the user's
+/// change applied, and saving it makes the file hold exactly that list. So
+/// when the file no longer holds what `current_tags` showed — it was changed
+/// in the gallery popup or another program, or a failed read left the buffer
+/// empty — nothing is written (that would undo those changes or wipe the
+/// file): the buffer is reloaded and the user asked to try again.
 fn save(state: &mut TagManagerState, path: &Path, tags: &[String], current_tags: &mut String) -> bool {
+    match read_sidecar_text(path) {
+        Some(on_disk) if parse_tags(&on_disk) != parse_tags(current_tags) => {
+            *current_tags = on_disk;
+            state.status_msg = "The tags changed on disk — reloaded, try again".to_string();
+            state.status_is_error = true;
+            return false;
+        }
+        Some(_) => {}
+        None => {
+            state.status_msg = "Couldn't read this image's .txt — left it untouched".to_string();
+            state.status_is_error = true;
+            return false;
+        }
+    }
     match write_sidecar(path, tags) {
         Some(text) => {
             *current_tags = text;
             true
         }
         None => {
-            state.status_msg = "Couldn't read this image's .txt — left it untouched".to_string();
+            state.status_msg = "Couldn't save this image's .txt".to_string();
             state.status_is_error = true;
             false
         }
     }
+}
+
+/// A file's sidecar text as it is on disk (`None` when it exists but can't
+/// be read).
+fn read_sidecar_text(path: &Path) -> Option<String> {
+    let txt = crate::right_details::sidecar_txt(path);
+    crate::sidecar::read(&txt).ok().map(|sc| sc.text)
 }
 
 /// Read and parse a file's sidecar tags from disk (`None` when the sidecar
@@ -1259,4 +1303,38 @@ fn add_to_all(all_images: &[PathBuf], new_tags: &[String]) -> (usize, usize) {
         }
     }
     (count, skipped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{save, TagManagerState};
+    use std::fs;
+
+    /// A Tag Manager change is written only over the text it was made from:
+    /// when the file changed underneath (another view, another program, or
+    /// a failed read that left the buffer empty), nothing is written and the
+    /// buffer is reloaded instead.
+    #[test]
+    fn save_refuses_a_stale_buffer() {
+        let dir = std::env::temp_dir().join(format!("ctf_tag_manager_save_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("a.png");
+        let txt = dir.join("a.txt");
+        fs::write(&txt, "a, b, c").unwrap();
+        let mut state = TagManagerState::default();
+
+        // The buffer is empty (as after a failed read): no write.
+        let mut buffer = String::new();
+        assert!(!save(&mut state, &img, &["1girl".to_string()], &mut buffer));
+        assert_eq!(fs::read_to_string(&txt).unwrap(), "a, b, c");
+        assert_eq!(buffer, "a, b, c", "reloaded from disk");
+
+        // From the current text, the change is written.
+        let tags: Vec<String> = ["a", "b", "c", "1girl"].iter().map(|t| t.to_string()).collect();
+        assert!(save(&mut state, &img, &tags, &mut buffer));
+        assert_eq!(fs::read_to_string(&txt).unwrap(), "a, b, c, 1girl");
+        assert_eq!(buffer, "a, b, c, 1girl");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

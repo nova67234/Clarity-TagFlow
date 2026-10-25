@@ -15,11 +15,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use eframe::egui;
 
@@ -28,6 +28,83 @@ use anim::{current_frame, stream_gif, AnimFrame, ANIM_FRAMES_PER_FRAME, MIN_FRAM
 
 /// Pixel count (≈ 4K: 3840×2160 ≈ 8.3 MP) at/above which a decode is "large".
 const LARGE_PIXELS: u64 = 8_000_000;
+
+/// Raw thumbnails up to this size come from the camera's embedded preview
+/// (see `decode_still`); larger decodes — the viewer's — develop the raw.
+#[cfg(feature = "avif")]
+const RAW_PREVIEW_THUMB_EDGE: u32 = 1024;
+
+/// Raw files read for their embedded preview at once, across all caches: each
+/// read loads the whole raw (tens of MB) into memory, and a cache has up to
+/// 64 workers.
+#[cfg(feature = "avif")]
+static RAW_PREVIEW_READS: Semaphore = Semaphore::new(4);
+
+/// AVIF / HEIC images from this size on take a large-decode permit (they have
+/// no reduced-size decode, so a thumbnail decodes every pixel). A 12 MP phone
+/// photo decodes alongside others; a 48 MP one waits its turn.
+#[cfg(feature = "avif")]
+const HEAVY_EXTENDED_PIXELS: u64 = 16_000_000;
+
+/// An AVIF / HEIC whose size the header doesn't give takes a large-decode
+/// permit from this file size on (see `decode_still`).
+#[cfg(feature = "avif")]
+const HEAVY_EXTENDED_BYTES: u64 = 8 * 1024 * 1024;
+
+/// A HEIF / AVIF file's pixel size from its container header: the largest
+/// `ispe` (image spatial extents) property — the full picture, as a grid
+/// image's tiles and its thumbnail are smaller. Read from the first 256 KiB,
+/// where the `meta` box sits in files from phones and most encoders; `None`
+/// when none is there.
+#[cfg(feature = "avif")]
+fn heif_extent(path: &Path) -> Option<(u32, u32)> {
+    use std::io::Read as _;
+    let mut head = Vec::new();
+    crate::archive::open(path).ok()?.take(256 * 1024).read_to_end(&mut head).ok()?;
+    let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    // A box: size, `ispe`, version + flags, width, height.
+    head.windows(4)
+        .enumerate()
+        .filter(|&(at, w)| w == b"ispe" && at >= 4)
+        .filter_map(|(at, _)| head.get(at + 8..at + 16).map(|b| (be(&b[0..4]), be(&b[4..8]))))
+        .filter(|&(w, h)| w > 0 && h > 0)
+        .max_by_key(|&(w, h)| w as u64 * h as u64)
+}
+
+/// Texture bytes a cache may keep in animations that weren't drawn last frame.
+/// Every GIF frame is its own texture (up to 2048² px, 16 MB), so a few long
+/// GIFs in the history could otherwise hold GBs of GPU memory.
+const IDLE_ANIM_BYTES: usize = 512 << 20;
+
+/// A file's (modification time, length) — what tells a file re-created at the
+/// same path apart from the one a cached result came from. `None` when it
+/// can't be read (a zip entry, which can't change; a missing file).
+pub(crate) type FileStamp = Option<(SystemTime, u64)>;
+
+pub(crate) fn file_stamp(path: &Path) -> FileStamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// Full-resolution sizes learned while decoding images whose header doesn't
+/// give them — AVIF / HEIC (which `image` can't read) and camera raws (whose
+/// header describes their small embedded thumbnail) — so the zoom viewer
+/// knows what 100% is and when to load full resolution. See [`decoded_size`].
+static DECODED_SIZES: LazyLock<Mutex<HashMap<PathBuf, (u32, u32)>>> = LazyLock::new(Default::default);
+
+fn remember_decoded_size(path: &Path, w: u32, h: u32) {
+    let mut sizes = DECODED_SIZES.lock().unwrap();
+    if sizes.len() >= 4096 {
+        sizes.clear(); // tiny entries, but never let them pile up forever
+    }
+    sizes.insert(path.to_path_buf(), (w, h));
+}
+
+/// The real (displayed) pixel size a decode found for `path`, for formats whose
+/// header can't be trusted; `None` for other formats or before any decode.
+pub fn decoded_size(path: &Path) -> Option<(u32, u32)> {
+    DECODED_SIZES.lock().unwrap().get(path).copied()
+}
 
 /// A tiny counting semaphore (std-only) used to bound concurrent heavy decodes.
 /// Each [`ImageCache`] owns its own, so the centre viewer and the browser
@@ -38,7 +115,7 @@ struct Semaphore {
 }
 
 impl Semaphore {
-    fn new(permits: usize) -> Self {
+    const fn new(permits: usize) -> Self {
         Self { permits: Mutex::new(permits), available: Condvar::new() }
     }
 
@@ -105,6 +182,8 @@ enum Slot {
         /// `done`, it plays *forward only* and holds on the latest decoded frame
         /// rather than looping over a partial animation. Once `done`, it loops.
         done: bool,
+        /// Texture bytes held by `frames` (for the [`IDLE_ANIM_BYTES`] budget).
+        bytes: usize,
     },
     Failed,
 }
@@ -113,6 +192,23 @@ struct Entry {
     slot: Slot,
     /// Frame index this image was last requested for (drives LRU eviction).
     last_used: u64,
+    /// Id of the job decoding this entry. Results carrying another id belong to
+    /// an earlier request for the same path — e.g. a GIF still streaming when
+    /// its entry was evicted and the path re-opened — and are dropped (they
+    /// used to start the new animation mid-way, with frames repeated).
+    job: u64,
+    /// Shared with that job and set when the entry is dropped (see `Drop`), so
+    /// work nobody will see stops: a queued job is skipped, a GIF stream ends.
+    cancel: Arc<AtomicBool>,
+    /// The file's stamp when the decode began (`None` until a result lands).
+    /// Re-checked when the entry comes back into use — see [`ImageCache::request`].
+    stamp: FileStamp,
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 /// What [`ImageCache::request`] reports for a path this frame.
@@ -137,9 +233,26 @@ enum DecodedImage {
     },
 }
 
-type Decoded = (PathBuf, Option<DecodedImage>);
+/// One message from a decode worker.
+struct Decoded {
+    path: PathBuf,
+    /// The job it answers (see [`Entry::job`]).
+    job: u64,
+    /// The file's stamp when the decode began (see [`Entry::stamp`]).
+    stamp: FileStamp,
+    image: Option<DecodedImage>,
+}
+
+/// One queued decode: the path, plus what ties its results to the entry that
+/// asked for it (see [`Entry::job`] / [`Entry::cancel`]).
+struct Job {
+    path: PathBuf,
+    id: u64,
+    cancel: Arc<AtomicBool>,
+}
+
 /// Shared FIFO of decode jobs; the condvar parks idle workers until work arrives.
-type JobQueue = Arc<(Mutex<VecDeque<PathBuf>>, Condvar)>;
+type JobQueue = Arc<(Mutex<VecDeque<Job>>, Condvar)>;
 
 pub struct ImageCache {
     entries: HashMap<PathBuf, Entry>,
@@ -159,6 +272,8 @@ pub struct ImageCache {
     /// so it can be changed at runtime (e.g. toggling HD thumbnails) without
     /// rebuilding the pool.
     max_edge: Arc<AtomicU32>,
+    /// Id of the most recently queued job (see [`Entry::job`]).
+    next_job: u64,
     _workers: Vec<thread::JoinHandle<()>>,
 }
 
@@ -212,6 +327,7 @@ impl ImageCache {
             // small browser thumbnails can upload several without a hitch.
             max_uploads_per_frame: if max_edge >= 1024 { 1 } else { 6 },
             max_edge: max_edge_shared,
+            next_job: 0,
             _workers: workers,
         }
     }
@@ -239,12 +355,12 @@ impl ImageCache {
         let mut anim_frames = 0;
         let mut did_work = false;
         while stills < self.max_uploads_per_frame && anim_frames < ANIM_FRAMES_PER_FRAME {
-            let Ok((path, decoded)) = self.results.try_recv() else { break };
-            match &decoded {
+            let Ok(msg) = self.results.try_recv() else { break };
+            match &msg.image {
                 Some(DecodedImage::Still(_)) | None => stills += 1,
                 Some(DecodedImage::AnimChunk { frames, .. }) => anim_frames += frames.len(),
             }
-            self.apply_decoded(ctx, &path, decoded);
+            self.apply_decoded(ctx, msg);
             did_work = true;
         }
         if did_work {
@@ -257,35 +373,44 @@ impl ImageCache {
     /// Upload a finished decode (or a streamed GIF chunk) into GPU texture(s) and
     /// record its aspect ratio. GIF chunks append to the entry's existing frames,
     /// so playback can begin before the whole animation has arrived.
-    fn apply_decoded(&mut self, ctx: &egui::Context, path: &Path, decoded: Option<DecodedImage>) {
-        match decoded {
+    fn apply_decoded(&mut self, ctx: &egui::Context, msg: Decoded) {
+        let Decoded { path, job, stamp, image } = msg;
+        let path = path.as_path();
+        // Only the entry's own job counts (see `Entry::job`); with the entry
+        // gone (evicted while in flight) there's nothing to fill either.
+        if self.entries.get(path).is_none_or(|e| e.job != job) {
+            return;
+        }
+        match image {
             Some(DecodedImage::Still(img)) => {
                 self.record_aspect(path, img.size);
                 let name = format!("img:{}", path.display());
                 let tex = ctx.load_texture(name, img, egui::TextureOptions::LINEAR);
                 if let Some(entry) = self.entries.get_mut(path) {
                     entry.slot = Slot::Ready(tex);
+                    entry.stamp = stamp;
                 }
             }
             Some(DecodedImage::AnimChunk { frames, done }) => {
                 if let Some((img, _)) = frames.first() {
                     self.record_aspect(path, img.size);
                 }
-                // Entry may have been evicted while the decode was in flight.
                 let Some(entry) = self.entries.get_mut(path) else { return };
+                entry.stamp = stamp;
                 // Append onto an in-progress animation, or start a new one (with
                 // the playback clock anchored to now, when its first frame lands).
-                let (frame_vec, total) = match &mut entry.slot {
-                    Slot::Animated { frames, total, .. } => (frames, total),
+                let (frame_vec, total, bytes) = match &mut entry.slot {
+                    Slot::Animated { frames, total, bytes, .. } => (frames, total, bytes),
                     _ => {
                         entry.slot = Slot::Animated {
                             frames: Vec::new(),
                             total: Duration::ZERO,
                             start: ctx.input(|i| i.time),
                             done: false,
+                            bytes: 0,
                         };
                         match &mut entry.slot {
-                            Slot::Animated { frames, total, .. } => (frames, total),
+                            Slot::Animated { frames, total, bytes, .. } => (frames, total, bytes),
                             _ => unreachable!(),
                         }
                     }
@@ -293,6 +418,7 @@ impl ImageCache {
                 for (img, delay) in frames {
                     let delay = delay.max(MIN_FRAME_DELAY);
                     *total += delay;
+                    *bytes += img.size[0] * img.size[1] * 4;
                     let name = format!("img:{}#{}", path.display(), frame_vec.len());
                     let tex = ctx.load_texture(name, img, egui::TextureOptions::LINEAR);
                     frame_vec.push(AnimFrame { tex, delay });
@@ -310,6 +436,7 @@ impl ImageCache {
                 if let Some(entry) = self.entries.get_mut(path)
                     && matches!(entry.slot, Slot::Loading) {
                         entry.slot = Slot::Failed;
+                        entry.stamp = stamp;
                     }
             }
         }
@@ -325,11 +452,23 @@ impl ImageCache {
     /// `now` is the egui time (seconds) used to pick the current animation frame.
     pub fn request(&mut self, path: &Path, now: f64) -> Cached {
         let frame = self.frame;
+        // An entry coming back into use after not being drawn (another image
+        // was on show, its tile scrolled away) may be for a file since replaced
+        // at the same path: a crop or cutout re-created under a deleted one's
+        // name, an outside edit. Compare the file's stamp once then — never per
+        // frame while it stays on screen — and decode afresh if it changed.
+        if let Some(entry) = self.entries.get(path)
+            && frame.wrapping_sub(entry.last_used) > 1
+            && !matches!(entry.slot, Slot::Loading)
+            && file_stamp(path) != entry.stamp
+        {
+            self.entries.remove(path);
+        }
         if let Some(entry) = self.entries.get_mut(path) {
             entry.last_used = frame;
             return match &entry.slot {
                 Slot::Ready(tex) => Cached::Ready(tex.clone()),
-                Slot::Animated { frames, total, start, done } => {
+                Slot::Animated { frames, total, start, done, .. } => {
                     Cached::Animated(current_frame(frames, *total, *start, now, *done))
                 }
                 Slot::Loading => Cached::Loading,
@@ -337,15 +476,20 @@ impl ImageCache {
             };
         }
         // First request for this path: record it and enqueue a decode job.
+        self.next_job += 1;
+        let cancel = Arc::new(AtomicBool::new(false));
         self.entries.insert(
             path.to_owned(),
             Entry {
                 slot: Slot::Loading,
                 last_used: frame,
+                job: self.next_job,
+                cancel: Arc::clone(&cancel),
+                stamp: None,
             },
         );
         let (lock, cv) = &*self.queue;
-        lock.lock().unwrap().push_back(path.to_owned());
+        lock.lock().unwrap().push_back(Job { path: path.to_owned(), id: self.next_job, cancel });
         cv.notify_one();
         Cached::Loading
     }
@@ -371,6 +515,7 @@ impl ImageCache {
     /// Drop the least-recently-used resolved entries once over capacity.
     /// In-flight (`Loading`) entries are kept so their decode isn't wasted.
     fn evict(&mut self) {
+        self.evict_idle_animations();
         if self.entries.len() <= self.capacity {
             return;
         }
@@ -384,6 +529,34 @@ impl ImageCache {
         let to_remove = self.entries.len() - self.capacity;
         for (path, _) in evictable.into_iter().take(to_remove) {
             self.entries.remove(&path); // dropping the TextureHandle(s) frees the GPU texture(s)
+        }
+    }
+
+    /// Keep animations that weren't drawn last frame within [`IDLE_ANIM_BYTES`],
+    /// dropping the least recently used first. What's on screen (or prefetched,
+    /// i.e. requested last frame) is never touched.
+    fn evict_idle_animations(&mut self) {
+        let frame = self.frame;
+        let idle_bytes = |e: &Entry| match &e.slot {
+            Slot::Animated { bytes, .. } if frame.wrapping_sub(e.last_used) > 1 => Some(*bytes),
+            _ => None,
+        };
+        let mut total: usize = self.entries.values().filter_map(idle_bytes).sum();
+        if total <= IDLE_ANIM_BYTES {
+            return;
+        }
+        let mut idle: Vec<(PathBuf, u64, usize)> = self
+            .entries
+            .iter()
+            .filter_map(|(p, e)| idle_bytes(e).map(|b| (p.clone(), e.last_used, b)))
+            .collect();
+        idle.sort_by_key(|(_, used, _)| *used); // oldest first
+        for (path, _, bytes) in idle {
+            if total <= IDLE_ANIM_BYTES {
+                break;
+            }
+            self.entries.remove(&path);
+            total -= bytes;
         }
     }
 }
@@ -400,9 +573,17 @@ fn worker_loop(queue: JobQueue, results: Sender<Decoded>, max_edge: Arc<AtomicU3
                 q = cv.wait(q).unwrap(); // park until a job is queued
             }
         };
+        // Its entry is already gone (cleared, re-requested) — nobody would see it.
+        if job.cancel.load(Ordering::Relaxed) {
+            continue;
+        }
+        // Stamped before reading, so a change made mid-decode shows up as a
+        // mismatch later instead of being missed.
+        let stamp = file_stamp(&job.path);
         // Read the resolution per job so a live change (e.g. HD toggle) applies.
         let edge = max_edge.load(Ordering::Relaxed);
         let is_gif = job
+            .path
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("gif"))
@@ -410,10 +591,10 @@ fn worker_loop(queue: JobQueue, results: Sender<Decoded>, max_edge: Arc<AtomicU3
 
         let alive = if animate && is_gif {
             // GIF: stream frames as they decode (sends several messages itself).
-            stream_gif(&job, &results, gate.as_ref())
+            stream_gif(&job, stamp, &results, gate.as_ref())
         } else {
-            let decoded = decode_still(&job, edge, &gate).map(DecodedImage::Still);
-            results.send((job, decoded)).is_ok()
+            let image = decode_still(&job.path, edge, &gate).map(DecodedImage::Still);
+            results.send(Decoded { path: job.path, job: job.id, stamp, image }).is_ok()
         };
         if !alive {
             break; // UI side is gone; stop the worker.
@@ -439,8 +620,12 @@ fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::Co
     // Radiance HDR (.hdr) decodes to linear, scene-referred floats whose values
     // exceed 1.0; the `image` crate's default 8-bit conversion just clamps, which
     // blows out highlights and skips gamma. Route it through our tone-mapper so it
-    // displays well. Lightweight pure-Rust decoder, so always available (no gate).
+    // displays well. Lightweight pure-Rust decoder, so always available.
     if ext_eq(path, "hdr") {
+        // Always gated: there's no reduced-resolution path, and the f32
+        // buffers peak at GBs for a 16k HDRI — a screenful decoding at once
+        // on every worker could run out of memory.
+        let _gate = gate.acquire();
         let img = decode_hdr(path)?;
         let img = image::DynamicImage::ImageRgba8(img).thumbnail(max_edge, max_edge);
         return Some(color_image(&img.to_rgba8()));
@@ -457,8 +642,37 @@ fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::Co
             .map(crate::is_extended_extension)
             .unwrap_or(false);
         if is_extended {
-            let _gate = large_decode_permit(path, gate);
+            let is_raw = ["dng", "arw", "cr2", "nef"].iter().any(|e| ext_eq(path, e));
+            // A raw's tile is the camera's own embedded preview when one is
+            // big enough: no develop (seconds and gigabytes for a few hundred
+            // pixels — a folder of raws filled in one tile at a time), and the
+            // camera's colour. The viewer, at larger sizes, develops the raw.
+            if is_raw && max_edge <= RAW_PREVIEW_THUMB_EDGE {
+                let preview = {
+                    let _reading = RAW_PREVIEW_READS.acquire();
+                    crate::archive::read(path)
+                        .ok()
+                        .and_then(|bytes| crate::raw_preview::embedded_jpeg_for(&bytes, max_edge))
+                };
+                if let Some(rgba) = preview {
+                    let img = image::DynamicImage::ImageRgba8(rgba).thumbnail(max_edge, max_edge);
+                    return Some(color_image(&img.to_rgba8()));
+                }
+            }
+            // These decode at full resolution, and `image` can't read their
+            // headers to say how big they are (it reports a raw's small
+            // embedded thumbnail). A raw develop always takes a permit; an
+            // AVIF / HEIC one when its container header says it's large —
+            // or, without one found there, when the file is — so a folder of
+            // phone photos decodes side by side instead of one at a time.
+            let heavy = is_raw
+                || match heif_extent(path) {
+                    Some((w, h)) => w as u64 * h as u64 >= HEAVY_EXTENDED_PIXELS,
+                    None => std::fs::metadata(path).ok().is_none_or(|m| m.len() >= HEAVY_EXTENDED_BYTES),
+                };
+            let _gate = heavy.then(|| gate.acquire());
             let rgba = crate::avif::decode_avif(path)?;
+            remember_decoded_size(path, rgba.width(), rgba.height());
             let img = image::DynamicImage::ImageRgba8(rgba).thumbnail(max_edge, max_edge);
             return Some(color_image(&img.to_rgba8()));
         }
@@ -502,6 +716,7 @@ fn decode_still(path: &Path, max_edge: u32, gate: &Semaphore) -> Option<egui::Co
         {
             let bytes = crate::archive::read(path).ok()?;
             let rgba = crate::raw_preview::largest_embedded_jpeg(&bytes)?;
+            remember_decoded_size(path, rgba.width(), rgba.height());
             let img = image::DynamicImage::ImageRgba8(rgba).thumbnail(max_edge, max_edge);
             Some(color_image(&img.to_rgba8()))
         }
@@ -551,10 +766,14 @@ pub(crate) fn open_oriented(path: &Path) -> image::ImageResult<image::DynamicIma
         }
     }
     let mut reader = image_reader(path).map_err(image::ImageError::IoError)?;
-    match image::ImageFormat::from_path(path) {
-        Ok(format) => reader.set_format(format),
-        Err(_) => reader = reader.with_guessed_format().map_err(image::ImageError::IoError)?,
+    // The content decides, like the viewer (`decode_still` sniffs too): a JPEG
+    // or WebP saved as `.png` displays fine, so Crop / Copy must read it as
+    // well. The extension is only the fallback when the bytes aren't
+    // recognised (`with_guessed_format` keeps the format set here then).
+    if let Ok(format) = image::ImageFormat::from_path(path) {
+        reader.set_format(format);
     }
+    let reader = reader.with_guessed_format().map_err(image::ImageError::IoError)?;
     let mut img = reader.decode()?;
     img.apply_orientation(exif_orientation(path));
     Ok(img)
@@ -917,6 +1136,140 @@ pub fn oriented_dimensions(path: &Path) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ctf_image_cache_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn entry(slot: Slot, last_used: u64, job: u64, stamp: FileStamp) -> Entry {
+        Entry { slot, last_used, job, cancel: Arc::new(AtomicBool::new(false)), stamp }
+    }
+
+    fn texture(ctx: &egui::Context) -> egui::TextureHandle {
+        ctx.load_texture("t", egui::ColorImage::filled([2, 2], egui::Color32::RED), egui::TextureOptions::LINEAR)
+    }
+
+    /// The HEIF size check finds the full picture among the header's
+    /// extents (a grid's 512 px tiles and the thumbnail are smaller).
+    #[cfg(feature = "avif")]
+    #[test]
+    fn heif_extent_reads_the_largest_ispe() {
+        let ispe = |w: u32, h: u32| [&20u32.to_be_bytes()[..], b"ispe", &[0; 4], &w.to_be_bytes(), &h.to_be_bytes()].concat();
+        let mut file = [&24u32.to_be_bytes()[..], b"ftypheic", &[0; 12]].concat();
+        file.extend(ispe(320, 240));
+        file.extend(ispe(512, 512));
+        file.extend(ispe(4032, 3024));
+        file.extend(b"mdat and the rest");
+        let dir = test_dir("heif_extent");
+        let p = dir.join("a.heic");
+        std::fs::write(&p, &file).unwrap();
+        assert_eq!(heif_extent(&p), Some((4032, 3024)));
+        std::fs::write(&p, b"no header here").unwrap();
+        assert_eq!(heif_extent(&p), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Crop / Copy read through `open_oriented`: a JPEG saved as `.png` (which
+    // the viewer shows fine, since it sniffs) must decode by its content.
+    #[test]
+    fn open_oriented_sniffs_content_over_extension() {
+        let dir = test_dir("sniff");
+        let img = image::RgbImage::from_pixel(6, 4, image::Rgb([200, 30, 30]));
+        let jpeg_as_png = dir.join("photo.png");
+        img.save_with_format(&jpeg_as_png, image::ImageFormat::Jpeg).unwrap();
+        let png_as_jpg = dir.join("other.jpg");
+        img.save_with_format(&png_as_jpg, image::ImageFormat::Png).unwrap();
+        for p in [&jpeg_as_png, &png_as_jpg] {
+            let got = open_oriented(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+            assert_eq!((got.width(), got.height()), (6, 4), "{}", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A GIF evicted mid-stream and re-opened gets a new job: the old stream's
+    // remaining chunks must not start (or join) the new animation.
+    #[test]
+    fn stale_job_results_are_dropped() {
+        let ctx = egui::Context::default();
+        let mut cache = ImageCache::new(64, 8, true, 1);
+        let path = PathBuf::from("/nonexistent/anim.gif");
+        cache.entries.insert(path.clone(), entry(Slot::Loading, 0, 2, None));
+        let chunk = |job| Decoded {
+            path: path.clone(),
+            job,
+            stamp: None,
+            image: Some(DecodedImage::AnimChunk {
+                frames: vec![(egui::ColorImage::filled([4, 4], egui::Color32::RED), Duration::from_millis(40))],
+                done: false,
+            }),
+        };
+        let frames = |cache: &ImageCache| match &cache.entries[&path].slot {
+            Slot::Animated { frames, bytes, .. } => Some((frames.len(), *bytes)),
+            _ => None,
+        };
+
+        cache.apply_decoded(&ctx, chunk(1)); // the evicted request's stream
+        assert!(frames(&cache).is_none(), "stale chunk started an animation");
+        cache.apply_decoded(&ctx, chunk(2));
+        cache.apply_decoded(&ctx, chunk(1));
+        assert_eq!(frames(&cache), Some((1, 4 * 4 * 4)));
+        cache.apply_decoded(&ctx, chunk(2));
+        assert_eq!(frames(&cache), Some((2, 2 * 4 * 4 * 4)));
+
+        // Dropping the entry cancels its job, so the stream stops.
+        let cancel = Arc::clone(&cache.entries[&path].cancel);
+        cache.entries.remove(&path);
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    // A file re-created at a cached path (crop → delete → crop again) must be
+    // decoded afresh once it's requested again — but an entry kept on screen
+    // isn't stat'ed every frame.
+    #[test]
+    fn replaced_file_is_redecoded_on_return() {
+        let ctx = egui::Context::default();
+        let dir = test_dir("stamp");
+        let path = dir.join("x_crop.png");
+        std::fs::write(&path, b"first crop").unwrap();
+        let mut cache = ImageCache::new(64, 8, false, 1);
+        cache.frame = 10;
+        cache.entries.insert(path.clone(), entry(Slot::Ready(texture(&ctx)), 9, 100, file_stamp(&path)));
+
+        std::fs::write(&path, b"second, longer crop").unwrap();
+        // Requested last frame (still on screen): served without a stat.
+        assert!(matches!(cache.request(&path, 0.0), Cached::Ready(_)));
+        // Not drawn for a while: the changed stamp forces a new decode job.
+        cache.frame = 20;
+        assert!(matches!(cache.request(&path, 0.0), Cached::Loading));
+        assert_ne!(cache.entries[&path].job, 100);
+
+        // An unchanged file keeps its texture across a gap.
+        let stamp = file_stamp(&path);
+        cache.entries.insert(path.clone(), entry(Slot::Ready(texture(&ctx)), 20, 7, stamp));
+        cache.frame = 40;
+        assert!(matches!(cache.request(&path, 0.0), Cached::Ready(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Animations not drawn last frame are trimmed to the byte budget, oldest
+    // first; ones still in use are kept whatever their size.
+    #[test]
+    fn idle_animations_are_kept_within_budget() {
+        let mut cache = ImageCache::new(64, 8, true, 1);
+        let anim = |bytes| Slot::Animated { frames: Vec::new(), total: Duration::ZERO, start: 0.0, done: true, bytes };
+        let half = IDLE_ANIM_BYTES / 2 + 1;
+        cache.frame = 100;
+        cache.entries.insert("old.gif".into(), entry(anim(half), 10, 1, None));
+        cache.entries.insert("newer.gif".into(), entry(anim(half), 50, 2, None));
+        cache.entries.insert("shown.gif".into(), entry(anim(IDLE_ANIM_BYTES * 2), 99, 3, None));
+        cache.evict();
+        let mut left: Vec<_> = cache.entries.keys().map(|p| p.display().to_string()).collect();
+        left.sort();
+        assert_eq!(left, ["newer.gif", "shown.gif"]);
+    }
 
     // The sample carries EXIF Orientation=6 (rotate 90° CW). Confirm we report
     // the *displayed* (rotated) dimensions, i.e. width/height swapped. Skips

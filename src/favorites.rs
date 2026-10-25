@@ -53,6 +53,15 @@ impl Favorites {
         now_favorite
     }
 
+    /// Drop `path`'s cached hash. Call when the file there is deleted or moved,
+    /// or a new one is written there (a crop or cutout can reuse a deleted
+    /// one's name): otherwise the next look-up reuses the old file's hash, and
+    /// the new file shows — and toggles — the old file's heart. (Look-ups run
+    /// per tile per frame, so they can't afford to stat the file.)
+    pub fn forget(&mut self, path: &Path) {
+        self.cache.remove(path);
+    }
+
     /// Content hash for `path`, computed once and then cached for the session.
     fn hash_of(&mut self, path: &Path) -> Option<String> {
         if let Some(h) = self.cache.get(path) {
@@ -83,4 +92,29 @@ fn store_path() -> PathBuf {
         .map(|p| p.join("Clarity TagFlow"))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("hearted.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Crop, heart the crop, delete it, crop again under the same name: once
+    // the path is forgotten the new file is judged by its own content.
+    // (Never calls `toggle`, which would write the real hearted.json.)
+    #[test]
+    fn forget_rehashes_a_replaced_file() {
+        let dir = std::env::temp_dir().join(format!("ctf_favorites_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("x_crop.png");
+        std::fs::write(&p, b"first crop").unwrap();
+        let mut fav = Favorites::default();
+        let first = fav.hash_of(&p).unwrap();
+        fav.hashes.insert(first);
+        assert!(fav.is_favorite(&p));
+
+        std::fs::write(&p, b"second crop").unwrap();
+        fav.forget(&p);
+        assert!(!fav.is_favorite(&p), "the new file inherited the old heart");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

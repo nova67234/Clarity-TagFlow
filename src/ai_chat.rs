@@ -52,16 +52,35 @@ pub fn claims_drop(llm: &crate::llm::LlmState, ctx: &egui::Context) -> bool {
 pub fn show(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::settings::Settings) {
     llm.poll(ui.ctx());
 
-    // Not usable yet — say why, centred, instead of an empty chat.
+    // Not usable yet — say why, centred, instead of an empty chat. With a
+    // way out: this view replaces the whole browser, and Settings only shows
+    // the "Activate AI Chat" switch for an installed model (picking one that
+    // isn't, or a download of many GB, would otherwise strand the user here).
     if !crate::llm::BUILT_WITH_LLM || !llm.installed {
-        ui.centered_and_justified(|ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() * 0.4);
             let msg = if !crate::llm::BUILT_WITH_LLM {
-                "This build was compiled without the AI feature."
+                "This build was compiled without the AI feature.".to_string()
+            } else if let Some(dl) = &llm.download {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+                format!("Downloading {}… {}%", llm.model.label(), dl.pct())
             } else {
-                "The AI model isn't set up yet — go to Settings → AI Model \
-                 and press \"Set up everything\"."
+                format!(
+                    "{} isn't downloaded yet — download it in Settings → AI Model, \
+                     or pick a model you have there.",
+                    llm.model.label()
+                )
             };
             ui.label(egui::RichText::new(msg).color(MUTED()).size(14.0));
+            ui.add_space(10.0);
+            if crate::llm::BUILT_WITH_LLM && ui.button("Open AI Model settings").clicked() {
+                settings.open = true;
+                settings.tab = crate::settings::SettingsTab::AiModel;
+            }
+            if ui.button("Turn off AI Chat").on_hover_text("Back to the browser").clicked() {
+                settings.ai_chat = false;
+                llm.unload();
+            }
         });
         return;
     }
@@ -638,7 +657,7 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                     .align(egui::RectAlign::TOP_START) // opens upward, like Tools
                                     .width(260.0)
                                     .gap(8.0)
-                                    .frame(crate::card_frame(14))
+                                    .frame(crate::float_card_frame(14))
                                     .show(|ui| chat_list(ui, llm));
                                 // Closed by a click outside, or by picking a chat.
                                 llm.chats_open &= open;
@@ -653,7 +672,7 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                     .align(egui::RectAlign::TOP_START) // opens upward (card sits at the bottom)
                                     .width(280.0)
                                     .gap(8.0)
-                                    .frame(crate::card_frame(14))
+                                    .frame(crate::float_card_frame(14))
                                     .show(|ui| {
                                         // Apple-style settings card: label + macOS
                                         // switch per row, muted hint beneath, faint
@@ -759,7 +778,9 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                             );
                                         });
                                     });
-                                llm.tools_open = open;
+                                // Closed by a click outside, or by the gear
+                                // (which opens AI Settings instead).
+                                llm.tools_open &= open;
                             }
                             let can_send = !llm.running
                                 && (!llm.draft.trim().is_empty() || llm.draft_image.is_some());
@@ -1017,9 +1038,10 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         });
         return;
     }
-    let mut shown = if streaming && llm.roleplay.enabled {
+    let mut shown = if streaming && llm.gen_roleplay {
         // Diary lines are extracted for real when the reply finishes; hide
-        // them while it streams so they never flash up.
+        // them while it streams so they never flash up. (Whether it's a
+        // role-play reply was settled when it was asked.)
         crate::roleplay::strip_memory_lines(&body)
     } else if streaming
         && (llm.tag_images

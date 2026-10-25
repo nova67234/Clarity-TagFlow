@@ -16,11 +16,10 @@
 // feel native there.
 
 use eframe::egui::{self, Color32, CornerRadius, Key, Pos2, Rect, Sense, Stroke, Vec2};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+
+use crate::image_cache::FileStamp;
 
 // Matches the Java ImageCanvas limits.
 const MIN_SCALE: f32 = 0.01;
@@ -71,6 +70,8 @@ const GY: usize = 64;
 /// gradient across many cells so the subject moves more as a unit and silhouettes
 /// shear softly instead of stretching — the main lever against the "stretchy" look.
 const BLUR_PASSES: usize = 6;
+/// Depth maps kept for revisits (~1 MB each), least recently used dropped first.
+const DEPTH_CACHE: usize = 16;
 
 /// State for the Spatial Scene depth-parallax viewer mode. The depth map for the
 /// current image is computed on a background thread, cached per path, and turned
@@ -78,13 +79,17 @@ const BLUR_PASSES: usize = 6;
 pub struct SpatialScene {
     /// Whether the parallax mode is currently engaged.
     pub active: bool,
-    /// Per-image depth cache so re-entry / revisits are instant.
-    cache: HashMap<PathBuf, Arc<crate::depth::DepthMap>>,
-    /// In-flight depth job result for the current image.
-    rx: Option<Receiver<Result<crate::depth::DepthMap, String>>>,
-    /// Generation counter — bumped when the selection changes so a stale
-    /// finishing thread is ignored (mirrors `right_details.rs`).
-    generation: Arc<AtomicUsize>,
+    /// Recent depth maps so re-entry / revisits are instant, least recently used
+    /// first (at most [`DEPTH_CACHE`]). Each keeps the stamp of the file it was
+    /// computed from, checked when the image is selected again.
+    cache: Vec<(PathBuf, FileStamp, Arc<crate::depth::DepthMap>)>,
+    /// The depth estimator's worker (one thread, model kept loaded, only the
+    /// newest request runs).
+    worker: crate::depth::DepthWorker,
+    /// The image whose depth was requested (with its file's stamp then),
+    /// until the result arrives. Cleared when the selection changes, so a
+    /// result that finishes after that is dropped.
+    pending: Option<(PathBuf, FileStamp)>,
     /// Last depth/inference error, shown as a banner with a flat-image fallback.
     error: Option<String>,
     /// In-flight depth-model download (kicked on first use when the model isn't
@@ -107,9 +112,9 @@ impl Default for SpatialScene {
     fn default() -> Self {
         Self {
             active: false,
-            cache: HashMap::new(),
-            rx: None,
-            generation: Arc::new(AtomicUsize::new(0)),
+            cache: Vec::new(),
+            worker: crate::depth::DepthWorker::default(),
+            pending: None,
             error: None,
             notice: None,
             orb: crate::ai_orb::AiOrb::default(),
@@ -117,6 +122,35 @@ impl Default for SpatialScene {
             download: None,
             layers: Vec::new(),
             layers_key: None,
+        }
+    }
+}
+
+impl SpatialScene {
+    /// `path`'s cached depth map, marked most recently used.
+    fn cached_depth(&mut self, path: &Path) -> Option<Arc<crate::depth::DepthMap>> {
+        let i = self.cache.iter().position(|(p, ..)| p == path)?;
+        let hit = self.cache.remove(i);
+        let map = Arc::clone(&hit.2);
+        self.cache.push(hit);
+        Some(map)
+    }
+
+    fn insert_depth(&mut self, path: PathBuf, stamp: FileStamp, map: crate::depth::DepthMap) {
+        self.cache.retain(|(p, ..)| *p != path);
+        self.cache.push((path, stamp, Arc::new(map)));
+        if self.cache.len() > DEPTH_CACHE {
+            self.cache.remove(0);
+        }
+    }
+
+    /// Forget `path`'s depth map if the file changed since it was computed — a
+    /// crop or cutout can re-create a deleted file's name. One stat, on selection.
+    fn drop_if_changed(&mut self, path: &Path) {
+        if let Some(i) = self.cache.iter().position(|(p, ..)| p == path)
+            && self.cache[i].1 != crate::image_cache::file_stamp(path)
+        {
+            self.cache.remove(i);
         }
     }
 }
@@ -222,13 +256,17 @@ impl ZoomState {
             self.crop_start = None;
             self.crop_rect = None;
             self.want_full = false;
-            self.true_size = crate::image_cache::oriented_dimensions(path)
+            // AVIF / HEIC headers can't be read and a raw's header describes its
+            // small embedded thumbnail, so for those the size comes from the
+            // decode that produced `tex`.
+            self.true_size = crate::image_cache::decoded_size(path)
+                .or_else(|| crate::image_cache::oriented_dimensions(path))
                 .map(|(w, h)| Vec2::new(w as f32, h as f32));
-            // Spatial Scene: drop any in-flight depth job for the previous image
-            // and clear its per-image render state. The mode itself persists; the
+            // Spatial Scene: ignore the previous image's in-flight depth job and
+            // clear its per-image render state. The mode itself persists; the
             // new image's depth is recomputed (or served instantly from cache).
-            self.spatial.generation.fetch_add(1, Ordering::SeqCst);
-            self.spatial.rx = None;
+            self.spatial.pending = None;
+            self.spatial.drop_if_changed(path);
             self.spatial.error = None;
             self.spatial.layers.clear();
             self.spatial.layers_key = None;
@@ -813,30 +851,20 @@ impl ZoomState {
             }
         }
 
-        // Poll the in-flight depth job.
-        if let Some(rx) = &self.spatial.rx {
-            match rx.try_recv() {
-                Ok(Ok(map)) => {
-                    self.spatial.cache.insert(path.to_path_buf(), Arc::new(map));
-                    self.spatial.rx = None;
-                }
-                Ok(Err(e)) => {
-                    self.spatial.error = Some(e);
-                    self.spatial.rx = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.spatial.rx = None;
-                    if self.spatial.error.is_none() {
-                        self.spatial.error = Some("Depth job ended unexpectedly".to_string());
-                    }
-                }
+        // Collect finished depth jobs; only the pending (current) image's counts.
+        while let Some((finished, result)) = self.spatial.worker.try_recv() {
+            let Some((image, stamp)) = self.spatial.pending.take_if(|(p, _)| *p == finished) else {
+                continue;
+            };
+            match result {
+                Ok(map) => self.spatial.insert_depth(image, stamp, map),
+                Err(e) => self.spatial.error = Some(e),
             }
         }
 
         // Serve from cache, or start a job if we have neither a result nor an error.
-        let depth = self.spatial.cache.get(path).cloned();
-        if depth.is_none() && self.spatial.rx.is_none() && self.spatial.error.is_none() {
+        let depth = self.spatial.cached_depth(path);
+        if depth.is_none() && self.spatial.pending.is_none() && self.spatial.error.is_none() {
             self.spawn_depth_job(ui, path);
         }
 
@@ -865,8 +893,9 @@ impl ZoomState {
         }
     }
 
-    /// Spawn the background depth-estimation thread for `path` (generation-guarded
-    /// so a stale finish is ignored). Mirrors the tag-job pattern.
+    /// Ask the depth worker for `path`'s depth map. It runs one request at a
+    /// time and a newer one replaces any not started yet, so paging through
+    /// images never stacks up estimations.
     fn spawn_depth_job(&mut self, ui: &egui::Ui, path: &Path) {
         let Some(model) = crate::tagger::resolve(DEPTH_FOLDER, "model.onnx") else {
             // Model was removed after entering — back out with a notice.
@@ -875,21 +904,8 @@ impl ZoomState {
                 Some((MODEL_MISSING_MSG.to_string(), ui.input(|i| i.time) + 6.0));
             return;
         };
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.spatial.rx = Some(rx);
-        let generation = self.spatial.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let generation_handle = Arc::clone(&self.spatial.generation);
-        let img_path = path.to_path_buf();
-        let ctx = ui.ctx().clone();
-        std::thread::spawn(move || {
-            if generation_handle.load(Ordering::SeqCst) != generation {
-                return; // selection already moved on
-            }
-            let result = crate::depth::run_depth_job(model, img_path);
-            if generation_handle.load(Ordering::SeqCst) == generation && tx.send(result).is_ok() {
-                ctx.request_repaint();
-            }
-        });
+        self.spatial.pending = Some((path.to_path_buf(), crate::image_cache::file_stamp(path)));
+        self.spatial.worker.request(model, path.to_path_buf(), ui.ctx());
     }
 
     /// Compute the smoothed parallax offset in [-1,1] per axis. While the mouse is
@@ -1101,7 +1117,8 @@ const MENU_W: f32 = 158.0;
 /// Shared with other context menus (e.g. the LoRA picker's).
 pub(crate) fn menu_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(crate::theme::PANEL())
+        // Opaque in every theme (the Glass panels are see-through).
+        .fill(crate::theme::FLOAT())
         .stroke(Stroke::new(1.0, crate::theme::EDGE()))
         .corner_radius(CornerRadius::same(12))
         .inner_margin(egui::Margin::same(5))
@@ -1173,4 +1190,46 @@ pub(crate) fn menu_sep(ui: &mut egui::Ui) {
         Stroke::new(1.0, crate::theme::EDGE()),
     );
     ui.add_space(2.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map() -> crate::depth::DepthMap {
+        crate::depth::DepthMap { w: 1, h: 1, data: vec![0.5] }
+    }
+
+    // Paging through images in Spatial mode keeps at most DEPTH_CACHE maps,
+    // dropping the least recently viewed.
+    #[test]
+    fn depth_cache_is_lru_capped() {
+        let mut s = SpatialScene::default();
+        for i in 0..DEPTH_CACHE {
+            s.insert_depth(PathBuf::from(format!("{i}.png")), None, map());
+        }
+        assert!(s.cached_depth(Path::new("0.png")).is_some()); // now the most recent
+        s.insert_depth(PathBuf::from("new.png"), None, map());
+        assert_eq!(s.cache.len(), DEPTH_CACHE);
+        assert!(s.cached_depth(Path::new("1.png")).is_none(), "the oldest should go");
+        assert!(s.cached_depth(Path::new("0.png")).is_some());
+        assert!(s.cached_depth(Path::new("new.png")).is_some());
+    }
+
+    // A depth map isn't reused for a file since re-created at the same path.
+    #[test]
+    fn depth_for_replaced_file_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("ctf_zoom_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("x_nobg.png");
+        std::fs::write(&p, b"first").unwrap();
+        let mut s = SpatialScene::default();
+        s.insert_depth(p.clone(), crate::image_cache::file_stamp(&p), map());
+        s.drop_if_changed(&p);
+        assert!(s.cached_depth(&p).is_some(), "an unchanged file keeps its map");
+        std::fs::write(&p, b"second, longer").unwrap();
+        s.drop_if_changed(&p);
+        assert!(s.cached_depth(&p).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

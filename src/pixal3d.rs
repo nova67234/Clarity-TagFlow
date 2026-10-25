@@ -424,7 +424,7 @@ fn settings_popup(anchor: &egui::Response, state: &mut Pixal3DState) {
         .align(egui::RectAlign::BOTTOM_END)
         .width(340.0)
         .gap(6.0)
-        .frame(crate::card_frame(22))
+        .frame(crate::float_card_frame(22))
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
             esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
@@ -1134,7 +1134,8 @@ pub(crate) fn save_hf_token(token: &str) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&path, crate::secret::protect(trimmed));
+    // Owner-only on Linux/macOS, where `protect` is just obfuscation.
+    let _ = crate::secret::write_private(&path, crate::secret::protect(trimmed));
 }
 
 /// On Windows, don't pop a console window for each spawned child process.
@@ -1233,6 +1234,11 @@ pub(crate) fn ensure_kill_on_exit_job() {
 /// Linux: best-effort — ask the kernel to SIGKILL the child if the spawning
 /// process dies (`PR_SET_PDEATHSIG`), so a closed/crashed app doesn't orphan the
 /// Python inference child. Set in the child via `pre_exec` (post-fork).
+///
+/// The signal actually fires when the *thread* that spawned the child exits,
+/// not the whole process — fine for a child its spawning thread waits on (as
+/// `run_streamed` does), but one that must outlive that thread has to go
+/// through [`spawn_app_lifetime`].
 #[cfg(target_os = "linux")]
 pub(crate) fn kill_on_parent_exit(cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
@@ -1251,3 +1257,49 @@ pub(crate) fn kill_on_parent_exit(cmd: &mut std::process::Command) {
 }
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn kill_on_parent_exit(_cmd: &mut std::process::Command) {}
+
+/// Spawn a child that outlives the calling thread (the shared ComfyUI server,
+/// launched from a short-lived job thread) yet still dies with the app. On
+/// Linux, [`kill_on_parent_exit`]'s signal follows the spawning *thread*, so a
+/// server spawned from a job thread was SIGKILLed the moment that job ended —
+/// every generation cold-started ComfyUI. Spawning from one thread that lives
+/// as long as the process keeps the signal for the app closing or crashing.
+#[cfg(target_os = "linux")]
+pub(crate) fn spawn_app_lifetime(cmd: std::process::Command) -> std::io::Result<std::process::Child> {
+    use std::process::{Child, Command};
+    use std::sync::OnceLock;
+    use std::sync::mpsc::{Sender, channel};
+
+    type Request = (Command, Sender<std::io::Result<Child>>);
+    static SPAWNER: OnceLock<Option<Sender<Request>>> = OnceLock::new();
+    let spawner = SPAWNER.get_or_init(|| {
+        let (tx, rx) = channel::<Request>();
+        // Never returns: the static keeps a Sender alive for the whole process.
+        std::thread::Builder::new()
+            .name("app-lifetime-spawner".into())
+            .spawn(move || {
+                for (mut cmd, reply) in rx {
+                    kill_on_parent_exit(&mut cmd);
+                    let _ = reply.send(cmd.spawn());
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    let Some(spawner) = spawner else {
+        // The thread couldn't be created: spawn here, without the death signal,
+        // rather than not at all.
+        let mut cmd = cmd;
+        return cmd.spawn();
+    };
+    let gone = || std::io::Error::other("child spawner thread stopped");
+    let (reply_tx, reply_rx) = channel();
+    spawner.send((cmd, reply_tx)).map_err(|_| gone())?;
+    reply_rx.recv().map_err(|_| gone())?
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn spawn_app_lifetime(mut cmd: std::process::Command) -> std::io::Result<std::process::Child> {
+    // Windows ties children to the app through the kill-on-close job object
+    // (ensure_kill_on_exit_job), whichever thread spawns them.
+    cmd.spawn()
+}

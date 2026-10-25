@@ -745,11 +745,19 @@ mod backend {
         Failed,
     }
 
+    /// Poster textures kept (~1.3 MB each at HD size) before the least recently
+    /// requested are dropped — the image thumbnails' cap. Failed and in-flight
+    /// entries hold no texture and are kept (a failed capture is slow to retry).
+    const MAX_POSTERS: usize = 400;
+
     /// Lazily produces a poster frame for each video by briefly decoding it with
     /// libVLC on a background thread, then caching the resulting texture. Captures
     /// are bounded so a folder full of videos doesn't spin up many decoders.
     pub struct VideoThumbs {
-        entries: HashMap<PathBuf, Thumb>,
+        /// Poster state per video, with the `tick` it was last requested at.
+        entries: HashMap<PathBuf, (Thumb, u64)>,
+        /// Counts `request` calls: the LRU clock for [`MAX_POSTERS`].
+        tick: u64,
         tx: mpsc::Sender<(PathBuf, Option<egui::ColorImage>)>,
         rx: mpsc::Receiver<(PathBuf, Option<egui::ColorImage>)>,
         in_flight: usize,
@@ -761,12 +769,26 @@ mod backend {
         /// Poster decode resolution (longest side, px). Mirrors the image
         /// thumbnail setting so "HD thumbnails" makes video posters crisp too.
         max_edge: u32,
+        /// Each captured poster's aspect (height / width). Kept when the
+        /// texture is evicted or dropped for a new size: the tile keeps its
+        /// shape while the poster re-captures, instead of snapping to the
+        /// square placeholder and back (which shifted the whole grid).
+        aspects: HashMap<PathBuf, f32>,
     }
 
     impl VideoThumbs {
         pub fn new() -> Self {
             let (tx, rx) = mpsc::channel();
-            VideoThumbs { entries: HashMap::new(), tx, rx, in_flight: 0, busy: None, max_edge: 320 }
+            VideoThumbs {
+                entries: HashMap::new(),
+                tick: 0,
+                tx,
+                rx,
+                in_flight: 0,
+                busy: None,
+                max_edge: 320,
+                aspects: HashMap::new(),
+            }
         }
 
         /// Change the poster decode resolution (longest side, px). If it actually
@@ -787,23 +809,42 @@ mod backend {
         /// Cached poster texture for `path`, starting a capture on first sight.
         /// Returns `None` while loading or on failure.
         pub fn request(&mut self, path: &Path, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+            self.tick += 1;
+            let tick = self.tick;
             // Absorb any finished captures into textures.
+            let mut added = false;
             while let Ok((p, img)) = self.rx.try_recv() {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 let state = match img {
-                    Some(ci) => Thumb::Ready(ctx.load_texture(
-                        format!("vthumb:{}", p.display()),
-                        ci,
-                        egui::TextureOptions::LINEAR,
-                    )),
+                    Some(ci) => {
+                        added = true;
+                        let [w, h] = ci.size;
+                        if w > 0 {
+                            self.aspects.insert(p.clone(), h as f32 / w as f32);
+                        }
+                        Thumb::Ready(ctx.load_texture(
+                            format!("vthumb:{}", p.display()),
+                            ci,
+                            egui::TextureOptions::LINEAR,
+                        ))
+                    }
                     None => Thumb::Failed,
                 };
-                self.entries.insert(p, state);
+                self.entries.insert(p, (state, tick));
+            }
+            if added {
+                self.evict();
             }
 
-            match self.entries.get(path) {
-                Some(Thumb::Ready(tex)) => return Some(tex.clone()),
-                Some(_) => return None, // loading or failed
+            match self.entries.get_mut(path) {
+                Some((Thumb::Ready(tex), used)) => {
+                    *used = tick;
+                    return Some(tex.clone());
+                }
+                Some((_, used)) => {
+                    *used = tick;
+                    return None; // loading or failed
+                }
                 None => {}
             }
 
@@ -818,14 +859,14 @@ mod backend {
             // would fail); show the placeholder video icon instead. This also runs
             // the one-time DLL-dir setup before the capture thread touches libVLC.
             if !super::vlc_runtime_available() {
-                self.entries.insert(path.to_path_buf(), Thumb::Failed);
+                self.entries.insert(path.to_path_buf(), (Thumb::Failed, tick));
                 return None;
             }
 
             // Not seen yet — start a capture if we're under the concurrency cap.
             const MAX_IN_FLIGHT: usize = 2;
             if self.in_flight < MAX_IN_FLIGHT {
-                self.entries.insert(path.to_path_buf(), Thumb::Loading);
+                self.entries.insert(path.to_path_buf(), (Thumb::Loading, tick));
                 self.in_flight += 1;
                 let tx = self.tx.clone();
                 let p = path.to_path_buf();
@@ -840,20 +881,32 @@ mod backend {
             None
         }
 
-        /// Aspect ratio (height / width) of the cached poster, available once
-        /// the capture has decoded. Lets the browser size the video tile to the
-        /// real frame instead of stretching it into the placeholder square.
+        /// Aspect ratio (height / width) of the video's poster, available once
+        /// a capture has decoded (and kept after its texture is dropped). Lets
+        /// the browser size the video tile to the real frame instead of
+        /// stretching it into the placeholder square.
         pub fn aspect(&self, path: &Path) -> Option<f32> {
-            match self.entries.get(path) {
-                Some(Thumb::Ready(tex)) => {
-                    let [w, h] = tex.size();
-                    if w == 0 {
-                        None
-                    } else {
-                        Some(h as f32 / w as f32)
-                    }
-                }
-                _ => None,
+            self.aspects.get(path).copied()
+        }
+
+        /// Drop the least recently requested posters beyond [`MAX_POSTERS`]
+        /// (they re-capture if scrolled back to). Without this every video
+        /// ever scrolled past kept its texture, across folder changes too.
+        fn evict(&mut self) {
+            let is_ready = |t: &Thumb| matches!(t, Thumb::Ready(_));
+            let ready = self.entries.values().filter(|(t, _)| is_ready(t)).count();
+            if ready <= MAX_POSTERS {
+                return;
+            }
+            let mut oldest: Vec<(PathBuf, u64)> = self
+                .entries
+                .iter()
+                .filter(|(_, (t, _))| is_ready(t))
+                .map(|(p, (_, used))| (p.clone(), *used))
+                .collect();
+            oldest.sort_by_key(|(_, used)| *used);
+            for (p, _) in oldest.into_iter().take(ready - MAX_POSTERS) {
+                self.entries.remove(&p);
             }
         }
     }

@@ -120,3 +120,109 @@ fn decode_jpeg_oriented(bytes: &[u8], container_orientation: Option<u8>) -> Opti
     img.apply_orientation(orientation);
     Some(img.into_rgba8())
 }
+
+/// A camera raw's thumbnail, straight from the JPEG previews it embeds: the
+/// smallest one whose long side reaches `max_edge`, decoded with the JPEG's own
+/// DCT downscaling (1/2, 1/4, 1/8). So a 320 px tile reads a medium preview at
+/// most — never develops the raw (seconds and gigabytes for a few hundred
+/// pixels) nor decodes a full 24 MP preview. Orientation as in
+/// [`largest_embedded_jpeg`]. `None` when no embedded JPEG is that large (a
+/// tiny one would make a blurry tile: the caller develops the raw instead).
+#[cfg_attr(not(feature = "avif"), allow(dead_code))] // raws are decoded only with avif
+pub fn embedded_jpeg_for(bytes: &[u8], max_edge: u32) -> Option<RgbaImage> {
+    use jpeg_decoder::{CodingProcess, Decoder};
+    let want = max_edge.min(u16::MAX as u32) as u16;
+    // Candidates by header only (cheap): (offset, width, height). Lossless
+    // JPEG is a raw's sensor data (CR2, many DNGs), not a picture.
+    let mut found: Vec<(usize, u16, u16)> = Vec::new();
+    let mut attempts = 0u32;
+    let mut i = 0usize;
+    while i + 3 < bytes.len() {
+        if bytes[i] == 0xFF && bytes[i + 1] == 0xD8 && bytes[i + 2] == 0xFF {
+            let mut d = Decoder::new(std::io::Cursor::new(&bytes[i..]));
+            if d.read_info().is_ok()
+                && let Some(info) = d.info()
+                && info.coding_process != CodingProcess::Lossless
+                && info.width.max(info.height) >= want
+            {
+                found.push((i, info.width, info.height));
+            }
+            attempts += 1;
+            if attempts >= 64 {
+                break;
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    // A size found again and again is a tile of the image data (a lossy
+    // DNG stores its pixels as JPEG tiles), not a preview.
+    let count = |w: u16, h: u16| found.iter().filter(|&&(_, fw, fh)| (fw, fh) == (w, h)).count();
+    let mut previews: Vec<(usize, u64)> = found
+        .iter()
+        .filter(|&&(_, w, h)| count(w, h) < 3)
+        .map(|&(at, w, h)| (at, w as u64 * h as u64))
+        .collect();
+    // Smallest first; a candidate that won't decode gives way to the next.
+    previews.sort_by_key(|&(_, px)| px);
+    let container_orientation = tiff_orientation(bytes);
+    previews.into_iter().find_map(|(at, _)| decode_jpeg_scaled(&bytes[at..], want, container_orientation))
+}
+
+/// Decode a JPEG at the smallest DCT scale that still reaches `edge` on one
+/// side, then apply orientation (the container's, else the JPEG's own EXIF).
+#[cfg_attr(not(feature = "avif"), allow(dead_code))]
+fn decode_jpeg_scaled(bytes: &[u8], edge: u16, container_orientation: Option<u8>) -> Option<RgbaImage> {
+    use jpeg_decoder::PixelFormat;
+    let mut d = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+    d.scale(edge, edge).ok()?;
+    let pixels = d.decode().ok()?;
+    let info = d.info()?;
+    let (w, h) = (info.width as u32, info.height as u32);
+    let mut img = match info.pixel_format {
+        PixelFormat::RGB24 => image::RgbImage::from_raw(w, h, pixels).map(image::DynamicImage::ImageRgb8),
+        PixelFormat::L8 => image::GrayImage::from_raw(w, h, pixels).map(image::DynamicImage::ImageLuma8),
+        _ => None,
+    }?;
+    let orientation = container_orientation
+        .or_else(|| d.exif_data().and_then(tiff_orientation))
+        .and_then(image::metadata::Orientation::from_exif)
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    img.apply_orientation(orientation);
+    Some(img.into_rgba8())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jpeg(w: u32, h: u32) -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(w, h, image::Rgb([200, 40, 40])));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Jpeg).unwrap();
+        out.into_inner()
+    }
+
+    /// A thumbnail comes from the smallest embedded preview that's big
+    /// enough, decoded scaled down; with none big enough, there's none.
+    #[test]
+    fn thumbnail_uses_the_smallest_big_enough_preview() {
+        let mut raw = b"II*\0\x08\0\0\0\0\0junk".to_vec();
+        raw.extend(jpeg(64, 48));
+        raw.extend(b"sensor data");
+        // Image data stored as JPEG tiles (a lossy DNG) isn't a preview.
+        for _ in 0..4 {
+            raw.extend(jpeg(256, 256));
+        }
+        raw.extend(jpeg(400, 300));
+        raw.extend(b"more");
+        raw.extend(jpeg(1600, 1200));
+        let thumb = embedded_jpeg_for(&raw, 100).unwrap();
+        assert_eq!(thumb.dimensions(), (100, 75)); // the 400 px one at 1/4
+        let thumb = embedded_jpeg_for(&raw, 1000).unwrap();
+        assert_eq!(thumb.dimensions(), (1600, 1200)); // only the big one reaches 1000
+        assert!(embedded_jpeg_for(&raw, 2000).is_none());
+        assert_eq!(largest_embedded_jpeg(&raw).unwrap().dimensions(), (1600, 1200));
+    }
+}

@@ -19,7 +19,7 @@ const ISIZE: u32 = 1024;
 
 /// Run BiRefNet on `image`, writing a transparent-background PNG next to it.
 /// Returns the path of the written cutout. Designed to be the body of a
-/// `std::thread::spawn`, mirroring [`crate::depth::run_depth_job`].
+/// `std::thread::spawn`, mirroring [`crate::tagger::run_job`].
 pub fn run_bgremove_job(model: PathBuf, image: PathBuf) -> Result<PathBuf, String> {
     // Decode the original at full resolution (handles AVIF/RAW/HDR too). We keep
     // these RGB pixels for the output and only feed a resized copy to the model.
@@ -92,8 +92,19 @@ pub fn run_bgremove_job(model: PathBuf, image: PathBuf) -> Result<PathBuf, Strin
         *px = Rgba([rgb[0], rgb[1], rgb[2], alpha.get_pixel(x, y)[0]]);
     }
 
-    let dest = bg_destination(&image);
-    out.save(&dest).map_err(|e| format!("Save: {e}"))?;
+    let (dest, file) = create_destination(&image).map_err(|e| format!("Save: {e}"))?;
+    let mut w = std::io::BufWriter::new(file);
+    let written = out
+        .write_to(&mut w, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())
+        .and_then(|()| std::io::Write::flush(&mut w).map_err(|e| e.to_string()));
+    if let Err(e) = written {
+        // The file was created empty by us a moment ago — don't leave a
+        // truncated PNG behind.
+        drop(w);
+        let _ = std::fs::remove_file(&dest);
+        return Err(format!("Save: {e}"));
+    }
     Ok(dest)
 }
 
@@ -114,9 +125,54 @@ fn preprocess(img: &RgbImage) -> Vec<f32> {
     data
 }
 
-/// Output path for a cutout: `<stem>_nobg.png` beside the source.
-pub fn bg_destination(src: &Path) -> PathBuf {
+/// Create the cutout's file beside `src`: `<stem>_nobg.png`, or
+/// `<stem>_nobg (n).png` when that's taken — the numbering crops use
+/// (`crop_destination` in main.rs). `create_new` makes the "taken?" check and
+/// the creation one step, so an existing file — an earlier cutout, a user's
+/// own file of that name, or `photo.png`'s cutout when this is `photo.jpg` —
+/// is never replaced, even if it appears mid-way.
+fn create_destination(src: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
     let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
     let dir = src.parent().map(Path::to_path_buf).unwrap_or_default();
-    dir.join(format!("{stem}_nobg.png"))
+    for n in 0..10_000u32 {
+        let dest = if n == 0 {
+            dir.join(format!("{stem}_nobg.png"))
+        } else {
+            dir.join(format!("{stem}_nobg ({n}).png"))
+        };
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&dest) {
+            Ok(file) => return Ok((dest, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free _nobg file name"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Re-running on the same image, or on `photo.png` after `photo.jpg`, must
+    // number the new cutout instead of replacing `photo_nobg.png`.
+    #[test]
+    fn destination_never_replaces_existing_files() {
+        let dir = std::env::temp_dir().join(format!("ctf_bgremove_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = dir.join("photo_nobg.png");
+        std::fs::write(&mine, b"user file").unwrap();
+
+        let (a, _) = create_destination(&dir.join("photo.jpg")).unwrap();
+        assert_eq!(a, dir.join("photo_nobg (1).png"));
+        let (b, _) = create_destination(&dir.join("photo.png")).unwrap();
+        assert_eq!(b, dir.join("photo_nobg (2).png"));
+        assert_eq!(std::fs::read(&mine).unwrap(), b"user file");
+
+        // A free base name is used as-is.
+        let (c, _) = create_destination(&dir.join("other.webp")).unwrap();
+        assert_eq!(c, dir.join("other_nobg.png"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -59,7 +59,7 @@ pub fn modal(ctx: &egui::Context, id: &str) -> Option<bool> {
         .resizable(false)
         .collapsible(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .frame(crate::card_frame(22))
+        .frame(crate::float_card_frame(22))
         .show(ctx, |ui| {
             ui.set_max_width(300.0);
             ui.vertical_centered(|ui| {

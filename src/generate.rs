@@ -1036,6 +1036,33 @@ fn embeddings_fetching() -> bool {
     EMBED_THUMB_RUNNING.load(Ordering::SeqCst)
 }
 
+/// A LoRA / embedding file, as `(path, size, modified)` — changes when the
+/// file does.
+type FileKey = (PathBuf, u64, Option<std::time::SystemTime>);
+
+/// SHA-256s of LoRA / embedding files hashed this session, by [`FileKey`]: a
+/// thumbnail pass that stopped (offline, the picker closed) or a lookup that
+/// failed doesn't re-hash the file (100-300 MB for a LoRA) on the next open.
+static SHA_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<FileKey, String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// `path`'s SHA-256, from [`SHA_CACHE`] when the file hasn't changed since.
+/// `None` when it can't be read right now (locked, still being copied).
+fn cached_sha256(path: &std::path::Path) -> Option<String> {
+    let m = std::fs::metadata(path).ok()?;
+    let key: FileKey = (path.to_path_buf(), m.len(), m.modified().ok());
+    if let Some(sha) = SHA_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Some(sha.clone());
+    }
+    let sha = crate::scan::sha256_file(path)?;
+    SHA_CACHE.lock().unwrap_or_else(|e| e.into_inner()).insert(key, sha.clone());
+    Some(sha)
+}
+
+/// After this many lookups in a row failed on their own (`PreviewFail::Item`),
+/// a thumbnail pass stops: Civitai's image server is likely failing them all.
+const MAX_ITEM_FAILURES_IN_A_ROW: u32 = 3;
+
 /// Background pass fetching Civitai preview thumbnails for embeddings without one:
 /// SHA-256 of the file → Civitai's by-hash endpoint → first still preview, saved
 /// to the thumbs cache. Single-flight; repaints as each thumb lands. Embeddings
@@ -1067,20 +1094,39 @@ fn spawn_embedding_thumb_fetch(files: Vec<String>, ctx: egui::Context, force: bo
 
         let dir = comfy_base().join("ComfyUI").join("models").join("embeddings");
         let _ = std::fs::create_dir_all(&tdir);
+        let mut failed_in_a_row = 0;
         for f in todo {
             if EMBED_THUMB_CANCEL.load(Ordering::SeqCst) {
                 break; // picker closed — finish later, when it reopens
             }
             let stem = embed_stem(&f);
+            // Unreadable right now (locked, still being copied) — try next open.
+            let Some(sha) = cached_sha256(&dir.join(&f)) else { continue };
             // Embeddings keep still thumbnails only (the still is a video's
             // poster frame when a model ships video-only previews).
-            let bytes = crate::scan::sha256_file(&dir.join(&f))
-                .and_then(|sha| crate::civitai::preview_media_by_hash(&sha).map(|(still, _)| still));
-            let write = match &bytes {
-                Some(b) => std::fs::write(tdir.join(format!("{stem}.img")), b),
-                None => std::fs::write(tdir.join(format!("{stem}.none")), b""),
-            };
-            let _ = write;
+            match crate::civitai::preview_media_by_hash(&sha) {
+                Ok(Some((still, _))) => {
+                    let _ = std::fs::write(tdir.join(format!("{stem}.img")), still);
+                    failed_in_a_row = 0;
+                }
+                // Civitai's own answer: not there / no preview — remember it.
+                Ok(None) => {
+                    let _ = std::fs::write(tdir.join(format!("{stem}.none")), b"");
+                    failed_in_a_row = 0;
+                }
+                // No verdict: cache nothing, so the next open retries (without
+                // re-hashing). Civitai unavailable — stop, the rest would fail
+                // the same way. Just this one failed — go on with the rest
+                // (stopping here kept every file after it from ever getting a
+                // thumbnail), unless several in a row did.
+                Err(crate::civitai::PreviewFail::Offline) => break,
+                Err(crate::civitai::PreviewFail::Item) => {
+                    failed_in_a_row += 1;
+                    if failed_in_a_row >= MAX_ITEM_FAILURES_IN_A_ROW {
+                        break;
+                    }
+                }
+            }
             ctx.request_repaint();
         }
     });
@@ -1102,13 +1148,15 @@ fn embedding_token(file: &str, strength: f32) -> String {
 }
 
 /// The space-joined `embedding:<name>` tokens for the selected embeddings of the
-/// requested polarity (`negative`), filtered to the current family — what gets
-/// appended to that polarity's encoder text at generation time.
+/// requested polarity (`negative`) — what gets appended to that polarity's
+/// encoder text at generation time. Not filtered by family: the family filter
+/// only decides which rows the picker lists, and its "Show for other models"
+/// rows exist so a known-mislabelled embedding can be picked and used.
 fn embed_tokens(state: &GenerateState, negative: bool) -> String {
     state
         .embeddings
         .iter()
-        .filter(|e| e.selected && e.negative == negative && e.base.matches(state.family))
+        .filter(|e| e.selected && e.negative == negative)
         .map(|e| embedding_token(&e.file, e.strength))
         .collect::<Vec<_>>()
         .join(" ")
@@ -1407,6 +1455,10 @@ pub struct GenerateState {
     /// Cooperative cancel flag for the in-flight generation (the in-prompt stop
     /// button sets it; the runner thread polls it and interrupts ComfyUI).
     cancel: Arc<AtomicBool>,
+    /// The running job is Setup or a drag-drop import, which can only stop
+    /// between steps (a download or pip run in flight can't be aborted) — so
+    /// Stop says so instead of a "Cancelling…" that looks stuck.
+    stop_between_steps: bool,
     /// Z-Image: measured height (last frame) of everything between the prompt box
     /// and the end of the Log row. The prompt stretches by this much short of the
     /// panel bottom, so the Log row + copy icon sit exactly on the bottom edge.
@@ -1505,6 +1557,7 @@ impl GenerateState {
             spell: crate::spellcheck::SpellcheckState::default(),
             neg_spell: crate::spellcheck::SpellcheckState::default(),
             cancel: Arc::new(AtomicBool::new(false)),
+            stop_between_steps: false,
             below_h: 210.0,
             frames,
             fps: 24,
@@ -1706,26 +1759,43 @@ fn spawn_lora_thumb_fetch(files: Vec<String>, ctx: egui::Context, force: bool) {
 
         let dir = comfy_base().join("ComfyUI").join("models").join("loras");
         let _ = std::fs::create_dir_all(&tdir);
+        let mut failed_in_a_row = 0;
         for f in todo {
             if THUMB_FETCH_CANCEL.load(Ordering::SeqCst) {
                 break; // picker closed — finish later, when it reopens
             }
             let stem = f.trim_end_matches(".safetensors");
             // Hashing reads the whole file (LoRAs are ~100-300 MB) — that's why
-            // this runs here and the result is cached forever.
-            let media = crate::scan::sha256_file(&dir.join(&f))
-                .and_then(|sha| crate::civitai::preview_media_by_hash(&sha));
-            match &media {
-                Some((still, mp4)) => {
+            // this runs here and the result is cached forever. Unreadable right
+            // now (locked, still being copied) — try again on the next open.
+            let Some(sha) = cached_sha256(&dir.join(&f)) else { continue };
+            match crate::civitai::preview_media_by_hash(&sha) {
+                Ok(Some((still, mp4))) => {
                     let _ = std::fs::write(tdir.join(format!("{stem}.img")), still);
                     // Video-only preview: also build an animated GIF thumbnail
                     // from the CDN's small mp4 (best-effort — needs ffmpeg).
                     if let Some(mp4) = mp4 {
-                        video_thumb_to_gif(&tdir, stem, mp4);
+                        video_thumb_to_gif(&tdir, stem, &mp4);
                     }
+                    failed_in_a_row = 0;
                 }
-                None => {
+                // Civitai's own answer: not there / no preview — remember it.
+                Ok(None) => {
                     let _ = std::fs::write(tdir.join(format!("{stem}.none")), b"");
+                    failed_in_a_row = 0;
+                }
+                // No verdict: writing `.none` here hid the preview for good, so
+                // cache nothing — the next open retries (without re-hashing).
+                // Civitai unavailable — stop, the rest would fail the same
+                // way. Just this one failed — go on with the rest (stopping
+                // here kept every LoRA after it from ever getting a
+                // thumbnail), unless several in a row did.
+                Err(crate::civitai::PreviewFail::Offline) => break,
+                Err(crate::civitai::PreviewFail::Item) => {
+                    failed_in_a_row += 1;
+                    if failed_in_a_row >= MAX_ITEM_FAILURES_IN_A_ROW {
+                        break;
+                    }
                 }
             }
             ctx.request_repaint();
@@ -2996,7 +3066,7 @@ fn polarity_pill(ui: &mut egui::Ui, text: &str, active: bool, accent: Color32) -
 
 fn window_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(PANEL())
+        .fill(FLOAT())
         .corner_radius(CornerRadius::same(16))
         .inner_margin(Margin::same(18))
         .stroke(egui::Stroke::new(1.0, EDGE()))
@@ -3045,6 +3115,10 @@ pub fn update_comfyui(send: &dyn Fn(String)) -> bool {
         send("ERROR: ComfyUI isn't installed yet — run Setup Requirements first.".into());
         return false;
     }
+    let Some(_install) = InstallGuard::acquire() else {
+        send("ERROR: a ComfyUI Setup or drag-drop import is still running — update once it finishes.".into());
+        return false;
+    };
 
     // Stop the bundled server so its source files aren't held open while we copy.
     if let Ok(mut guard) = SERVER.lock()
@@ -3445,7 +3519,9 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                             .show(|ui| {
                                 ui.set_min_width(150.0);
                                 round_menu_rows(ui);
-                                let n = state.loras.iter().filter(|l| l.selected && l.base.matches(state.family)).count();
+                                // Every selected LoRA is applied (incl. "other model"
+                                // picks), so count them all.
+                                let n = state.loras.iter().filter(|l| l.selected).count();
                                 let label = if n > 0 { format!("LoRA ({n})") } else { "LoRA".to_string() };
                                 let licon = egui::Image::new(egui::include_image!("../icons/lora.svg"))
                                     .fit_to_exact_size(egui::vec2(16.0, 16.0))
@@ -3458,7 +3534,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
 
                                 // Embeddings (textual inversion): selected ones are
                                 // injected into the workflow's pos/neg encoder.
-                                let en = state.embeddings.iter().filter(|e| e.selected && e.base.matches(state.family)).count();
+                                let en = state.embeddings.iter().filter(|e| e.selected).count();
                                 let elabel = if en > 0 { format!("Embeddings ({en})") } else { "Embeddings".to_string() };
                                 let eicon = egui::Image::new(egui::include_image!("../icons/extension.svg"))
                                     .fit_to_exact_size(egui::vec2(16.0, 16.0))
@@ -3503,18 +3579,29 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                     // compact model selector to their left.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if state.running {
-                            if round_icon_button(ui, egui::include_image!("../icons/stop.svg"), 18.0, "Stop generating", true).clicked() {
+                            let tip = if state.stop_between_steps { "Stop after the current step" } else { "Stop generating" };
+                            if round_icon_button(ui, egui::include_image!("../icons/stop.svg"), 18.0, tip, true).clicked() {
                                 state.cancel.store(true, Ordering::SeqCst);
-                                state.status = "Cancelling…".into();
+                                state.status = if state.stop_between_steps {
+                                    "Stopping after the current step…".into()
+                                } else {
+                                    "Cancelling…".into()
+                                };
                             }
                         } else if !state.prompt.trim().is_empty() {
                             // The send button only appears once you start typing.
                             let inst = is_installed();
-                            // Image-to-video needs a selected source image.
-                            let needs_img = state.family.is_video() && state.i2v && current_image.is_none();
+                            // Image-to-video needs a selected source *image*. After a
+                            // video run the browser selects the newest output (a
+                            // .webm), which ComfyUI can't use as the start frame.
+                            let src_is_video = current_image.is_some_and(crate::is_video);
+                            let needs_img =
+                                state.family.is_video() && state.i2v && (current_image.is_none() || src_is_video);
                             let ready = inst && !needs_img;
                             let tip = if !inst {
                                 "Run Setup Requirements first"
+                            } else if needs_img && src_is_video {
+                                "The selected file is a video — select an image to animate"
                             } else if needs_img {
                                 "Select an image in the browser first"
                             } else {
@@ -3633,6 +3720,9 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
         });
         if state.i2v {
             let txt = match current_image {
+                Some(p) if crate::is_video(p) => {
+                    "The selected file is a video — select an image to animate.".to_string()
+                }
                 Some(p) => format!(
                     "Source: {}",
                     p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
@@ -3801,7 +3891,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
 /// matching the app's panel styling.
 fn menu_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(PANEL())
+        .fill(FLOAT())
         .corner_radius(CornerRadius::same(22))
         .inner_margin(Margin::same(12))
         .stroke(egui::Stroke::new(1.0, EDGE()))
@@ -4127,7 +4217,39 @@ fn mode_label(ui: &mut egui::Ui, from: &str, to: &str) {
     });
 }
 
+/// Set while Setup, a drag-drop import or a ComfyUI update installs into the
+/// shared ComfyUI tree. Each Generate tab has its own `running`, so without this
+/// two tabs could run Setup at once — writing the same `python.tar.gz` /
+/// `comfyui.zip` `.part` files and pip-installing into one Python env.
+static INSTALL_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Holds [`INSTALL_BUSY`]; released on drop, so every exit path (a panic
+/// included) frees it.
+struct InstallGuard;
+
+impl InstallGuard {
+    /// `None` while another install holds it.
+    fn acquire() -> Option<InstallGuard> {
+        if INSTALL_BUSY.swap(true, Ordering::SeqCst) {
+            None
+        } else {
+            Some(InstallGuard)
+        }
+    }
+}
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        INSTALL_BUSY.store(false, Ordering::SeqCst);
+    }
+}
+
 fn start_setup(state: &mut GenerateState, ctx: &egui::Context) {
+    let Some(install) = InstallGuard::acquire() else {
+        state.status = "Another ComfyUI Setup or import is already running".into();
+        state.status_err = true;
+        return;
+    };
     let (tx, rx) = mpsc::channel();
     state.rx = Some(rx);
     state.running = true;
@@ -4135,12 +4257,17 @@ fn start_setup(state: &mut GenerateState, ctx: &egui::Context) {
     state.status_err = false;
     state.log.clear();
     state.show_log = true; // surface progress + any error
+    // Fresh flag: a Stop left over from an earlier job must not cancel this run.
+    state.cancel.store(false, Ordering::SeqCst);
+    state.stop_between_steps = true;
+    let cancel = state.cancel.clone();
 
     let model = state.model;
     let token = state.hf_token.trim().to_string();
     let ctx = ctx.clone();
     std::thread::spawn(move || {
-        let ok = run_setup(model, &token, &tx, &ctx);
+        let _install = install;
+        let ok = run_setup(model, &token, &tx, &ctx, &cancel);
         let _ = tx.send(RunnerMsg::Done(ok));
         ctx.request_repaint();
     });
@@ -4229,6 +4356,7 @@ fn run_setup(
     token: &str,
     tx: &mpsc::Sender<RunnerMsg>,
     ctx: &egui::Context,
+    cancel: &AtomicBool,
 ) -> bool {
     let send = |s: String| {
         let _ = tx.send(RunnerMsg::Line(s));
@@ -4237,6 +4365,18 @@ fn run_setup(
     let status = |s: &str| {
         let _ = tx.send(RunnerMsg::Status(s.to_string()));
         ctx.request_repaint();
+    };
+    // Stop is honoured between steps and between model files: net.rs can't
+    // abort a download in flight, and killing pip mid-install can leave a
+    // half-installed package. Like a cancelled generation it isn't an error,
+    // and a later Setup resumes (finished steps are skipped, `.part`s resume).
+    let stopped = || {
+        let stop = cancel.load(Ordering::SeqCst);
+        if stop {
+            send("== Setup cancelled — Setup Requirements resumes from here.".into());
+            status("Setup cancelled");
+        }
+        stop
     };
 
     let base = comfy_base();
@@ -4270,6 +4410,9 @@ fn run_setup(
         send("== Python already present".into());
     }
     let py = py.to_string_lossy().to_string();
+    if stopped() {
+        return true;
+    }
 
     // 2 — PyTorch (CUDA 12.8).
     status("Installing PyTorch…");
@@ -4288,6 +4431,9 @@ fn run_setup(
     ) {
         send("ERROR: PyTorch install failed".into());
         return false;
+    }
+    if stopped() {
+        return true;
     }
 
     // 3 — ComfyUI source.
@@ -4321,6 +4467,9 @@ fn run_setup(
         }
     } else {
         send("== ComfyUI already present".into());
+    }
+    if stopped() {
+        return true;
     }
 
     // 4 — ComfyUI requirements + the GGUF node.
@@ -4359,6 +4508,9 @@ fn run_setup(
         }
     }
     pip_retry(&base, &py, &["-m", "pip", "install", "gguf"], &send);
+    if stopped() {
+        return true;
+    }
 
     // 5/6 — the chosen family's model files.
     let m = |sub: &str| comfy.join("models").join(sub);
@@ -4366,6 +4518,10 @@ fn run_setup(
         if dest.exists() {
             send(format!("== {name} already present"));
             return true;
+        }
+        // Stopped: skip the remaining files (reported once, below).
+        if cancel.load(Ordering::SeqCst) {
+            return false;
         }
         send(format!("== Downloading {name}…"));
         match download_auth(url, &dest, auth, send) {
@@ -4481,6 +4637,9 @@ fn run_setup(
             ok &= fetch(KREA2_VAE, m("vae").join("qwen_image_vae.safetensors"), "Qwen-Image VAE", "", &send);
         }
     }
+    if stopped() {
+        return true;
+    }
 
     if ok {
         status("Setup complete");
@@ -4496,7 +4655,22 @@ const SERVER_URL: &str = "http://127.0.0.1:8188";
 /// The long-lived ComfyUI server process (started on first Generate, reused after).
 static SERVER: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
 
+/// ComfyUI must restart to pick up new custom nodes (a drag-drop import) or
+/// changed model folders, which it only reads at startup. The server is shared
+/// by every Generate tab, so instead of stopping it on the spot (killing any
+/// job another tab has running) the next generation restarts it once the
+/// queue is idle. Cleared whenever a fresh server process is launched.
+static SERVER_RESTART_PENDING: AtomicBool = AtomicBool::new(false);
+
 fn start_generate(state: &mut GenerateState, ctx: &egui::Context, cur_image: Option<&Path>) {
+    // Image-to-video needs an image: after a video run the browser selects the
+    // newest output (a .webm), which would otherwise be uploaded as the start
+    // frame and fail inside ComfyUI.
+    if state.family.is_video() && state.i2v && cur_image.is_some_and(crate::is_video) {
+        state.status = "The selected file is a video — select an image to animate".into();
+        state.status_err = true;
+        return;
+    }
     let (tx, rx) = mpsc::channel();
     state.rx = Some(rx);
     state.running = true;
@@ -4504,6 +4678,7 @@ fn start_generate(state: &mut GenerateState, ctx: &egui::Context, cur_image: Opt
     state.status_err = false;
     state.nodes_status = None;
     state.cancel.store(false, Ordering::SeqCst);
+    state.stop_between_steps = false;
     let cancel = state.cancel.clone();
 
     let seed = if state.randomize_seed {
@@ -4526,10 +4701,13 @@ fn start_generate(state: &mut GenerateState, ctx: &egui::Context, cur_image: Opt
         height: state.height,
         seed,
         checkpoint: state.checkpoint.clone(),
+        // Every selected LoRA: the family filter only decides which rows the
+        // picker lists — its "other model" rows exist so a known-mislabelled
+        // LoRA can be picked, which filtering here silently dropped.
         loras: state
             .loras
             .iter()
-            .filter(|l| l.selected && l.base.matches(state.family))
+            .filter(|l| l.selected)
             .map(|l| (l.file.clone(), l.strength))
             .collect(),
         pos_embeds: embed_tokens(state, false),
@@ -4626,7 +4804,12 @@ fn import_dropped_file(state: &mut GenerateState, path: &Path, ctx: &egui::Conte
 
     // Download/install the workflow's custom nodes AND any referenced model files
     // it's missing, on a worker — reusing the Log + `running` machinery so
-    // progress shows and the orb spins.
+    // progress shows and the orb spins. One install at a time across tabs (see
+    // INSTALL_BUSY): the prompt + settings above are already filled either way.
+    let Some(install) = InstallGuard::acquire() else {
+        state.nodes_status = Some("Another ComfyUI install is running — drop the file again once it finishes".into());
+        return;
+    };
     let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
     let (tx, rx) = mpsc::channel();
     state.rx = Some(rx);
@@ -4642,15 +4825,34 @@ fn import_dropped_file(state: &mut GenerateState, path: &Path, ctx: &egui::Conte
     if !names.is_empty() {
         state.log.push(format!("== Importing workflow tools: {}", names.join(", ")));
     }
+    // Fresh flag: a Stop left over from an earlier job must not cancel this run.
+    state.cancel.store(false, Ordering::SeqCst);
+    state.stop_between_steps = true;
+    let cancel = state.cancel.clone();
 
     let ctx2 = ctx.clone();
     std::thread::spawn(move || {
-        let ok = nodes.is_empty() || install_custom_nodes(nodes, &tx, &ctx2);
+        let _install = install;
+        let ok = nodes.is_empty() || install_custom_nodes(nodes, &tx, &ctx2, &cancel);
         // Then resolve + download any model files the workflow needs.
-        if let Some(graph) = graph {
-            download_missing_models(&graph, &civitai, &tx, &ctx2);
+        if let Some(graph) = graph
+            && !cancel.load(Ordering::SeqCst)
+        {
+            download_missing_models(&graph, &civitai, &tx, &ctx2, &cancel);
         }
-        let _ = tx.send(RunnerMsg::Done(ok));
+        // Always end on a status — otherwise the header kept the starting
+        // "Installing custom nodes…" (or "Stopping…" after a Stop) for good.
+        // A cancel isn't an error, same as a cancelled generation.
+        let cancelled = cancel.load(Ordering::SeqCst);
+        let msg = if cancelled {
+            "Import cancelled"
+        } else if ok {
+            "Import complete"
+        } else {
+            "Import finished with issues — see Log"
+        };
+        let _ = tx.send(RunnerMsg::Status(msg.into()));
+        let _ = tx.send(RunnerMsg::Done(ok || cancelled));
         ctx2.request_repaint();
     });
 }
@@ -4669,6 +4871,7 @@ fn download_missing_models(
     civitai: &[crate::sd_metadata::CivitaiRef],
     tx: &mpsc::Sender<RunnerMsg>,
     ctx: &egui::Context,
+    cancel: &AtomicBool,
 ) {
     let send = |s: String| {
         let _ = tx.send(RunnerMsg::Line(s));
@@ -4695,6 +4898,9 @@ fn download_missing_models(
         .map(|n| n.replace('\\', "/").rsplit('/').next().unwrap_or(n).to_string())
         .collect();
 
+    // Stop is honoured between files (a download in flight can't be aborted).
+    let stopped = || cancel.load(Ordering::SeqCst);
+
     // Pass 1 — ComfyUI-Manager's index (well-known VAEs, SAM, upscalers, CLIP…).
     let index = fetch_model_list(&send);
     remaining.retain(|base| match index.get(&base.to_ascii_lowercase()) {
@@ -4705,6 +4911,9 @@ fn download_missing_models(
             if dest.exists() {
                 got += 1;
                 return false;
+            }
+            if stopped() {
+                return true;
             }
             send(format!("== Downloading {base} → models/{folder}/"));
             if download(url, &dest, &send).is_ok() {
@@ -4733,6 +4942,9 @@ fn download_missing_models(
         }
         let key = crate::civitai::load_civitai_key();
         for cref in civitai {
+            if stopped() {
+                break;
+            }
             let cat = air_cat(&cref.kind);
             if need.get(&cat).copied().unwrap_or(0) == 0 {
                 continue; // already have every model of this category
@@ -4777,7 +4989,10 @@ fn download_missing_models(
         }
     }
 
-    if remaining.is_empty() {
+    if stopped() {
+        send(format!("== Cancelled — {} model file(s) not downloaded.", remaining.len()));
+        label(format!("Cancelled · {got} model(s) downloaded"));
+    } else if remaining.is_empty() {
         send("== All referenced models are present.".into());
         label(format!("{got} model(s) downloaded"));
     } else {
@@ -4966,6 +5181,7 @@ fn install_custom_nodes(
     nodes: Vec<crate::sd_metadata::CustomNodeRef>,
     tx: &mpsc::Sender<RunnerMsg>,
     ctx: &egui::Context,
+    cancel: &AtomicBool,
 ) -> bool {
     let send = |s: String| {
         let _ = tx.send(RunnerMsg::Line(s));
@@ -4996,6 +5212,12 @@ fn install_custom_nodes(
     let total = nodes.len();
     let mut ok_count = 0usize;
     for (i, node) in nodes.iter().enumerate() {
+        // Stop is honoured between nodes (a download or pip run in flight
+        // can't be aborted safely).
+        if cancel.load(Ordering::SeqCst) {
+            send("== Cancelled — the remaining custom nodes weren't installed.".into());
+            break;
+        }
         label(format!("Installing {}/{}: {}", i + 1, total, node.name));
         send(format!("== [{}/{}] {}", i + 1, total, node.name));
 
@@ -5027,9 +5249,10 @@ fn install_custom_nodes(
         }
     }
 
-    // New nodes only register when ComfyUI (re)starts — stop the server so the
-    // next generation relaunches it and picks them up.
-    stop_server();
+    // New nodes only register when ComfyUI (re)starts. Not stopped here: the
+    // server is shared, and another tab may be mid-job on it — the next
+    // generation restarts it once nothing is running (see run_generate).
+    SERVER_RESTART_PENDING.store(true, Ordering::SeqCst);
     if ok_count == total {
         label(format!("{total} custom node{} added", if total == 1 { "" } else { "s" }));
         send("== Done. ComfyUI will relaunch with the new nodes on the next generation.".into());
@@ -5169,13 +5392,22 @@ fn github_owner_repo(url: &str) -> Option<String> {
     Some(format!("{owner}/{name}"))
 }
 
+/// Which of the tab's settings [`override_imported`] actually wrote into an
+/// imported graph — the only ones the PNG metadata can vouch for.
+#[derive(Clone, Copy, Default)]
+struct ImportedOverrides {
+    prompt: bool,
+    negative: bool,
+    seed: bool,
+}
+
 /// Swap the current prompt / negative / seed into an imported ComfyUI API graph,
 /// leaving everything else (model, steps, cfg, size, custom nodes) exactly as the
-/// dropped image had it. Returns the edited graph, or `None` if it can't be
-/// parsed (the caller then runs it verbatim). Steps/CFG/size are intentionally
-/// left alone — they're part of the imported recipe and overriding every sampler
-/// would break multi-stage (e.g. upscale) workflows.
-fn override_imported(graph: &str, job: &GenJob) -> Option<serde_json::Value> {
+/// dropped image had it. Returns the edited graph plus what was swapped in, or
+/// `None` if it can't be parsed (the caller then runs it verbatim). Steps/CFG/size
+/// are intentionally left alone — they're part of the imported recipe and
+/// overriding every sampler would break multi-stage (e.g. upscale) workflows.
+fn override_imported(graph: &str, job: &GenJob) -> Option<(serde_json::Value, ImportedOverrides)> {
     use serde_json::json;
     let mut root: serde_json::Value = crate::sd_metadata::parse_comfy_json(graph)?;
 
@@ -5199,25 +5431,30 @@ fn override_imported(graph: &str, job: &GenJob) -> Option<serde_json::Value> {
     }
 
     let map = root.as_object_mut()?;
+    let mut applied = ImportedOverrides::default();
     for (id, node) in map.iter_mut() {
         let ct = node.get("class_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let Some(inputs) = node.get_mut("inputs").and_then(|v| v.as_object_mut()) else { continue };
         if ct.starts_with("KSampler") {
             if inputs.contains_key("seed") {
                 inputs.insert("seed".into(), json!(job.seed));
+                applied.seed = true;
             }
             if inputs.contains_key("noise_seed") {
                 inputs.insert("noise_seed".into(), json!(job.seed));
+                applied.seed = true;
             }
         }
         if pos_ids.contains(id.as_str()) && inputs.get("text").is_some_and(|t| t.is_string()) {
             inputs.insert("text".into(), json!(with_embeds(&job.prompt, &job.pos_embeds)));
+            applied.prompt = true;
         }
         if neg_ids.contains(id.as_str()) && inputs.get("text").is_some_and(|t| t.is_string()) {
             inputs.insert("text".into(), json!(with_embeds(&job.negative, &job.neg_embeds)));
+            applied.negative = true;
         }
     }
-    Some(root)
+    Some((root, applied))
 }
 
 /// Scan an imported API graph for the model files it references (checkpoints,
@@ -5398,15 +5635,38 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
     // 1 — make sure the ComfyUI server is up. For checkpoint-picker families,
     // register the extra checkpoint folders first; if that config changed, the
     // running server must be restarted to pick it up (paths load at startup only).
-    if job.model.family().uses_checkpoint_picker() && ensure_checkpoint_paths(&comfy) && ping() {
-        status("Updating model folders — restarting ComfyUI…");
-        stop_server();
+    // So must one that's missing a drag-drop import's new custom nodes. Wait for
+    // the queue to empty first: the server is shared, and stopping it would kill
+    // another tab's job.
+    if job.model.family().uses_checkpoint_picker() && ensure_checkpoint_paths(&comfy) {
+        SERVER_RESTART_PENDING.store(true, Ordering::SeqCst);
+    }
+    if SERVER_RESTART_PENDING.load(Ordering::SeqCst) && ping() {
+        status("Restarting ComfyUI to load new nodes / model folders…");
+        if !wait_until_idle(cancel, &status) {
+            send("== Cancelled".into());
+            status("Cancelled");
+            return true;
+        }
+        // swap: when two tabs get here together, only one restarts it.
+        if SERVER_RESTART_PENDING.swap(false, Ordering::SeqCst) {
+            stop_server();
+        }
     }
     if !ping() {
         status("Starting ComfyUI…");
-        if let Err(e) = start_server(&comfy, &py, &send) {
-            send(format!("ERROR: {e}"));
-            return false;
+        match start_server(&comfy, &py, &send, cancel) {
+            Ok(true) => {}
+            Ok(false) => {
+                send("== Cancelled".into());
+                status("Cancelled");
+                return true;
+            }
+            Err(e) => {
+                send(format!("ERROR: {e}"));
+                send_server_log_tail(&send);
+                return false;
+            }
         }
     }
 
@@ -5454,15 +5714,21 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
     // 4xx returns a readable body instead of a bare status code — ComfyUI puts the
     // real reason (missing model, bad node input) in the body's `error`/`node_errors`.
     status("Queuing…");
+    // What got swapped into an imported graph — all the PNG metadata can vouch for.
+    let mut applied = ImportedOverrides::default();
     let wf = match &job.imported_workflow {
         // Run the dropped image's own graph (custom nodes and all), swapping in
         // the current prompt / negative / seed. Falls back to verbatim if the
         // graph can't be parsed for substitution.
         Some(graph) => {
             send("== Using imported workflow (custom nodes)".into());
-            override_imported(graph, &job)
-                .or_else(|| crate::sd_metadata::parse_comfy_json(graph))
-                .unwrap_or(serde_json::Value::Null)
+            match override_imported(graph, &job) {
+                Some((wf, a)) => {
+                    applied = a;
+                    wf
+                }
+                None => crate::sd_metadata::parse_comfy_json(graph).unwrap_or(serde_json::Value::Null),
+            }
         }
         None => build_workflow(&job, image_name.as_deref()),
     };
@@ -5521,15 +5787,27 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
     let max_polls = if is_video { 7200 } else { 1200 };
     status("Generating…");
     let mut images: Option<serde_json::Value> = None;
+    // Consecutive polls that found nothing listening on the port.
+    let mut refused = 0u32;
     for _ in 0..max_polls {
         if cancel.load(Ordering::SeqCst) {
-            // Abort the running job server-side (and drop it from the queue in
-            // case it hadn't started), then bail out without flagging an error.
-            let _ = agent.post(&format!("{SERVER_URL}/interrupt")).send_empty();
+            // Cancel only THIS job, then bail out without flagging an error. The
+            // server is shared by every Generate tab, and a bare /interrupt stops
+            // whatever is executing — possibly another tab's job. So drop ours
+            // from the pending queue first (then it can't start), and interrupt
+            // only if it's the one running. (Recent ComfyUI also honours a
+            // prompt_id on /interrupt; older builds ignore the body — hence the
+            // queue check.)
             let _ = agent
                 .post(&format!("{SERVER_URL}/queue"))
                 .header("Content-Type", "application/json")
                 .send(serde_json::json!({ "delete": [prompt_id] }).to_string().as_str());
+            if server_queue().is_some_and(|q| queue_has(&q, "queue_running", &prompt_id)) {
+                let _ = agent
+                    .post(&format!("{SERVER_URL}/interrupt"))
+                    .header("Content-Type", "application/json")
+                    .send(serde_json::json!({ "prompt_id": prompt_id }).to_string().as_str());
+            }
             send("== Cancelled".into());
             status("Cancelled");
             return true;
@@ -5539,7 +5817,33 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
         if let Some(pct) = read_progress(&log_path, log_offset) {
             status(&format!("Generating… {pct}%"));
         }
-        let Ok(h) = agent.get(&format!("{SERVER_URL}/history/{prompt_id}")).call() else { continue };
+        let h = match agent.get(&format!("{SERVER_URL}/history/{prompt_id}")).call() {
+            Ok(h) => {
+                refused = 0;
+                h
+            }
+            // Nothing listening: the server died mid-job (crash, OOM kill). Fail
+            // now, with its log, instead of polling a dead port for up to an
+            // hour — at once when it's our own process that exited, after a
+            // short run of refusals for a server we didn't launch.
+            Err(ureq::Error::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                refused += 1;
+                let exited = server_exit_status();
+                if exited.is_some() || refused >= 20 {
+                    send(match exited {
+                        Some(st) => format!("ERROR: ComfyUI exited during the job ({st})"),
+                        None => "ERROR: lost the connection to ComfyUI — it stopped responding".into(),
+                    });
+                    send_server_log_tail(&send);
+                    return false;
+                }
+                continue;
+            }
+            Err(_) => {
+                refused = 0;
+                continue;
+            }
+        };
         let Ok(hist) = read_json(h) else { continue };
         let Some(entry) = hist.get(&prompt_id) else { continue };
         // Surface a node error if the run failed.
@@ -5607,7 +5911,7 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
     let dest = outdir.join(format!("gen_{stamp}.png"));
     // Stamp A1111-style generation metadata (incl. the Clarity TagFlow version) so
     // sites like Civitai surface the prompt/settings and attribute the tool.
-    let bytes = add_png_text(&bytes, "parameters", &build_params(&job));
+    let bytes = add_png_text(&bytes, "parameters", &build_params(&job, applied));
     if let Err(e) = std::fs::write(&dest, &bytes) {
         send(format!("ERROR: could not save image: {e}"));
         return false;
@@ -5665,9 +5969,29 @@ fn blank_png(w: u32, h: u32) -> Vec<u8> {
     buf.into_inner()
 }
 
-/// Build an A1111-style `parameters` string for the PNG metadata. The trailing
+/// Build an A1111-style `parameters` string for the PNG metadata, recording what
+/// the workflow really ran with — the Details panel, the Civitai panel and
+/// uploads read this block ahead of ComfyUI's own graph. The trailing
 /// `Version:` field is how generators attribute themselves (Civitai shows it).
-fn build_params(job: &GenJob) -> String {
+fn build_params(job: &GenJob, applied: ImportedOverrides) -> String {
+    let version = format!("Version: Clarity TagFlow v{}", env!("CARGO_PKG_VERSION"));
+    if job.imported_workflow.is_some() {
+        // An imported graph ran its own model, sampler, steps, CFG, size and
+        // LoRA loaders (the tab only holds clamped copies of the dropped image's
+        // values), so record just what was swapped into it; the ComfyUI `prompt`
+        // chunk saved alongside has the rest. Without a `Steps:` key readers
+        // treat this as a note rather than a full parameter block.
+        let mut lines = Vec::new();
+        if applied.prompt {
+            lines.push(with_embeds(&job.prompt, &job.pos_embeds));
+        }
+        let neg = with_embeds(&job.negative, &job.neg_embeds);
+        if applied.negative && !neg.is_empty() {
+            lines.push(format!("Negative prompt: {neg}"));
+        }
+        lines.push(if applied.seed { format!("Seed: {}, {version}", job.seed) } else { version });
+        return lines.join("\n");
+    }
     let model = match job.model {
         GenModel::SchnellQ4 | GenModel::SchnellQ8 => "FLUX.1-schnell",
         GenModel::DevQ4 | GenModel::DevQ8 => "FLUX.1-dev",
@@ -5681,22 +6005,40 @@ fn build_params(job: &GenJob) -> String {
         GenModel::AnimaBase => "Anima v1.0",
         GenModel::Krea2Turbo => "Krea 2 Turbo",
     };
-    let mut prompt = job.prompt.clone();
+    // A picked installed checkpoint / diffusion model is what actually loaded.
+    let model = job.checkpoint.as_deref().map(ckpt_display_name).unwrap_or(model);
+    // The KSampler settings and negative-encoder text each workflow builder
+    // below really uses (the params_match_each_builtin_workflow test keeps the
+    // two in step).
+    let (sampler, schedule, negative) = match job.model.family() {
+        // Flux samples at cfg 1 — its guidance, which CFG scale records, goes
+        // through FluxGuidance — and cfg 1 skips the negative entirely.
+        GenFamily::Flux => ("Euler", "Simple", None),
+        GenFamily::ZImage => ("Euler", "Simple", Some(neg_with(job, ""))),
+        GenFamily::Sdxl => ("DPM++ 2M", "Karras", Some(neg_with(job, SDXL_NEG))),
+        GenFamily::Anima => ("er_sde", "Simple", Some(neg_with(job, ANIMA_NEG))),
+        // Krea 2 zeroes its negative conditioning (ConditioningZeroOut).
+        GenFamily::Krea2 => ("Euler", "Simple", None),
+        // Video is saved via SaveWEBM and never reaches this PNG path.
+        GenFamily::Ltx => ("Euler", "Simple", None),
+        GenFamily::Wan => ("UniPC", "Simple", None),
+    };
+    // Each latent cell is 8 px, so the image comes out at the size rounded down
+    // to a multiple of 8 (the SDXL / Anima / Krea 2 builders round it explicitly).
+    let (w, h) = ((job.width / 8).max(8) * 8, (job.height / 8).max(8) * 8);
+    let mut prompt = with_embeds(&job.prompt, &job.pos_embeds);
     // Surface selected LoRAs as A1111 tags so they show up too.
     use std::fmt::Write as _;
     for (file, strength) in &job.loras {
         let name = file.trim_end_matches(".safetensors");
         let _ = write!(prompt, " <lora:{name}:{strength}>");
     }
+    if let Some(neg) = negative.filter(|n| !n.is_empty()) {
+        let _ = write!(prompt, "\nNegative prompt: {neg}");
+    }
     format!(
-        "{prompt}\nNegative prompt: \nSteps: {}, Sampler: Euler, CFG scale: {}, Seed: {}, Size: {}x{}, Model: {}, Version: Clarity TagFlow v{}",
-        job.steps,
-        job.guidance,
-        job.seed,
-        job.width,
-        job.height,
-        model,
-        env!("CARGO_PKG_VERSION"),
+        "{prompt}\nSteps: {}, Sampler: {sampler}, Schedule type: {schedule}, CFG scale: {}, Seed: {}, Size: {w}x{h}, Model: {model}, {version}",
+        job.steps, job.guidance, job.seed,
     )
 }
 
@@ -5748,6 +6090,10 @@ fn build_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
     }
 }
 
+/// Anima's built-in negative: a light anime-oriented one (cfg 4 uses the
+/// negative conditioning). Also recorded in the PNG metadata (build_params).
+const ANIMA_NEG: &str = "lowres, worst quality, low quality, bad anatomy, bad hands, text, watermark, jpeg artifacts, signature";
+
 /// Anima Base v1.0 text-to-image (CircleStone Labs / Comfy Org, NVIDIA Cosmos 2):
 /// UNETLoader + CLIPLoader(qwen3, type "stable_diffusion") + VAELoader(qwen image) +
 /// dual CLIPTextEncode + EmptyLatentImage + KSampler (er_sde/simple) + VAEDecode +
@@ -5783,8 +6129,6 @@ fn anima_workflow(job: &GenJob) -> serde_json::Value {
         clip_ref = json!([node, 1]);
     }
 
-    // A light anime-oriented negative (cfg 4 uses the negative conditioning).
-    const ANIMA_NEG: &str = "lowres, worst quality, low quality, bad anatomy, bad hands, text, watermark, jpeg artifacts, signature";
     obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref}}));
     obj.insert("6".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": neg_with(job, ANIMA_NEG), "clip": clip_ref}}));
     obj.insert("7".into(), json!({"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}));
@@ -5850,6 +6194,10 @@ fn krea2_workflow(job: &GenJob) -> serde_json::Value {
     wf
 }
 
+/// SDXL's built-in negative: a standard quality one. Also recorded in the PNG
+/// metadata (build_params).
+const SDXL_NEG: &str = "ugly, low quality, worst quality, blurry, jpeg artifacts, watermark, text, deformed, bad anatomy";
+
 /// SDXL Base 1.0 text-to-image: CheckpointLoaderSimple (UNet + dual CLIP + VAE) +
 /// CLIPTextEncode ×2 + EmptyLatentImage + KSampler + VAEDecode + SaveImage, with
 /// any selected LoRAs chained in model+clip via LoraLoader nodes.
@@ -5883,8 +6231,6 @@ fn sdxl_workflow(job: &GenJob) -> serde_json::Value {
     }
 
     let vae_ref = json!(["1", 2]);
-    // A standard SDXL quality negative.
-    const SDXL_NEG: &str = "ugly, low quality, worst quality, blurry, jpeg artifacts, watermark, text, deformed, bad anatomy";
     obj.insert("3".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": with_embeds(&job.prompt, &job.pos_embeds), "clip": clip_ref}}));
     obj.insert("4".into(), json!({"class_type": "CLIPTextEncode", "inputs": {"text": neg_with(job, SDXL_NEG), "clip": clip_ref}}));
     obj.insert("5".into(), json!({"class_type": "EmptyLatentImage", "inputs": {
@@ -6323,48 +6669,166 @@ fn ping() -> bool {
 }
 
 /// Launch ComfyUI (server output to a log file) and wait until it answers.
-fn start_server(comfy: &Path, py: &Path, send: &dyn Fn(String)) -> Result<(), String> {
+/// `Ok(false)`: Stop was pressed while waiting — the server is left to finish
+/// starting, since it's shared and the next job will use it.
+fn start_server(comfy: &Path, py: &Path, send: &dyn Fn(String), cancel: &AtomicBool) -> Result<bool, String> {
     use std::process::{Command, Stdio};
 
     let mut lock = SERVER.lock().unwrap();
     if ping() {
-        return Ok(());
+        return Ok(true);
     }
-    send("== Launching ComfyUI server (first run takes ~30-60s)…".into());
-    #[cfg(windows)]
-    crate::pixal3d::ensure_kill_on_exit_job();
+    // A server we launched that's still running is just not up yet (another
+    // tab started it moments ago) — wait for it instead of launching a second
+    // copy that can't bind the port. One that has exited is reaped here, so a
+    // crashed server doesn't linger as a zombie once it's replaced.
+    let starting = matches!(lock.as_mut().map(|c| c.try_wait()), Some(Ok(None)));
+    if starting {
+        send("== Waiting for ComfyUI to finish starting…".into());
+    } else {
+        if let Some(mut old) = lock.take() {
+            let _ = old.kill();
+            let _ = old.wait();
+        }
+        send("== Launching ComfyUI server (first run takes ~30-60s)…".into());
+        #[cfg(windows)]
+        crate::pixal3d::ensure_kill_on_exit_job();
 
-    let logf = std::fs::File::create(comfy.parent().unwrap_or(comfy).join("comfyui-server.log"))
-        .map_err(|e| e.to_string())?;
-    let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
+        let logf = std::fs::File::create(comfy.parent().unwrap_or(comfy).join("comfyui-server.log"))
+            .map_err(|e| e.to_string())?;
+        let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
 
-    let mut cmd = Command::new(py);
-    cmd.arg("main.py")
-        .arg("--port")
-        .arg("8188")
-        .current_dir(comfy)
-        // Force UTF-8 I/O: stdout is a file here, so Python would otherwise use the
-        // Windows locale (cp1252) and crash when tqdm writes Unicode progress bars.
-        .env("PYTHONIOENCODING", "utf-8")
-        .env("PYTHONUTF8", "1")
-        .stdout(Stdio::from(logf))
-        .stderr(Stdio::from(logf2));
-    crate::pixal3d::hide_window(&mut cmd);
-    crate::pixal3d::kill_on_parent_exit(&mut cmd);
+        let mut cmd = Command::new(py);
+        cmd.arg("main.py")
+            .arg("--port")
+            .arg("8188")
+            .current_dir(comfy)
+            // Force UTF-8 I/O: stdout is a file here, so Python would otherwise use the
+            // Windows locale (cp1252) and crash when tqdm writes Unicode progress bars.
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("PYTHONUTF8", "1")
+            .stdout(Stdio::from(logf))
+            .stderr(Stdio::from(logf2));
+        crate::pixal3d::hide_window(&mut cmd);
 
-    let child = cmd.spawn().map_err(|e| format!("could not start ComfyUI: {e}"))?;
-    *lock = Some(child);
+        // Not spawned from this thread: on Linux the kill-on-exit signal is tied
+        // to the spawning *thread*, and this job thread ends with the job — which
+        // killed the shared server after every generation (see spawn_app_lifetime).
+        let child = crate::pixal3d::spawn_app_lifetime(cmd).map_err(|e| format!("could not start ComfyUI: {e}"))?;
+        *lock = Some(child);
+        // A fresh process loads the current custom nodes + model folders.
+        SERVER_RESTART_PENDING.store(false, Ordering::SeqCst);
+    }
     drop(lock);
 
-    // Wait for readiness (server.log has details if it never comes up).
+    // Wait for readiness — but give up as soon as the process dies (a Python
+    // import error, a missing DLL…) instead of waiting out the full 3 minutes,
+    // and let Stop end the wait.
     for _ in 0..180 {
         std::thread::sleep(std::time::Duration::from_millis(1000));
         if ping() {
             send("== ComfyUI server ready".into());
-            return Ok(());
+            return Ok(true);
+        }
+        if let Some(st) = server_exit_status() {
+            return Err(format!("ComfyUI exited while starting ({st})"));
+        }
+        if cancel.load(Ordering::SeqCst) {
+            return Ok(false);
         }
     }
-    Err("ComfyUI server did not become ready (see comfyui-server.log)".into())
+    Err("ComfyUI server did not become ready within 3 minutes".into())
+}
+
+/// How the ComfyUI server this app launched ended, once it has (crashed, or
+/// was killed by the OS) — `None` while it runs, or when the server on the
+/// port isn't ours.
+fn server_exit_status() -> Option<std::process::ExitStatus> {
+    SERVER.lock().ok()?.as_mut()?.try_wait().ok().flatten()
+}
+
+/// ComfyUI's `GET /queue`: `{"queue_running": [...], "queue_pending": [...]}`,
+/// each item `[number, prompt_id, …]`. `None` if the server can't be asked.
+fn server_queue() -> Option<serde_json::Value> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(5)))
+        .build()
+        .into();
+    read_json(agent.get(&format!("{SERVER_URL}/queue")).call().ok()?).ok()
+}
+
+/// Whether `prompt_id` is among the `key` ("queue_running" / "queue_pending")
+/// items of a `GET /queue` reply.
+fn queue_has(queue: &serde_json::Value, key: &str, prompt_id: &str) -> bool {
+    queue
+        .get(key)
+        .and_then(|v| v.as_array())
+        .is_some_and(|items| items.iter().any(|it| it.get(1).and_then(|id| id.as_str()) == Some(prompt_id)))
+}
+
+/// Nothing running or waiting in a `GET /queue` reply.
+fn queue_is_idle(queue: &serde_json::Value) -> bool {
+    ["queue_running", "queue_pending"]
+        .iter()
+        .all(|k| queue.get(k).and_then(|v| v.as_array()).is_none_or(|a| a.is_empty()))
+}
+
+/// Block until the shared server has nothing running or queued, so a restart
+/// can't kill another tab's job. `false` when Stop was pressed meanwhile. An
+/// unreadable queue counts as idle (nothing is known to be running).
+fn wait_until_idle(cancel: &AtomicBool, status: &dyn Fn(&str)) -> bool {
+    let mut told = false;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return false;
+        }
+        match server_queue() {
+            Some(q) if !queue_is_idle(&q) => {
+                if !told {
+                    status("Waiting for the running job to finish before restarting ComfyUI…");
+                    told = true;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            _ => return true,
+        }
+    }
+}
+
+/// Copy the end of `comfyui-server.log` into the Log: when the server fails,
+/// that's where the reason is (a Python traceback, CUDA out of memory…), and
+/// the app shows nothing else of that file.
+fn send_server_log_tail(send: &dyn Fn(String)) {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = comfy_base().join("comfyui-server.log");
+    let Ok(mut f) = std::fs::File::open(&path) else { return };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(16 * 1024);
+    let mut buf = Vec::new();
+    if f.seek(SeekFrom::Start(start)).is_err() || f.read_to_end(&mut buf).is_err() {
+        return;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    // Reading from mid-file: drop the cut-off first line.
+    let text = if start > 0 { text.split_once('\n').map_or("", |(_, rest)| rest) } else { &text };
+    let lines = log_tail(text, 25);
+    if !lines.is_empty() {
+        send(format!("== Last lines of {}:", path.display()));
+        for line in lines {
+            send(format!("   {line}"));
+        }
+    }
+}
+
+/// The last `n` non-blank lines of a log as a terminal shows them: tqdm redraws
+/// its bar in place with `\r`, so each line's last non-blank segment wins.
+fn log_tail(text: &str, n: usize) -> Vec<String> {
+    let lines: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.split('\r').rev().find(|seg| !seg.trim().is_empty()))
+        .map(str::trim_end)
+        .collect();
+    lines[lines.len().saturating_sub(n)..].iter().map(|s| s.to_string()).collect()
 }
 
 fn read_json(resp: ureq::http::Response<ureq::Body>) -> Result<serde_json::Value, String> {
@@ -6629,5 +7093,177 @@ mod ltx2_resolution_tests {
         let wf = ltx2_workflow(&job(1280, 704, false), None);
         assert_eq!(dims(&wf, "297", "width", "height"), (640, 352));
         assert_eq!(dims(&wf, "292", "resize_type.width", "resize_type.height"), (1280, 704));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn job(model: GenModel) -> GenJob {
+        GenJob {
+            model,
+            prompt: "a cat".into(),
+            steps: 20,
+            guidance: 5.5,
+            width: 1024,
+            height: 772, // not a multiple of 8: the image comes out 768 tall
+            seed: 7,
+            checkpoint: None,
+            loras: vec![("detail.safetensors".into(), 0.8)],
+            pos_embeds: "embedding:good".into(),
+            neg_embeds: "embedding:bad".into(),
+            negative: "blurry".into(),
+            frames: 49,
+            fps: 24,
+            i2v: false,
+            src_image: None,
+            imported_workflow: None,
+        }
+    }
+
+    /// The node a `[id, slot]` link input points at.
+    fn linked<'a>(wf: &'a serde_json::Value, link: &serde_json::Value) -> &'a serde_json::Value {
+        &wf[link[0].as_str().unwrap()]
+    }
+
+    /// The PNG metadata must state what each built-in graph really runs — its
+    /// KSampler's sampler/scheduler/steps, the negative encoder's text (none
+    /// when the graph ignores it) and the latent size — not a fixed "Euler" and
+    /// an empty negative.
+    #[test]
+    fn params_match_each_builtin_workflow() {
+        let a1111 = |s: &str| match s {
+            "euler" => "Euler",
+            "dpmpp_2m" => "DPM++ 2M",
+            "er_sde" => "er_sde",
+            "simple" => "Simple",
+            "karras" => "Karras",
+            other => panic!("no metadata name for {other}"),
+        };
+        for model in [GenModel::SchnellQ4, GenModel::ZImageFast, GenModel::SdxlBase, GenModel::AnimaBase, GenModel::Krea2Turbo] {
+            let j = job(model);
+            let wf = build_workflow(&j, None);
+            let params = build_params(&j, ImportedOverrides::default());
+            let ks = wf.as_object().unwrap().values().find(|n| n["class_type"] == "KSampler").unwrap();
+            let inputs = &ks["inputs"];
+            let sampler = a1111(inputs["sampler_name"].as_str().unwrap());
+            let schedule = a1111(inputs["scheduler"].as_str().unwrap());
+            assert!(params.contains(&format!("Sampler: {sampler}, Schedule type: {schedule},")), "{params}");
+            assert!(params.contains(&format!("Steps: {},", inputs["steps"])), "{params}");
+
+            let neg = linked(&wf, &inputs["negative"]);
+            // cfg 1 skips the negative; a ConditioningZeroOut has no text.
+            if neg["class_type"] == "CLIPTextEncode" && inputs["cfg"].as_f64() != Some(1.0) {
+                let text = neg["inputs"]["text"].as_str().unwrap();
+                assert!(params.contains(&format!("\nNegative prompt: {text}\n")), "{params}");
+            } else {
+                assert!(!params.contains("Negative prompt"), "{params}");
+            }
+
+            let latent = &linked(&wf, &inputs["latent_image"])["inputs"];
+            let (w, h) = (latent["width"].as_i64().unwrap() / 8 * 8, latent["height"].as_i64().unwrap() / 8 * 8);
+            assert!(params.contains(&format!("Size: {w}x{h},")), "{params}");
+            assert!(params.starts_with("a cat embedding:good <lora:detail:0.8>"), "{params}");
+        }
+    }
+
+    #[test]
+    fn params_name_a_picked_checkpoint() {
+        let mut j = job(GenModel::SdxlBase);
+        j.checkpoint = Some("juggernautXL_v9.safetensors".into());
+        assert!(build_params(&j, ImportedOverrides::default()).contains("Model: juggernautXL_v9,"));
+    }
+
+    /// An imported graph runs its own model/steps/CFG/size/LoRAs — only what was
+    /// swapped into it may be recorded.
+    #[test]
+    fn imported_params_record_only_what_was_swapped_in() {
+        let mut j = job(GenModel::SdxlBase);
+        j.imported_workflow = Some("{}".into());
+        let version = format!("Version: Clarity TagFlow v{}", env!("CARGO_PKG_VERSION"));
+
+        let all = ImportedOverrides { prompt: true, negative: true, seed: true };
+        let params = build_params(&j, all);
+        assert_eq!(params, format!("a cat embedding:good\nNegative prompt: blurry embedding:bad\nSeed: 7, {version}"));
+        for absent in ["Steps:", "Model:", "CFG scale:", "Size:", "Sampler:", "<lora:"] {
+            assert!(!params.contains(absent), "{absent} in {params}");
+        }
+        assert_eq!(build_params(&j, ImportedOverrides::default()), version);
+    }
+
+    #[test]
+    fn override_imported_reports_what_it_replaced() {
+        let j = job(GenModel::SdxlBase);
+        let graph = json!({
+            "3": {"class_type": "KSampler", "inputs": {"seed": 1, "steps": 30, "cfg": 7.0,
+                "positive": ["6", 0], "negative": ["7", 0], "model": ["4", 0], "latent_image": ["5", 0]}},
+            "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "old positive", "clip": ["4", 1]}},
+            "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "old negative", "clip": ["4", 1]}}
+        })
+        .to_string();
+        let (wf, applied) = override_imported(&graph, &j).unwrap();
+        assert!(applied.prompt && applied.negative && applied.seed);
+        assert_eq!(wf["6"]["inputs"]["text"], "a cat embedding:good");
+        assert_eq!(wf["3"]["inputs"]["seed"], 7);
+        assert_eq!(wf["3"]["inputs"]["steps"], 30, "the graph keeps its own steps");
+
+        // A custom sampler this can't trace: nothing swapped, nothing claimed.
+        let custom = json!({
+            "1": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["2", 0]}},
+            "2": {"class_type": "RandomNoise", "inputs": {"noise_seed": 3}}
+        })
+        .to_string();
+        let (_, applied) = override_imported(&custom, &j).unwrap();
+        assert!(!applied.prompt && !applied.negative && !applied.seed);
+    }
+
+    /// Stop must only touch this tab's prompt: find it in GET /queue.
+    #[test]
+    fn queue_lookup() {
+        let q = json!({
+            "queue_running": [[5, "abc", {}, {}, []]],
+            "queue_pending": [[6, "def", {}, {}, []]]
+        });
+        assert!(queue_has(&q, "queue_running", "abc"));
+        assert!(!queue_has(&q, "queue_running", "def"));
+        assert!(queue_has(&q, "queue_pending", "def"));
+        assert!(!queue_has(&q, "queue_pending", "zzz"));
+        assert!(!queue_is_idle(&q));
+        assert!(!queue_is_idle(&json!({"queue_running": [], "queue_pending": [[1, "x"]]})));
+        assert!(queue_is_idle(&json!({"queue_running": [], "queue_pending": []})));
+    }
+
+    /// The server log tail as a terminal shows it: tqdm's `\r` redraws keep
+    /// only the latest bar, blank lines are dropped, the newest `n` lines kept.
+    #[test]
+    fn log_tail_reads_like_a_terminal() {
+        let log = "boot\n\nTraceback (most recent call last):\r\n  File \"main.py\", line 9\n \
+                   10%|#   | 1/10\r 50%|#####   | 5/10\r\nImportError: no module named torch\n";
+        assert_eq!(
+            log_tail(log, 3),
+            ["  File \"main.py\", line 9", " 50%|#####   | 5/10", "ImportError: no module named torch"]
+        );
+        assert_eq!(log_tail(log, 50).len(), 5);
+        assert!(log_tail("", 5).is_empty());
+    }
+
+    /// An embedding picked from "Show for other models" is used, not dropped.
+    #[test]
+    fn other_family_embedding_selection_is_applied() {
+        let mut state = GenerateState::new(GenFamily::Flux);
+        state.embeddings = vec![EmbeddingEntry {
+            file: "sdxl_style.safetensors".into(),
+            base: LoraBase::Sdxl,
+            sniffed: true,
+            selected: true,
+            negative: false,
+            strength: 1.0,
+            thumb: None,
+            thumb_missing: false,
+        }];
+        assert_eq!(embed_tokens(&state, false), "embedding:sdxl_style");
+        assert_eq!(embed_tokens(&state, true), "");
     }
 }

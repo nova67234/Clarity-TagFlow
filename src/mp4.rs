@@ -105,7 +105,8 @@ fn find_top_level_box(
     target: &[u8; 4],
 ) -> Option<(u64, u64)> {
     let mut pos = 0u64;
-    while pos + 8 <= file_len {
+    // Saturating: a corrupt box size can push `pos` to near u64::MAX.
+    while pos.saturating_add(8) <= file_len {
         f.seek(SeekFrom::Start(pos)).ok()?;
         let mut hdr = [0u8; 8];
         f.read_exact(&mut hdr).ok()?;
@@ -154,15 +155,18 @@ fn parse_boxes(buf: &[u8]) -> Vec<([u8; 4], &[u8])> {
             if p + 16 > buf.len() {
                 break;
             }
-            let s = u64::from_be_bytes(buf[p + 8..p + 16].try_into().ok().unwrap()) as usize;
-            (16usize, s)
+            let s = u64::from_be_bytes(buf[p + 8..p + 16].try_into().ok().unwrap());
+            (16usize, usize::try_from(s).unwrap_or(usize::MAX))
         } else if size32 == 0 {
             (8usize, buf.len() - p)
         } else {
             (8usize, size32)
         };
 
-        if total < header || p + total > buf.len() {
+        // Compare against the bytes left rather than computing `p + total`: a
+        // corrupt 64-bit size near u64::MAX wrapped that sum past the check in
+        // release builds, and the slice below then panicked.
+        if total < header || total > buf.len() - p {
             break;
         }
         out.push((typ, &buf[p + header..p + total]));
@@ -237,4 +241,75 @@ fn pretty_codec(fourcc: &[u8]) -> String {
         _ => return raw,
     };
     format!("{pretty} ({raw})")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A box with a plain 32-bit size.
+    fn bx(typ: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut v = ((8 + body.len()) as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(typ);
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// A box claiming the 64-bit size `size` (`size32 == 1`), whatever its real length.
+    fn bx64(typ: &[u8; 4], size: u64, body: &[u8]) -> Vec<u8> {
+        let mut v = 1u32.to_be_bytes().to_vec();
+        v.extend_from_slice(typ);
+        v.extend_from_slice(&size.to_be_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// `mvhd` v0 with timescale 1000 and duration 5000 (5 s).
+    fn mvhd() -> Vec<u8> {
+        let mut body = vec![0u8; 20];
+        body[12..16].copy_from_slice(&1000u32.to_be_bytes());
+        body[16..20].copy_from_slice(&5000u32.to_be_bytes());
+        bx(b"mvhd", &body)
+    }
+
+    // A 64-bit size near u64::MAX made `p + total` wrap past the bounds check in
+    // release builds (overflow in debug), then the slice panicked: such a box
+    // must just end the parse.
+    #[test]
+    fn huge_64bit_child_size_is_skipped() {
+        for size in [u64::MAX, u64::MAX - 7, u64::MAX - 15, 1 << 40] {
+            let mut buf = bx(b"free", &[0; 4]);
+            buf.extend(bx64(b"trak", size, &[0; 8]));
+            let boxes = parse_boxes(&buf);
+            assert_eq!(boxes.len(), 1, "size {size:#x}");
+            assert_eq!(&boxes[0].0, b"free");
+        }
+    }
+
+    // End to end through `probe`: a bad box inside `moov` (and inside a track)
+    // is skipped and the rest still reads; a bad top-level size gives `None`.
+    #[test]
+    fn probe_survives_huge_box_sizes() {
+        let dir = std::env::temp_dir().join(format!("ctf_mp4_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut moov_body = mvhd();
+        moov_body.extend(bx(b"trak", &bx64(b"tkhd", u64::MAX - 7, &[0; 8])));
+        moov_body.extend(bx64(b"trak", u64::MAX - 7, &[0; 8]));
+        let mut file = bx(b"ftyp", b"isom");
+        file.extend(bx(b"moov", &moov_body));
+        let ok = dir.join("bad_child.mp4");
+        std::fs::write(&ok, &file).unwrap();
+        let info = probe(&ok).expect("moov should still parse");
+        assert_eq!(info.duration_secs, Some(5.0));
+        assert_eq!((info.width, info.height), (None, None));
+
+        let mut top = bx64(b"ftyp", u64::MAX - 3, &[]);
+        top.extend(bx(b"moov", &mvhd()));
+        let bad = dir.join("bad_top.mp4");
+        std::fs::write(&bad, &top).unwrap();
+        assert!(probe(&bad).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

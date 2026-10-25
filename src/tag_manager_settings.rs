@@ -11,9 +11,6 @@ use eframe::egui;
 
 use crate::theme::*;
 
-/// Separator choices, mirroring the Java combo box (comma / space / newline).
-const SEPARATOR_LABELS: [&str; 3] = ["Comma", "Space", "Newline"];
-
 /// Segmented-control tabs across the top of the popup.
 const TABS: [&str; 2] = ["Settings", "Get Models"];
 
@@ -28,11 +25,15 @@ pub struct TagManagerSettings {
     /// Active tab index into [`TABS`] (never persisted).
     #[serde(skip)]
     pub tab: usize,
+    // The next five came over from the Java dialog but nothing acts on them
+    // yet, so their switches are hidden (they showed, and did nothing). Kept
+    // so saved settings still load and the switches can come back with the
+    // features.
     pub auto_save: bool,
     pub autocomplete: bool,
     pub auto_tag_append: bool,
     pub auto_tag_overwrite: bool,
-    /// Index into [`SEPARATOR_LABELS`] (0 = comma, 1 = space, 2 = newline).
+    /// 0 = comma, 1 = space, 2 = newline.
     pub separator_idx: usize,
     pub default_threshold: f32,
     pub blacklist: String,
@@ -75,7 +76,7 @@ pub fn show(
         .align(egui::RectAlign::BOTTOM_END)
         .width(380.0)
         .gap(6.0)
-        .frame(crate::card_frame(22))
+        .frame(crate::float_card_frame(22))
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
             esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
@@ -150,62 +151,7 @@ fn segmented_control(ui: &mut egui::Ui, current: &mut usize) {
 /// The preferences tab: Apple-style cards of label-left/switch-right rows
 /// (the shared helpers from settings.rs).
 fn settings_tab(ui: &mut egui::Ui, s: &mut TagManagerSettings) {
-    use crate::settings::{row, row_sep, section, switch};
-
-    section(ui, "General", |ui| {
-        row(
-            ui,
-            "Auto-save sidecar files",
-            Some("Write the .txt automatically after AI tagging."),
-            |ui| {
-                switch(ui, &mut s.auto_save);
-            },
-        );
-        row_sep(ui);
-        row(
-            ui,
-            "Tag autocomplete",
-            Some("Suggest tags while typing."),
-            |ui| {
-                switch(ui, &mut s.autocomplete);
-            },
-        );
-        row_sep(ui);
-        // The two auto-tag modes are mutually exclusive: enabling one clears
-        // the other (matches the Java).
-        row(
-            ui,
-            "Auto tag all — keep tags",
-            Some("Tag every image, keeping its existing tags."),
-            |ui| {
-                if switch(ui, &mut s.auto_tag_append).changed() && s.auto_tag_append {
-                    s.auto_tag_overwrite = false;
-                }
-            },
-        );
-        row_sep(ui);
-        row(
-            ui,
-            "Auto tag all — overwrite",
-            Some("Tag every image, removing its old tags first."),
-            |ui| {
-                if switch(ui, &mut s.auto_tag_overwrite).changed() && s.auto_tag_overwrite {
-                    s.auto_tag_append = false;
-                }
-            },
-        );
-        row_sep(ui);
-        row(ui, "Tag separator", None, |ui| {
-            // Inline pills instead of a combo — a combo's dropdown would count
-            // as a click outside this popup and close it. The right-to-left
-            // control layout lays children rightmost-first, so iterate reversed
-            // to keep Comma · Space · Newline reading left to right.
-            ui.spacing_mut().item_spacing.x = 4.0;
-            for (i, label) in SEPARATOR_LABELS.iter().enumerate().rev() {
-                ui.selectable_value(&mut s.separator_idx, i, *label);
-            }
-        });
-    });
+    use crate::settings::{row, section};
 
     section(ui, "AI tagger", |ui| {
         row(

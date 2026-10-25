@@ -62,6 +62,14 @@ pub fn open_archive(zip_path: &Path, password: &str) -> Result<Vec<PathBuf>, Ope
             continue;
         }
         let name = entry.name().to_string();
+        // Only names that stay inside the archive. An absolute one
+        // ("/etc/x.png", "C:\…") makes `zip_path.join` a REAL path — listed as
+        // an ordinary file, so Edit/Move/Delete acted on it — and `..` can
+        // climb out of the zip's prefix. (zip's `enclosed_name()` strips a
+        // leading root instead of rejecting it, so it can't be the test.)
+        if !is_plain_entry_name(&name) {
+            continue;
+        }
         if entry.encrypted() && first_encrypted.is_none() {
             first_encrypted = Some(name.clone());
         }
@@ -96,6 +104,15 @@ pub fn open_archive(zip_path: &Path, password: &str) -> Result<Vec<PathBuf>, Ope
         zip: Mutex::new(zip),
     }));
     Ok(paths)
+}
+
+/// True for an entry name that maps to a virtual path inside the archive:
+/// relative and made only of plain components — no root, drive/UNC prefix,
+/// `.` or `..` (backslashes count as separators on Windows).
+fn is_plain_entry_name(name: &str) -> bool {
+    let path = Path::new(name);
+    path.components().next().is_some()
+        && path.components().all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
 /// Unmount the active archive (its password is dropped with it).
@@ -206,10 +223,14 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// The mounted archive is process-global: tests that mount one take turns.
+    static MOUNT: Mutex<()> = Mutex::new(());
+
     /// Round-trip: write an AES-256 encrypted zip (as Create Backup does),
     /// mount it, and read entries back through the virtual-path API.
     #[test]
     fn encrypted_zip_roundtrip() {
+        let _mount = MOUNT.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join("clarity_archive_test");
         let _ = std::fs::create_dir_all(&dir);
         let zip_path = dir.join("test.zip");
@@ -245,5 +266,30 @@ mod tests {
         close();
         assert!(!is_entry(&img));
         std::fs::remove_file(&zip_path).unwrap();
+    }
+
+    /// Entry names that would leave the archive aren't listed: an absolute
+    /// one became a real (and so editable/deletable) path, `..` climbs out.
+    #[test]
+    fn escaping_entry_names_are_skipped() {
+        let _mount = MOUNT.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("clarity_archive_names_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let zip_path = dir.join("names.zip");
+
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        for name in ["ok/fine.png", "/abs/evil.png", "../up.png", "dir/../../x.png", ""] {
+            w.start_file(name, opts).unwrap();
+            w.write_all(b"x").unwrap();
+        }
+        w.finish().unwrap();
+
+        let entries = open_archive(&zip_path, "").unwrap();
+        assert_eq!(entries, vec![zip_path.join("ok/fine.png")]);
+        assert!(is_entry(&entries[0]));
+        assert_eq!(read(&entries[0]).unwrap(), b"x");
+        close();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

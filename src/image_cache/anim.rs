@@ -14,14 +14,14 @@
 //! Everything here is used only through the parent module (`pub(super)`); it
 //! borrows the parent's `Semaphore`, `color_image`, etc. via `super::`.
 
-use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use eframe::egui;
 use image::AnimationDecoder;
 
-use super::{color_image, large_decode_permit, Decoded, DecodedImage, Semaphore};
+use super::{color_image, large_decode_permit, Decoded, DecodedImage, FileStamp, Job, Semaphore};
 
 /// GPU OFFLOAD: Raised from 512 to 2048.
 /// By increasing this, most GIFs (up to 1080p) will bypass CPU downscaling completely.
@@ -93,11 +93,17 @@ pub(super) fn current_frame(
 /// streaming the frames to the cache in chunks as they decode rather than waiting
 /// for the whole animation. The first frame is sent on its own so it paints
 /// almost immediately; the rest follow in [`GIF_STREAM_BATCH`]-sized chunks.
-pub(super) fn stream_gif(path: &Path, results: &Sender<Decoded>, gate: &Semaphore) -> bool {
+/// Every message carries `job`'s id, and the stream stops early once the
+/// entry that asked for it is dropped (`job.cancel`).
+pub(super) fn stream_gif(job: &Job, stamp: FileStamp, results: &Sender<Decoded>, gate: &Semaphore) -> bool {
+    let path = job.path.as_path();
     // Throttle large decodes so a burst of them can't spike RAM and freeze the UI.
     let _gate = large_decode_permit(path, gate);
 
-    let fail = || results.send((path.to_owned(), None)).is_ok();
+    let send = |image: Option<DecodedImage>| {
+        results.send(Decoded { path: path.to_owned(), job: job.id, stamp, image }).is_ok()
+    };
+    let fail = || send(None);
 
     let Ok(file) = crate::archive::open(path) else { return fail() };
 
@@ -117,6 +123,11 @@ pub(super) fn stream_gif(path: &Path, results: &Sender<Decoded>, gate: &Semaphor
     let mut resize_dims: Option<(u32, u32)> = None;
 
     for frame in decoder.into_frames() {
+        // Evicted (or closed and re-opened, which is a new job): stop decoding
+        // frames nobody will see.
+        if job.cancel.load(Ordering::Relaxed) {
+            return true;
+        }
         let Ok(frame) = frame else { break }; // stop on a bad frame; flush what we have
 
         // Clamp to MIN_FRAME_DELAY (16ms) to allow 60 FPS while avoiding 0-delay warp speed.
@@ -151,10 +162,7 @@ pub(super) fn stream_gif(path: &Path, results: &Sender<Decoded>, gate: &Semaphor
             // Take the chunk and immediately pre-allocate memory for the next incoming chunk
             let chunk = std::mem::replace(&mut batch, Vec::with_capacity(GIF_STREAM_BATCH));
 
-            if results
-                .send((path.to_owned(), Some(DecodedImage::AnimChunk { frames: chunk, done: false })))
-                .is_err()
-            {
+            if !send(Some(DecodedImage::AnimChunk { frames: chunk, done: false })) {
                 return false;
             }
             sent_any = true;
@@ -168,7 +176,5 @@ pub(super) fn stream_gif(path: &Path, results: &Sender<Decoded>, gate: &Semaphor
     }
 
     // Final chunk (possibly empty) marks the animation complete.
-    results
-        .send((path.to_owned(), Some(DecodedImage::AnimChunk { frames: batch, done: true })))
-        .is_ok()
+    send(Some(DecodedImage::AnimChunk { frames: batch, done: true }))
 }

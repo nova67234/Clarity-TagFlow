@@ -25,7 +25,7 @@ use eframe::egui;
 use suppaftp::native_tls::TlsConnector;
 use suppaftp::{NativeTlsConnector, NativeTlsFtpStream};
 
-use crate::theme::{ACCENT1, EDGE, FIELD, MUTED, PANEL, TEXT};
+use crate::theme::{ACCENT1, EDGE, FIELD, FLOAT, MUTED, PANEL, TEXT};
 
 /// Everything needed to open one connection. Snapshotted from `Settings` (+ the
 /// decrypted password) when an operation starts, so background threads never
@@ -272,10 +272,7 @@ fn list_dir(ftp: &mut NativeTlsFtpStream, path: &str) -> Result<Vec<RemoteEntry>
     let mut entries: Vec<RemoteEntry> = lines
         .iter()
         .filter_map(|l| suppaftp::list::File::try_from(l.as_str()).ok())
-        .filter(|f| {
-            let n = f.name();
-            n != "." && n != ".."
-        })
+        .filter(|f| is_plain_name(f.name()))
         .map(|f| RemoteEntry {
             name: f.name().to_string(),
             is_dir: f.is_directory(),
@@ -284,6 +281,14 @@ fn list_dir(ftp: &mut NativeTlsFtpStream, path: &str) -> Result<Vec<RemoteEntry>
         .collect();
     entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     Ok(entries)
+}
+
+/// True for a LIST name that is one plain file name (not `.`/`..`, no `/`, no
+/// root or drive). suppaftp keeps whatever the server sends, and the name is
+/// joined onto a local folder for downloads — so a hostile server could have
+/// written `../../…/x.png` (and its `.part`) anywhere the user can write.
+fn is_plain_name(name: &str) -> bool {
+    std::path::Path::new(name).file_name() == Some(std::ffi::OsStr::new(name))
 }
 
 /// The local cache folder mirroring `host:path` — under the per-user cache dir
@@ -295,12 +300,43 @@ fn cache_dir(host: &str, path: &str) -> PathBuf {
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
         .collect();
     let leaf = if safe.is_empty() { "root".to_string() } else { safe };
-    dirs::cache_dir()
+    let host_dir = dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("Clarity TagFlow")
         .join("ftp")
-        .join(host)
-        .join(leaf)
+        .join(host);
+    claim_cache_dir(&host_dir, &leaf, path)
+}
+
+/// Marker in each FTP cache folder naming the remote directory it mirrors.
+const CACHE_SOURCE_FILE: &str = ".ftp_source";
+
+/// The cache folder for remote `path`, whose flattened name is `leaf`. That
+/// name isn't unique — "/a/b", "/a_b" and "/a b" all flatten to "a_b" — and
+/// sharing one folder mixed their files and tag .txt sidecars. So a folder
+/// records its remote path in a marker, and a path whose leaf another path
+/// already owns gets `leaf~<hash>` (no flattened name contains `~`). A folder
+/// cached before markers existed is claimed by the first path to load it, so
+/// tags written there stay where the user left them.
+fn claim_cache_dir(host_dir: &std::path::Path, leaf: &str, path: &str) -> PathBuf {
+    let dir = host_dir.join(leaf);
+    let marker = dir.join(CACHE_SOURCE_FILE);
+    match std::fs::read_to_string(&marker) {
+        Ok(owner) if owner == path => dir,
+        Ok(_) => host_dir.join(format!("{leaf}~{:016x}", fnv1a(path))),
+        Err(_) => {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(&marker, path);
+            dir
+        }
+    }
+}
+
+/// 64-bit FNV-1a — stable across builds (std's hasher isn't guaranteed to
+/// be), so a remote path keeps its cache folder between app versions.
+fn fnv1a(s: &str) -> u64 {
+    s.bytes()
+        .fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
 }
 
 /// Path of the encrypted FTP password file in the app config dir.
@@ -327,7 +363,8 @@ pub fn save_password(pass: &str) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&path, crate::secret::protect(pass));
+    // Owner-only on Linux/macOS, where `protect` is just obfuscation.
+    let _ = crate::secret::write_private(&path, crate::secret::protect(pass));
 }
 
 /// Join a child onto a "/"-rooted remote path.
@@ -420,7 +457,7 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .frame(
             egui::Frame::new()
-                .fill(PANEL())
+                .fill(FLOAT())
                 .corner_radius(egui::CornerRadius::same(16))
                 .inner_margin(egui::Margin::same(18))
                 .stroke(egui::Stroke::new(1.0, EDGE()))
@@ -780,6 +817,40 @@ mod tests {
         assert_eq!(parent_remote("/pub/example"), "/pub");
         assert_eq!(parent_remote("/pub"), "/");
         assert_eq!(parent_remote("/"), "/");
+    }
+
+    #[test]
+    fn only_plain_list_names_are_accepted() {
+        for ok in ["a.png", "my photo.jpg", "..hidden", "x..png"] {
+            assert!(is_plain_name(ok), "{ok}");
+        }
+        for bad in ["", ".", "..", "../x.png", "../../etc/x.png", "/abs/x.png", "sub/x.png", "x.png/"] {
+            assert!(!is_plain_name(bad), "{bad}");
+        }
+        // The real LIST parser keeps such names verbatim — hence the filter.
+        let f = suppaftp::list::File::try_from("-rw-r--r-- 1 u g 10 Jan 01 2020 ../../x.png").unwrap();
+        assert!(!is_plain_name(f.name()), "{}", f.name());
+    }
+
+    #[test]
+    fn colliding_remote_paths_get_separate_cache_folders() {
+        let host_dir = std::env::temp_dir().join(format!("ctf_ftp_cache_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&host_dir);
+
+        let ab = claim_cache_dir(&host_dir, "a_b", "/a/b");
+        let a_b = claim_cache_dir(&host_dir, "a_b", "/a_b");
+        assert_eq!(ab, host_dir.join("a_b"));
+        assert_ne!(a_b, ab, "\"/a_b\" must not share \"/a/b\"'s folder");
+        // Each path keeps mapping to its own folder.
+        assert_eq!(claim_cache_dir(&host_dir, "a_b", "/a/b"), ab);
+        assert_eq!(claim_cache_dir(&host_dir, "a_b", "/a_b"), a_b);
+
+        // A folder cached before markers existed is kept by the first claimant.
+        std::fs::create_dir_all(host_dir.join("c_d")).unwrap();
+        assert_eq!(claim_cache_dir(&host_dir, "c_d", "/c d"), host_dir.join("c_d"));
+        assert_ne!(claim_cache_dir(&host_dir, "c_d", "/c/d"), host_dir.join("c_d"));
+
+        let _ = std::fs::remove_dir_all(&host_dir);
     }
 
     /// Live integration test against Rebex's public read-only FTP test server
