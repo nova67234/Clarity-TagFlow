@@ -258,7 +258,7 @@ fn chat_list(ui: &mut egui::Ui, llm: &mut LlmState) {
                     btn.fill(egui::Color32::TRANSPARENT)
                 };
                 if ui.add_sized(egui::vec2(title_w, 30.0), btn).clicked() {
-                    llm.active_chat = i;
+                    llm.select_chat(i);
                     llm.chats_open = false;
                 }
                 if icon_button_tinted(ui, egui::include_image!("../icons/x.svg"), 14.0, "Delete this chat", true, icon_tint(MUTED()))
@@ -662,6 +662,17 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                     .show(|ui| chat_list(ui, llm));
                                 // Closed by a click outside, or by picking a chat.
                                 llm.chats_open &= open;
+                            }
+                            // Remember across chats: the AI is writing down
+                            // what a chat brought (sending anything stops it).
+                            if !llm.running && llm.memory_activity() == crate::llm::MemoryActivity::Updating {
+                                ui.add_space(2.0);
+                                ui.add(egui::Spinner::new().size(14.0).color(MUTED()));
+                                ui.label(egui::RichText::new("Updating memories…").color(MUTED()).size(11.5))
+                                    .on_hover_text(
+                                        "The AI is writing down what your chat brought (AI Settings → Memory). \
+                                         Sending a message stops it; it picks up again later.",
+                                    );
                             }
                             if llm.tools_open {
                                 let mut open = llm.tools_open;
@@ -1121,7 +1132,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
             if llm.speak_target == Some((chat_id, index)) {
                 // First OmniVoice use loads the model — show that it's coming.
                 if llm.voice.loading || llm.voice.pending > 0 {
-                    ui.add(egui::Spinner::new().size(11.0).color(MUTED()));
+                    ui.add(egui::Spinner::new().size(14.0).color(MUTED()));
                 }
                 if let Some(e) = &llm.voice.last_err {
                     ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(11.0));

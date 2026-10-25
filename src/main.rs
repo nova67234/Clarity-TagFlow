@@ -2053,7 +2053,7 @@ impl eframe::App for ViewerApp {
         // A model loaded only for Link devices goes when they haven't used
         // it for 10 minutes (this PC's own chat keeps it while it's on).
         if !self.settings.ai_chat
-            && !self.llm.running
+            && !self.llm.needs_poll()
             && llm::worker_loaded()
             && llm::remote_idle_for().is_some_and(|d| d > Duration::from_secs(600))
         {
@@ -2200,10 +2200,11 @@ impl eframe::App for ViewerApp {
         self.video_previews.set_enabled(self.settings.video_thumbnail_play);
         self.video_previews.begin_frame();
 
-        // Chat switched off mid-reply: keep draining the worker so the reply
-        // finishes and the deferred unload frees the model weights (nothing
-        // else polls once the chat view and Settings are closed).
-        if !self.settings.ai_chat && self.llm.running {
+        // Chat switched off mid-reply (or with memory passes still due):
+        // keep draining the worker so they finish and the deferred unload
+        // frees the model weights (nothing else polls once the chat view and
+        // Settings are closed).
+        if !self.settings.ai_chat && self.llm.needs_poll() {
             self.llm.poll(ui.ctx());
         }
 
@@ -2423,6 +2424,8 @@ impl eframe::App for ViewerApp {
         self.llm.tag_images = self.settings.ai_tag_images;
         self.llm.params = self.settings.ai_gen;
         self.llm.set_model(self.settings.ai_gemma_model);
+        self.llm.set_memory_enabled(self.settings.ai_memory_enabled);
+        self.llm.set_ai_chat_on(self.settings.ai_chat);
         settings::show(ui.ctx(), &mut self.settings, &mut self.update, &mut self.ftp, &mut self.llm, &mut self.link);
         // Files another PC offers over Link.
         link::offer_prompt(ui.ctx(), &mut self.link);
@@ -2545,6 +2548,9 @@ impl eframe::App for ViewerApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.right_state.save_pending_edit();
         self.detail_popup.save_edit();
+        // What the AI's memory hasn't read yet waits (encrypted) for the
+        // next run.
+        self.llm.save_memory_for_later();
         // A Link host with background hosting on hands over to a background
         // copy of the app.
         self.link.on_exit(&self.settings);

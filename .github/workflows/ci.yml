@@ -61,9 +61,10 @@ jobs:
       - name: Check (Apple Silicon, no VLC)
         run: cargo check --all-targets --no-default-features --features avif --target aarch64-apple-darwin
       # Link's networking runs differently per OS (accepted sockets, timeouts):
-      # its end-to-end tests (loopback host + receiver) run here too.
-      - name: Link tests
-        run: "cargo test --no-default-features --features avif --target aarch64-apple-darwin link::"
+      # its end-to-end tests (loopback host + receiver) run here too, and so do
+      # the AI memory's (its files are encrypted differently per OS).
+      - name: Link and memory tests
+        run: "cargo test --no-default-features --features avif --target aarch64-apple-darwin -- link:: memory"
 
   windows:
     runs-on: windows-2022
@@ -91,6 +92,7 @@ jobs:
           RUSTFLAGS: -L native=${{ env.VLC_LIB }}
         run: cargo check --all-targets --no-default-features --features vlc,avif
       # Link's networking runs differently per OS (accepted sockets, timeouts):
-      # its end-to-end tests (loopback host + receiver) run here too.
-      - name: Link tests
-        run: "cargo test --no-default-features --features avif link::"
+      # its end-to-end tests (loopback host + receiver) run here too, and so do
+      # the AI memory's (its files are encrypted with DPAPI here).
+      - name: Link and memory tests
+        run: "cargo test --no-default-features --features avif -- link:: memory"

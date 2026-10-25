@@ -197,6 +197,7 @@ fn memory_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
             ui.add_space(6.0);
             if ui.button(egui::RichText::new("Start fresh").size(12.5)).clicked() {
                 llm.memory.start_fresh();
+                llm.reset_memory_queue();
             }
         });
     }
@@ -209,16 +210,36 @@ fn memory_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
             // Only Windows really encrypts (DPAPI); src/secret.rs merely
             // obfuscates on other systems, so don't promise it there.
             Some(if cfg!(windows) {
-                "The AI keeps notes from your chats and looks them up when they're useful. Stored \
-                 encrypted on this computer."
+                "After each chat the AI writes down what matters, by itself, and remembers it in new \
+                 chats. Stored encrypted on this computer."
             } else {
-                "The AI keeps notes from your chats and looks them up when they're useful. Stored \
-                 on this computer."
+                "After each chat the AI writes down what matters, by itself, and remembers it in new \
+                 chats. Stored on this computer."
             }),
             |ui| {
                 switch(ui, &mut settings.ai_memory_enabled);
             },
         );
+        // What it's doing, while it's on (the switch takes effect next frame).
+        if settings.ai_memory_enabled {
+            use crate::llm::MemoryActivity as A;
+            let status = match llm.memory_activity() {
+                A::Updating => "Updating memories now…".to_string(),
+                A::Waiting(1) => "1 chat waiting to be read.".to_string(),
+                A::Waiting(n) => format!("{n} chats waiting to be read."),
+                A::UpToDate | A::Off => "Up to date.".to_string(),
+                A::Unreadable => String::new(),
+            };
+            if !status.is_empty() {
+                crate::settings::hint(
+                    ui,
+                    &format!(
+                        "{status} A chat is read once you leave it or it has been quiet for 3 minutes, \
+                         while the model is loaded. Role play, Krea 2 prompts and Tag images never are."
+                    ),
+                );
+            }
+        }
         row_sep(ui);
         let stats = if n == 0 {
             "Nothing remembered yet.".to_string()
@@ -293,12 +314,14 @@ fn memory_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
             "Clear all memories",
             Some("Deletes every memory, the summary and the AI's notes from this computer."),
             |ui| {
-                let enabled = !llm.memory.load_failed && (n > 0 || !llm.memory.header.persona.is_empty());
+                let enabled = !llm.memory.load_failed && (n > 0 || !llm.memory.is_empty());
                 if confirming {
                     let yes = egui::Button::new(egui::RichText::new("Delete all").color(egui::Color32::WHITE).size(12.5))
                         .fill(egui::Color32::from_rgb(180, 40, 40));
                     if ui.add(yes).clicked() {
                         llm.memory.clear_all();
+                        // Nor does anything waiting to be read come back.
+                        llm.reset_memory_queue();
                         ui.data_mut(|d| d.remove::<bool>(confirm_id));
                     }
                     if ui.button(egui::RichText::new("Cancel").size(12.5)).clicked() {

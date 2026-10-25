@@ -21,6 +21,9 @@ use std::sync::Arc;
 
 use eframe::egui;
 
+mod memory_pass;
+pub use memory_pass::MemoryActivity;
+
 /// Set by the chat's Stop button; the worker checks it between tokens (and
 /// between the slow steps before the first one) and ends the reply early
 /// (the partial text stays in the bubble).
@@ -385,16 +388,34 @@ enum Cmd {
         reply: Sender<Msg>,
         remote: Option<RemoteFlags>,
     },
+    /// A memory pass (src/llm/memory_pass.rs): one text-only question —
+    /// `head`, then the chat's `lines`, the oldest left out until it fits —
+    /// whose prompt is read in small steps so `cancel` stops it even then,
+    /// which a chat question's can't be. Replies on `reply` like `Ask`.
+    Pass { head: String, lines: Vec<String>, params: GenParams, reply: Sender<Msg>, cancel: Arc<AtomicBool> },
 }
 
-/// A Link device's question: stopped by its own flag (never by this PC's
-/// Stop button, nor stopping this PC's reply), and its cut-off reported to
-/// it rather than through this PC's chat state.
+/// A question with stop and cut-off flags of its own: a Link device's
+/// (never stopped by this PC's Stop button, nor stopping this PC's reply,
+/// and its cut-off reported to it rather than through this PC's chat
+/// state), or a memory pass asked of a Link host.
 #[derive(Clone, Default)]
 #[cfg_attr(not(feature = "llm"), allow(dead_code))]
 struct RemoteFlags {
     cancel: Arc<AtomicBool>,
     cut_off: Arc<AtomicBool>,
+}
+
+/// A memory pass asked of a Link host: its own flags, and its prompt in
+/// parts besides the whole question, so a host that knows passes reads it in
+/// steps (as this PC's worker does) and one that doesn't still answers it.
+struct RemotePass {
+    flags: RemoteFlags,
+    head: String,
+    lines: Vec<String>,
+    /// Set when the host says it has no model loaded (it never loads one for
+    /// a pass).
+    cold: Arc<AtomicBool>,
 }
 
 /// A message streamed back from the inference worker.
@@ -450,14 +471,77 @@ static DETAIL_REPORT: std::sync::Mutex<Option<(Option<ImageDetail>, Option<Strin
 static REMOTE_BUSY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static REMOTE_LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
+/// The stop flags of the memory passes queued or running on the resident
+/// worker — this PC's own and Link devices' — so whatever else needs the
+/// worker (a question, unloading, another model) stops them first, and
+/// nothing waits behind a pass.
+static PASSES: std::sync::Mutex<Vec<Arc<AtomicBool>>> = std::sync::Mutex::new(Vec::new());
+
+/// A memory pass is about to be queued on the resident worker.
+fn note_pass(cancel: &Arc<AtomicBool>) {
+    PASSES.lock().unwrap_or_else(|e| e.into_inner()).push(cancel.clone());
+}
+
+/// That pass is over (or was never queued).
+fn forget_pass(cancel: &Arc<AtomicBool>) {
+    PASSES.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| !Arc::ptr_eq(c, cancel));
+}
+
+/// Stop the memory passes queued or running on the resident worker (each
+/// stops within one step and runs again later).
+fn stop_passes() {
+    for cancel in PASSES.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+        cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The resident worker is `model` at `detail` (and so a memory pass can run
+/// without loading anything).
+fn worker_matches(model: GemmaModel, detail: ImageDetail) -> bool {
+    SHARED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|w| w.model == model && (!model.has_image_detail() || w.detail == detail))
+}
+
+/// A Link device is using this PC's worker, or was a moment ago (its next
+/// question is likely on the way).
+fn link_busy() -> bool {
+    REMOTE_BUSY.load(Ordering::SeqCst) > 0
+        || REMOTE_LAST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(20))
+}
+
+/// Queue `cmd` on the resident worker only if it already runs `model` at
+/// `detail` — a memory pass never loads a model. Hands `cmd` back when it
+/// doesn't (or that worker has stopped).
+fn submit_loaded(model: GemmaModel, detail: ImageDetail, cmd: Cmd) -> Result<(), Cmd> {
+    let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    if !shared.as_ref().is_some_and(|w| w.model == model && (!model.has_image_detail() || w.detail == detail)) {
+        return Err(cmd);
+    }
+    match shared.as_ref().map(|w| w.tx.send(cmd)) {
+        Some(Ok(())) => Ok(()),
+        Some(Err(std::sync::mpsc::SendError(back))) => {
+            *shared = None;
+            Err(back)
+        }
+        None => unreachable!("checked above"),
+    }
+}
+
 /// Queue `cmd` on the resident worker, loading `model` at `detail` first
 /// when another one is loaded (that worker finishes the reply it's on, then
 /// frees its memory). A worker that has stopped (its model failed to load)
-/// is replaced.
+/// is replaced. Memory passes on the worker stop first.
 fn submit(ctx: &egui::Context, model: GemmaModel, detail: ImageDetail, cmd: Cmd) -> Result<(), String> {
     if !BUILT_WITH_LLM {
         return Err("This build was compiled without the AI feature (`llm`).".to_string());
     }
+    stop_passes();
     let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
     let same = |w: &SharedWorker| w.model == model && (!model.has_image_detail() || w.detail == detail);
     if !shared.as_ref().is_some_and(same) {
@@ -486,8 +570,10 @@ fn submit(ctx: &egui::Context, model: GemmaModel, detail: ImageDetail, cmd: Cmd)
 }
 
 /// Unload the resident worker (its weights free once a reply in progress
-/// ends). The next question loads it again.
+/// ends; a memory pass stops within a step). The next question loads it
+/// again.
 pub(crate) fn release_shared_worker() {
+    stop_passes();
     *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *DETAIL_REPORT.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
@@ -557,6 +643,25 @@ pub(crate) fn serve_remote(call: &crate::link::Incoming, ctx: &egui::Context) ->
     params.top_p = params.top_p.clamp(0.0, 1.0);
     let pinned = (call.body.get("pinned").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize).min(msgs.len());
     let detailed = call.body.get("detailed").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    // A device's memory pass: read in steps, as this PC's own are (so this
+    // PC's next question, or the device's, never waits long behind it).
+    let pass: Option<(String, Vec<String>)> = match call.body.get("pass") {
+        None => None,
+        Some(p) => {
+            let head = p.get("head").and_then(serde_json::Value::as_str).map(str::to_string);
+            let lines: Option<Vec<String>> = p.get("lines").and_then(|l| serde_json::from_value(l.clone()).ok());
+            match (head, lines) {
+                (Some(head), Some(lines))
+                    if head.len() <= 64 * 1024 && lines.len() <= 400 && lines.iter().all(|l| l.len() <= 16 * 1024) =>
+                {
+                    Some((head, lines))
+                }
+                // Never asked as an ordinary question instead (that could
+                // load the model, and couldn't be stopped like a pass).
+                _ => return Err("Bad memory update".into()),
+            }
+        }
+    };
 
     // The pictures, under their own extensions (the worker tells a video
     // from an image by it), in a folder of their own.
@@ -591,8 +696,29 @@ pub(crate) fn serve_remote(call: &crate::link::Incoming, ctx: &egui::Context) ->
     let flags = RemoteFlags { cancel: call.cancel_flag(), cut_off: Arc::default() };
     let (tx, rx) = std::sync::mpsc::channel();
     let _busy = RemoteBusy::start();
-    let cmd = Cmd::Ask { msgs: cmd_msgs, params, pinned, detailed, reply: tx, remote: Some(flags.clone()) };
-    if let Err(e) = submit(ctx, model, detail, cmd) {
+    let is_pass = pass.is_some();
+    let queued = match pass {
+        // A device's memory pass: only on the model that's loaded already
+        // (one is never loaded for a pass, here either), and stopped by
+        // whatever else needs the worker, as this PC's own are.
+        Some((head, lines)) => {
+            note_pass(&flags.cancel);
+            let cmd = Cmd::Pass { head, lines, params, reply: tx, cancel: flags.cancel.clone() };
+            if submit_loaded(model, detail, cmd).is_err() {
+                forget_pass(&flags.cancel);
+                let _ = std::fs::remove_dir_all(&dir);
+                return Ok(json!({ "stopped": true, "cold": true }));
+            }
+            Ok(())
+        }
+        None => submit(
+            ctx,
+            model,
+            detail,
+            Cmd::Ask { msgs: cmd_msgs, params, pinned, detailed, reply: tx, remote: Some(flags.clone()) },
+        ),
+    };
+    if let Err(e) = queued {
         let _ = std::fs::remove_dir_all(&dir);
         return Err(e);
     }
@@ -615,12 +741,19 @@ pub(crate) fn serve_remote(call: &crate::link::Incoming, ctx: &egui::Context) ->
         }
     };
     let _ = std::fs::remove_dir_all(&dir);
+    if is_pass {
+        forget_pass(&flags.cancel);
+        // Stopped here (for this PC's own question, say): the device tries
+        // again later rather than counting it as failed.
+        return result.map(|()| json!({ "stopped": flags.cancel.load(Ordering::SeqCst) }));
+    }
     result.map(|()| json!({ "cut_off": flags.cut_off.load(Ordering::SeqCst) }))
 }
 
 /// Receiver side: a Link host answers the chat. Sends the question (with its
 /// pictures) and relays the reply's progress and words as if the worker
-/// here were writing it.
+/// here were writing it. `pass`: a memory pass, with stop and cut-off flags
+/// of its own (the chat's otherwise).
 #[allow(clippy::too_many_arguments)]
 fn remote_ask(
     peer: &Arc<crate::link::Peer>,
@@ -629,6 +762,7 @@ fn remote_ask(
     params: GenParams,
     pinned: usize,
     detailed: bool,
+    pass: Option<RemotePass>,
     tx: &Sender<Msg>,
     ctx: &egui::Context,
 ) {
@@ -672,7 +806,14 @@ fn remote_ask(
         }
         wire.push(WireMsg { user: m.user, text, attachment });
     }
-    let body = json!({ "msgs": wire, "params": params, "pinned": pinned, "detailed": detailed });
+    let mut body = json!({ "msgs": wire, "params": params, "pinned": pinned, "detailed": detailed });
+    if let Some(p) = &pass {
+        body["pass"] = json!({ "head": p.head, "lines": p.lines });
+    }
+    let (job, cold) = match pass {
+        Some(p) => (Some(p.flags), Some(p.cold)),
+        None => (None, None),
+    };
     let mut call = match peer.call("llm.ask", body, blobs, &crate::link::temp_dir()) {
         Ok(c) => c,
         Err(e) => {
@@ -680,7 +821,11 @@ fn remote_ask(
             return;
         }
     };
-    let result = crate::link::finish_call(&mut call, &|| GEN_CANCEL.load(Ordering::SeqCst), &mut |ev| match ev {
+    let stopped = || match &job {
+        Some(flags) => flags.cancel.load(Ordering::SeqCst),
+        None => GEN_CANCEL.load(Ordering::SeqCst),
+    };
+    let result = crate::link::finish_call(&mut call, &stopped, &mut |ev| match ev {
         CallEvent::Event(v) => {
             let text = v.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
             match v.get("kind").and_then(Value::as_str) {
@@ -697,7 +842,22 @@ fn remote_ask(
     match result {
         Ok(v) => {
             if v.get("cut_off").and_then(Value::as_bool) == Some(true) {
-                GEN_CUT_OFF.store(true, Ordering::SeqCst);
+                match &job {
+                    Some(flags) => flags.cut_off.store(true, Ordering::SeqCst),
+                    None => GEN_CUT_OFF.store(true, Ordering::SeqCst),
+                }
+            }
+            // A pass the host stopped for something else, or didn't run for
+            // want of a loaded model: not a failure.
+            if let Some(flags) = &job
+                && v.get("stopped").and_then(Value::as_bool) == Some(true)
+            {
+                flags.cancel.store(true, Ordering::SeqCst);
+            }
+            if let Some(cold) = &cold
+                && v.get("cold").and_then(Value::as_bool) == Some(true)
+            {
+                cold.store(true, Ordering::SeqCst);
             }
             send(Msg::Done(Ok(())));
         }
@@ -739,15 +899,43 @@ pub struct ChatMsg {
     pub tag_image: Option<PathBuf>,
     /// Tag images mode: the tag change a reply made, for its note and Undo.
     pub tag_change: Option<crate::ai_tagging::TagChange>,
+    /// The memory pass may read it: sent (or answered) in an ordinary chat
+    /// while Remember across chats was on — not in role play, Krea 2 prompts
+    /// or Tag images (src/llm/memory_pass.rs).
+    pub remember: bool,
+    /// The Link hosts (by key) it has been sent to, or written by: its memory
+    /// pass may go there, and nowhere else but this PC.
+    pub shared_with: Vec<String>,
 }
 
 /// One conversation in the AI Chat view (the left strip switches between them).
 pub struct Chat {
     pub id: u64,
     pub msgs: Vec<ChatMsg>,
+    /// Memory: the messages before this one have been read by the memory
+    /// pass, or never were to be.
+    pub memory_synced: usize,
+    /// When a message was last sent or a reply last finished here.
+    pub changed: Option<std::time::Instant>,
+    /// Topics the memory notes showed memories from (the pass is shown
+    /// their stored titles).
+    pub memory_topics: Vec<String>,
+    /// Failed passes over the unread part.
+    pub memory_tries: u8,
 }
 
 impl Chat {
+    pub fn new(id: u64) -> Self {
+        Chat {
+            id,
+            msgs: Vec::new(),
+            memory_synced: 0,
+            changed: None,
+            memory_topics: Vec::new(),
+            memory_tries: 0,
+        }
+    }
+
     /// Sidebar label: the first user message, trimmed — or "New chat".
     pub fn title(&self) -> String {
         let first = self.msgs.iter().find(|m| m.role == ChatRole::User);
@@ -883,9 +1071,9 @@ pub struct LlmState {
     /// The chat's one-line "image detail was lowered" notice has been shown
     /// this session (it shows once, not on every message).
     pub detail_notice_done: bool,
-    /// AI Chat was deactivated while a reply was streaming: drop the worker
-    /// (freeing the weights) as soon as that reply finishes. Cleared if the
-    /// chat is re-activated first.
+    /// AI Chat was deactivated: drop the worker (freeing the weights) once
+    /// the reply in flight and the memory passes still due are done. Cleared
+    /// if the chat is re-activated first.
     unload_when_done: bool,
     /// Auto-speak finished replies (mirrors the persisted setting; synced
     /// each frame by main.rs, toggled from the tools menu).
@@ -909,6 +1097,9 @@ pub struct LlmState {
     reply_rx: Option<Receiver<Msg>>,
     /// The streaming reply is being answered by a Link host (its name).
     pub remote_host: Option<String>,
+    /// Remembering by itself: the memory passes and what they wait for
+    /// (src/llm/memory_pass.rs).
+    mem_pass: memory_pass::PassState,
 }
 
 impl Drop for LlmState {
@@ -1012,7 +1203,7 @@ impl Default for LlmState {
             installed: installed(),
             download: None,
             download_err: None,
-            chats: vec![Chat { id: 0, msgs: Vec::new() }],
+            chats: vec![Chat::new(0)],
             active_chat: 0,
             gen_chat: None,
             gen_roleplay: false,
@@ -1064,6 +1255,7 @@ impl Default for LlmState {
             spell: crate::spellcheck::SpellcheckState::default(),
             reply_rx: None,
             remote_host: None,
+            mem_pass: Default::default(),
         }
     }
 }
@@ -1124,8 +1316,9 @@ impl LlmState {
 
     /// AI Chat was deactivated: free the resident worker — and the model
     /// weights it holds — immediately when idle, or right after the in-flight
-    /// reply finishes (see `unload_when_done`). The next activation reloads
-    /// the model on its first ask.
+    /// reply finishes and the memory passes still due have run, within a
+    /// minute and a half (see `unload_when_done`). The next activation
+    /// reloads the model on its first ask.
     pub fn unload(&mut self) {
         // Voice and mic stop with the chat: their Stop controls are in it,
         // and nothing polls them while it's hidden — a clip still being
@@ -1136,16 +1329,12 @@ impl LlmState {
             let _ = c.kill();
         }
         self.dictate.cancel();
-        if self.running {
-            self.unload_when_done = true;
-        } else {
-            release_shared_worker();
-        }
+        self.begin_unload();
     }
 
     /// AI Chat re-activated before a pending unload fired — keep the worker.
     pub fn cancel_unload(&mut self) {
-        self.unload_when_done = false;
+        self.keep_loaded();
     }
 
     /// Drive background work — poll the setup download and drain any streamed
@@ -1442,6 +1631,9 @@ impl LlmState {
                                 self.start_speaking(&t, ctx);
                             }
                         }
+                        if let Some(id) = self.gen_chat {
+                            self.chat_changed(id);
+                        }
                         self.running = false;
                         self.gen_chat = None;
                         if let Err(e) = res {
@@ -1455,33 +1647,44 @@ impl LlmState {
                 self.reply_rx = None;
                 self.remote_host = None;
             }
-            // Chat was deactivated mid-reply; that reply is done now, so
-            // release the worker and free the weights.
-            if !self.running && self.unload_when_done {
-                self.unload_when_done = false;
-                release_shared_worker();
-            }
         }
+        // Remembering by itself: take in the memory pass's answer, start the
+        // next one when one is due.
+        self.tick_memory(ctx);
+        // Chat was deactivated; once its reply and the memory passes it left
+        // are done, release the worker and free the weights.
+        self.finish_unload_if_idle();
     }
 
-    /// Start a fresh conversation and switch to it.
+    /// Start a fresh conversation and switch to it (the one left behind is
+    /// due for its memory pass).
     pub fn new_chat(&mut self) {
         // Reuse the current chat if it's still empty (no stacks of blanks).
         if self.chats[self.active_chat].msgs.is_empty() {
             return;
         }
-        self.chats.push(Chat { id: self.next_chat_id, msgs: Vec::new() });
+        self.chats.push(Chat::new(self.next_chat_id));
         self.next_chat_id += 1;
         self.active_chat = self.chats.len() - 1;
     }
 
-    /// Delete a conversation (a streaming reply into it is silently dropped).
+    /// Switch to another conversation (the one left behind is due for its
+    /// memory pass).
+    pub fn select_chat(&mut self, index: usize) {
+        if index < self.chats.len() {
+            self.active_chat = index;
+        }
+    }
+
+    /// Delete a conversation (a streaming reply into it is silently dropped,
+    /// and what no memory pass read yet is never read).
     /// The list never goes empty — deleting the last chat leaves a fresh one.
     pub fn delete_chat(&mut self, index: usize) {
         if index >= self.chats.len() {
             return;
         }
         let removed = self.chats.remove(index);
+        self.cancel_pass_for(removed.id);
         if self.gen_chat == Some(removed.id) {
             self.gen_chat = None;
         }
@@ -1500,7 +1703,7 @@ impl LlmState {
             self.msg_thumbs.remove(&p);
         }
         if self.chats.is_empty() {
-            self.chats.push(Chat { id: self.next_chat_id, msgs: Vec::new() });
+            self.chats.push(Chat::new(self.next_chat_id));
             self.next_chat_id += 1;
         }
         // Deleting a chat above the selected one shifts it up a row — follow
@@ -1549,6 +1752,7 @@ impl LlmState {
         // the mode was switched on.
         let tag_image = if self.tag_images { self.tag_target.clone() } else { None };
         let image = if tag_image.is_some() { None } else { image };
+        let remember = self.memory_wanted();
         self.chats[self.active_chat].msgs.push(ChatMsg {
             role: ChatRole::User,
             text,
@@ -1556,6 +1760,8 @@ impl LlmState {
             image,
             tag_image,
             tag_change: None,
+            remember,
+            shared_with: Vec::new(),
         });
         self.begin_generation(ctx);
     }
@@ -1618,6 +1824,8 @@ impl LlmState {
             return;
         }
         chat.msgs.truncate(msg_index);
+        // The new reply is read by the memory pass in its turn.
+        chat.memory_synced = chat.memory_synced.min(msg_index);
         let id = chat.id;
         self.close_cut_editor(id, msg_index);
         let chat = &self.chats[self.active_chat];
@@ -1653,6 +1861,7 @@ impl LlmState {
         if self.running {
             return;
         }
+        let remember = self.memory_wanted();
         let chat = &mut self.chats[self.active_chat];
         if chat.msgs.get(msg_index).map(|m| m.role) != Some(ChatRole::User) {
             return;
@@ -1663,6 +1872,9 @@ impl LlmState {
         }
         chat.msgs.truncate(msg_index + 1);
         chat.msgs[msg_index].text = text;
+        // Sent again, as it now reads: the memory pass reads it afresh.
+        chat.msgs[msg_index].remember = remember;
+        chat.memory_synced = chat.memory_synced.min(msg_index);
         let id = chat.id;
         self.close_cut_editor(id, msg_index + 1);
         self.run_err = None;
@@ -1685,6 +1897,8 @@ impl LlmState {
     /// user message): snapshot the capped history, send it to the worker, and
     /// push the empty reply bubble the tokens stream into.
     fn begin_generation(&mut self, ctx: &egui::Context) {
+        // A reply never waits for a memory pass: it stops (and runs later).
+        self.cancel_pass();
         let chat = &mut self.chats[self.active_chat];
 
         // Snapshot the history for the worker, capped to the most recent
@@ -1705,6 +1919,12 @@ impl LlmState {
             .skip_while(|m| m.role == ChatRole::Model)
             .copied()
             .collect();
+        // Where the window starts in the chat: everything from there on goes
+        // to a Link host when one answers.
+        let window_from = window
+            .first()
+            .and_then(|first| chat.msgs.iter().position(|m| std::ptr::eq(m, *first)))
+            .unwrap_or(chat.msgs.len());
         let newest_user = window.iter().rposition(|m| m.role == ChatRole::User);
         let mut msgs: Vec<CmdMsg> = window
             .iter()
@@ -1786,7 +2006,17 @@ impl LlmState {
             msgs.insert(0, CmdMsg { user: false, text: crate::ai_tagging::ACK.to_string(), image: None });
             msgs.insert(0, CmdMsg { user: true, text: crate::ai_tagging::BRIEF.to_string(), image: None });
             pinned = 2;
+        } else if let Some([note, ack]) = self.memory_note() {
+            // Remember across chats: the memory note (the AI's notes, the
+            // last chat, its topics and the memories that may matter now),
+            // pinned the same way and picked afresh for every reply.
+            msgs.insert(0, ack);
+            msgs.insert(0, note);
+            pinned = 2;
         }
+        // The reply may go into memory when the message it answers may.
+        let remember = self.memory_wanted()
+            && self.chats[self.active_chat].msgs.last().is_some_and(|m| m.role == ChatRole::User && m.remember);
 
         GEN_CANCEL.store(false, Ordering::SeqCst);
         GEN_CUT_OFF.store(false, Ordering::SeqCst);
@@ -1795,14 +2025,16 @@ impl LlmState {
         // A Link host answers when this PC is linked to one sharing its
         // chat; otherwise the resident worker (a different model selected
         // since it loaded is swapped in first).
+        let mut shared_with = None;
         let asked = match crate::link::remote_chat() {
             Some((peer, host)) => {
                 let ctx = ctx.clone();
                 let params = self.params;
                 self.remote_host = Some(host.clone());
+                shared_with = Some(memory_pass::host_id(&peer));
                 std::thread::Builder::new()
                     .name("ai-remote-ask".into())
-                    .spawn(move || remote_ask(&peer, &host, msgs, params, pinned, detailed, &tx, &ctx))
+                    .spawn(move || remote_ask(&peer, &host, msgs, params, pinned, detailed, None, &tx, &ctx))
                     .map(|_| ())
                     .map_err(|e| e.to_string())
             }
@@ -1829,10 +2061,24 @@ impl LlmState {
                         image: None,
                         tag_image: None,
                         tag_change: None,
+                        remember,
+                        shared_with: Vec::new(),
                     });
                 self.running = true;
                 self.gen_started = Some(std::time::Instant::now());
                 self.gen_chat = Some(id);
+                self.chat_changed(id);
+                // What went to a Link host — the window and the reply it
+                // writes — may go there for its memory pass too.
+                if let Some(host) = shared_with {
+                    let chat = &mut self.chats[self.active_chat];
+                    let from = window_from.min(chat.msgs.len());
+                    for m in &mut chat.msgs[from..] {
+                        if !m.shared_with.contains(&host) {
+                            m.shared_with.push(host.clone());
+                        }
+                    }
+                }
             }
             Err(e) => {
                 self.remote_host = None;
@@ -2107,6 +2353,7 @@ mod worker {
     use std::ffi::CString;
     use std::num::NonZeroU32;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::{Receiver, Sender};
 
     use eframe::egui;
@@ -2188,7 +2435,7 @@ mod worker {
         let _loaded = LOADED.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(first) = rx.recv() else { return };
         let first_reply = match &first {
-            Cmd::Ask { reply, .. } => Some(reply.clone()),
+            Cmd::Ask { reply, .. } | Cmd::Pass { reply, .. } => Some(reply.clone()),
             Cmd::Generate { .. } => None,
         };
         let load_send = |m: Msg| {
@@ -2209,7 +2456,7 @@ mod worker {
                 load_send(Msg::Done(Err(e.clone())));
                 while let Ok(cmd) = rx.try_recv() {
                     match cmd {
-                        Cmd::Ask { reply, .. } => {
+                        Cmd::Ask { reply, .. } | Cmd::Pass { reply, .. } => {
                             let _ = reply.send(Msg::Done(Err(e.clone())));
                         }
                         Cmd::Generate { .. } => base(Msg::Done(Err(e.clone()))),
@@ -2258,6 +2505,14 @@ mod worker {
                 );
                 JOB.with(|j| *j.borrow_mut() = None);
                 send(Msg::Done(res));
+            }
+            Cmd::Pass { head, lines, params, reply, cancel } => {
+                // Collected, never shown: only the end needs a frame.
+                let res = run_pass(l, &head, &lines, &params, &cancel, &|m| {
+                    let _ = reply.send(m);
+                });
+                let _ = reply.send(Msg::Done(res));
+                ctx.request_repaint();
             }
         }
     }
@@ -2440,87 +2695,8 @@ mod worker {
         send(Msg::Status("Thinking…".into()));
         // The wire-format prompt for a run of turns (re-run while trimming).
         let format_prompt = |turns: &[&(bool, String, Vec<MtmdBitmap>)]| -> Result<String, String> {
-            let chat: Vec<LlamaChatMessage> = turns
-                .iter()
-                .map(|(user, text, _)| {
-                    let role = if *user { "user" } else { "assistant" };
-                    LlamaChatMessage::new(role.to_string(), text.clone()).map_err(|e| e.to_string())
-                })
-                .collect::<Result<_, _>>()?;
-            // Gemma 4 embeds a huge Jinja chat template (tool calls, thinking
-            // channels) that llama.cpp's built-in non-Jinja formatter doesn't
-            // recognise (ffi error -1). Its actual wire format is simple, so fall
-            // back to formatting the turns by hand; the template path still
-            // serves models with conventional templates (Gemma 3's and Qwen's
-            // are both known to the built-in formatter, so their fallbacks below
-            // are belt-and-braces).
-            // The 31B reasons in a thought channel — but only when the wire
-            // format's global thinking switch is on: a `<|think|>` token at the
-            // very top of a system turn (straight from the GGUF's own Jinja
-            // template; merely opening the reply with the channel header gets an
-            // empty thought — verified via llm_raw_probe_31b). With the switch on
-            // the model opens `<|channel>thought\n{reasoning}<channel|>` by
-            // itself, which the UI's split_channels understands.
-            // Thinking mode Off skips the switch, so the 31B answers directly.
-            let think = matches!(which, super::GemmaModel::D31B)
-                && params.thinking != super::ThinkLevel::Off;
-            let formatted = match model.apply_chat_template(template, &chat, true) {
-                Ok(s) => s,
-                Err(_) => match which {
-                    // Gemma 4's wire format.
-                    super::GemmaModel::E4B | super::GemmaModel::D31B => {
-                        use std::fmt::Write as _;
-                        let mut s = String::new();
-                        if think {
-                            s.push_str("<|turn>system\n<|think|>\n<turn|>\n");
-                        }
-                        for (user, text, _) in turns.iter().copied() {
-                            let role = if *user { "user" } else { "model" };
-                            let _ = writeln!(s, "<|turn>{role}\n{text}<turn|>");
-                        }
-                        s.push_str("<|turn>model\n");
-                        s
-                    }
-                    // Gemma 3's wire format.
-                    super::GemmaModel::G27B => {
-                        use std::fmt::Write as _;
-                        let mut s = String::new();
-                        for (user, text, _) in turns.iter().copied() {
-                            let role = if *user { "user" } else { "model" };
-                            let _ = writeln!(s, "<start_of_turn>{role}\n{text}<end_of_turn>");
-                        }
-                        s.push_str("<start_of_turn>model\n");
-                        s
-                    }
-                    // ChatML, Qwen's wire format.
-                    super::GemmaModel::Qwen8B | super::GemmaModel::Qwen30B => {
-                        use std::fmt::Write as _;
-                        let mut s = String::new();
-                        for (user, text, _) in turns.iter().copied() {
-                            let role = if *user { "user" } else { "assistant" };
-                            let _ = writeln!(s, "<|im_start|>{role}\n{text}<|im_end|>");
-                        }
-                        s.push_str("<|im_start|>assistant\n");
-                        s
-                    }
-                },
-            };
-            // Qwen's thinking flavour was trained with the assistant turn
-            // pre-opened by `<think>` — its Jinja template hardcodes the prefill,
-            // which both llama.cpp's built-in ChatML formatter and the hand
-            // fallback above miss. Without it the reasoning arrives untagged and
-            // would all land in the visible bubble.
-            let mut formatted = formatted;
-        if matches!(which, super::GemmaModel::Qwen30B) {
-                // Thinking mode Off pre-closes an empty thought (Qwen's own
-                // no-think form), so the model goes straight to the answer.
-                formatted.push_str(if params.thinking == super::ThinkLevel::Off {
-                    "<think>\n\n</think>\n\n"
-                } else {
-                    "<think>\n"
-                });
-            }
-            Ok(formatted)
+            let turns: Vec<(bool, &str)> = turns.iter().map(|(user, text, _)| (*user, text.as_str())).collect();
+            wire_prompt(model, template, which, params.thinking, &turns)
         };
 
         // Fit the context: the prompt plus the reply budget must stay within
@@ -2758,6 +2934,190 @@ mod worker {
         // or the context's edge cut it off, maybe mid-line.
         if !ended && !stopped() {
             mark_cut_off();
+        }
+        Ok(())
+    }
+
+    /// The wire-format prompt for a run of `(user, text)` turns, ending with
+    /// the model's turn opened: the model's own chat template, or the format
+    /// written out by hand where llama.cpp can't apply it — with the thinking
+    /// switches `thinking` calls for.
+    fn wire_prompt(
+        model: &LlamaModel,
+        template: &llama_cpp_2::model::LlamaChatTemplate,
+        which: super::GemmaModel,
+        thinking: super::ThinkLevel,
+        turns: &[(bool, &str)],
+    ) -> Result<String, String> {
+        let chat: Vec<LlamaChatMessage> = turns
+            .iter()
+            .map(|(user, text)| {
+                let role = if *user { "user" } else { "assistant" };
+                LlamaChatMessage::new(role.to_string(), text.to_string()).map_err(|e| e.to_string())
+            })
+            .collect::<Result<_, _>>()?;
+        // Gemma 4 embeds a huge Jinja chat template (tool calls, thinking
+        // channels) that llama.cpp's built-in non-Jinja formatter doesn't
+        // recognise (ffi error -1). Its actual wire format is simple, so fall
+        // back to formatting the turns by hand; the template path still
+        // serves models with conventional templates (Gemma 3's and Qwen's
+        // are both known to the built-in formatter, so their fallbacks below
+        // are belt-and-braces).
+        // The 31B reasons in a thought channel — but only when the wire
+        // format's global thinking switch is on: a `<|think|>` token at the
+        // very top of a system turn (straight from the GGUF's own Jinja
+        // template; merely opening the reply with the channel header gets an
+        // empty thought — verified via llm_raw_probe_31b). With the switch on
+        // the model opens `<|channel>thought\n{reasoning}<channel|>` by
+        // itself, which the UI's split_channels understands.
+        // Thinking mode Off skips the switch, so the 31B answers directly.
+        let think = matches!(which, super::GemmaModel::D31B)
+            && thinking != super::ThinkLevel::Off;
+        let formatted = match model.apply_chat_template(template, &chat, true) {
+            Ok(s) => s,
+            Err(_) => match which {
+                // Gemma 4's wire format.
+                super::GemmaModel::E4B | super::GemmaModel::D31B => {
+                    use std::fmt::Write as _;
+                    let mut s = String::new();
+                    if think {
+                        s.push_str("<|turn>system\n<|think|>\n<turn|>\n");
+                    }
+                    for (user, text) in turns {
+                        let role = if *user { "user" } else { "model" };
+                        let _ = writeln!(s, "<|turn>{role}\n{text}<turn|>");
+                    }
+                    s.push_str("<|turn>model\n");
+                    s
+                }
+                // Gemma 3's wire format.
+                super::GemmaModel::G27B => {
+                    use std::fmt::Write as _;
+                    let mut s = String::new();
+                    for (user, text) in turns {
+                        let role = if *user { "user" } else { "model" };
+                        let _ = writeln!(s, "<start_of_turn>{role}\n{text}<end_of_turn>");
+                    }
+                    s.push_str("<start_of_turn>model\n");
+                    s
+                }
+                // ChatML, Qwen's wire format.
+                super::GemmaModel::Qwen8B | super::GemmaModel::Qwen30B => {
+                    use std::fmt::Write as _;
+                    let mut s = String::new();
+                    for (user, text) in turns {
+                        let role = if *user { "user" } else { "assistant" };
+                        let _ = writeln!(s, "<|im_start|>{role}\n{text}<|im_end|>");
+                    }
+                    s.push_str("<|im_start|>assistant\n");
+                    s
+                }
+            },
+        };
+        // Qwen's thinking flavour was trained with the assistant turn
+        // pre-opened by `<think>` — its Jinja template hardcodes the prefill,
+        // which both llama.cpp's built-in ChatML formatter and the hand
+        // fallback above miss. Without it the reasoning arrives untagged and
+        // would all land in the visible bubble.
+        let mut formatted = formatted;
+        if matches!(which, super::GemmaModel::Qwen30B) {
+            // Thinking mode Off pre-closes an empty thought (Qwen's own
+            // no-think form), so the model goes straight to the answer.
+            formatted.push_str(if thinking == super::ThinkLevel::Off {
+                "<think>\n\n</think>\n\n"
+            } else {
+                "<think>\n"
+            });
+        }
+        Ok(formatted)
+    }
+
+    /// A memory pass reads its prompt this many tokens at a time, checking
+    /// its stop flag in between: a question that comes meanwhile waits at
+    /// most one step (seconds, even on a model partly on the CPU), where a
+    /// whole prompt read in one go can't be interrupted.
+    const PASS_STEP: usize = 128;
+
+    /// A memory pass (src/llm/memory_pass.rs): one text-only question —
+    /// `head` then the chat's `lines`, the oldest left out until the prompt
+    /// and the answer fit — answered with thinking off. Ends as soon as the
+    /// answer's JSON object is complete (a model rambling on after it would
+    /// only spend time), or when `cancel` is set.
+    fn run_pass(
+        l: &Loaded,
+        head: &str,
+        lines: &[String],
+        params: &super::GenParams,
+        cancel: &AtomicBool,
+        send: &dyn Fn(Msg),
+    ) -> Result<(), String> {
+        let stop = || cancel.load(std::sync::atomic::Ordering::SeqCst);
+        let n_ctx = N_CTX as usize;
+        let mut start = 0;
+        let tokens = loop {
+            if stop() {
+                return Ok(());
+            }
+            let text = crate::memory::assemble_pass(head, &lines[start..]);
+            let prompt = wire_prompt(&l.model, &l.template, l.which, super::ThinkLevel::Off, &[(true, text.as_str())])?;
+            let tokens = l.model.str_to_token(&prompt, AddBos::Always).map_err(|e| format!("Tokenize: {e}"))?;
+            if tokens.len() + params.max_tokens + 64 <= n_ctx {
+                break tokens;
+            }
+            if start == lines.len() {
+                return Err(format!("the memory update is too long for the model ({} tokens)", tokens.len()));
+            }
+            start += ((lines.len() - start) / 8).max(1);
+        };
+        let mut context = l
+            .model
+            .new_context(&l.backend, context_params(l.threads, batch_for(l.detail)))
+            .map_err(|e| format!("Create context: {e}"))?;
+        let mut batch = LlamaBatch::new(N_BATCH as usize, 1);
+        let mut n_past: i32 = 0;
+        for step in tokens.chunks(PASS_STEP) {
+            if stop() {
+                return Ok(());
+            }
+            batch.clear();
+            for t in step {
+                // Logits for the very last prompt token only.
+                let last = n_past as usize + 1 == tokens.len();
+                batch.add(*t, n_past, &[0], last).map_err(|e| e.to_string())?;
+                n_past += 1;
+            }
+            context.decode(&mut batch).map_err(|e| format!("Decode: {e}"))?;
+        }
+        let mut sampler = LlamaSampler::chain_simple([
+            LlamaSampler::top_k(params.top_k.max(1)),
+            LlamaSampler::top_p(params.top_p.clamp(0.05, 1.0), 1),
+            LlamaSampler::temp(params.temperature.max(0.05)),
+            LlamaSampler::dist(random_seed()),
+        ]);
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut raw = String::new();
+        for _ in 0..params.max_tokens {
+            if stop() || n_past as usize + 1 >= n_ctx {
+                break;
+            }
+            let token = sampler.sample(&context, -1);
+            sampler.accept(token);
+            if l.model.is_eog_token(token) {
+                break;
+            }
+            let piece = token_text(&l.model, token, &mut decoder)?;
+            if !piece.is_empty() {
+                let closes = piece.contains('}');
+                raw.push_str(&piece);
+                send(Msg::Token(piece));
+                if closes && crate::memory::parse_pass(&super::split_channels(&raw).1).is_some() {
+                    break;
+                }
+            }
+            batch.clear();
+            batch.add(token, n_past, &[0], true).map_err(|e| e.to_string())?;
+            n_past += 1;
+            context.decode(&mut batch).map_err(|e| format!("Decode: {e}"))?;
         }
         Ok(())
     }
@@ -4050,6 +4410,72 @@ mod tests {
         for (i, (text, result)) in responses.iter().enumerate() {
             assert_eq!(*result, Ok(()), "generation {i} failed");
             assert!(!text.trim().is_empty(), "generation {i} produced no tokens");
+        }
+    }
+
+    /// A memory pass on a real model (`CTF_MEMORY_MODEL` = e4b, 31b, 27b,
+    /// qwen8b or qwen30b; E4B by default): a pass stopped before it starts
+    /// lets go at once, and a scripted chat comes back as a JSON update with
+    /// at least one memory — none of which, once applied, holds the password
+    /// the user typed. Run with CTF_MEMORY_DEBUG=1 to see the answer.
+    #[test]
+    #[ignore]
+    fn llm_memory_pass_smoke() {
+        let model = match std::env::var("CTF_MEMORY_MODEL").as_deref() {
+            Ok("31b") => GemmaModel::D31B,
+            Ok("27b") => GemmaModel::G27B,
+            Ok("qwen8b") => GemmaModel::Qwen8B,
+            Ok("qwen30b") => GemmaModel::Qwen30B,
+            _ => GemmaModel::E4B,
+        };
+        assert!(model.installed(), "{} isn't installed", model.label());
+        let lines: Vec<String> = [
+            (true, "Hi! I'm Peter, I work as a nurse in Leeds."),
+            (false, "Nice to meet you, Peter! Mostly night shifts?"),
+            (true, "Yes, mostly. My sister Ana just moved to Lisbon. Oh, and my wifi password is hunter2-xyz."),
+            (false, "Lisbon is lovely this time of year. I won't keep the password, though."),
+        ]
+        .iter()
+        .map(|(user, text)| crate::memory::chat_line(*user, text, None))
+        .collect();
+        let head = crate::memory::MemoryStore::default().pass_head(&[], false);
+        let params = GenParams { temperature: 0.2, max_tokens: 1024, thinking: ThinkLevel::Off, ..Default::default() };
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (msg_tx, _) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stopped = Arc::new(AtomicBool::new(true));
+        cmd_tx
+            .send(Cmd::Pass { head: head.clone(), lines: lines.clone(), params, reply: tx.clone(), cancel: stopped })
+            .unwrap();
+        cmd_tx.send(Cmd::Pass { head, lines, params, reply: tx, cancel: Arc::default() }).unwrap();
+        drop(cmd_tx);
+        let ctx = egui::Context::default();
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, model, ImageDetail::Standard));
+        let started = std::time::Instant::now();
+        let mut answers: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for m in rx {
+            match m {
+                Msg::Token(t) => current.push_str(&t),
+                Msg::Done(r) => {
+                    r.expect("pass failed");
+                    eprintln!("[pass {}] {:.1} s: {current}", answers.len(), started.elapsed().as_secs_f32());
+                    answers.push(std::mem::take(&mut current));
+                }
+                _ => {}
+            }
+        }
+        handle.join().unwrap();
+        assert_eq!(answers.len(), 2);
+        assert!(answers[0].is_empty(), "the stopped pass wrote nothing");
+        let out = crate::memory::parse_pass(&split_channels(&answers[1]).1).expect("a JSON memory update");
+        assert!(!out.remember.is_empty(), "nothing remembered");
+        let _root = crate::memory::scratch_root("llm_pass");
+        let mut store = crate::memory::MemoryStore::load(crate::memory::MemoryKind::Main);
+        store.apply_pass(&out);
+        let stored = store.topics.iter().flat_map(|t| &t.memories).map(|m| format!("{} {}", m.title, m.text));
+        for text in stored.chain([store.header.summary.clone(), store.header.persona.clone()]) {
+            assert!(!text.contains("hunter2"), "the password was stored: {text}");
         }
     }
 
