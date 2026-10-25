@@ -95,6 +95,9 @@ pub struct UpdateState {
     flash_download: Option<Instant>,
     flash_check: Option<Instant>,
     flash_dismiss: Option<Instant>,
+
+    /// The release notes' Markdown viewer cache.
+    md_cache: egui_commonmark::CommonMarkCache,
 }
 
 impl UpdateState {
@@ -366,7 +369,7 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
                         ui.add_space(6.0);
                         ui.label(RichText::new("What's new").color(TEXT()).strong().size(12.0));
                         ui.add_space(2.0);
-                        notes_box(ui, "app_notes", &ri.notes);
+                        notes_box(ui, "app_notes", &ri.notes, &mut state.md_cache);
                     } else {
                         ui.label(RichText::new("You're on the latest version.").color(MUTED()).size(12.0));
                     }
@@ -426,7 +429,7 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
                     if !latest.notes.trim().is_empty() {
                         ui.label(RichText::new("What's new").color(TEXT()).strong().size(12.0));
                         ui.add_space(2.0);
-                        notes_box(ui, "comfy_notes", &latest.notes);
+                        notes_box(ui, "comfy_notes", &latest.notes, &mut state.md_cache);
                     }
                 } else {
                     ui.add_space(2.0);
@@ -492,8 +495,10 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
         }
 }
 
-/// A bordered, scrollable box for release notes.
-fn notes_box(ui: &mut egui::Ui, id: &str, text: &str) {
+/// A bordered, scrollable box for release notes, rendered as Markdown (both
+/// GitHub release bodies are Markdown: headings, bullets, bold, links) in
+/// the tab's small muted text, with bold and headings in the normal ink.
+fn notes_box(ui: &mut egui::Ui, id: &str, text: &str, cache: &mut egui_commonmark::CommonMarkCache) {
     let body = text.trim();
     let body = if body.is_empty() { "(no notes provided)" } else { body };
     egui::Frame::new()
@@ -508,7 +513,23 @@ fn notes_box(ui: &mut egui::Ui, id: &str, text: &str) {
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.add(egui::Label::new(RichText::new(body).color(MUTED()).size(11.5)).wrap());
+                    let s = ui.style_mut();
+                    for (style, size) in [
+                        (egui::TextStyle::Body, 12.0),
+                        (egui::TextStyle::Heading, 14.0),
+                        (egui::TextStyle::Monospace, 11.0),
+                    ] {
+                        if let Some(f) = s.text_styles.get_mut(&style) {
+                            f.size = size;
+                        }
+                    }
+                    let v = ui.visuals_mut();
+                    v.override_text_color = Some(MUTED());
+                    // Bold and headings: the normal ink, so they stand out.
+                    v.widgets.active.fg_stroke.color = TEXT();
+                    ui.push_id(id, |ui| {
+                        egui_commonmark::CommonMarkViewer::new().show(ui, cache, body);
+                    });
                 });
         });
 }
