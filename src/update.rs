@@ -175,6 +175,9 @@ impl UpdateState {
         self.comfy_updating = true;
         self.comfy_done = None;
         self.comfy_log.clear();
+        // The release the check found: a hotfix (v0.42.1) can be tagged on a
+        // release branch while master still says the older version.
+        let tag = self.result.as_ref().and_then(|r| r.comfy_latest.as_ref()).map(|ri| ri.tag.clone());
         let (tx, rx) = mpsc::channel();
         self.comfy_rx = Some(rx);
         let ctx = ctx.clone();
@@ -183,7 +186,7 @@ impl UpdateState {
                 let _ = tx.send(ComfyMsg::Line(s));
                 ctx.request_repaint();
             };
-            let ok = run_comfy_update(&send);
+            let ok = run_comfy_update(tag.as_deref(), &send);
             let _ = tx.send(ComfyMsg::Done(ok));
             ctx.request_repaint();
         });
@@ -220,11 +223,11 @@ fn comfy_installed_version() -> Option<String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn run_comfy_update(send: &dyn Fn(String)) -> bool {
-    crate::generate::update_comfyui(send)
+fn run_comfy_update(tag: Option<&str>, send: &dyn Fn(String)) -> bool {
+    crate::generate::update_comfyui(tag, send)
 }
 #[cfg(target_os = "macos")]
-fn run_comfy_update(_send: &dyn Fn(String)) -> bool {
+fn run_comfy_update(_tag: Option<&str>, _send: &dyn Fn(String)) -> bool {
     false
 }
 

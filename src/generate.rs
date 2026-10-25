@@ -3197,12 +3197,14 @@ pub fn comfyui_installed_version() -> Option<String> {
     None
 }
 
-/// Re-download ComfyUI (master) and refresh the code in place, preserving the
-/// user's `models/`, `custom_nodes/`, `user/`, `input/`, and `output/` dirs, then
-/// re-install requirements. Returns true on success. Runs on a worker thread; all
-/// progress goes through `send`. The running server (if any) is stopped first so
-/// its files aren't locked on Windows.
-pub fn update_comfyui(send: &dyn Fn(String)) -> bool {
+/// Re-download ComfyUI and refresh the code in place, preserving the user's
+/// `models/`, `custom_nodes/`, `user/`, `input/`, and `output/` dirs, then
+/// re-install requirements. `tag` is the release to install (the one the update
+/// check offered — a hotfix can live on a release branch, so master would still
+/// be the older version); without one, master. Returns true on success. Runs on
+/// a worker thread; all progress goes through `send`. The running server (if
+/// any) is stopped first so its files aren't locked on Windows.
+pub fn update_comfyui(tag: Option<&str>, send: &dyn Fn(String)) -> bool {
     let base = comfy_base();
     let comfy = base.join("ComfyUI");
     if !comfy.join("main.py").exists() {
@@ -3222,9 +3224,20 @@ pub fn update_comfyui(send: &dyn Fn(String)) -> bool {
             let _ = child.wait();
         }
 
-    send("== Downloading latest ComfyUI…".into());
+    // Only a plain tag name goes into the URL.
+    let tag = tag.filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)));
+    let url = match tag {
+        Some(t) => {
+            send(format!("== Downloading ComfyUI {t}…"));
+            format!("https://github.com/comfyanonymous/ComfyUI/archive/refs/tags/{t}.zip")
+        }
+        None => {
+            send("== Downloading latest ComfyUI…".into());
+            COMFYUI_ZIP.to_string()
+        }
+    };
     let zip = base.join("comfyui_update.zip");
-    if let Err(e) = download(COMFYUI_ZIP, &zip, send) {
+    if let Err(e) = download(&url, &zip, send) {
         send(format!("ERROR: download failed: {e}"));
         return false;
     }
@@ -3237,12 +3250,15 @@ pub fn update_comfyui(send: &dyn Fn(String)) -> bool {
         return false;
     }
     let _ = std::fs::remove_file(&zip);
-    let src = tmp.join("ComfyUI-master");
-    if !src.join("main.py").exists() {
+    // The archive's one top-level folder (ComfyUI-master, ComfyUI-0.42.1…).
+    let src = std::fs::read_dir(&tmp)
+        .ok()
+        .and_then(|mut d| d.find_map(|e| e.ok().map(|e| e.path()).filter(|p| p.join("main.py").exists())));
+    let Some(src) = src else {
         send("ERROR: unexpected archive layout — aborting.".into());
         let _ = std::fs::remove_dir_all(&tmp);
         return false;
-    }
+    };
 
     // Copy the fresh code over the install, but never touch the user's data dirs
     // (downloaded models, installed nodes, generated outputs).
@@ -3268,7 +3284,14 @@ pub fn update_comfyui(send: &dyn Fn(String)) -> bool {
         let _ = pip_retry(&base, &py, &["-m", "pip", "install", "-r", &req.to_string_lossy()], send);
     }
     match comfyui_installed_version() {
-        Some(v) => send(format!("== ComfyUI updated to {v}. It will relaunch on the next generation.")),
+        Some(v) => {
+            if let Some(t) = tag
+                && t.trim_start_matches('v') != v
+            {
+                send(format!("WARNING: {t} was downloaded, but it reports version {v}."));
+            }
+            send(format!("== ComfyUI updated to {v}. It will relaunch on the next generation."))
+        }
         None => send("== ComfyUI updated. It will relaunch on the next generation.".into()),
     }
     true
