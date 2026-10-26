@@ -36,6 +36,16 @@
 //! own, and what's said in them is never read. Krea 2 prompts still recall:
 //! its brief comes with the memory note, so prompts can follow the user's
 //! taste.
+//!
+//! **Pictures.** Images sent in a chat (and, in Krea 2 prompts, the images
+//! alone, with the prompt written for each to say what it shows) reach a
+//! pass numbered — `[image 1]`… — and it may keep a couple in the album
+//! (src/album.rs): a copy, encrypted, under a memory in the Pictures topic
+//! saying what it shows, with why it was kept beside it. Pictures of the
+//! same thing again and again become a memory too, and grow the AI's notes
+//! about itself. The pass never sees the pictures, only what was said about
+//! them; the copies are made here, on this PC, even for a pass that ran on
+//! a Link host.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -73,9 +83,9 @@ const PASS_REPLY: usize = 1536;
 const NOTE_ACK: &str = "Understood.";
 /// Ends the memory note in a chat that recalls but isn't saved (Krea 2
 /// prompts).
-const RECALL_ONLY: &str = "
-Right now you're writing image prompts: use what you remember (like                            the user's taste in subjects, styles or colours) only where it fits the                            prompt asked for. Nothing said here is saved to your memory.
-";
+const RECALL_ONLY: &str = "\nRight now you're writing image prompts: use what you remember (like the \
+                           user's taste in subjects, styles or colours) only where it fits the prompt \
+                           asked for. Of what's said here, only the pictures may go into your memory.\n";
 
 /// What the memory is doing, for the chat and AI Settings.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -139,6 +149,8 @@ struct Job {
     cold: Option<Arc<AtomicBool>>,
     rx: Receiver<Msg>,
     answer: String,
+    /// The pictures its lines number, for the album.
+    pictures: Vec<std::path::PathBuf>,
 }
 
 /// The next part to read.
@@ -147,6 +159,8 @@ struct Next {
     lines: Vec<String>,
     touched: Vec<String>,
     extends_summary: bool,
+    /// The pictures its lines number (`[image 1]` is the first).
+    pictures: Vec<std::path::PathBuf>,
     /// It goes to the Link host (it has been sent there before); to this
     /// PC's worker otherwise.
     on_host: bool,
@@ -194,6 +208,8 @@ struct Part {
     upto: usize,
     /// The Link hosts (by key) every one of them went to.
     hosts: Vec<String>,
+    /// The pictures its lines number (`[image 1]` is the first).
+    pictures: Vec<std::path::PathBuf>,
 }
 
 /// The same hosts, in any order.
@@ -203,7 +219,7 @@ fn same_hosts(a: &[String], b: &[String]) -> bool {
 
 /// A message a pass may read.
 fn readable(m: &super::ChatMsg) -> bool {
-    m.remember && (!m.text.trim().is_empty() || m.image.is_some())
+    (m.remember || m.picture_memory) && (!m.text.trim().is_empty() || m.image.is_some())
 }
 
 /// The part of `chat` from message `from` on that a pass reads: up to the
@@ -219,13 +235,32 @@ fn pass_part(chat: &Chat, from: usize, streaming: bool) -> Option<Part> {
     if from >= end {
         return None;
     }
-    let mut part = Part { lines: Vec::new(), upto: end, hosts: Vec::new() };
+    let mut part = Part { lines: Vec::new(), upto: end, hosts: Vec::new(), pictures: Vec::new() };
     let mut used = 0;
     for (i, m) in msgs.iter().enumerate().take(end).skip(from) {
         if !readable(m) {
             continue;
         }
-        let line = memory::chat_line(m.role == ChatRole::User, &m.text, m.image.as_deref().map(attachment_kind));
+        let user = m.role == ChatRole::User;
+        // Images are numbered (videos aren't kept); a Krea 2 message is read
+        // for its picture only: the image, then the prompt saying what it
+        // shows (for an image in an earlier part, nothing).
+        let picture = m.image.as_deref().filter(|p| !crate::is_video(p));
+        let n = part.pictures.len() + 1;
+        let label = match (picture, &m.image) {
+            (Some(_), _) => Some(format!("image {n}")),
+            (None, Some(p)) => Some(attachment_kind(p).to_string()),
+            (None, None) => None,
+        };
+        let line = if m.remember {
+            memory::chat_line(user, &m.text, label.as_deref())
+        } else if user {
+            memory::chat_line(true, "", label.as_deref())
+        } else if !part.pictures.is_empty() {
+            memory::picture_line(part.pictures.len(), &m.text)
+        } else {
+            continue;
+        };
         let cost = memory::approx_tokens(&line) + 1;
         if part.lines.is_empty() {
             part.hosts = m.shared_with.clone();
@@ -238,6 +273,9 @@ fn pass_part(chat: &Chat, from: usize, streaming: bool) -> Option<Part> {
         }
         used += cost;
         part.lines.push(line);
+        if let Some(p) = picture {
+            part.pictures.push(p.to_path_buf());
+        }
     }
     Some(part)
 }
@@ -245,6 +283,17 @@ fn pass_part(chat: &Chat, from: usize, streaming: bool) -> Option<Part> {
 /// How an attachment shows in a pass: `[image]` or `[video]`.
 fn attachment_kind(path: &std::path::Path) -> &'static str {
     if crate::is_video(path) { "video" } else { "image" }
+}
+
+/// The topics a part touched, and the album's when it has pictures: the
+/// pass sees what's kept already (not to keep it twice, and to notice the
+/// same thing coming back).
+fn with_pictures(mut touched: Vec<String>, part: &Part) -> Vec<String> {
+    let pictures = crate::memory::PICTURES_TOPIC;
+    if !part.pictures.is_empty() && !touched.iter().any(|t| t.eq_ignore_ascii_case(pictures)) {
+        touched.push(pictures.to_string());
+    }
+    touched
 }
 
 /// The first message of `chat` no pass has read yet that a pass may read.
@@ -334,7 +383,7 @@ impl Books<'_> {
         let now = Instant::now();
         match out {
             Some(out) if self.memory.revision == job.revision => {
-                self.finish(job.target, &out);
+                self.finish(job.target, &out, &job.pictures);
                 self.pass.retry_at = None;
             }
             // The memory changed while the pass ran: it read the old one, so
@@ -355,10 +404,11 @@ impl Books<'_> {
     }
 
     /// Write down what a pass decided and mark what it read as read.
-    fn finish(&mut self, target: Target, out: &memory::PassOutput) {
+    fn finish(&mut self, target: Target, out: &memory::PassOutput, pictures: &[std::path::PathBuf]) {
         let applied = self.memory.apply_pass(out);
+        let kept = self.keep_pictures(&out.keep, pictures);
         if debug() {
-            eprintln!("[memory] applied: {applied:?}");
+            eprintln!("[memory] applied: {applied:?}, {kept} pictures kept");
         }
         match target {
             Target::Chat { id, upto } => {
@@ -380,6 +430,48 @@ impl Books<'_> {
                 }
             }
         }
+    }
+
+    /// Keep the pictures a pass chose (at most `PASS_MAX_KEEP`) in the
+    /// album: a copy, encrypted, under a memory saying what it shows. Not
+    /// one that's gone, isn't an image, looks like it holds a secret, or
+    /// whose title the album has already. How many were kept.
+    fn keep_pictures(&mut self, keep: &[memory::KeepPicture], pictures: &[std::path::PathBuf]) -> usize {
+        use crate::memory::{MemoryKind, PICTURES_TOPIC};
+        let mut kept = 0;
+        let mut used: Vec<usize> = Vec::new();
+        for k in keep.iter().filter(|k| k.keepable()).take(memory::PASS_MAX_KEEP) {
+            let Some(src) = pictures.get(k.image - 1) else { continue };
+            if used.contains(&k.image) || !src.is_file() || crate::is_video(src) {
+                continue;
+            }
+            let description = memory::cut(k.description.trim(), 400);
+            let title = if k.title.trim().is_empty() {
+                crate::roleplay::title_from(&description)
+            } else {
+                memory::cut(k.title.trim(), 80)
+            };
+            let known = self
+                .memory
+                .find_topic(PICTURES_TOPIC)
+                .is_some_and(|ti| self.memory.topics[ti].memories.iter().any(|m| memory::same_words(&m.title, &title)));
+            if known {
+                continue;
+            }
+            let why = memory::cut(k.why.trim(), 400);
+            match crate::album::save(MemoryKind::Main, src, &why) {
+                Ok(name) => {
+                    if self.memory.add_entry(PICTURES_TOPIC, &title, &description, true, Some(name.clone())).is_some() {
+                        used.push(k.image);
+                        kept += 1;
+                    } else {
+                        crate::album::remove(MemoryKind::Main, &name);
+                    }
+                }
+                Err(e) => eprintln!("[memory] couldn't keep a picture: {e}"),
+            }
+        }
+        kept
     }
 
     /// A pass failed: it's tried once more, then that part is given up on
@@ -420,6 +512,7 @@ impl Books<'_> {
                     lines: p.lines.clone(),
                     touched: p.touched.clone(),
                     extends_summary: p.extends_summary,
+                    pictures: p.pictures.clone(),
                     on_host,
                 });
             }
@@ -454,9 +547,10 @@ impl Books<'_> {
         let Some(part) = pass_part(c, c.memory_synced, false) else { return Err(soonest) };
         Ok(Next {
             target: Target::Chat { id: c.id, upto: part.upto },
-            touched: self.memory.touched_topics(&part.lines.join("\n"), &c.memory_topics),
+            touched: with_pictures(self.memory.touched_topics(&part.lines.join("\n"), &c.memory_topics), &part),
             lines: part.lines,
             extends_summary: self.pass.summary_chat == Some(c.id),
+            pictures: part.pictures,
             on_host,
         })
     }
@@ -490,12 +584,14 @@ impl Books<'_> {
             let mut first = true;
             while let Some(part) = pass_part(c, from, streaming == Some(c.id)) {
                 if !part.lines.is_empty() {
-                    let touched = self.memory.touched_topics(&part.lines.join("\n"), &c.memory_topics);
+                    let touched =
+                        with_pictures(self.memory.touched_topics(&part.lines.join("\n"), &c.memory_topics), &part);
                     keep.push(PendingChat {
                         lines: part.lines.iter().map(|l| memory::redact_line(l)).collect(),
                         touched,
                         extends_summary: extends || !first,
                         host: part.hosts.last().cloned(),
+                        pictures: part.pictures.clone(),
                         tries: 0,
                     });
                     first = false;
@@ -551,9 +647,15 @@ impl LlmState {
         self.memory_recalled() && !self.krea_prompts
     }
 
+    /// Pictures sent now may go into the album (but not what's said): in
+    /// Krea 2 prompts, with the memory on.
+    pub(super) fn pictures_wanted(&self) -> bool {
+        self.memory_recalled() && self.krea_prompts
+    }
+
     /// Replies now may use the memory: it's on, and neither role play (it
-    /// has its own diary) nor Tag images is. Krea 2 prompts recall but never
-    /// save.
+    /// has its own diary) nor Tag images is. Krea 2 prompts recall, and
+    /// save only their pictures.
     pub(super) fn memory_recalled(&self) -> bool {
         self.memory_on() && !self.roleplay.enabled && !self.tag_images
     }
@@ -787,7 +889,7 @@ impl LlmState {
                 return;
             }
         };
-        let head = self.memory.pass_head(&next.touched, next.extends_summary);
+        let head = self.memory.pass_head(&next.touched, next.extends_summary, next.pictures.len());
         let params = GenParams {
             temperature: 0.2,
             top_k: self.params.top_k,
@@ -827,8 +929,15 @@ impl LlmState {
             if debug() {
                 eprintln!("[memory] pass started: {:?}, on the {}", next.target, if next.on_host { "host" } else { "worker" });
             }
-            self.mem_pass.job =
-                Some(Job { target: next.target, revision: self.memory.revision, cancel, cold, rx, answer: String::new() });
+            self.mem_pass.job = Some(Job {
+                target: next.target,
+                revision: self.memory.revision,
+                cancel,
+                cold,
+                rx,
+                answer: String::new(),
+                pictures: next.pictures,
+            });
         }
     }
 
@@ -862,6 +971,7 @@ mod tests {
             tag_image: None,
             tag_change: None,
             remember,
+            picture_memory: false,
             shared_with: Vec::new(),
         }
     }
@@ -889,6 +999,7 @@ mod tests {
             cold: Some(cold.clone()),
             rx,
             answer: String::new(),
+            pictures: Vec::new(),
         });
         (tx, cold)
     }
@@ -961,6 +1072,92 @@ mod tests {
         assert_eq!(books.memory.count(), 1);
         assert_eq!(books.pass.retry_at, None);
         assert_eq!(MemoryStore::load(MemoryKind::Main).count(), 1, "on disk");
+    }
+
+    /// Pictures are numbered as a pass reads them; a Krea 2 message is read
+    /// for its picture only (the prompt saying what it shows, never the
+    /// words typed), and a video isn't numbered.
+    #[test]
+    fn pictures_in_a_pass() {
+        let mut c = chat(1, &[(true, "My dog Max!", true), (false, "What a good boy.", true)]);
+        c.msgs[0].image = Some("C:/pics/max.jpg".into());
+        let mut krea = msg(true, "make it moody", false);
+        krea.image = Some("C:/pics/cat.png".into());
+        krea.picture_memory = true;
+        let mut prompt = msg(false, "A grey tabby cat curled on a sunlit windowsill.", false);
+        prompt.picture_memory = true;
+        let mut clip = msg(true, "and a clip", true);
+        clip.image = Some("C:/pics/run.mp4".into());
+        let ignored = msg(true, "a Krea 2 idea in words", false);
+        c.msgs.extend([krea, prompt, ignored, clip, msg(false, "Fun!", true)]);
+        let part = pass_part(&c, 0, false).unwrap();
+        assert_eq!(
+            part.lines,
+            vec![
+                "User: [image 1] My dog Max!",
+                "You: What a good boy.",
+                "User: [image 2]",
+                "You (the Krea 2 prompt you wrote for image 2, only to know what it shows): A grey tabby cat curled \
+                 on a sunlit windowsill.",
+                "User: [video] and a clip",
+                "You: Fun!",
+            ]
+        );
+        assert_eq!(part.pictures, vec![std::path::PathBuf::from("C:/pics/max.jpg"), "C:/pics/cat.png".into()]);
+        assert_eq!(with_pictures(vec!["Pets".into()], &part), vec!["Pets".to_string(), "Pictures".into()]);
+        // A Krea 2 prompt whose picture is in an earlier part says nothing.
+        let later = pass_part(&c, 3, false).unwrap();
+        assert_eq!(later.lines[0], "User: [video] and a clip");
+        assert!(later.pictures.is_empty());
+    }
+
+    /// A pass's chosen pictures go into the album, encrypted, under a memory
+    /// in the Pictures topic — not a picture that's gone, a number that isn't
+    /// there, one that looks like a secret, or one already kept.
+    #[test]
+    fn a_pass_keeps_pictures() {
+        let _root = memory::scratch_root("pass_album");
+        let mut memory = MemoryStore::load(MemoryKind::Main);
+        let mut pass = PassState { enabled: Some(true), pending_loaded: true, ..Default::default() };
+        let dog = memory::root().join("max.jpg");
+        std::fs::write(&dog, b"jpeg bytes").unwrap();
+        let mut chats = vec![chat(7, &[(true, "My dog Max!", true), (false, "Adorable.", true)])];
+        chats[0].msgs[0].image = Some(dog.clone());
+        let pictures = vec![dog.clone(), memory::root().join("gone.jpg")];
+        let keep = |image: usize, title: &str, description: &str| memory::KeepPicture {
+            image,
+            title: title.into(),
+            description: description.into(),
+            why: "They love him so much.".into(),
+        };
+        let out = memory::PassOutput {
+            keep: vec![
+                keep(1, "Max the dog", "Their golden retriever Max asleep on a blue rug."),
+                keep(2, "Gone", "A picture that isn't there any more."),
+            ],
+            ..Default::default()
+        };
+        let mut books = Books { pass: &mut pass, memory: &mut memory, chats: &mut chats, active: Some(7) };
+        books.finish(Target::Chat { id: 7, upto: 2 }, &out, &pictures);
+        let ti = books.memory.find_topic("Pictures").expect("the album's topic");
+        let m = &books.memory.topics[ti].memories[0];
+        assert_eq!(books.memory.topics[ti].memories.len(), 1);
+        assert_eq!((m.title.as_str(), m.text.as_str()), ("Max the dog", "Their golden retriever Max asleep on a blue rug."));
+        let name = m.image.clone().expect("names its picture");
+        assert_eq!(std::fs::read(crate::album::load(MemoryKind::Main, &name).unwrap()).unwrap(), b"jpeg bytes");
+        assert_eq!(crate::album::why(MemoryKind::Main, &name).as_deref(), Some("They love him so much."));
+        // Kept already, out of range, a secret: nothing more.
+        let again = memory::PassOutput {
+            keep: vec![
+                keep(1, "Max the dog", "Max again."),
+                keep(9, "Nine", "No ninth picture."),
+                keep(1, "Wifi card", "The wifi password is hunter2-xyz on a card."),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(books.keep_pictures(&again.keep, &pictures), 0);
+        assert_eq!(books.memory.topics[ti].memories.len(), 1);
+        crate::album::clear(MemoryKind::Main);
     }
 
     /// The user changed the memory while the pass ran: its answer is thrown

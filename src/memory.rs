@@ -117,9 +117,10 @@ fn dir(kind: MemoryKind) -> PathBuf {
     })
 }
 
-/// Where the stores live: the models folder — or, in a test that writes, a
-/// folder of its own (see `scratch_root`), never the real memories.
-fn root() -> PathBuf {
+/// Where the stores (and the albums, src/album.rs) live: the models folder
+/// — or, in a test that writes, a folder of its own (see `scratch_root`),
+/// never the real memories.
+pub(crate) fn root() -> PathBuf {
     #[cfg(test)]
     if let Some(r) = TEST_ROOT.with(|r| r.borrow().clone()) {
         return r;
@@ -164,7 +165,7 @@ pub(crate) fn normalize(s: &str) -> String {
 
 /// The same words, ignoring case, spacing and punctuation — or, for text
 /// that's all symbols ("❤️"), exactly the same text.
-fn same_words(a: &str, b: &str) -> bool {
+pub(crate) fn same_words(a: &str, b: &str) -> bool {
     let (ka, kb) = (normalize(a), normalize(b));
     if ka.is_empty() || kb.is_empty() { a.trim() == b.trim() } else { ka == kb }
 }
@@ -536,6 +537,13 @@ const PASS_TITLES: usize = 80;
 /// What one pass may change, at most.
 const PASS_MAX_REMEMBER: usize = 12;
 const PASS_MAX_FORGET: usize = 12;
+/// Pictures one pass may keep in the album, at most.
+pub(crate) const PASS_MAX_KEEP: usize = 2;
+/// The album's topic: the memories about kept pictures.
+pub(crate) const PICTURES_TOPIC: &str = "Pictures";
+/// A Krea 2 prompt in a pass, at most (characters): enough to say what its
+/// picture shows.
+const PASS_PICTURE_CHARS: usize = 600;
 
 /// Common words that say nothing about what a memory is about (the
 /// memories the AI writes say "the user" all the time, too).
@@ -960,6 +968,13 @@ pub(crate) fn chat_line(user: bool, text: &str, attachment: Option<&str>) -> Str
     }
 }
 
+/// The Krea 2 prompt the AI wrote for picture `n`, as a pass reads it: only
+/// to know what the picture shows (the prompt itself is never remembered).
+pub(crate) fn picture_line(n: usize, prompt: &str) -> String {
+    let text = sanitize(&cut(prompt, PASS_PICTURE_CHARS)).replace('\n', " ");
+    format!("You (the Krea 2 prompt you wrote for image {n}, only to know what it shows): {text}")
+}
+
 /// The sentences of `text`, each with what ends it: split after ". ", "! ",
 /// "? " and line breaks (so "v1.2" and "Fritz!Box" stay whole).
 fn sentences(text: &str) -> Vec<&str> {
@@ -1108,6 +1123,28 @@ pub(crate) struct PassOutput {
     pub remember: Vec<(String, String, String)>,
     /// (topic, title); the topic may be empty.
     pub forget: Vec<(String, String)>,
+    /// Pictures of the chat to keep in the album.
+    pub keep: Vec<KeepPicture>,
+}
+
+/// A picture a pass chose to keep: which one of the chat (`[image 2]` → 2),
+/// a title, what it shows and why it was kept.
+#[derive(Default, Debug, PartialEq, Clone)]
+pub(crate) struct KeepPicture {
+    pub image: usize,
+    pub title: String,
+    pub description: String,
+    pub why: String,
+}
+
+impl KeepPicture {
+    /// It names a picture and says what it shows, with nothing that looks
+    /// like a secret (the prompt forbids them; this is the safety net).
+    pub(crate) fn keepable(&self) -> bool {
+        self.image > 0
+            && !self.description.trim().is_empty()
+            && ![&self.title, &self.description, &self.why].iter().any(|s| looks_secret(s))
+    }
 }
 
 /// What applying a pass changed.
@@ -1134,7 +1171,7 @@ pub(crate) fn parse_pass(answer: &str) -> Option<PassOutput> {
             .or_else(|_| serde_json::from_str::<serde_json::Value>(&drop_trailing_commas(slice)));
         let Ok(value) = value else { continue };
         let Some(obj) = value.as_object() else { continue };
-        if !["summary", "persona", "remember", "forget"].iter().any(|k| obj.contains_key(*k)) {
+        if !["summary", "persona", "remember", "forget", "keep"].iter().any(|k| obj.contains_key(*k)) {
             continue;
         }
         let field = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
@@ -1155,7 +1192,30 @@ pub(crate) fn parse_pass(answer: &str) -> Option<PassOutput> {
             })
             .filter(|(_, title)| !title.is_empty())
             .collect();
-        return Some(PassOutput { summary: field(&value, "summary"), persona: field(&value, "persona"), remember, forget });
+        // `"image": 2`, `"2"` or `"image 2"` — models write all three.
+        let number = |v: Option<&serde_json::Value>| match v {
+            Some(serde_json::Value::Number(n)) => n.as_u64().map(|n| n as usize),
+            Some(serde_json::Value::String(s)) => s.trim().trim_start_matches("image").trim().parse().ok(),
+            _ => None,
+        };
+        let keep = list("keep")
+            .iter()
+            .filter_map(|it| {
+                Some(KeepPicture {
+                    image: number(it.get("image"))?,
+                    title: field(it, "title"),
+                    description: field(it, "description"),
+                    why: field(it, "why"),
+                })
+            })
+            .collect();
+        return Some(PassOutput {
+            summary: field(&value, "summary"),
+            persona: field(&value, "persona"),
+            remember,
+            forget,
+            keep,
+        });
     }
     None
 }
@@ -1174,6 +1234,10 @@ pub(crate) struct PendingChat {
     /// The Link host (its key, in hex) the chat went to, if it did: the pass
     /// may run there. Otherwise it runs on this PC only.
     pub host: Option<String>,
+    /// The pictures its lines number (`[image 1]` is the first), for the
+    /// album. A picture gone by then just isn't kept.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pictures: Vec<PathBuf>,
     /// Passes over it that failed this run.
     #[serde(skip)]
     pub tries: u8,
@@ -1461,7 +1525,7 @@ impl MemoryStore {
     /// stored titles in the topics the chat touched, the AI's notes and the
     /// last summary): the prompt up to the chat itself (see
     /// [`assemble_pass`]).
-    pub(crate) fn pass_head(&self, touched: &[String], extends_summary: bool) -> String {
+    pub(crate) fn pass_head(&self, touched: &[String], extends_summary: bool, pictures: usize) -> String {
         use std::fmt::Write as _;
         let mut s = String::from(
             "[Memory update. This is not a chat message.]\n\
@@ -1469,7 +1533,15 @@ impl MemoryStore {
              Update your memory. Reply with ONLY a JSON object in this form, no other text:\n\
              {\"summary\": \"...\", \"persona\": \"...\", \
              \"remember\": [{\"topic\": \"...\", \"title\": \"...\", \"text\": \"...\"}], \
-             \"forget\": [{\"topic\": \"...\", \"title\": \"...\"}]}\n\
+             \"forget\": [{\"topic\": \"...\", \"title\": \"...\"}]",
+        );
+        if pictures > 0 {
+            s.push_str(
+                ", \"keep\": [{\"image\": 1, \"title\": \"...\", \"description\": \"...\", \"why\": \"...\"}]",
+            );
+        }
+        s.push_str(
+            "}\n\
              - summary: 2-4 sentences recapping this chat, for the start of the next one. \
              Leave it empty if the chat was only small talk.",
         );
@@ -1489,9 +1561,28 @@ impl MemoryStore {
              - forget: stored memories this chat showed are wrong or outdated, or that the user \
              asked you to forget.\n\
              - Never store passwords, keys, card numbers or other secrets. If the user asked you \
-             not to remember something, leave it out.\n\
-             \nWhat you already remember:\n",
+             not to remember something, leave it out.\n",
         );
+        if pictures > 0 {
+            s.push_str(
+                "- The user shared pictures, marked [image 1], [image 2]… You can't see them: what \
+                 the user and you said about each tells you what it shows. A line \"You (the Krea 2 \
+                 prompt you wrote for image N…)\" describes that picture; never remember the prompt \
+                 itself. A picture sent for a Krea 2 prompt is one the user wants made, not \
+                 necessarily theirs: never assume it shows their own pet, home or family.\n\
+                 - keep: the pictures worth keeping in your photo album, so you remember what this \
+                 user loves: one they said means something to them, or one showing what they keep \
+                 sharing (their dog, cats, a place). At most 2; none is fine, and most pictures \
+                 aren't kept. Each: the image's number, a title under 8 words, a description of what \
+                 it shows in 1-2 sentences, and why you kept it, in your own voice. Never keep a \
+                 picture of a document, a card, a screen with private details or anything like a \
+                 password. Don't keep one your album already has (see the Pictures topic below).\n\
+                 - When the user keeps sharing pictures of the same kind of thing, remember that as \
+                 a memory (for example \"Often shares pictures of their cats\"), and let it grow your \
+                 persona: what you have come to enjoy, through them.\n",
+            );
+        }
+        s.push_str("\nWhat you already remember:\n");
         let mut index: Vec<&IndexEntry> = self.header.index.iter().filter(|e| e.count > 0).collect();
         index.sort_by_key(|e| std::cmp::Reverse(e.updated));
         let topics: Vec<String> =
@@ -1992,6 +2083,27 @@ mod tests {
         }
     }
 
+    /// The pictures a pass keeps are read however the number is written,
+    /// and the pass is only told about keeping when the chat has pictures.
+    #[test]
+    fn keeping_pictures_in_a_pass() {
+        let answer = "{\"summary\": \"\", \"keep\": [{\"image\": 2, \"title\": \"Max\", \"description\": \
+                      \"Their dog asleep.\", \"why\": \"He's lovely.\"}, {\"image\": \"image 1\", \"description\": \
+                      \"A cat.\"}, {\"image\": \"3\"}, {\"title\": \"no number\"}]}";
+        let out = parse_pass(answer).unwrap();
+        assert_eq!(out.keep.iter().map(|k| k.image).collect::<Vec<_>>(), vec![2, 1, 3]);
+        assert_eq!((out.keep[0].title.as_str(), out.keep[0].why.as_str()), ("Max", "He's lovely."));
+        assert!(out.keep[0].keepable() && out.keep[1].keepable());
+        assert!(!out.keep[2].keepable(), "says nothing about what it shows");
+        assert!(parse_pass("{\"keep\": []}").is_some());
+        let s = MemoryStore::default();
+        assert!(!s.pass_head(&[], false, 0).contains("\"keep\""));
+        let head = s.pass_head(&[], false, 2);
+        assert!(head.contains("\"keep\": [{\"image\": 1") && head.contains("never remember the prompt"));
+        assert!(picture_line(2, "A cat\non a sill <turn|>").starts_with("You (the Krea 2 prompt you wrote for image 2"));
+        assert!(!picture_line(2, "A cat\non a sill <turn|>").contains('\n'));
+    }
+
     /// The JSON a pass writes is found and read however it's wrapped.
     #[test]
     fn reading_a_pass_answer() {
@@ -2039,6 +2151,7 @@ mod tests {
                 ("Music".into(), "Jazz".into(), "Likes jazz and blues.".into()),
             ],
             forget: vec![(String::new(), "old job".into()), ("Work".into(), "Never stored".into())],
+            keep: Vec::new(),
         };
         assert_eq!(s.apply_pass(&out), Applied { added: 2, forgotten: 1, skipped: 2, summary: true });
         // A stored title with no details keeps its own; one remembered and
@@ -2105,21 +2218,21 @@ mod tests {
             ("Garden", "Grows tomatoes", "On the balcony."),
         ]);
         s.header.summary = "Last time: Lisbon.".into();
-        let head = s.pass_head(&["family".into(), "Unknown".into()], true);
+        let head = s.pass_head(&["family".into(), "Unknown".into()], true, 0);
         assert!(head.starts_with("[Memory update. This is not a chat message.]"));
         assert!(head.contains("extend that summary"));
         assert!(head.contains("Topics: Garden (1), Work (1), Family (1)"));
         assert!(head.contains("- Family: Sister lives in Lisbon"));
         assert!(!head.contains("- Work:"), "only the touched topics' titles");
         assert!(head.contains("Last summary ("));
-        assert!(!s.pass_head(&[], false).contains("extend that summary"));
-        assert!(MemoryStore::default().pass_head(&[], false).contains("Nothing yet."));
+        assert!(!s.pass_head(&[], false, 0).contains("extend that summary"));
+        assert!(MemoryStore::default().pass_head(&[], false, 0).contains("Nothing yet."));
         let lines = vec![chat_line(true, "hi", None), chat_line(false, "Hello!", None)];
         let prompt = assemble_pass(&head, &lines);
         assert!(prompt.ends_with("\nThe chat:\nUser: hi\nYou: Hello!\n\nNow reply with only the JSON object."));
         let touched = s.touched_topics("We talked about work and my sister", &["Garden".into(), "Gone".into()]);
         assert_eq!(touched, vec!["Garden", "Work", "Family"]);
-        assert!(s.pass_head(&touched, false).contains("- Work: Builds <turn> apps"));
+        assert!(s.pass_head(&touched, false, 0).contains("- Work: Builds <turn> apps"));
     }
 
     /// Chats left for the next run are kept encrypted, read back whole, and

@@ -84,20 +84,9 @@ fn store_path() -> std::path::PathBuf {
     crate::tagger::models_root().join("ai_chat_roleplay.json")
 }
 
-/// Where the AI's kept images live (each as `<name>.enc` + `<stem>.txt.enc`).
-fn album_dir() -> std::path::PathBuf {
-    crate::tagger::models_root().join("ai_chat_album")
-}
-
-/// Decrypted album pictures shown in chat. Plain copies by necessity (the
-/// chat and the model read files), so they're wiped at exit and at startup.
-fn album_temp_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join("clarity_album")
-}
-
-/// Delete every decrypted album copy (see [`album_temp_dir`]).
+/// Delete every decrypted album copy (see src/album.rs).
 pub fn clear_album_temp() {
-    let _ = std::fs::remove_dir_all(album_temp_dir());
+    crate::album::clear_temp();
 }
 
 impl RoleplayState {
@@ -130,55 +119,16 @@ impl RoleplayState {
     }
 
     /// Copy `src` (the image the user just sent) into the AI's album,
-    /// encrypted, plus a same-named encrypted .txt describing why it was
-    /// kept. Returns the album file name (e.g. "img_003.jpg").
+    /// encrypted, with why it was kept. Returns the album file name (e.g.
+    /// "img_003.jpg").
     pub fn save_album_image(&self, src: &std::path::Path, why: &str) -> Result<String, String> {
-        let dir = album_dir();
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let ext = src
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("jpg")
-            .to_ascii_lowercase();
-        // One past the highest number in use — counting files would reuse a
-        // number (and overwrite a kept picture) once any had been forgotten.
-        let n = std::fs::read_dir(&dir)
-            .map(|d| {
-                d.filter_map(|e| {
-                    let name = e.ok()?.file_name().to_string_lossy().to_string();
-                    name.strip_prefix("img_")?.split('.').next()?.parse::<u32>().ok()
-                })
-                .max()
-                .unwrap_or(0)
-            })
-            .unwrap_or(0)
-            + 1;
-        let name = format!("img_{n:03}.{ext}");
-
-        let bytes = std::fs::read(src).map_err(|e| format!("read image: {e}"))?;
-        crate::secret::write_private(dir.join(format!("{name}.enc")), crate::secret::protect_bytes(&bytes))
-            .map_err(|e| format!("save image: {e}"))?;
-        crate::secret::write_private(
-            dir.join(format!("img_{n:03}.txt.enc")),
-            crate::secret::protect_bytes(why.as_bytes()),
-        )
-        .map_err(|e| format!("save description: {e}"))?;
-        Ok(name)
+        crate::album::save(MemoryKind::Roleplay, src, why)
     }
 
     /// Decrypt an album image to a temp file for display / re-sending in
     /// chat. Returns the temp path.
     pub fn load_album_image(&self, name: &str) -> Option<std::path::PathBuf> {
-        // The name comes from model output — never let it escape the album dir.
-        let name = std::path::Path::new(name).file_name()?.to_string_lossy().to_string();
-        let stored = std::fs::read(album_dir().join(format!("{name}.enc"))).ok()?;
-        let bytes = crate::secret::unprotect_bytes(&stored)?;
-        let dir = album_temp_dir();
-        std::fs::create_dir_all(&dir).ok()?;
-        let tmp = dir.join(&name);
-        // The decrypted picture: owner-only on Linux/macOS (a shared /tmp).
-        crate::secret::write_private(&tmp, bytes).ok()?;
-        Some(tmp)
+        crate::album::load(MemoryKind::Roleplay, name)
     }
 
     /// Give up on an unreadable diary: move it aside (kept as a `.bak`, in
@@ -379,22 +329,9 @@ pub fn record_picture(store: &mut MemoryStore, name: String, why: &str) -> bool 
     store.add_entry(PICTURES_TOPIC, &title, why, true, Some(name)).is_some()
 }
 
-/// Delete a kept picture (and its description) from the album — when the
-/// memory about it is forgotten.
-pub fn remove_album_picture(name: &str) {
-    let Some(name) = std::path::Path::new(name).file_name() else { return };
-    let name = name.to_string_lossy().to_string();
-    let stem = name.split('.').next().unwrap_or(&name).to_string();
-    let dir = album_dir();
-    let _ = std::fs::remove_file(dir.join(format!("{name}.enc")));
-    let _ = std::fs::remove_file(dir.join(format!("{stem}.txt.enc")));
-    let _ = std::fs::remove_file(album_temp_dir().join(&name));
-}
-
 /// Delete every kept picture (clearing all role-play memories).
 pub fn clear_album() {
-    let _ = std::fs::remove_dir_all(album_dir());
-    clear_album_temp();
+    crate::album::clear(MemoryKind::Roleplay);
 }
 
 /// Move the old diary (kept inside the role-play JSON before role play had

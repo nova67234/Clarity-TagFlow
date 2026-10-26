@@ -12,6 +12,10 @@
 //! positively. Run locally, Krea 2 uses the prompt as-is (no hosted prompt
 //! expander), so the prompt has to carry all the detail itself.
 //!
+//! Anything that isn't a picture, an idea or a change ("hi", "thanks", a
+//! question) gets an ordinary short answer instead: the brief used to ask
+//! for nothing but prompts, so a greeting got no reply at all.
+//!
 //! The brief rides along as a pinned priming turn (like role play's
 //! preamble), and pictures are read with Detailed Vision (src/llm.rs tiles
 //! the newest image) so small details make it into the prompt.
@@ -28,6 +32,12 @@ same picture; use them for small details only.\n\
 - When I describe an idea in words: turn it into a Krea 2 prompt.\n\
 - When I ask for a change (\"make it night\", \"more cinematic\", \"as an oil \
 painting\"): rewrite the WHOLE prompt with the change applied.\n\
+- When I'm just talking to you — a greeting, thanks, a question about you, \
+about Krea 2 or about a prompt you wrote — answer me normally, warmly and in \
+a few sentences, in the language I write in. Don't write a prompt then. If \
+I haven't asked for anything yet, say you can turn a picture or an idea \
+into a Krea 2 prompt. Even a few words that describe something to picture \
+(\"a cat in the rain\") are an idea: write the prompt.\n\
 \n\
 How to write the prompt:\n\
 - One flowing paragraph of 4 to 8 sentences (roughly 90 to 200 words), the \
@@ -61,9 +71,10 @@ ultra detailed, highly detailed, hyperrealistic, trending, award-winning.\n\
 - Only describe what you can actually see (or what I asked for). Don't invent \
 names, brands or a backstory.\n\
 \n\
-Reply with ONLY the prompt paragraph: no title, no introduction, no quotes \
-around it, no markdown, no lists, nothing after it.";
+When you write a prompt, reply with ONLY the prompt paragraph: no title, no \
+introduction, no quotes around it, no markdown, no lists, nothing after it.";
 
 /// The model's scripted acknowledgement of the brief (keeps the user/model
 /// turn alternation intact).
-pub const ACK: &str = "Understood. I'll reply with only the Krea 2 prompt.";
+pub const ACK: &str = "Understood. When you send a picture, an idea or a change, I'll reply with only the \
+                        Krea 2 prompt; otherwise I'll just talk with you.";

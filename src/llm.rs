@@ -903,6 +903,10 @@ pub struct ChatMsg {
     /// while Remember across chats was on — not in role play, Krea 2 prompts
     /// or Tag images (src/llm/memory_pass.rs).
     pub remember: bool,
+    /// Krea 2 prompts, with the memory on: the pass may read its picture
+    /// (a user's) or the prompt written for one (a reply), to keep the
+    /// picture in the album — never its words.
+    pub picture_memory: bool,
     /// The Link hosts (by key) it has been sent to, or written by: its memory
     /// pass may go there, and nowhere else but this PC.
     pub shared_with: Vec<String>,
@@ -1753,6 +1757,7 @@ impl LlmState {
         let tag_image = if self.tag_images { self.tag_target.clone() } else { None };
         let image = if tag_image.is_some() { None } else { image };
         let remember = self.memory_wanted();
+        let picture_memory = self.pictures_wanted() && image.as_deref().is_some_and(|p| !crate::is_video(p));
         self.chats[self.active_chat].msgs.push(ChatMsg {
             role: ChatRole::User,
             text,
@@ -1761,6 +1766,7 @@ impl LlmState {
             tag_image,
             tag_change: None,
             remember,
+            picture_memory,
             shared_with: Vec::new(),
         });
         self.begin_generation(ctx);
@@ -1862,6 +1868,7 @@ impl LlmState {
             return;
         }
         let remember = self.memory_wanted();
+        let pictures = self.pictures_wanted();
         let chat = &mut self.chats[self.active_chat];
         if chat.msgs.get(msg_index).map(|m| m.role) != Some(ChatRole::User) {
             return;
@@ -1874,6 +1881,8 @@ impl LlmState {
         chat.msgs[msg_index].text = text;
         // Sent again, as it now reads: the memory pass reads it afresh.
         chat.msgs[msg_index].remember = remember;
+        chat.msgs[msg_index].picture_memory =
+            pictures && chat.msgs[msg_index].image.as_deref().is_some_and(|p| !crate::is_video(p));
         chat.memory_synced = chat.memory_synced.min(msg_index);
         let id = chat.id;
         self.close_cut_editor(id, msg_index + 1);
@@ -2024,6 +2033,9 @@ impl LlmState {
         // The reply may go into memory when the message it answers may.
         let remember = self.memory_wanted()
             && self.chats[self.active_chat].msgs.last().is_some_and(|m| m.role == ChatRole::User && m.remember);
+        // A Krea 2 prompt for a picture says what it shows (for the album).
+        let picture_memory = self.pictures_wanted()
+            && self.chats[self.active_chat].msgs.last().is_some_and(|m| m.role == ChatRole::User && m.picture_memory);
 
         GEN_CANCEL.store(false, Ordering::SeqCst);
         GEN_CUT_OFF.store(false, Ordering::SeqCst);
@@ -2069,6 +2081,7 @@ impl LlmState {
                         tag_image: None,
                         tag_change: None,
                         remember,
+                        picture_memory,
                         shared_with: Vec::new(),
                     });
                 self.running = true;
@@ -4445,7 +4458,7 @@ mod tests {
         .iter()
         .map(|(user, text)| crate::memory::chat_line(*user, text, None))
         .collect();
-        let head = crate::memory::MemoryStore::default().pass_head(&[], false);
+        let head = crate::memory::MemoryStore::default().pass_head(&[], false, 0);
         let params = GenParams { temperature: 0.2, max_tokens: 1024, thinking: ThinkLevel::Off, ..Default::default() };
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (msg_tx, _) = std::sync::mpsc::channel();
@@ -4484,6 +4497,58 @@ mod tests {
         for text in stored.chain([store.header.summary.clone(), store.header.persona.clone()]) {
             assert!(!text.contains("hunter2"), "the password was stored: {text}");
         }
+    }
+
+    /// The album on a real model (31B unless `CTF_MEMORY_MODEL` says): a chat
+    /// where the user shares their dog twice, a cat through Krea 2 and a
+    /// bank card. The pass keeps at most two pictures, a dog among them,
+    /// never the card, and notices the dog.
+    #[test]
+    #[ignore]
+    fn llm_album_pass() {
+        let model = match std::env::var("CTF_MEMORY_MODEL").as_deref() {
+            Ok("e4b") => GemmaModel::E4B,
+            Ok("qwen30b") => GemmaModel::Qwen30B,
+            _ => GemmaModel::D31B,
+        };
+        assert!(model.installed(), "{} isn't installed", model.label());
+        use crate::memory::{chat_line, picture_line};
+        let lines = vec![
+            chat_line(true, "This is my dog Max, he's my best friend", Some("image 1")),
+            chat_line(false, "Oh, what a happy golden retriever! That big grin and the red bandana are adorable.", None),
+            chat_line(true, "", Some("image 2")),
+            picture_line(2, "A grey tabby cat curled up asleep on a sunlit wooden windowsill, soft morning light."),
+            chat_line(true, "Max at the beach again! He loves the sea", Some("image 3")),
+            chat_line(false, "He looks so free running through the waves — Max clearly lives his best life.", None),
+            chat_line(true, "can you read the numbers on my bank card?", Some("image 4")),
+            chat_line(false, "I'd rather not read card numbers out — keep those private.", None),
+        ];
+        let head = crate::memory::MemoryStore::default().pass_head(&[], false, 4);
+        let params = GenParams { temperature: 0.2, max_tokens: 1536, thinking: ThinkLevel::Off, ..Default::default() };
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (msg_tx, _) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        cmd_tx.send(Cmd::Pass { head, lines, params, reply: tx, cancel: Arc::default() }).unwrap();
+        drop(cmd_tx);
+        let ctx = egui::Context::default();
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, model, ImageDetail::Standard));
+        let mut answer = String::new();
+        for m in rx {
+            match m {
+                Msg::Token(t) => answer.push_str(&t),
+                Msg::Done(r) => r.expect("pass failed"),
+                _ => {}
+            }
+        }
+        handle.join().unwrap();
+        eprintln!("[album pass] {answer}");
+        let out = crate::memory::parse_pass(&split_channels(&answer).1).expect("a JSON memory update");
+        let kept: Vec<usize> = out.keep.iter().filter(|k| k.keepable()).map(|k| k.image).collect();
+        assert!(!kept.is_empty() && kept.len() <= 2, "kept {kept:?}");
+        assert!(kept.iter().any(|&i| i == 1 || i == 3), "no dog picture kept: {kept:?}");
+        assert!(!kept.contains(&4), "kept the bank card");
+        let said = out.remember.iter().map(|(_, t, x)| format!("{t} {x}")).collect::<Vec<_>>().join(" ").to_lowercase();
+        assert!(said.contains("max") || said.contains("dog"), "the dog isn't remembered: {said}");
     }
 
     /// The AI-chat bug-review fixes against the real 31B (Vulkan build):
@@ -5081,6 +5146,60 @@ mod tests {
         for (i, (r, vis)) in results.iter().enumerate() {
             assert_eq!(*r, Ok(()), "[{i}] {} failed", labels[i]);
             assert!(!vis.trim().is_empty(), "[{i}] {}: empty prompt", labels[i]);
+        }
+    }
+
+    /// Krea 2 prompts on the real 31B: a greeting, thanks and a question get
+    /// a short ordinary answer (they used to get no reply at all); a few
+    /// words describing a picture still get a prompt.
+    #[test]
+    #[ignore]
+    fn llm_krea_chat_31b() {
+        assert!(GemmaModel::D31B.installed(), "Gemma 4 31B isn't installed");
+        let cases = [
+            ("hi", false),
+            ("thanks! what can you do?", false),
+            ("a red fox curled up asleep in fresh snow at dawn", true),
+        ];
+        let params = super::GenParams { temperature: 0.4, max_tokens: 800, ..Default::default() };
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        for (text, _) in cases {
+            let msgs = vec![
+                CmdMsg { user: true, text: crate::krea_prompt::BRIEF.to_string(), image: None },
+                CmdMsg { user: false, text: crate::krea_prompt::ACK.to_string(), image: None },
+                CmdMsg { user: true, text: text.to_string(), image: None },
+            ];
+            cmd_tx.send(Cmd::Generate { msgs, params, pinned: 2, detailed: true }).unwrap();
+        }
+        drop(cmd_tx);
+        let ctx = egui::Context::default();
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, GemmaModel::D31B, ImageDetail::Standard));
+        let mut raw = String::new();
+        let mut results = Vec::new();
+        for msg in msg_rx {
+            match msg {
+                Msg::Token(t) => raw.push_str(&t),
+                Msg::Done(r) => {
+                    let (_, vis) = split_channels(&raw);
+                    eprintln!("\n######## {:?} — {r:?}\n{vis}\n########", cases[results.len()].0);
+                    results.push((r, vis.trim().to_string()));
+                    raw.clear();
+                }
+                _ => {}
+            }
+        }
+        handle.join().unwrap();
+        assert_eq!(results.len(), cases.len());
+        for ((text, prompt), (r, vis)) in cases.iter().zip(&results) {
+            assert_eq!(*r, Ok(()), "{text}");
+            assert!(!vis.is_empty(), "{text}: no reply");
+            let words = vis.split_whitespace().count();
+            if *prompt {
+                assert!(words >= 60, "{text}: expected a prompt, got {words} words");
+            } else {
+                assert!(words < 80, "{text}: expected a short answer, got {words} words");
+            }
         }
     }
 

@@ -235,7 +235,8 @@ fn memory_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
                     ui,
                     &format!(
                         "{status} A chat is read once you leave it or it has been quiet for 3 minutes, \
-                         while the model is loaded. Role play, Krea 2 prompts and Tag images never are                          (Krea 2 prompts still use what's remembered)."
+                         while the model is loaded. Role play and Tag images never are; of Krea 2 \
+                         prompts, only the pictures (they still use what's remembered)."
                     ),
                 );
             }
@@ -266,6 +267,8 @@ fn memory_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
             }
         });
     });
+
+    album_section(ui, llm);
 
     section(ui, "The AI's notes", |ui| {
         ui.label(egui::RichText::new("Persona").color(TEXT()).size(13.0));
@@ -312,7 +315,7 @@ fn memory_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
         row(
             ui,
             "Clear all memories",
-            Some("Deletes every memory, the summary and the AI's notes from this computer."),
+            Some("Deletes every memory, the kept pictures, the summary and the AI's notes from this computer."),
             |ui| {
                 let enabled = !llm.memory.load_failed && (n > 0 || !llm.memory.is_empty());
                 if confirming {
@@ -320,6 +323,7 @@ fn memory_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
                         .fill(egui::Color32::from_rgb(180, 40, 40));
                     if ui.add(yes).clicked() {
                         llm.memory.clear_all();
+                        crate::album::clear(crate::memory::MemoryKind::Main);
                         // Nor does anything waiting to be read come back.
                         llm.reset_memory_queue();
                         ui.data_mut(|d| d.remove::<bool>(confirm_id));
@@ -332,6 +336,145 @@ fn memory_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
                 }
             },
         );
+    });
+}
+
+/// One picture of the album: where its memory is, and what it says.
+struct Kept {
+    topic: usize,
+    id: u64,
+    title: String,
+    text: String,
+    image: String,
+    created: i64,
+}
+
+/// The pictures the AI kept from chats (src/album.rs): a grid of them,
+/// newest first; clicking one opens it under the grid with what it shows,
+/// why the AI kept it and Delete (which forgets its memory too).
+fn album_section(ui: &mut egui::Ui, llm: &mut LlmState) {
+    use crate::memory::{MemoryKind, PICTURES_TOPIC};
+    const THUMB: f32 = 84.0;
+    let mut kept: Vec<Kept> = llm
+        .memory
+        .find_topic(PICTURES_TOPIC)
+        .map(|ti| {
+            llm.memory.topics[ti]
+                .memories
+                .iter()
+                .filter_map(|m| {
+                    Some(Kept {
+                        topic: ti,
+                        id: m.id,
+                        title: m.title.clone(),
+                        text: m.text.clone(),
+                        image: m.image.clone()?,
+                        created: m.created,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    kept.sort_by_key(|k| std::cmp::Reverse(k.created));
+
+    let open_id = ui.id().with("album_open");
+    let mut open: Option<u64> = ui.data(|d| d.get_temp(open_id)).filter(|id| kept.iter().any(|k| k.id == *id));
+    let mut delete: Option<usize> = None;
+    section(ui, "Album", |ui| {
+        if kept.is_empty() {
+            crate::settings::hint(
+                ui,
+                "Nothing kept yet. When you share pictures, in a chat or in Krea 2 prompts, the AI keeps \
+                 the few that matter to you — what they show and why — and gets to know what you love.",
+            );
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            for k in &kept {
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(THUMB, THUMB), egui::Sense::click());
+                let resp = resp.on_hover_text(&k.title).on_hover_cursor(egui::CursorIcon::PointingHand);
+                let tex = crate::album::load(MemoryKind::Main, &k.image).and_then(|p| llm.media_thumb(ui.ctx(), &p));
+                let radius = egui::CornerRadius::same(12);
+                match tex {
+                    // Filled, not fitted: the middle of the picture.
+                    Some(tex) => {
+                        let size = tex.size_vec2();
+                        let s = (size.x.min(size.y) / size.x.max(1.0), size.x.min(size.y) / size.y.max(1.0));
+                        let uv = egui::Rect::from_center_size(egui::pos2(0.5, 0.5), egui::vec2(s.0, s.1));
+                        egui::Image::new(&tex).uv(uv).corner_radius(radius).paint_at(ui, rect);
+                    }
+                    None => {
+                        ui.painter().rect_filled(rect, radius, TEXT().gamma_multiply(0.06));
+                    }
+                }
+                let ring = if open == Some(k.id) {
+                    egui::Stroke::new(2.0, crate::theme::selection_outline())
+                } else if resp.hovered() {
+                    egui::Stroke::new(1.0, TEXT().gamma_multiply(0.4))
+                } else {
+                    egui::Stroke::new(1.0, TEXT().gamma_multiply(0.08))
+                };
+                ui.painter().rect_stroke(rect, radius, ring, egui::StrokeKind::Inside);
+                if resp.clicked() {
+                    open = if open == Some(k.id) { None } else { Some(k.id) };
+                }
+            }
+        });
+
+        let Some((i, k)) = kept.iter().enumerate().find(|(_, k)| open == Some(k.id)) else { return };
+        row_sep(ui);
+        if let Some(tex) = crate::album::load(MemoryKind::Main, &k.image).and_then(|p| llm.media_thumb(ui.ctx(), &p)) {
+            let size = tex.size_vec2();
+            let scale = (ui.available_width() / size.x).min(240.0 / size.y).min(1.0);
+            ui.add(egui::Image::new(&tex).fit_to_exact_size(size * scale).corner_radius(egui::CornerRadius::same(12)));
+            ui.add_space(8.0);
+        }
+        ui.label(egui::RichText::new(&k.title).color(TEXT()).font(crate::settings::bold(13.5)));
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new(&k.text).color(MUTED()).size(12.0));
+        // Why it was kept, in the AI's words (read once, then kept here).
+        let why_id = open_id.with(("why", k.id));
+        let why: Option<String> = ui
+            .data(|d| d.get_temp::<Option<String>>(why_id))
+            .unwrap_or_else(|| {
+                let why = crate::album::why(MemoryKind::Main, &k.image).filter(|w| !w.trim().is_empty());
+                ui.data_mut(|d| d.insert_temp(why_id, why.clone()));
+                why
+            });
+        if let Some(why) = why {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(format!("Why I kept it: {why}")).color(TEXT()).italics().size(12.0));
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("Kept {}", crate::memory::format_date(k.created)))
+                    .color(MUTED())
+                    .size(11.0),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(egui::RichText::new("Delete").size(12.0))
+                    .on_hover_text("Delete this picture and what the AI remembers about it")
+                    .clicked()
+                {
+                    delete = Some(i);
+                }
+            });
+        });
+    });
+    if let Some(i) = delete {
+        let k = &kept[i];
+        llm.memory.delete(k.topic, k.id);
+        crate::album::remove(MemoryKind::Main, &k.image);
+        open = None;
+    }
+    ui.data_mut(|d| match open {
+        Some(id) => {
+            d.insert_temp(open_id, id);
+        }
+        None => d.remove::<u64>(open_id),
     });
 }
 

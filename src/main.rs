@@ -74,6 +74,7 @@ mod ai_chat;
 // AI Settings window (the Tools menu's gear): replies, memory
 // and role play tabs.
 mod ai_settings;
+mod album;
 // The AI's long-term memory across chats (and role play's own, kept apart),
 // and the 3D memory map.
 mod memory;

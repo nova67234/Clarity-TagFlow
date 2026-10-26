@@ -419,12 +419,12 @@ pub fn window(ctx: &egui::Context, llm: &mut crate::llm::LlmState) {
             };
             map.ui(ui, store, &mut ask);
         });
-    // Role play: forgetting a memory about a kept picture deletes the picture.
+    // Forgetting a memory about a kept picture deletes the picture (from
+    // that memory's own album).
     if let Some(m) = map.forgotten.take()
-        && map.kind == MemoryKind::Roleplay
         && let Some(image) = m.image
     {
-        crate::roleplay::remove_album_picture(&image);
+        crate::album::remove(map.kind, &image);
     }
     if let Some(q) = ask {
         add_question(&mut llm.draft, &q);
