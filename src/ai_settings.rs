@@ -500,11 +500,11 @@ fn album_section(ui: &mut egui::Ui, llm: &mut LlmState) {
                     }
                 }
                 let ring = if open == Some(k.id) {
-                    egui::Stroke::new(2.0, crate::theme::selection_outline())
+                    egui::Stroke::new(2.0_f32, crate::theme::selection_outline())
                 } else if resp.hovered() {
-                    egui::Stroke::new(1.0, TEXT().gamma_multiply(0.4))
+                    egui::Stroke::new(1.0_f32, TEXT().gamma_multiply(0.4))
                 } else {
-                    egui::Stroke::new(1.0, TEXT().gamma_multiply(0.08))
+                    egui::Stroke::new(1.0_f32, TEXT().gamma_multiply(0.08))
                 };
                 ui.painter().rect_stroke(rect, radius, ring, egui::StrokeKind::Inside);
                 if resp.clicked() {

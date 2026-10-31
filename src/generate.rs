@@ -2024,10 +2024,10 @@ fn lora_card(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui))
     let (fill, stroke) = if selected {
         (
             lerp_color(PANEL(), ACCENT1(), 0.12),
-            egui::Stroke::new(1.5, ACCENT1()),
+            egui::Stroke::new(1.5_f32, ACCENT1()),
         )
     } else {
-        (PANEL(), egui::Stroke::new(1.0, EDGE()))
+        (PANEL(), egui::Stroke::new(1.0_f32, EDGE()))
     };
     let r = egui::Frame::new()
         .fill(fill)
@@ -2158,7 +2158,7 @@ fn lora_row(
                     ui.painter().rect_stroke(
                         rect,
                         CornerRadius::same(8),
-                        egui::Stroke::new(1.0, EDGE()),
+                        egui::Stroke::new(1.0_f32, EDGE()),
                         egui::StrokeKind::Inside,
                     );
                     egui::Image::new(egui::include_image!("../icons/lora.svg"))
@@ -2231,7 +2231,7 @@ fn lora_row(
                 ui.add_space(8.0);
                 let (lr, _) =
                     ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-                ui.painter().hline(lr.x_range(), lr.center().y, egui::Stroke::new(1.0, EDGE()));
+                ui.painter().hline(lr.x_range(), lr.center().y, egui::Stroke::new(1.0_f32, EDGE()));
                 ui.add_space(6.0);
                 if info.triggers.is_empty() && info.facts.is_empty() {
                     ui.label(RichText::new("No metadata in this file.").color(MUTED()).size(10.5));
@@ -2396,7 +2396,7 @@ fn negative_popup(ctx: &egui::Context, state: &mut GenerateState) {
             let out = egui::Frame::new()
                 .fill(FIELD())
                 .corner_radius(CornerRadius::same(14))
-                .stroke(egui::Stroke::new(1.0, EDGE()))
+                .stroke(egui::Stroke::new(1.0_f32, EDGE()))
                 .inner_margin(Margin::same(10))
                 .show(ui, |ui| {
                     egui::TextEdit::multiline(&mut state.negative)
@@ -3026,7 +3026,7 @@ fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, tdir: &Path, off_fam
                     ui.painter().rect_stroke(
                         rect,
                         CornerRadius::same(8),
-                        egui::Stroke::new(1.0, EDGE()),
+                        egui::Stroke::new(1.0_f32, EDGE()),
                         egui::StrokeKind::Inside,
                     );
                     egui::Image::new(egui::include_image!("../icons/extension.svg"))
@@ -3151,7 +3151,7 @@ fn polarity_pill(ui: &mut egui::Ui, text: &str, active: bool, accent: Color32) -
         let fill = if active { accent } else { PANEL().gamma_multiply(1.4) };
         ui.painter().rect_filled(rect, CornerRadius::same(9), fill);
         if !active {
-            ui.painter().rect_stroke(rect, CornerRadius::same(9), egui::Stroke::new(1.0, EDGE()), egui::StrokeKind::Inside);
+            ui.painter().rect_stroke(rect, CornerRadius::same(9), egui::Stroke::new(1.0_f32, EDGE()), egui::StrokeKind::Inside);
         }
         ui.painter().galley(rect.min + pad, galley, Color32::WHITE);
     }
@@ -3163,7 +3163,7 @@ fn window_frame() -> egui::Frame {
         .fill(FLOAT())
         .corner_radius(CornerRadius::same(16))
         .inner_margin(Margin::same(18))
-        .stroke(egui::Stroke::new(1.0, EDGE()))
+        .stroke(egui::Stroke::new(1.0_f32, EDGE()))
         .shadow(egui::epaint::Shadow {
             offset: [0, 6],
             blur: 22,
@@ -3391,7 +3391,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
     // --- Header (title + status + orb), mirroring Pixal3D. ---
     egui::Frame::new()
         .fill(PANEL())
-        .stroke(egui::Stroke::new(1.0, EDGE()))
+        .stroke(egui::Stroke::new(1.0_f32, EDGE()))
         .corner_radius(CornerRadius::same(18))
         .inner_margin(Margin::symmetric(12, 6))
         .show(ui, |ui| {
@@ -3591,7 +3591,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
         .fill(PANEL())
         .corner_radius(CornerRadius::same(22))
         .inner_margin(Margin::same(12))
-        .stroke(egui::Stroke::new(1.0, EDGE()));
+        .stroke(egui::Stroke::new(1.0_f32, EDGE()));
     // The box stretches downward so the settings + Log row below it (height
     // measured last frame → state.below_h) bottom out exactly at the panel's
     // edge. 24 = the prompt frame's own top+bottom inner margins.
@@ -3780,7 +3780,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
         p.rect_stroke(
             prompt_rect,
             CornerRadius::same(22),
-            egui::Stroke::new(2.0, DROP_BLUE),
+            egui::Stroke::new(2.0_f32, DROP_BLUE),
             egui::StrokeKind::Inside,
         );
         let side = 56.0_f32.min(prompt_rect.height() * 0.5);
@@ -3985,7 +3985,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
             .fill(bg)
             .corner_radius(CornerRadius::same(22))
             .inner_margin(Margin::same(10))
-            .stroke(egui::Stroke::new(1.0, EDGE()))
+            .stroke(egui::Stroke::new(1.0_f32, EDGE()))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 // Same fixed-height well as the Gelbooru downloader console:
@@ -4035,7 +4035,7 @@ fn menu_frame() -> egui::Frame {
         .fill(FLOAT())
         .corner_radius(CornerRadius::same(22))
         .inner_margin(Margin::same(12))
-        .stroke(egui::Stroke::new(1.0, EDGE()))
+        .stroke(egui::Stroke::new(1.0_f32, EDGE()))
 }
 
 /// Round the hover highlight of menu rows (egui's default is square).
@@ -4231,7 +4231,7 @@ fn fetch_indicator(ui: &mut egui::Ui) -> egui::Response {
     // Spinning arc around it (this is only drawn while a fetch is in flight).
     let radius = 11.0;
     let t = ui.input(|i| i.time) as f32;
-    painter.circle_stroke(center, radius, egui::Stroke::new(2.0, ACCENT1().gamma_multiply(0.25)));
+    painter.circle_stroke(center, radius, egui::Stroke::new(2.0_f32, ACCENT1().gamma_multiply(0.25)));
     let start = (t * 3.0) % std::f32::consts::TAU;
     let sweep = std::f32::consts::PI * 0.6;
     let pts: Vec<egui::Pos2> = (0..=24)
@@ -4240,7 +4240,7 @@ fn fetch_indicator(ui: &mut egui::Ui) -> egui::Response {
             center + radius * egui::vec2(a.cos(), a.sin())
         })
         .collect();
-    painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0, ACCENT1())));
+    painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0_f32, ACCENT1())));
     ui.ctx().request_repaint();
     resp
 }
@@ -4311,9 +4311,9 @@ fn aspect_selector(ui: &mut egui::Ui, state: &mut GenerateState) {
 /// on click.
 fn aspect_tile(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, label: &str, dims: &str, selected: bool) -> bool {
     let (fill, stroke) = if selected {
-        (lerp_color(PANEL(), ACCENT1(), 0.14), egui::Stroke::new(2.0, ACCENT1()))
+        (lerp_color(PANEL(), ACCENT1(), 0.14), egui::Stroke::new(2.0_f32, ACCENT1()))
     } else {
-        (PANEL(), egui::Stroke::new(1.0, EDGE()))
+        (PANEL(), egui::Stroke::new(1.0_f32, EDGE()))
     };
     let inner = egui::Frame::new()
         .fill(fill)

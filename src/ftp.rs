@@ -460,7 +460,7 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
                 .fill(FLOAT())
                 .corner_radius(egui::CornerRadius::same(16))
                 .inner_margin(egui::Margin::same(18))
-                .stroke(egui::Stroke::new(1.0, EDGE()))
+                .stroke(egui::Stroke::new(1.0_f32, EDGE()))
                 .shadow(egui::epaint::Shadow {
                     offset: [0, 6],
                     blur: 20,
@@ -521,7 +521,7 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
             egui::Frame::new()
                 .fill(PANEL())
                 .corner_radius(egui::CornerRadius::same(12))
-                .stroke(egui::Stroke::new(1.0, EDGE()))
+                .stroke(egui::Stroke::new(1.0_f32, EDGE()))
                 .inner_margin(egui::Margin::same(8))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -617,7 +617,7 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
                                         ui.painter().hline(
                                             (rect.left() + 32.0)..=rect.right(),
                                             rect.bottom(),
-                                            egui::Stroke::new(1.0, EDGE()),
+                                            egui::Stroke::new(1.0_f32, EDGE()),
                                         );
                                     }
                                 }

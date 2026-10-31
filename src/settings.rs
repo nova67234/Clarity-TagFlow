@@ -409,7 +409,7 @@ pub fn show(
                     // The underline beneath the title (as in the design sketch).
                     let w = ui.available_width() - 10.0;
                     let (line, _) = ui.allocate_exact_size(egui::vec2(w, 1.0), egui::Sense::hover());
-                    ui.painter().hline(line.x_range(), line.center().y, egui::Stroke::new(1.0, hairline()));
+                    ui.painter().hline(line.x_range(), line.center().y, egui::Stroke::new(1.0_f32, hairline()));
                     ui.add_space(12.0);
 
                     ui.spacing_mut().item_spacing.y = 4.0;
@@ -474,7 +474,7 @@ pub fn show(
             ui.painter().vline(
                 rect.left() + 144.0,
                 rect.y_range(),
-                egui::Stroke::new(1.0, hairline()),
+                egui::Stroke::new(1.0_f32, hairline()),
             );
         });
     FRESH.set(false);
@@ -1339,13 +1339,13 @@ pub(crate) fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     let frame = if fresh() {
         egui::Frame::new()
             .fill(card_fill())
-            .stroke(egui::Stroke::new(1.0, hairline()))
+            .stroke(egui::Stroke::new(1.0_f32, hairline()))
             .corner_radius(egui::CornerRadius::same(18))
             .inner_margin(egui::Margin::same(16))
     } else {
         egui::Frame::new()
             .fill(PANEL())
-            .stroke(egui::Stroke::new(1.0, EDGE()))
+            .stroke(egui::Stroke::new(1.0_f32, EDGE()))
             .corner_radius(egui::CornerRadius::same(12))
             .inner_margin(egui::Margin::symmetric(12, 10))
     };
@@ -1395,7 +1395,7 @@ fn color_pill(ui: &mut egui::Ui, rgb: &mut [u8; 3]) -> bool {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(46.0, 18.0), egui::Sense::click());
     let radius = rect.height() / 2.0;
     ui.painter().rect_filled(rect, radius, col);
-    ui.painter().rect_stroke(rect, radius, egui::Stroke::new(1.0, EDGE()), egui::StrokeKind::Inside);
+    ui.painter().rect_stroke(rect, radius, egui::Stroke::new(1.0_f32, EDGE()), egui::StrokeKind::Inside);
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -1454,9 +1454,9 @@ pub(crate) fn row_sep(ui: &mut egui::Ui) {
     ui.add_space(gap);
     let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
     if fresh {
-        ui.painter().hline((r.left() + 4.0)..=(r.right() - 4.0), r.center().y, egui::Stroke::new(1.0, hairline()));
+        ui.painter().hline((r.left() + 4.0)..=(r.right() - 4.0), r.center().y, egui::Stroke::new(1.0_f32, hairline()));
     } else {
-        ui.painter().hline(r.x_range(), r.center().y, egui::Stroke::new(1.0, EDGE()));
+        ui.painter().hline(r.x_range(), r.center().y, egui::Stroke::new(1.0_f32, EDGE()));
     }
     ui.add_space(gap);
 }
@@ -1478,7 +1478,7 @@ pub(crate) fn switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     let track = mix(off, crate::theme::ACCENT1(), t);
     let radius = rect.height() / 2.0;
     ui.painter().rect_filled(rect, radius, track);
-    ui.painter().rect_stroke(rect, radius, egui::Stroke::new(1.0, EDGE()), egui::StrokeKind::Inside);
+    ui.painter().rect_stroke(rect, radius, egui::Stroke::new(1.0_f32, EDGE()), egui::StrokeKind::Inside);
     let x = egui::lerp((rect.left() + 11.0)..=(rect.right() - 11.0), t);
     ui.painter().circle_filled(egui::pos2(x, rect.center().y), 8.0, egui::Color32::WHITE);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1520,7 +1520,7 @@ pub(crate) fn pill_field(ui: &mut egui::Ui, width: f32, edit: egui::TextEdit<'_>
     let ring = if resp.has_focus() { crate::theme::selection_outline() } else { egui::Color32::TRANSPARENT };
     ui.painter().set(
         bg,
-        egui::epaint::RectShape::new(rect, h / 2.0, well_fill(), egui::Stroke::new(1.0, ring), egui::StrokeKind::Inside),
+        egui::epaint::RectShape::new(rect, h / 2.0, well_fill(), egui::Stroke::new(1.0_f32, ring), egui::StrokeKind::Inside),
     );
     resp
 }
@@ -1591,7 +1591,7 @@ pub(crate) fn window_frame() -> egui::Frame {
         .fill(FLOAT())
         .corner_radius(egui::CornerRadius::same(16))
         .inner_margin(egui::Margin::same(18))
-        .stroke(egui::Stroke::new(1.0, EDGE()))
+        .stroke(egui::Stroke::new(1.0_f32, EDGE()))
         .shadow(egui::epaint::Shadow {
             offset: [0, 6],
             blur: 20,
@@ -1606,7 +1606,7 @@ pub(crate) fn window_frame() -> egui::Frame {
 pub(crate) fn fresh_window_frame() -> egui::Frame {
     window_frame()
         .corner_radius(egui::CornerRadius::same(24))
-        .stroke(egui::Stroke::new(1.0, hairline()))
+        .stroke(egui::Stroke::new(1.0_f32, hairline()))
         .shadow(egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: egui::Color32::from_black_alpha(150) })
 }
 

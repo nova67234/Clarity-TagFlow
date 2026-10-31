@@ -442,7 +442,7 @@ impl ModelManager {
         egui::Frame::new()
             .fill(PANEL())
             .corner_radius(egui::CornerRadius::same(22))
-            .stroke(egui::Stroke::new(1.0, EDGE()))
+            .stroke(egui::Stroke::new(1.0_f32, EDGE()))
             .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());

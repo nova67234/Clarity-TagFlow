@@ -310,7 +310,7 @@ pub fn show(
             // with the same faint edge so it still reads as a bar.
             egui::Frame::new()
                 .fill(PANEL())
-                .stroke(egui::Stroke::new(1.0, EDGE()))
+                .stroke(egui::Stroke::new(1.0_f32, EDGE()))
                 .corner_radius(CornerRadius::same(18))
                 .inner_margin(Margin::symmetric(12, 6))
                 .show(ui, |ui| {
@@ -376,7 +376,7 @@ pub fn show(
             egui::Frame::new()
                 .fill(PANEL())
                 .corner_radius(CornerRadius::same(12))
-                .stroke(egui::Stroke::new(1.0, EDGE()))
+                .stroke(egui::Stroke::new(1.0_f32, EDGE()))
                 .inner_margin(Margin::symmetric(6, 6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -445,7 +445,7 @@ pub fn show(
             egui::Frame::new()
                 .fill(PANEL())
                 .corner_radius(CornerRadius::same(12))
-                .stroke(egui::Stroke::new(1.0, EDGE()))
+                .stroke(egui::Stroke::new(1.0_f32, EDGE()))
                 // Vertical padding so the text/caret sits inside the box instead of
                 // poking out the top edge.
                 .inner_margin(Margin::symmetric(8, 6))
@@ -609,7 +609,7 @@ pub fn show(
             let box_resp = egui::Frame::new()
                 .fill(PANEL())
                 .corner_radius(CornerRadius::same(22))
-                .stroke(egui::Stroke::new(1.0, EDGE()))
+                .stroke(egui::Stroke::new(1.0_f32, EDGE()))
                 .inner_margin(Margin::same(10))
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
@@ -865,7 +865,7 @@ fn tag_chip(ui: &mut egui::Ui, text: &str, selected: bool, ai_new: bool, flash: 
         ui.painter().rect_filled(rect, radius, fill);
         if !selected {
             let edge = if ai_new { AI_NEW_VIOLET } else { EDGE() };
-            ui.painter().rect_stroke(rect, radius, egui::Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+            ui.painter().rect_stroke(rect, radius, egui::Stroke::new(1.0_f32, edge), egui::StrokeKind::Inside);
         }
         ui.painter().galley(rect.min + pad, galley, ink);
     }
@@ -897,7 +897,7 @@ fn edit_chip(ui: &mut egui::Ui, buf: &mut String) -> egui::Response {
     ui.painter().rect_stroke(
         rect,
         radius,
-        egui::Stroke::new(1.0, selection_outline()),
+        egui::Stroke::new(1.0_f32, selection_outline()),
         egui::StrokeKind::Inside,
     );
     // A non-allocating child ui for the editor — `ui.put` would allocate the
@@ -980,7 +980,7 @@ fn drop_caret(ui: &egui::Ui, rects: &[egui::Rect], idx: usize) {
     };
     ui.painter().line_segment(
         [egui::pos2(x, top), egui::pos2(x, bottom)],
-        egui::Stroke::new(2.0, selection_outline()),
+        egui::Stroke::new(2.0_f32, selection_outline()),
     );
 }
 

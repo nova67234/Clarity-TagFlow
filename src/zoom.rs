@@ -555,7 +555,7 @@ impl ZoomState {
                 painter.rect_stroke(
                     r,
                     CornerRadius::same(3),
-                    Stroke::new(2.0, d.color),
+                    Stroke::new(2.0_f32, d.color),
                     egui::StrokeKind::Outside,
                 );
                 // Label chip pinned to the box's top-left (falls inside the box
@@ -666,7 +666,7 @@ impl ZoomState {
                 painter.rect_stroke(
                     cr,
                     CornerRadius::ZERO,
-                    Stroke::new(1.5, Color32::from_gray(240)),
+                    Stroke::new(1.5_f32, Color32::from_gray(240)),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -1131,7 +1131,7 @@ pub(crate) fn menu_frame() -> egui::Frame {
     egui::Frame::new()
         // Glass in the Glass themes, like the panels (see FLOAT).
         .fill(crate::theme::FLOAT())
-        .stroke(Stroke::new(1.0, crate::theme::EDGE()))
+        .stroke(Stroke::new(1.0_f32, crate::theme::EDGE()))
         .corner_radius(CornerRadius::same(12))
         .inner_margin(egui::Margin::same(5))
         .shadow(egui::epaint::Shadow {
@@ -1199,7 +1199,7 @@ pub(crate) fn menu_sep(ui: &mut egui::Ui) {
     ui.painter().hline(
         (r.left() + 6.0)..=(r.right() - 6.0),
         r.center().y,
-        Stroke::new(1.0, crate::theme::EDGE()),
+        Stroke::new(1.0_f32, crate::theme::EDGE()),
     );
     ui.add_space(2.0);
 }

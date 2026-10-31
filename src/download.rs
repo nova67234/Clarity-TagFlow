@@ -768,7 +768,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
                     .fill(crate::theme::console_bg())
                     .corner_radius(egui::CornerRadius::same(22))
                     .inner_margin(egui::Margin::same(10))
-                    .stroke(egui::Stroke::new(1.0, EDGE()))
+                    .stroke(egui::Stroke::new(1.0_f32, EDGE()))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         egui::ScrollArea::vertical()
@@ -1042,7 +1042,7 @@ fn hero_card(ui: &mut egui::Ui, state: &mut DownloaderState) {
     egui::Frame::new()
         .fill(PANEL())
         .corner_radius(egui::CornerRadius::same(18))
-        .stroke(egui::Stroke::new(1.0, EDGE()))
+        .stroke(egui::Stroke::new(1.0_f32, EDGE()))
         .inner_margin(egui::Margin::symmetric(14, 12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1216,7 +1216,7 @@ fn download_indicator(ui: &mut egui::Ui, running: bool, done: bool) {
         let radius = size * 0.5 - 1.0;
         let t = ui.input(|i| i.time) as f32;
         // Faint full ring underneath, then a brighter rotating arc on top.
-        painter.circle_stroke(center, radius, egui::Stroke::new(2.0, ACCENT1().gamma_multiply(0.25)));
+        painter.circle_stroke(center, radius, egui::Stroke::new(2.0_f32, ACCENT1().gamma_multiply(0.25)));
         let start = (t * 3.0) % std::f32::consts::TAU;
         let sweep = std::f32::consts::PI * 0.6;
         let pts: Vec<egui::Pos2> = (0..=24)
@@ -1225,7 +1225,7 @@ fn download_indicator(ui: &mut egui::Ui, running: bool, done: bool) {
                 center + radius * egui::vec2(a.cos(), a.sin())
             })
             .collect();
-        painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0, ACCENT1())));
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0_f32, ACCENT1())));
         ui.ctx().request_repaint(); // keep the spinner animating
     }
 
@@ -1247,7 +1247,7 @@ fn status_capsule(ui: &mut egui::Ui, api: u8) {
     };
     egui::Frame::new()
         .fill(FIELD())
-        .stroke(egui::Stroke::new(1.0, EDGE()))
+        .stroke(egui::Stroke::new(1.0_f32, EDGE()))
         .corner_radius(egui::CornerRadius::same(10))
         .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
@@ -1291,7 +1291,7 @@ fn section_card(
         .fill(PANEL())
         .corner_radius(egui::CornerRadius::same(14))
         .inner_margin(egui::Margin::symmetric(12, 10))
-        .stroke(egui::Stroke::new(1.0, EDGE()))
+        .stroke(egui::Stroke::new(1.0_f32, EDGE()))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui);
@@ -1326,7 +1326,7 @@ fn type_chip(ui: &mut egui::Ui, on: &mut bool, icon: egui::ImageSource<'_>, labe
         };
         ui.painter().rect_filled(rect, r, fill);
         if !*on {
-            ui.painter().rect_stroke(rect, r, egui::Stroke::new(1.0, EDGE()), egui::StrokeKind::Inside);
+            ui.painter().rect_stroke(rect, r, egui::Stroke::new(1.0_f32, EDGE()), egui::StrokeKind::Inside);
         }
         let icon_rect = egui::Rect::from_center_size(
             egui::pos2(rect.left() + pad_x + icon_s / 2.0, rect.center().y),
@@ -1366,7 +1366,7 @@ fn opt_chip(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
         };
         ui.painter().rect_filled(rect, r, fill);
         if !*on {
-            ui.painter().rect_stroke(rect, r, egui::Stroke::new(1.0, EDGE()), egui::StrokeKind::Inside);
+            ui.painter().rect_stroke(rect, r, egui::Stroke::new(1.0_f32, EDGE()), egui::StrokeKind::Inside);
         }
         let text_pos = egui::pos2(rect.left() + pad_x, rect.center().y - galley.size().y / 2.0);
         ui.painter().galley(text_pos, galley, ink);

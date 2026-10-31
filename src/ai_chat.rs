@@ -518,7 +518,7 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                 let drop_h = 8.0 * row_h + 44.0;
                 egui::Frame::new()
                     .fill(DROP_BLUE.gamma_multiply(0.18))
-                    .stroke(egui::Stroke::new(1.5, DROP_BLUE))
+                    .stroke(egui::Stroke::new(1.5_f32, DROP_BLUE))
                     .corner_radius(egui::CornerRadius::same(24))
                     .inner_margin(egui::Margin::symmetric(12, 10))
                     .show(ui, |ui| {
@@ -557,7 +557,7 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
             // card visually above the chat.
             egui::Frame::new()
                 .fill(PANEL())
-                .stroke(egui::Stroke::new(1.0, EDGE()))
+                .stroke(egui::Stroke::new(1.0_f32, EDGE()))
                 .corner_radius(egui::CornerRadius::same(24))
                 .inner_margin(egui::Margin::symmetric(12, 10))
                 .shadow(egui::epaint::Shadow {
@@ -949,7 +949,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
             if llm.editing == Some((chat_id, index)) {
                 egui::Frame::new()
                     .fill(ui.visuals().extreme_bg_color)
-                    .stroke(egui::Stroke::new(1.0, EDGE()))
+                    .stroke(egui::Stroke::new(1.0_f32, EDGE()))
                     .corner_radius(egui::CornerRadius::same(16))
                     .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
@@ -2166,7 +2166,7 @@ fn paint_cube(painter: &egui::Painter, c: egui::Pos2, a: f32, col: egui::Color32
     let tint = |col: egui::Color32| col.gamma_multiply(alpha);
     let top = col.lerp_to_gamma(egui::Color32::WHITE, 0.35);
     let right = col.lerp_to_gamma(egui::Color32::BLACK, 0.35);
-    let edge = egui::Stroke::new(0.8, tint(col.lerp_to_gamma(egui::Color32::WHITE, 0.55)));
+    let edge = egui::Stroke::new(0.8_f32, tint(col.lerp_to_gamma(egui::Color32::WHITE, 0.55)));
     painter.add(egui::Shape::convex_polygon(
         vec![p(0.0, -a), p(w, -a / 2.0), p(0.0, 0.0), p(-w, -a / 2.0)],
         tint(top),
@@ -2238,7 +2238,7 @@ fn thinking_slider(ui: &mut egui::Ui, level: &mut crate::llm::ThinkLevel) -> egu
         // Off: a faint outline where the pile would be.
         let c = base;
         let w = a * 0.87;
-        let ghost = egui::Stroke::new(1.0, MUTED().gamma_multiply(0.6 * dim));
+        let ghost = egui::Stroke::new(1.0_f32, MUTED().gamma_multiply(0.6 * dim));
         painter.add(egui::Shape::closed_line(
             vec![
                 c + egui::vec2(0.0, -a), c + egui::vec2(w, -a / 2.0), c + egui::vec2(w, a / 2.0),

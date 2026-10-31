@@ -1286,7 +1286,7 @@ impl ViewerApp {
                         .fill(FLOAT())
                         .corner_radius(CornerRadius::same(16))
                         .inner_margin(Margin::same(18))
-                        .stroke(Stroke::new(1.0, EDGE()))
+                        .stroke(Stroke::new(1.0_f32, EDGE()))
                         .shadow(egui::epaint::Shadow {
                             offset: [0, 6],
                             blur: 20,
@@ -2901,7 +2901,7 @@ pub(crate) fn card_frame(radius: u8) -> egui::Frame {
         .fill(PANEL())
         .corner_radius(CornerRadius::same(radius))
         .inner_margin(Margin::same(12))
-        .stroke(Stroke::new(1.0, EDGE()))
+        .stroke(Stroke::new(1.0_f32, EDGE()))
         .shadow(egui::epaint::Shadow {
             offset: [0, 4],
             blur: 14,

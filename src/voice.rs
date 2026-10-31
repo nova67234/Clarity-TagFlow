@@ -852,7 +852,7 @@ pub fn recorder_window(ctx: &egui::Context, voice: &mut VoiceState) {
                     } else {
                         (
                             egui::CornerRadius::same(16),
-                            egui::Stroke::new(1.0, EDGE()),
+                            egui::Stroke::new(1.0_f32, EDGE()),
                         )
                     };
                     // Opaque: in the Glass theme PANEL is see-through, and
@@ -893,7 +893,7 @@ pub fn recorder_window(ctx: &egui::Context, voice: &mut VoiceState) {
                         ui.painter().circle_stroke(
                             center,
                             17.0,
-                            egui::Stroke::new(1.5, if recording { red } else { EDGE() }),
+                            egui::Stroke::new(1.5_f32, if recording { red } else { EDGE() }),
                         );
                         if recording {
                             let now = ui.input(|i| i.time);
@@ -901,7 +901,7 @@ pub fn recorder_window(ctx: &egui::Context, voice: &mut VoiceState) {
                             ui.painter().circle_stroke(
                                 center,
                                 20.0,
-                                egui::Stroke::new(2.0, red.gamma_multiply(pulse)),
+                                egui::Stroke::new(2.0_f32, red.gamma_multiply(pulse)),
                             );
                         }
                         // The red core: full circle when idle, stop square when live.

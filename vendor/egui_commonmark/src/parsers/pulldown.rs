@@ -592,6 +592,11 @@ impl CommonMarkViewerInternal {
             // here beneath each text row instead — one chip per visual row,
             // so a span that wraps gets a clean chip on every line.
             let chip = ui.visuals().code_bg_color;
+            // PATCH(Clarity TagFlow): a span egui would wrap wrongly here
+            // starts on the next row instead — see `wraps_badly`.
+            if wraps_badly(ui, rich_text.clone()) {
+                ui.end_row();
+            }
             let (pos, galley, response) = egui::Label::new(rich_text).layout_in_ui(ui);
             let painter = ui.painter();
             for row in &galley.rows {
@@ -606,7 +611,7 @@ impl CommonMarkViewerInternal {
                 egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), &text)
             });
         } else if !text_has_emoji(&text) {
-            ui.label(rich_text);
+            label_run(ui, &self.text_style, &text, rich_text);
         } else {
             // PATCH(Clarity TagFlow): render color emoji as inline Twemoji
             // SVG images — egui's font rasterizer is monochrome-only, so
@@ -617,7 +622,7 @@ impl CommonMarkViewerInternal {
                 match twemoji_svg(g) {
                     Some(asset) => {
                         if !run.is_empty() {
-                            ui.label(self.text_style.to_richtext(ui, &run));
+                            label_run(ui, &self.text_style, &run, self.text_style.to_richtext(ui, &run));
                             run.clear();
                         }
                         // Sized slightly above the font so it reads at the
@@ -648,7 +653,7 @@ impl CommonMarkViewerInternal {
                 }
             }
             if !run.is_empty() {
-                ui.label(self.text_style.to_richtext(ui, &run));
+                label_run(ui, &self.text_style, &run, self.text_style.to_richtext(ui, &run));
             }
         }
     }
@@ -890,4 +895,43 @@ fn twemoji_svg(grapheme: &str) -> Option<&'static twemoji_assets::svg::SvgTwemoj
 fn text_has_emoji(text: &str) -> bool {
     unicode_segmentation::UnicodeSegmentation::graphemes(text, true)
         .any(|g| twemoji_svg(g).is_some())
+}
+
+/// Where egui would break a line: whitespace, except a no-break space.
+fn breaks_line(c: char) -> bool {
+    c.is_whitespace() && c != '\u{a0}'
+}
+
+/// PATCH(Clarity TagFlow): a text run as one label (`rich`, the run styled)
+/// — or, where egui would wrap that label wrongly (see `wraps_badly`: a URL
+/// after "**Full Changelog**:"), as one label per word. A label holding a
+/// single word wraps correctly, and the words read and copy the same.
+fn label_run(ui: &mut Ui, style: &Style, text: &str, rich: egui::RichText) {
+    if !wraps_badly(ui, rich.clone()) {
+        ui.label(rich);
+        return;
+    }
+    for piece in word_pieces(text) {
+        ui.label(style.to_richtext(ui, piece));
+    }
+}
+
+/// `text` cut into its leading whitespace (if any), then each word with the
+/// whitespace after it.
+fn word_pieces(text: &str) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut after_space = true;
+    for (i, c) in text.char_indices() {
+        let space = breaks_line(c);
+        if !space && after_space && i > start {
+            pieces.push(&text[start..i]);
+            start = i;
+        }
+        after_space = space;
+    }
+    if start < text.len() {
+        pieces.push(&text[start..]);
+    }
+    pieces
 }

@@ -210,7 +210,7 @@ pub fn search_pill(
                 // Half the pill height → fully rounded ends, like the mock.
                 .corner_radius(CornerRadius::same((pill_h / 2.0) as u8))
                 .inner_margin(Margin::symmetric(16, 8))
-                .stroke(Stroke::new(1.0, EDGE()))
+                .stroke(Stroke::new(1.0_f32, EDGE()))
                 .shadow(egui::epaint::Shadow {
                     offset: [0, 4],
                     blur: 16,
@@ -382,7 +382,7 @@ fn tile(
             radius,
             // Same weight + colour rules as the browser tiles (accent blue,
             // Aurora pink).
-            Stroke::new(3.0, crate::theme::selection_outline()),
+            Stroke::new(3.0_f32, crate::theme::selection_outline()),
             egui::StrokeKind::Inside,
         );
     }

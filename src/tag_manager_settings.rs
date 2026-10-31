@@ -109,7 +109,7 @@ fn segmented_control(ui: &mut egui::Ui, current: &mut usize) {
         track,
         egui::CornerRadius::same(10),
         FIELD(),
-        egui::Stroke::new(1.0, EDGE()),
+        egui::Stroke::new(1.0_f32, EDGE()),
         egui::StrokeKind::Inside,
     );
 

@@ -21,9 +21,12 @@ pub const MODEL_FILE: &str = "ggml-base.bin";
 
 /// Cap a dictation at two minutes — Whisper transcribes the whole clip in
 /// one go, so an unbounded recording would mean unbounded memory and wait.
+/// (Only the capture, which needs the `llm` feature, reads these two.)
+#[cfg_attr(not(feature = "llm"), allow(dead_code))]
 const MAX_RECORD_SECS: u64 = 120;
 
 /// Whisper's fixed input format: 16 kHz mono f32 PCM.
+#[cfg_attr(not(feature = "llm"), allow(dead_code))]
 const WHISPER_RATE: u32 = 16_000;
 
 pub fn installed() -> bool {

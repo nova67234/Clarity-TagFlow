@@ -739,7 +739,7 @@ fn hud_stats(ui: &mut egui::Ui, sections: &[HudSection]) {
 
         if icons {
             let c = egui::pos2(x + HUD_ICON / 2.0, cy);
-            painter.circle(c, HUD_ICON / 2.0 - 0.5, s.color.gamma_multiply(0.15), Stroke::new(1.0, s.color.gamma_multiply(0.3)));
+            painter.circle(c, HUD_ICON / 2.0 - 0.5, s.color.gamma_multiply(0.15), Stroke::new(1.0_f32, s.color.gamma_multiply(0.3)));
             painter.text(c, egui::Align2::CENTER_CENTER, s.name, prop(9.0), s.color);
             x += HUD_ICON + HUD_ICON_GAP;
         }
@@ -1026,7 +1026,7 @@ fn popup_frame() -> egui::Frame {
         .fill(FLOAT())
         .corner_radius(CornerRadius::same(22))
         .inner_margin(egui::Margin::same(18))
-        .stroke(Stroke::new(1.0, EDGE()))
+        .stroke(Stroke::new(1.0_f32, EDGE()))
         .shadow(egui::epaint::Shadow {
             offset: [0, 6],
             blur: 20,

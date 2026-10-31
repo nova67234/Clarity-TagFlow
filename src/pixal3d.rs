@@ -163,7 +163,7 @@ fn show_body(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<
     // --- Header bar (title + status + orb), mirroring the Tag Manager. ---
     egui::Frame::new()
         .fill(PANEL())
-        .stroke(egui::Stroke::new(1.0, EDGE()))
+        .stroke(egui::Stroke::new(1.0_f32, EDGE()))
         .corner_radius(CornerRadius::same(18))
         .inner_margin(Margin::symmetric(12, 6))
         .show(ui, |ui| {
@@ -385,7 +385,7 @@ fn show_body(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<
             .fill(log_bg)
             .corner_radius(CornerRadius::same(22))
             .inner_margin(Margin::same(10))
-            .stroke(egui::Stroke::new(1.0, EDGE()))
+            .stroke(egui::Stroke::new(1.0_f32, EDGE()))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 egui::ScrollArea::vertical()

@@ -168,7 +168,7 @@ fn squiggle(painter: &egui::Painter, galley_pos: Pos2, x1: f32, x2: f32, bottom:
         x += 2.0;
         up = !up;
     }
-    painter.add(Shape::line(points, Stroke::new(1.0, SQUIGGLE)));
+    painter.add(Shape::line(points, Stroke::new(1.0_f32, SQUIGGLE)));
 }
 
 /// Closest dictionary words by Levenshtein distance — same filters as the Java

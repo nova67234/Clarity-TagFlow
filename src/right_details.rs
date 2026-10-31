@@ -1025,7 +1025,7 @@ pub fn show(
                                     .corner_radius(radius)
                                     // Faint edge so the PANEL-on-PANEL box still
                                     // reads (same as the Tag Manager's boxes).
-                                    .stroke(egui::Stroke::new(1.0, EDGE()))
+                                    .stroke(egui::Stroke::new(1.0_f32, EDGE()))
                                     .inner_margin(egui::Margin::same(12))
                                     .show(ui, |ui| {
                                         ui.set_height(inner_h); // fixed — never grows with text
@@ -1179,7 +1179,7 @@ pub(crate) fn image_details_section(ui: &mut egui::Ui, meta: &ImageMeta) {
         .inner_margin(egui::Margin::symmetric(16, 12))
         // Faint edge so the PANEL-on-PANEL box still reads (same as the tag box
         // and the Tag Manager's boxes).
-        .stroke(egui::Stroke::new(1.0, EDGE()));
+        .stroke(egui::Stroke::new(1.0_f32, EDGE()));
 
     frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -1256,7 +1256,7 @@ fn detail_color_row(ui: &mut egui::Ui, label: &str, colors: &[egui::Color32]) {
                     ui.painter().rect_stroke(
                         rect,
                         corner_radius,
-                        egui::Stroke::new(1.0, EDGE()),
+                        egui::Stroke::new(1.0_f32, EDGE()),
                         egui::StrokeKind::Inside,
                     );
                 }

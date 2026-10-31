@@ -109,12 +109,14 @@ fn vlc_runtime_available() -> bool {
 
 /// True when the libVLC runtime is present (probing sets up the DLL search
 /// path as a side effect). Public so the AI chat can explain a missing VLC
-/// instead of failing opaquely.
+/// instead of failing opaquely (the chat's only caller needs `llm`).
 #[cfg(feature = "vlc")]
+#[cfg_attr(not(feature = "llm"), allow(dead_code))]
 pub fn vlc_available() -> bool {
     vlc_runtime_available()
 }
 #[cfg(not(feature = "vlc"))]
+#[cfg_attr(not(feature = "llm"), allow(dead_code))]
 pub fn vlc_available() -> bool {
     false
 }

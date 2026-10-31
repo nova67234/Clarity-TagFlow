@@ -215,6 +215,51 @@ impl Style {
     }
 }
 
+/// PATCH(Clarity TagFlow): true when an egui `Label` holding `text`, added at
+/// the cursor, would be laid out wrongly. egui's line breaking (epaint's
+/// `line_break`, unchanged through 0.37) keeps a label's first-row indent
+/// after its first wrap: a label that starts partway along a wrapping row,
+/// wraps, and then reaches a word wider than the whole row has that word's
+/// row shifted left by the indent — drawn past the column's left edge, and
+/// at some widths making the label wider than the column, which widens
+/// whatever holds it. ("**Full Changelog**: https://github.com/…/compare/…"
+/// ends every GitHub release note.) This lays the text out exactly as
+/// `Label::layout_in_ui` would — the same job, so the label's own layout is
+/// then a cache hit — and looks for the tell: when a label starting partway
+/// along a row gives up that row, egui leaves an empty row, which is fine as
+/// the first row and is the bug anywhere else.
+pub fn wraps_badly(ui: &Ui, text: impl Into<egui::WidgetText>) -> bool {
+    let layout = ui.layout();
+    let available_width = ui.available_width();
+    let indent = available_width - ui.available_size_before_wrap().x;
+    let label_wraps_here = ui.wrap_mode() == egui::TextWrapMode::Wrap
+        && layout.main_dir() == egui::Direction::LeftToRight
+        && layout.main_wrap()
+        && available_width.is_finite();
+    if !label_wraps_here || indent <= 0.0 {
+        return false;
+    }
+    let mut job = std::sync::Arc::unwrap_or_clone(text.into().into_layout_job(
+        ui.style(),
+        egui::FontSelection::Default,
+        ui.text_valign(),
+    ));
+    job.wrap.max_width = available_width;
+    job.first_row_min_height = ui.cursor().height();
+    job.halign = egui::Align::Min;
+    job.justify = false;
+    if let Some(first) = job.sections.first_mut() {
+        first.leading_space = indent;
+    }
+    let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(job));
+    let last = galley.rows.len().saturating_sub(1);
+    galley
+        .rows
+        .iter()
+        .enumerate()
+        .any(|(i, row)| (1..last).contains(&i) && row.row.glyphs.is_empty() && !row.ends_with_newline)
+}
+
 #[derive(Default)]
 pub struct Link {
     pub destination: String,
@@ -238,6 +283,11 @@ impl Link {
                 egui::FontSelection::Default,
                 egui::Align::LEFT,
             );
+        }
+        // PATCH(Clarity TagFlow): link text egui would wrap wrongly here
+        // starts on the next row instead — see `wraps_badly`.
+        if wraps_badly(ui, layout_job.clone()) {
+            ui.end_row();
         }
         if cache.link_hooks().contains_key(&destination) {
             let ui_link = ui.link(layout_job);

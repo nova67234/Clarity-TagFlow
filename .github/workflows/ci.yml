@@ -22,6 +22,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       # Same system libs the Linux release build links against (eframe/egui, rfd,
       # native-tls).
@@ -41,6 +43,17 @@ jobs:
       # its smoke test needs model files on disk and is #[ignore]d too.
       - name: Check + test (no VLC)
         run: cargo test --all-targets --no-default-features --features llm,avif
+      # Lints: clippy over the same code (tests included), then over a build
+      # without the local AI, which is what the macOS and Windows jobs compile
+      # (code only `llm` uses shows up as unused there). Any warning, rustc's
+      # or clippy's, fails the step. The second run also denies rustc warnings
+      # in the vendored crates (vendor/), which clippy's own `-D warnings`
+      # doesn't reach: they aren't workspace members. After the tests, so a
+      # lint never hides a test result.
+      - name: Clippy
+        run: |
+          cargo clippy --all-targets --no-default-features --features llm,avif -- -D warnings
+          RUSTFLAGS="-D warnings" cargo clippy --all-targets --no-default-features --features avif -- -D warnings
 
   macos:
     runs-on: macos-15 # Apple Silicon, like the release build.

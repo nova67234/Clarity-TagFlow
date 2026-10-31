@@ -396,6 +396,8 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
             Some(v) => ui.label(RichText::new(format!("Installed: {v}")).color(MUTED()).size(12.0)),
             None => ui.label(RichText::new("Not installed.").color(MUTED()).size(12.0)),
         };
+        // The release notes, shown below the update's progress.
+        let mut notes = None;
         if let Some(r) = &state.result
             && let (Some(inst), Some(latest)) = (&r.comfy_installed, &r.comfy_latest) {
                 if is_newer(&latest.tag, inst) {
@@ -407,8 +409,13 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("Update available — {}", latest.tag)).color(GREEN).strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if comfy_updating {
-                                ui.add(egui::Spinner::new().size(18.0).color(ACCENT1()));
+                            // Also while the re-check after a successful
+                            // update runs: until it lands, the arrow would
+                            // start the same update over.
+                            if comfy_updating || (checking && state.comfy_done == Some(true)) {
+                                // In the arrow's 20-point slot, so the row
+                                // keeps its height.
+                                ui.add_sized([20.0, 20.0], egui::Spinner::new().size(18.0).color(ACCENT1()));
                             } else {
                                 let arrow = egui::include_image!("../icons/arrow_circle_down.svg");
                                 let r = ui
@@ -428,24 +435,21 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
                             }
                         });
                     });
-                    ui.add_space(6.0);
                     if !latest.notes.trim().is_empty() {
-                        ui.label(RichText::new("What's new").color(TEXT()).strong().size(12.0));
-                        ui.add_space(2.0);
-                        notes_box(ui, "comfy_notes", &latest.notes, &mut state.md_cache);
+                        notes = Some(&latest.notes);
                     }
                 } else {
                     ui.add_space(2.0);
                     ui.label(RichText::new("ComfyUI is up to date.").color(MUTED()).size(12.0));
                 }
             }
-        // Live progress / result of the in-place update.
+        // Live progress / result of the in-place update, right under the
+        // arrow that starts it — above the notes, so it's in view.
         if comfy_updating || state.comfy_done.is_some() {
             ui.add_space(6.0);
-            if let Some(last) = state.comfy_log.last() {
-                ui.label(RichText::new(last).color(MUTED()).size(11.0));
-            }
+            log_box(ui, "comfy_update_log", &state.comfy_log);
             if let Some(ok) = state.comfy_done {
+                ui.add_space(4.0);
                 let (txt, col) = if ok {
                     ("ComfyUI updated.", GREEN)
                 } else {
@@ -453,6 +457,12 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
                 };
                 ui.label(RichText::new(txt).color(col).size(11.5));
             }
+        }
+        if let Some(notes) = notes {
+            ui.add_space(6.0);
+            ui.label(RichText::new("What's new").color(TEXT()).strong().size(12.0));
+            ui.add_space(2.0);
+            notes_box(ui, "comfy_notes", notes, &mut state.md_cache);
         }
     });
 
@@ -498,24 +508,44 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
         }
 }
 
+/// The release notes box's height once the notes are longer than that.
+const NOTES_H: f32 = 150.0;
+/// The ComfyUI update log's height.
+const LOG_H: f32 = 96.0;
+
 /// A bordered, scrollable box for release notes, rendered as Markdown (both
 /// GitHub release bodies are Markdown: headings, bullets, bold, links) in
 /// the tab's small muted text, with bold and headings in the normal ink.
-fn notes_box(ui: &mut egui::Ui, id: &str, text: &str, cache: &mut egui_commonmark::CommonMarkCache) {
+/// Its width is the tab's, whatever the notes hold: text wraps to it, and
+/// anything that can't wrap (a wide table) scrolls inside the box instead
+/// of widening the Settings window.
+fn notes_box(
+    ui: &mut egui::Ui,
+    id: &str,
+    text: &str,
+    cache: &mut egui_commonmark::CommonMarkCache,
+) -> egui::scroll_area::ScrollAreaOutput<()> {
     let body = text.trim();
     let body = if body.is_empty() { "(no notes provided)" } else { body };
     egui::Frame::new()
         .fill(PANEL())
         .corner_radius(CornerRadius::same(22))
         .inner_margin(Margin::same(8))
-        .stroke(Stroke::new(1.0, EDGE()))
+        .stroke(Stroke::new(1.0_f32, EDGE()))
         .show(ui, |ui| {
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::both()
                 .id_salt(id)
-                .max_height(150.0)
+                .max_height(NOTES_H)
+                // Long notes take the full height wherever the box sits in
+                // the tab (near the bottom of the view it would shrink).
+                .min_scrolled_height(NOTES_H)
                 .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
+                .show_viewport(ui, |ui, viewport| {
+                    // The visible width, less a float hair: the area egui
+                    // hands the content is rounded to whole pixels and can
+                    // be a fraction wider, which (at 125% or 175% scaling)
+                    // would bring up a sideways scrollbar for plain text.
+                    ui.set_width(viewport.width() - 0.01);
                     let s = ui.style_mut();
                     for (style, size) in [
                         (egui::TextStyle::Body, 12.0),
@@ -533,6 +563,34 @@ fn notes_box(ui: &mut egui::Ui, id: &str, text: &str, cache: &mut egui_commonmar
                     ui.push_id(id, |ui| {
                         egui_commonmark::CommonMarkViewer::new().show(ui, cache, body);
                     });
+                })
+        })
+        .inner
+}
+
+/// A console well (the Generate panel's Log look) for a running job's
+/// output, holding at the newest line. Its size is fixed — a long line wraps
+/// inside it — so pip's long lines don't make the tab grow and shrink as
+/// they stream in, and the whole log stays readable afterwards.
+fn log_box(ui: &mut egui::Ui, id: &str, lines: &[String]) {
+    egui::Frame::new()
+        .fill(crate::theme::console_bg())
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(Margin::same(8))
+        .stroke(Stroke::new(1.0_f32, EDGE()))
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt(id)
+                .max_height(LOG_H)
+                .min_scrolled_height(LOG_H)
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    // Keep scrolling while a text selection is dragged past the edge.
+                    crate::drag_select_autoscroll(ui);
+                    for line in lines {
+                        ui.label(RichText::new(line).color(TEXT()).monospace().size(11.0));
+                    }
                 });
         });
 }
@@ -588,6 +646,177 @@ fn flash_button_rounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What laying something out in a column produced.
+    struct Laid {
+        column: egui::Rect,
+        /// The rect the contents took.
+        used: egui::Rect,
+        /// Left and right ends of the text drawn (glyphs can be drawn outside
+        /// the rect their label took — that's the wrap bug below).
+        text: (f32, f32),
+    }
+
+    impl Laid {
+        fn within(&self, x: f32) -> bool {
+            x >= self.column.left() - 0.5 && x <= self.column.right() + 0.5
+        }
+        fn used_inside(&self) -> bool {
+            self.within(self.used.left()) && self.within(self.used.right())
+        }
+        fn text_inside(&self) -> bool {
+            self.within(self.text.0) && self.within(self.text.1)
+        }
+    }
+
+    /// Lays `add` out in a `width`-point column (two frames, so scroll areas
+    /// settle).
+    fn lay_out(width: f32, add: impl FnMut(&mut egui::Ui)) -> Laid {
+        lay_out_at(egui::Rect::from_min_size(egui::pos2(100.0, 20.0), egui::vec2(width, 2000.0)), 1.0, add)
+    }
+
+    /// Lays `add` out in `column` at `ppp` pixels per point.
+    fn lay_out_at(column: egui::Rect, ppp: f32, mut add: impl FnMut(&mut egui::Ui)) -> Laid {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(ppp);
+        egui_extras::install_image_loaders(&ctx);
+        let mut used = egui::Rect::NOTHING;
+        let mut text = (f32::INFINITY, f32::NEG_INFINITY);
+        for _ in 0..2 {
+            let out = ctx.run_ui(Default::default(), |ui| {
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(column));
+                add(&mut child);
+                used = child.min_rect();
+            });
+            text = (f32::INFINITY, f32::NEG_INFINITY);
+            for clipped in &out.shapes {
+                if let egui::Shape::Text(t) = &clipped.shape {
+                    for placed in &t.galley.rows {
+                        for g in &placed.row.glyphs {
+                            let x = t.pos.x + placed.pos.x + g.pos.x;
+                            text = (text.0.min(x), text.1.max(x + g.advance_width));
+                        }
+                    }
+                }
+            }
+        }
+        Laid { column, used, text }
+    }
+
+    /// GitHub's generated release notes end with "**Full Changelog**:
+    /// <compare URL>". A word wider than the column, in a label that starts
+    /// partway along a line, hit egui's wrap bug (see `wraps_badly` in the
+    /// vendored egui_commonmark_backend): the word's row was drawn left of
+    /// the column, and at some widths the notes also grew wider than it — so
+    /// Settings widened whenever ComfyUI had an update. Text, inline code and
+    /// link text each take their own path through the viewer.
+    #[test]
+    fn markdown_long_words_stay_in_their_column() {
+        let changelog = "https://github.com/comfyanonymous/ComfyUI/compare/v0.3.65...v0.3.66";
+        let notes = format!(
+            "## What's Changed\n\
+             * Faster loading by @someone in https://github.com/comfyanonymous/ComfyUI/pull/10340\n\n\
+             **Full Changelog**: {changelog}\n\n\
+             *Moved*: C:\\ComfyUI\\python_embeded\\Lib\\site-packages\\torch\\lib\\torch_cuda.dll, and \
+             with an emoji 🎉 then https://github.com/comfyanonymous/ComfyUI/compare/v0.3.63...v0.3.64\n\n\
+             Run **this**: `pip install https://download.pytorch.org/whl/cu128/torch-2.8.0%2Bcu128-cp312-cp312-win_amd64.whl` \
+             now.\n\n\
+             See [the full changelog at {changelog}]({changelog}) too."
+        );
+        let mut cache = egui_commonmark::CommonMarkCache::default();
+        // The Updates tab's notes are about 326 points wide; the bug shows
+        // differently at other widths.
+        for width in [250.0, 300.0, 326.0, 400.0] {
+            let laid = lay_out(width, |ui| {
+                egui_commonmark::CommonMarkViewer::new().show(ui, &mut cache, &notes);
+            });
+            assert!(laid.used_inside(), "{width}: {:?} spills out of {:?}", laid.used, laid.column);
+            assert!(laid.text_inside(), "{width}: text drawn at {:?}, out of {:?}", laid.text, laid.column);
+        }
+    }
+
+    /// Whatever the notes hold, their box keeps to the tab's width: a table
+    /// too wide to wrap scrolls inside it instead of widening Settings.
+    #[test]
+    fn notes_box_keeps_to_its_column() {
+        let notes = "| Package | Old | New |\n|---|---|---|\n\
+            | comfyui-frontend-package-with-a-long-name | 1.28.7-with-a-long-suffix | 1.28.8-with-a-long-suffix |\n";
+        let mut cache = egui_commonmark::CommonMarkCache::default();
+        let laid = lay_out(300.0, |ui| {
+            notes_box(ui, "notes", notes, &mut cache);
+        });
+        assert!(laid.used_inside(), "{:?} spills out of {:?}", laid.used, laid.column);
+    }
+
+    /// Long notes fill the box's full height even with little room left
+    /// below it in the tab, where the box used to shrink.
+    #[test]
+    fn notes_box_keeps_its_height() {
+        let notes = "A line of notes.\n\n".repeat(30);
+        let mut cache = egui_commonmark::CommonMarkCache::default();
+        let mut height = |room: f32| {
+            let column = egui::Rect::from_min_size(egui::pos2(100.0, 20.0), egui::vec2(300.0, room));
+            lay_out_at(column, 1.0, |ui| {
+                notes_box(ui, "notes", &notes, &mut cache);
+            })
+            .used
+            .height()
+        };
+        let roomy = height(2000.0);
+        assert!(roomy >= NOTES_H, "{roomy}");
+        assert_eq!(height(60.0), roomy);
+    }
+
+    /// Notes that wrap leave no sideways scrollbar, at any scale or position:
+    /// egui rounds the box's content area to whole pixels, and at 125% and
+    /// 175% content filling it came out a fraction wider than the box.
+    #[test]
+    fn notes_box_text_never_scrolls_sideways() {
+        for ppp in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            for i in 0..16 {
+                let column = egui::Rect::from_min_size(egui::pos2(400.0 + i as f32, 20.0), egui::vec2(344.0, 600.0));
+                let mut cache = egui_commonmark::CommonMarkCache::default();
+                let mut out = None;
+                lay_out_at(column, ppp, |ui| out = Some(notes_box(ui, "notes", "Short notes.", &mut cache)));
+                let out = out.unwrap();
+                assert!(
+                    out.content_size.x <= out.inner_rect.width(),
+                    "at {ppp}x, x = {}: content {} wider than the box's {}",
+                    column.left(),
+                    out.content_size.x,
+                    out.inner_rect.width()
+                );
+            }
+        }
+    }
+
+    /// The update log keeps one size from its first short line to a long log
+    /// of long lines, and wherever it sits — so the tab doesn't jump as pip's
+    /// output streams in.
+    #[test]
+    fn log_box_keeps_its_size() {
+        let short = ["   45%  (12.3/27.4 MB)".to_string()];
+        let long: Vec<String> = (1..=40)
+            .map(|i| {
+                format!(
+                    "Requirement already satisfied: package-{i} in c:\\users\\someone\\appdata\\roaming\\\
+                     clarity tagflow\\tools\\comfyui\\python\\lib\\site-packages (from -r requirements.txt \
+                     (line {i}))"
+                )
+            })
+            .collect();
+        let size = |lines: &[String], room: f32| {
+            let column = egui::Rect::from_min_size(egui::pos2(100.0, 20.0), egui::vec2(300.0, room));
+            let laid = lay_out_at(column, 1.0, |ui| log_box(ui, "log", lines));
+            assert!(laid.used_inside(), "{:?} spills out of {:?}", laid.used, laid.column);
+            laid.used.size()
+        };
+        let first = size(&short, 2000.0);
+        assert!((LOG_H..LOG_H + 20.0).contains(&first.y), "{first:?}");
+        assert_eq!(size(&long, 2000.0), first);
+        assert_eq!(size(&[], 2000.0), first);
+        assert_eq!(size(&short, 40.0), first, "with little room left below it");
+    }
 
     #[test]
     fn version_compare() {

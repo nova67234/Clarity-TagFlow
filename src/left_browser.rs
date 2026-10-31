@@ -83,7 +83,7 @@ pub fn show(
                 // Same darker PANEL + faint-edge box style as the rest of the app.
                 let search_frame = egui::Frame::default()
                     .fill(PANEL())
-                    .stroke(egui::Stroke::new(1.0, EDGE()))
+                    .stroke(egui::Stroke::new(1.0_f32, EDGE()))
                     .corner_radius(CornerRadius::same(16))
                     .inner_margin(Margin::symmetric(10, 3));
 
@@ -452,7 +452,7 @@ fn draw_tile(
         ui.painter().rect_stroke(
             rect,
             radius,
-            Stroke::new(3.0, crate::theme::selection_outline()),
+            Stroke::new(3.0_f32, crate::theme::selection_outline()),
             egui::StrokeKind::Inside,
         );
     }
