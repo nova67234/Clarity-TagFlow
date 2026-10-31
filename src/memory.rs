@@ -1115,7 +1115,7 @@ fn drop_trailing_commas(json: &str) -> String {
 }
 
 /// What a pass decided (see [`parse_pass`]).
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Clone)]
 pub(crate) struct PassOutput {
     pub summary: String,
     pub persona: String,
@@ -1125,6 +1125,14 @@ pub(crate) struct PassOutput {
     pub forget: Vec<(String, String)>,
     /// Pictures of the chat to keep in the album.
     pub keep: Vec<KeepPicture>,
+}
+
+impl PassOutput {
+    /// It remembers, forgets or keeps something — more than a summary and
+    /// notes.
+    pub(crate) fn has_entries(&self) -> bool {
+        !self.remember.is_empty() || !self.forget.is_empty() || !self.keep.is_empty()
+    }
 }
 
 /// A picture a pass chose to keep: which one of the chat (`[image 2]` → 2),
@@ -1156,68 +1164,296 @@ pub(crate) struct Applied {
     pub skipped: usize,
     /// The summary was replaced.
     pub summary: bool,
+    /// The AI's notes about itself changed.
+    pub persona: bool,
+}
+
+/// The fields a pass's answer object has (at least one of them).
+const PASS_KEYS: &[&str] = &["summary", "persona", "remember", "forget", "keep"];
+/// Every key a pass's answer has, its items' included.
+const ANSWER_KEYS: &[&str] =
+    &["summary", "persona", "remember", "forget", "keep", "topic", "title", "text", "image", "description", "why"];
+
+/// `slice` as JSON: as written, or with its trailing commas dropped.
+fn from_json(slice: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(slice).ok().or_else(|| serde_json::from_str(&drop_trailing_commas(slice)).ok())
+}
+
+/// `s` — JSON from an object's opening brace on — with the slips models make
+/// writing it mended: a double quote inside a text left unescaped (`"My name
+/// is "Nova"."`), and line breaks, tabs or other control characters inside a
+/// text. A key ends at its next quote; any other text only at a quote that
+/// what follows could follow (see [`ends_text`]).
+fn mend(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len() + 16);
+    // The objects and lists open, and the last thing outside a text (spaces
+    // aside): a text right after `{` or `,` in an object is a key.
+    let mut open: Vec<char> = Vec::new();
+    let mut last = ' ';
+    let (mut in_str, mut key, mut escaped) = (false, false, false);
+    // In a text: where in `out` its last comma went, with only spaces and
+    // line breaks after it.
+    let mut comma: Option<usize> = None;
+    for (i, &c) in chars.iter().enumerate() {
+        if !in_str {
+            match c {
+                '"' => {
+                    in_str = true;
+                    key = open.last() == Some(&'{') && matches!(last, '{' | ',');
+                    comma = None;
+                }
+                '{' | '[' => open.push(c),
+                '}' | ']' => {
+                    open.pop();
+                }
+                _ => {}
+            }
+            if !c.is_whitespace() {
+                last = c;
+            }
+            out.push(c);
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            comma = None;
+            out.push(c);
+            continue;
+        }
+        match c {
+            '\\' => {
+                escaped = true;
+                out.push(c);
+            }
+            // A text's closing quote left out before the next key (`"title":
+            // "Has a cat, "text": …`): close it before the comma, and this
+            // quote opens the key.
+            '"' if !key && open.last() == Some(&'{') && comma.is_some() && opens_key(&chars[i..]) => {
+                if let Some(at) = comma.take() {
+                    out.truncate(at);
+                }
+                out.push_str("\", \"");
+                key = true;
+            }
+            '"' if key || ends_text(&chars[i + 1..], open.last() == Some(&'[')) => {
+                in_str = false;
+                last = c;
+                out.push(c);
+                // The next key right after a text, its comma left out: put
+                // the comma back.
+                if !key
+                    && open.last() == Some(&'{')
+                    && chars[i + 1..].iter().find(|c| !c.is_whitespace()) == Some(&'"')
+                {
+                    out.push(',');
+                    last = ',';
+                }
+            }
+            '"' => {
+                comma = None;
+                out.push_str("\\\"");
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {}
+            ',' => {
+                comma = Some(out.len());
+                out.push(c);
+            }
+            c => {
+                if !c.is_whitespace() {
+                    comma = None;
+                }
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// A quote inside a text that isn't a key (`rest` is what follows it) ends
+/// it where what follows could follow a text there: nothing (the answer was
+/// cut off), or — after any spaces — the end of its object or list, or a
+/// comma and then the next item of a list (`in_list`) or the next key of an
+/// object (`"title":`, its comma perhaps left out), or the end of either. So
+/// `"Loves "Alien", 1979"` and `"They said "hi", then left"` stay whole.
+fn ends_text(rest: &[char], in_list: bool) -> bool {
+    let next = |from: usize| (from..rest.len()).find(|&j| !rest[j].is_whitespace());
+    // A key starts at `k`: a quoted name, then a colon — or a key cut off,
+    // with nothing closing after it (a `}` after it means the quote at `k`
+    // was inside the text, as in `"I'm "Nova""}`).
+    let key_at = |k: usize| match (k + 1..rest.len()).find(|&m| rest[m] == '"') {
+        None => !rest[k + 1..].iter().any(|c| matches!(c, '}' | ']')),
+        Some(close) => next(close + 1).is_none_or(|m| rest[m] == ':'),
+    };
+    let Some(j) = next(0) else { return true };
+    match rest[j] {
+        '}' | ']' => true,
+        '"' if !in_list => key_at(j),
+        ',' => {
+            let Some(k) = next(j + 1) else { return true };
+            match rest[k] {
+                '}' | ']' => true,
+                '"' | '{' | '[' if in_list => true,
+                '"' => key_at(k),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// `rest` starts with one of the keys of a pass's answer, quoted, and then
+/// a colon.
+fn opens_key(rest: &[char]) -> bool {
+    let Some(close) = rest.iter().skip(1).position(|&c| c == '"').map(|p| p + 1) else { return false };
+    let name: String = rest[1..close].iter().collect();
+    ANSWER_KEYS.contains(&name.as_str()) && rest[close + 1..].iter().find(|c| !c.is_whitespace()) == Some(&':')
 }
 
 /// Read a pass's answer: the first JSON object in it with any of the fields
 /// a pass writes — after any thought, in a code block or not, trailing
-/// commas forgiven. A field of the wrong kind is skipped, not fatal, and a
-/// memory written as a bare sentence is kept. `None` when there's no such
-/// object (yet).
+/// commas and the usual slips forgiven (see [`mend`]). A field of the wrong
+/// kind is skipped, not fatal, and a memory written as a bare sentence is
+/// kept. `None` when there's no such object (yet).
 pub(crate) fn parse_pass(answer: &str) -> Option<PassOutput> {
     for (start, _) in answer.match_indices('{') {
-        let Some(end) = json_end(answer, start) else { continue };
-        let slice = &answer[start..end];
-        let value = serde_json::from_str::<serde_json::Value>(slice)
-            .or_else(|_| serde_json::from_str::<serde_json::Value>(&drop_trailing_commas(slice)));
-        let Ok(value) = value else { continue };
-        let Some(obj) = value.as_object() else { continue };
-        if !["summary", "persona", "remember", "forget", "keep"].iter().any(|k| obj.contains_key(*k)) {
-            continue;
-        }
-        let field = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-        let list = |k: &str| obj.get(k).and_then(|x| x.as_array()).cloned().unwrap_or_default();
-        let remember = list("remember")
-            .iter()
-            .filter_map(|it| match it.as_str() {
-                Some(text) => Some((String::new(), String::new(), text.trim().to_string())),
-                None => it.is_object().then(|| (field(it, "topic"), field(it, "title"), field(it, "text"))),
-            })
-            .filter(|(_, title, text)| !title.is_empty() || !text.is_empty())
-            .collect();
-        let forget = list("forget")
-            .iter()
-            .filter_map(|it| match it.as_str() {
-                Some(title) => Some((String::new(), title.trim().to_string())),
-                None => it.is_object().then(|| (field(it, "topic"), field(it, "title"))),
-            })
-            .filter(|(_, title)| !title.is_empty())
-            .collect();
-        // `"image": 2`, `"2"` or `"image 2"` — models write all three.
-        let number = |v: Option<&serde_json::Value>| match v {
-            Some(serde_json::Value::Number(n)) => n.as_u64().map(|n| n as usize),
-            Some(serde_json::Value::String(s)) => s.trim().trim_start_matches("image").trim().parse().ok(),
-            _ => None,
-        };
-        let keep = list("keep")
-            .iter()
-            .filter_map(|it| {
-                Some(KeepPicture {
-                    image: number(it.get("image"))?,
-                    title: field(it, "title"),
-                    description: field(it, "description"),
-                    why: field(it, "why"),
-                })
-            })
-            .collect();
-        return Some(PassOutput {
-            summary: field(&value, "summary"),
-            persona: field(&value, "persona"),
-            remember,
-            forget,
-            keep,
+        let value = json_end(answer, start).and_then(|end| from_json(&answer[start..end])).or_else(|| {
+            let mended = mend(&answer[start..]);
+            json_end(&mended, 0).and_then(|end| from_json(&mended[..end]))
         });
+        if let Some(out) = value.as_ref().and_then(pass_output) {
+            return Some(out);
+        }
     }
     None
+}
+
+/// An answer that ended before its JSON did (it ran out of room, or the
+/// model stopped mid-way): what's complete in it — the fields, memories and
+/// pictures before the cut. `None` when nothing in it is, and for an answer
+/// whose JSON is complete but can't be read (that's no cut: it fails, and
+/// goes again).
+pub(crate) fn salvage_pass(answer: &str) -> Option<PassOutput> {
+    for (start, _) in answer.match_indices('{') {
+        if json_end(answer, start).is_some() {
+            continue; // complete as written: parse_pass's (and not an answer)
+        }
+        let text = mend(&answer[start..]);
+        if json_end(&text, 0).is_some() {
+            continue;
+        }
+        // Where a cut could go — just after a whole field of the answer, or
+        // a whole item of one of its lists (never inside a memory half
+        // written) — and what would close everything still open there.
+        let mut cuts: Vec<(usize, String)> = Vec::new();
+        let mut open: Vec<char> = Vec::new();
+        let (mut in_str, mut escaped) = (false, false);
+        let whole = |open: &Vec<char>| open.len() == 1 || open.last() == Some(&']');
+        for (i, c) in text.char_indices() {
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_str = false;
+                    if whole(&open) {
+                        cuts.push((i + 1, open.iter().rev().collect()));
+                    }
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '{' => open.push('}'),
+                '[' => open.push(']'),
+                '}' | ']' => {
+                    open.pop();
+                    if !open.is_empty() && whole(&open) {
+                        cuts.push((i + 1, open.iter().rev().collect()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (cut, close) in cuts.iter().rev() {
+            if let Some(out) = from_json(&format!("{}{close}", &text[..*cut])).as_ref().and_then(pass_output)
+                && out != PassOutput::default()
+            {
+                return Some(out);
+            }
+        }
+    }
+    None
+}
+
+/// A pass's answer object read into its fields (`None` when it has none of
+/// them).
+fn pass_output(value: &serde_json::Value) -> Option<PassOutput> {
+    let obj = value.as_object()?;
+    if !PASS_KEYS.iter().any(|k| obj.contains_key(*k)) {
+        return None;
+    }
+    let field = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let list = |k: &str| obj.get(k).and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let remember = list("remember")
+        .iter()
+        .filter_map(|it| match it.as_str() {
+            Some(text) => Some((String::new(), String::new(), text.trim().to_string())),
+            None => it.is_object().then(|| (field(it, "topic"), field(it, "title"), field(it, "text"))),
+        })
+        .filter(|(_, title, text)| !title.is_empty() || !text.is_empty())
+        .collect();
+    let forget = list("forget")
+        .iter()
+        .filter_map(|it| match it.as_str() {
+            Some(title) => Some((String::new(), title.trim().to_string())),
+            None => it.is_object().then(|| (field(it, "topic"), field(it, "title"))),
+        })
+        .filter(|(_, title)| !title.is_empty())
+        .collect();
+    // `"image": 2`, `"2"` or `"image 2"` — models write all three.
+    let number = |v: Option<&serde_json::Value>| match v {
+        Some(serde_json::Value::Number(n)) => n.as_u64().map(|n| n as usize),
+        Some(serde_json::Value::String(s)) => s.trim().trim_start_matches("image").trim().parse().ok(),
+        _ => None,
+    };
+    let keep = list("keep")
+        .iter()
+        .filter_map(|it| {
+            Some(KeepPicture {
+                image: number(it.get("image"))?,
+                title: field(it, "title"),
+                description: field(it, "description"),
+                why: field(it, "why"),
+            })
+        })
+        .collect();
+    Some(PassOutput { summary: field(value, "summary"), persona: field(value, "persona"), remember, forget, keep })
+}
+
+/// What the last pass did (src/llm/memory_pass.rs), for AI Settings.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LastPass {
+    /// Written down (unix seconds): new or changed memories, forgotten ones,
+    /// and whether the AI's notes or the summary changed.
+    Saved { at: i64, added: usize, forgotten: usize, notes: bool, summary: bool },
+    /// Failed (unix seconds), why, and what happens to that part now.
+    Failed { at: i64, why: String, retry: Retry },
+}
+
+/// What happens to a part of a chat whose pass failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retry {
+    /// It goes again in a minute.
+    Soon,
+    /// It's set aside for the next run (or Save now).
+    NextRun,
+    /// It failed in run after run: left out.
+    GaveUp,
 }
 
 /// A chat whose newest part hadn't been gone through when the app closed:
@@ -1241,6 +1477,21 @@ pub(crate) struct PendingChat {
     /// Passes over it that failed this run.
     #[serde(skip)]
     pub tries: u8,
+    /// Passes over it that failed, in all runs: after a few it's left out.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub failures: u8,
+    /// Set aside after its passes failed: newer chats were read since, so
+    /// its pass leaves their summary as it is.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub aside: bool,
+    /// This run: the chat (by id) and its messages it was set aside from —
+    /// it goes back there if they change, and goes with the chat.
+    #[serde(skip)]
+    pub chat: Option<(u64, std::ops::Range<usize>)>,
+}
+
+fn is_zero(n: &u8) -> bool {
+    *n == 0
 }
 
 /// One memory, scored for what's being said.
@@ -1423,12 +1674,19 @@ impl MemoryStore {
     /// The memory note a reply starts with (pinned before the chat, as role
     /// play's is): what the memory is and how to use it, today's date, the
     /// AI's notes, the last chat's summary (left out when it's about this very
-    /// chat), the topics, and the memories that may matter for what's being
-    /// said — about a thousand tokens at most. `None` while nothing is
-    /// remembered (or the store can't be read). Also returns the topics whose
-    /// memories it shows.
-    pub(crate) fn chat_brief(&self, query: &[(&str, f32)], summary_is_this_chat: bool) -> Option<(String, Vec<String>)> {
-        if self.load_failed || self.is_empty() {
+    /// chat), the topics, the memories that may matter for what's being said,
+    /// and `recent`: lines from the latest chats no pass has read yet, so what
+    /// the user just said counts before it's sorted into memories — about a
+    /// thousand tokens at most, plus those. `None` while there's nothing (or
+    /// the store can't be read). Also returns the topics whose memories it
+    /// shows.
+    pub(crate) fn chat_brief(
+        &self,
+        query: &[(&str, f32)],
+        summary_is_this_chat: bool,
+        recent: &[String],
+    ) -> Option<(String, Vec<String>)> {
+        if self.load_failed || (self.is_empty() && recent.is_empty()) {
             return None;
         }
         use std::fmt::Write as _;
@@ -1481,6 +1739,16 @@ impl MemoryStore {
             s.push_str("\nWhat you remember that may matter now:\n");
             for (topic, m) in &memories {
                 s.push_str(&memory_line(topic, m));
+                s.push('\n');
+            }
+        }
+        if !recent.is_empty() {
+            s.push_str(
+                "\nFrom your latest chats with this user, not sorted into your memory yet (count it as \
+                 remembered):\n",
+            );
+            for line in recent {
+                s.push_str(&sanitize(line));
                 s.push('\n');
             }
         }
@@ -1549,15 +1817,16 @@ impl MemoryStore {
             s.push_str(" This chat continues the one the last summary describes, so extend that summary.");
         }
         s.push_str(
-            "\n- persona: your notes on yourself and how this user likes your replies, at most 3 \
-             sentences. Keep what still applies. Leave it empty for no change.\n\
+            "\n- persona: your notes on yourself — the name the user gave you, if they did — and how \
+             this user likes your replies, at most 3 sentences. Keep what still applies. Leave it \
+             empty for no change.\n\
              - remember: one fact per memory, with a title under 10 words and a sentence or two of \
              detail. Only what the user said or clearly meant that will still matter in a later \
-             chat: who they are, the people and places in their life, their work and projects, \
-             what they like and dislike, their plans. No small talk, and nothing about this chat \
-             itself. Reuse an existing topic when one fits; topics are broad (a person, a project, \
-             an interest). To change a stored memory, reuse its exact title. At most 12; none is \
-             fine.\n\
+             chat: who they are (their name too), the people and places in their life, their work \
+             and projects, what they like and dislike, their plans — and always what they asked you \
+             to remember. No small talk, and nothing about this chat itself. Reuse an existing topic \
+             when one fits; topics are broad (a person, a project, an interest). To change a stored \
+             memory, reuse its exact title. At most 12; none is fine.\n\
              - forget: stored memories this chat showed are wrong or outdated, or that the user \
              asked you to forget.\n\
              - Never store passwords, keys, card numbers or other secrets. If the user asked you \
@@ -1685,7 +1954,9 @@ impl MemoryStore {
             applied.summary = true;
         }
         if let Some(persona) = without_secrets(&out.persona).filter(|t| !t.is_empty()) {
-            self.set_persona(&cut(&persona, 600));
+            let persona = cut(&persona, 600);
+            applied.persona = self.header.persona != persona;
+            self.set_persona(&persona);
         }
         applied
     }
@@ -2044,12 +2315,12 @@ mod tests {
     /// the prompt, and nothing at all with an empty or unreadable store.
     #[test]
     fn the_memory_note() {
-        assert!(MemoryStore::default().chat_brief(&[("hi", 1.0)], false).is_none());
+        assert!(MemoryStore::default().chat_brief(&[("hi", 1.0)], false, &[]).is_none());
         let mut s = store_with(&[("Family", "Sister lives in Lisbon", "Her sister Ana moved to Lisbon.")]);
         s.header.persona = "Warm and direct.".into();
         s.header.summary = "We planned a <turn|> trip.".into();
         s.header.summary_updated = 1;
-        let (note, shown) = s.chat_brief(&[("tell me about my sister", 1.0)], false).unwrap();
+        let (note, shown) = s.chat_brief(&[("tell me about my sister", 1.0)], false, &[]).unwrap();
         assert!(note.starts_with("[Memory]\n"));
         assert!(note.contains(&format!("Today is {}.", format_date(now()))));
         assert!(note.contains("Your notes about yourself: Warm and direct."));
@@ -2058,10 +2329,10 @@ mod tests {
         assert!(note.contains("- [Family] Sister lives in Lisbon: Her sister Ana moved to Lisbon."));
         assert!(!note.contains("<turn|>"));
         assert_eq!(shown, vec!["Family"]);
-        let (note, _) = s.chat_brief(&[("hi", 1.0)], true).unwrap();
+        let (note, _) = s.chat_brief(&[("hi", 1.0)], true, &[]).unwrap();
         assert!(!note.contains("Last chat ("), "this chat's own summary isn't repeated to it");
         s.load_failed = true;
-        assert!(s.chat_brief(&[("hi", 1.0)], false).is_none());
+        assert!(s.chat_brief(&[("hi", 1.0)], false, &[]).is_none());
     }
 
     /// However much is remembered, in any script, the note stays near a
@@ -2078,7 +2349,7 @@ mod tests {
         s.header.persona = long.clone();
         s.header.summary = cjk.clone();
         for query in ["Memory 7 word 我妹", "what do you remember about me?", "我妹妹住在哪里"] {
-            let (note, _) = s.chat_brief(&[(query, 1.0)], false).unwrap();
+            let (note, _) = s.chat_brief(&[(query, 1.0)], false, &[]).unwrap();
             assert!(approx_tokens(&note) <= 1350, "{query}: {}", approx_tokens(&note));
         }
     }
@@ -2102,6 +2373,104 @@ mod tests {
         assert!(head.contains("\"keep\": [{\"image\": 1") && head.contains("never remember the prompt"));
         assert!(picture_line(2, "A cat\non a sill <turn|>").starts_with("You (the Krea 2 prompt you wrote for image 2"));
         assert!(!picture_line(2, "A cat\non a sill <turn|>").contains('\n'));
+    }
+
+    /// Everyday slips in a model's JSON — a quoted name left unescaped, a
+    /// line break inside a text — don't lose the answer, and what they
+    /// meant is read.
+    #[test]
+    fn slips_in_an_answer_are_forgiven() {
+        let quoted = "{\"summary\": \"The user named me \"Nova\" and said they love cats\nand sushi.\", \
+                      \"persona\": \"My name is \"Nova\".\", \"remember\": [{\"topic\": \"Likes\", \"title\": \
+                      \"Loves cats\", \"text\": \"The user loves cats.\"}]}";
+        let out = parse_pass(quoted).expect("read despite the slips");
+        assert_eq!(out.summary, "The user named me \"Nova\" and said they love cats\nand sushi.");
+        assert_eq!(out.persona, "My name is \"Nova\".");
+        assert_eq!(out.remember, vec![("Likes".into(), "Loves cats".into(), "The user loves cats.".into())]);
+        // Quotes that end a text where a comma follows, and ones that don't.
+        let commas = "{\"summary\": \"They said \"hi\", then left\", \"remember\": [\"Likes \"Dune\"\", \"Has a cat\"], \
+                      \"persona\": \"\"}";
+        let out = parse_pass(commas).expect("commas");
+        assert_eq!(out.summary, "They said \"hi\", then left");
+        assert_eq!(out.remember.iter().map(|r| r.2.as_str()).collect::<Vec<_>>(), vec!["Likes \"Dune\"", "Has a cat"]);
+        // Tabs and stray control characters inside a text.
+        let out = parse_pass("{\"summary\": \"a\tb\u{1}c\"}").unwrap();
+        assert_eq!(out.summary, "a\tbc");
+        // A quote then a comma ends a text only where the next key (or list
+        // item) follows: years, colons and quoted words inside stay text.
+        let films = "{\"remember\": [{\"topic\": \"Films\", \"title\": \"Favourite films\", \"text\": \"Loves \
+                     \"Alien\", 1979 and \"Heat\", 1995.\"}], \"summary\": \"Film: \"Heat\": a classic, \"Up\", \
+                     \"Big\" too\", \"forget\": []}";
+        let out = parse_pass(films).expect("films");
+        assert_eq!(out.remember[0].2, "Loves \"Alien\", 1979 and \"Heat\", 1995.");
+        assert_eq!(out.summary, "Film: \"Heat\": a classic, \"Up\", \"Big\" too");
+        // A comma left out before the next key is put back.
+        let out = parse_pass("{\"remember\": [{\"title\": \"Has a cat\" \"text\": \"A tabby.\"}]}").expect("comma");
+        assert_eq!(out.remember, vec![(String::new(), "Has a cat".into(), "A tabby.".into())]);
+        // A quoted name right before the end stays in its text.
+        let out = parse_pass("{\"summary\": \"x\", \"persona\": \"I'm \"Nova\"\"}").expect("persona last");
+        assert_eq!(out.persona, "I'm \"Nova\"");
+        let out = parse_pass("{\"remember\": [{\"title\": \"Cat\", \"text\": \"Their cat is \"Miso\"\"}]}").expect("last");
+        assert_eq!(out.remember[0].2, "Their cat is \"Miso\"");
+        // A text's closing quote left out before the next key is put back —
+        // with the key on the same line or the next.
+        for answer in [
+            "{\"remember\": [{\"title\": \"Has a cat, \"text\": \"A tabby.\"}]}",
+            "{\"remember\": [{\"title\": \"Has a cat,\n    \"text\": \"A tabby.\"}]}",
+        ] {
+            let out = parse_pass(answer).expect("closed");
+            assert_eq!(out.remember, vec![(String::new(), "Has a cat".into(), "A tabby.".into())]);
+        }
+        // Valid JSON reads exactly as before.
+        assert_eq!(parse_pass("{\"summary\": \"He said \\\"yes\\\".\"}").unwrap().summary, "He said \"yes\".");
+    }
+
+    /// An answer that ended before its JSON did keeps what's complete; one
+    /// with nothing complete keeps nothing.
+    #[test]
+    fn salvaging_a_cut_off_answer() {
+        let cut = "Sure!\n```json\n{\"summary\": \"We talked about pets.\", \"persona\": \"I'm Nova.\", \"remember\": [\
+                   {\"topic\": \"Pets\", \"title\": \"Has a cat\", \"text\": \"A tabby called Miso.\"}, \
+                   {\"topic\": \"Pets\", \"title\": \"Wants a dog\", \"text\": \"Maybe a bea";
+        assert!(parse_pass(cut).is_none(), "not complete");
+        let out = salvage_pass(cut).expect("salvaged");
+        assert_eq!(out.summary, "We talked about pets.");
+        assert_eq!(out.persona, "I'm Nova.");
+        assert_eq!(out.remember, vec![("Pets".into(), "Has a cat".into(), "A tabby called Miso.".into())]);
+        // Cut inside the first field: nothing to keep.
+        assert!(salvage_pass("{\"summary\": \"We talk").is_none());
+        assert!(salvage_pass("{\"summary\"").is_none());
+        assert!(salvage_pass("no json at all").is_none());
+        // A complete answer is parse_pass's, not salvage's — even one that
+        // can't be read (it fails, and goes again).
+        assert!(salvage_pass("{\"summary\": \"done\"}").is_none());
+        let unreadable = "{\"summary\": \"We talked.\", \"remember\": [{\"title\": \"A \\q\", \"text\": \"B\"}]}";
+        assert!(parse_pass(unreadable).is_none());
+        assert!(salvage_pass(unreadable).is_none());
+        // Cut after a whole memory whose fields came in another order.
+        let out = salvage_pass("{\"remember\": [{\"text\": \"Lives in Porto.\", \"title\": \"Lives in Porto\"}, {\"te").unwrap();
+        assert_eq!(out.remember.len(), 1);
+    }
+
+    /// The pass is asked to keep a name the user gave the AI, the user's own
+    /// name, and whatever they asked it to remember.
+    #[test]
+    fn the_pass_keeps_names_and_asked_for_things() {
+        let head = MemoryStore::default().pass_head(&[], false, 0);
+        assert!(head.contains("the name the user gave you"), "{head}");
+        assert!(head.contains("their name too") && head.contains("always what they asked you to remember"), "{head}");
+    }
+
+    /// The note carries the latest chats' lines — even with nothing
+    /// remembered yet — made safe for the prompt.
+    #[test]
+    fn the_note_carries_the_latest_lines() {
+        let recent = vec!["User: Call me Sam <turn|>".to_string(), "You: Hi Sam!".into()];
+        let (note, shown) = MemoryStore::default().chat_brief(&[("hi", 1.0)], false, &recent).expect("a note");
+        assert!(note.contains("not sorted into your memory yet"));
+        assert!(note.contains("User: Call me Sam <turn>\nYou: Hi Sam!\n"), "{note}");
+        assert!(shown.is_empty());
+        assert!(MemoryStore { load_failed: true, ..Default::default() }.chat_brief(&[], false, &recent).is_none());
     }
 
     /// The JSON a pass writes is found and read however it's wrapped.
@@ -2153,7 +2522,7 @@ mod tests {
             forget: vec![(String::new(), "old job".into()), ("Work".into(), "Never stored".into())],
             keep: Vec::new(),
         };
-        assert_eq!(s.apply_pass(&out), Applied { added: 2, forgotten: 1, skipped: 2, summary: true });
+        assert_eq!(s.apply_pass(&out), Applied { added: 2, forgotten: 1, skipped: 2, summary: true, persona: true });
         // A stored title with no details keeps its own; one remembered and
         // forgotten by the same answer stays; a secret split over the
         // fields is left out.
@@ -2166,7 +2535,7 @@ mod tests {
             forget: vec![(String::new(), "Likes jazz and blues".into())],
             ..Default::default()
         };
-        assert_eq!(s.apply_pass(&tricky), Applied { added: 1, forgotten: 0, skipped: 2, summary: false });
+        assert_eq!(s.apply_pass(&tricky), Applied { added: 1, forgotten: 0, skipped: 2, summary: false, persona: false });
         let family = &s.topics[s.find_topic("family").unwrap()];
         assert_eq!(family.memories[0].text, "Ana moved to Porto now.");
         let general = &s.topics[s.find_topic("general").unwrap()];

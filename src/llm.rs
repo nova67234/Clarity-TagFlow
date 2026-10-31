@@ -516,8 +516,9 @@ fn link_busy() -> bool {
 }
 
 /// Queue `cmd` on the resident worker only if it already runs `model` at
-/// `detail` — a memory pass never loads a model. Hands `cmd` back when it
-/// doesn't (or that worker has stopped).
+/// `detail` — a memory pass never loads a model by itself (only Save now
+/// does, through `submit`). Hands `cmd` back when it doesn't (or that
+/// worker has stopped).
 fn submit_loaded(model: GemmaModel, detail: ImageDetail, cmd: Cmd) -> Result<(), Cmd> {
     let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
     if !shared.as_ref().is_some_and(|w| w.model == model && (!model.has_image_detail() || w.detail == detail)) {

@@ -668,11 +668,25 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                             if !llm.running && llm.memory_activity() == crate::llm::MemoryActivity::Updating {
                                 ui.add_space(2.0);
                                 ui.add(egui::Spinner::new().size(14.0).color(MUTED()));
-                                ui.label(egui::RichText::new("Updating memories…").color(MUTED()).size(11.5))
+                                ui.label(egui::RichText::new("Saving to memory…").color(MUTED()).size(11.5))
                                     .on_hover_text(
                                         "The AI is writing down what your chat brought (AI Settings → Memory). \
                                          Sending a message stops it; it picks up again later.",
                                     );
+                            } else if let Some(crate::memory::LastPass::Saved { at, added, notes, .. }) = llm.memory_last()
+                                && (*added > 0 || *notes)
+                                && crate::memory::now().saturating_sub(*at) < 8
+                            {
+                                // Just saved something: say so for a few seconds.
+                                ui.add_space(2.0);
+                                let what = match (*added, *notes) {
+                                    (0, _) => "its notes about itself".to_string(),
+                                    (1, _) => "1 memory".to_string(),
+                                    (n, _) => format!("{n} memories"),
+                                };
+                                ui.label(egui::RichText::new("Saved to memory").color(MUTED()).size(11.5))
+                                    .on_hover_text(format!("The AI just saved {what} (AI Settings → Memory)."));
+                                ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
                             }
                             if llm.tools_open {
                                 let mut open = llm.tools_open;

@@ -211,10 +211,10 @@ fn memory_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
             // obfuscates on other systems, so don't promise it there.
             Some(if cfg!(windows) {
                 "After each chat the AI writes down what matters, by itself, and remembers it in new \
-                 chats. Stored encrypted on this computer."
+                 chats — only what's said while this is on. Stored encrypted on this computer."
             } else {
                 "After each chat the AI writes down what matters, by itself, and remembers it in new \
-                 chats. Stored on this computer."
+                 chats — only what's said while this is on. Stored on this computer."
             }),
             |ui| {
                 switch(ui, &mut settings.ai_memory_enabled);
@@ -222,24 +222,7 @@ fn memory_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
         );
         // What it's doing, while it's on (the switch takes effect next frame).
         if settings.ai_memory_enabled {
-            use crate::llm::MemoryActivity as A;
-            let status = match llm.memory_activity() {
-                A::Updating => "Updating memories now…".to_string(),
-                A::Waiting(1) => "1 chat waiting to be read.".to_string(),
-                A::Waiting(n) => format!("{n} chats waiting to be read."),
-                A::UpToDate | A::Off => "Up to date.".to_string(),
-                A::Unreadable => String::new(),
-            };
-            if !status.is_empty() {
-                crate::settings::hint(
-                    ui,
-                    &format!(
-                        "{status} A chat is read once you leave it or it has been quiet for 3 minutes, \
-                         while the model is loaded. Role play and Tag images never are; of Krea 2 \
-                         prompts, only the pictures (they still use what's remembered)."
-                    ),
-                );
-            }
+            memory_status(ui, llm);
         }
         row_sep(ui);
         let stats = if n == 0 {
@@ -337,6 +320,107 @@ fn memory_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
             },
         );
     });
+}
+
+/// Under "Remember across chats": what the memory is doing, with Save now
+/// while chats wait to be saved, and what the last save did (or why it
+/// didn't work).
+fn memory_status(ui: &mut egui::Ui, llm: &mut LlmState) {
+    use crate::llm::MemoryActivity as A;
+    use crate::memory::{LastPass, Retry};
+    let activity = llm.memory_activity();
+    if activity == A::Unreadable {
+        return;
+    }
+    let saving = llm.saving_memory_now();
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let status = match activity {
+            A::Updating => "Saving to memory now…".to_string(),
+            // Save now waits a little (after a failed try, or while another
+            // PC uses this one's AI).
+            A::Waiting(_) if saving => "Saving to memory soon…".to_string(),
+            A::Waiting(1) => "1 chat isn't saved to memory yet.".to_string(),
+            A::Waiting(n) => format!("{n} chats aren't saved to memory yet."),
+            _ => "Everything is saved.".to_string(),
+        };
+        ui.label(egui::RichText::new(status).color(TEXT()).size(12.5));
+        if matches!(activity, A::Waiting(_)) && !saving {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let tip = if crate::link::remote_chat().is_some() {
+                    "Save what's waiting now, on the PC your chats run on (while it has its model loaded)."
+                } else {
+                    "Save what's waiting now instead of after a quiet moment. The model loads first if it \
+                     isn't loaded."
+                };
+                let save = ui
+                    .add_enabled(llm.usable(), egui::Button::new(egui::RichText::new("Save now").size(12.5)))
+                    .on_hover_text(tip)
+                    .on_disabled_hover_text("Set up the model first (Settings → AI Model).");
+                if save.clicked() {
+                    llm.save_memory_now();
+                }
+            });
+        }
+    });
+    if let Some(loading) = llm.memory_loading() {
+        crate::settings::hint(ui, loading);
+    }
+    if let (A::Waiting(_), Some(why)) = (activity, llm.memory_save_blocked()) {
+        crate::settings::hint(ui, &format!("Not everything could be saved now: {why}."));
+    }
+    if let Some(last) = llm.memory_last() {
+        let line = match last {
+            LastPass::Saved { at, added, forgotten, notes, summary } => {
+                let mut what: Vec<String> = Vec::new();
+                match added {
+                    0 => {}
+                    1 => what.push("1 new or updated memory".to_string()),
+                    n => what.push(format!("{n} new or updated memories")),
+                }
+                if *forgotten > 0 {
+                    what.push(format!("forgot {forgotten}"));
+                }
+                if *notes {
+                    what.push("its notes about itself".to_string());
+                }
+                if *summary {
+                    what.push("a summary of the chat".to_string());
+                }
+                if what.is_empty() {
+                    what.push("nothing new worth keeping".to_string());
+                }
+                format!("Last saved at {}: {}.", clock(*at), what.join(", "))
+            }
+            LastPass::Failed { at, why, retry } => {
+                let next = match retry {
+                    Retry::Soon => "It's tried again in a minute — nothing is lost.",
+                    Retry::NextRun => {
+                        "It's kept and tried again when the app next starts (or with Save now) — nothing \
+                         is lost."
+                    }
+                    Retry::GaveUp => {
+                        "It didn't work any time it was tried, so that part of a chat was left out — tell \
+                         the AI again if it mattered."
+                    }
+                };
+                format!("The last save, at {}, didn't work ({why}). {next}", clock(*at))
+            }
+        };
+        crate::settings::hint(ui, &line);
+    }
+    crate::settings::hint(
+        ui,
+        "A chat is saved once you leave it, or after 3 quiet minutes while the model is loaded — and \
+         until then, new chats already know what you said in it. Role play and Tag images are never \
+         saved; of Krea 2 prompts, only the pictures (they still use what's remembered).",
+    );
+}
+
+/// `secs` (unix) as a time of day: "9:41 PM".
+fn clock(secs: i64) -> String {
+    use chrono::TimeZone as _;
+    chrono::Local.timestamp_opt(secs, 0).single().map(|t| t.format("%-I:%M %p").to_string()).unwrap_or_default()
 }
 
 /// One picture of the album: where its memory is, and what it says.
