@@ -2368,7 +2368,7 @@ fn negative_popup(ctx: &egui::Context, state: &mut GenerateState) {
         .collapsible(false)
         .resizable(false)
         .placed_centered(ctx)
-        .frame(window_frame().corner_radius(CornerRadius::same(22)))
+        .frame(crate::settings::fresh_window_frame())
         .show(ctx, |ui| {
             // Only the top strip drags the popup — not stray drags on the body.
             crate::popup_drag_strip(ui, 30.0);
@@ -2447,7 +2447,7 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
         .collapsible(false)
         .resizable(false)
         .placed_centered(ctx)
-        .frame(window_frame().corner_radius(CornerRadius::same(22)))
+        .frame(crate::settings::fresh_window_frame())
         .show(ctx, |ui| {
             // Only the top strip drags the popup — not stray drags on the body.
             crate::popup_drag_strip(ui, 30.0);
@@ -2657,7 +2657,7 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
             .resizable(false)
             .collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .frame(window_frame().corner_radius(CornerRadius::same(22)))
+            .frame(crate::settings::fresh_window_frame())
             .show(ctx, |ui| {
                 ui.set_max_width(280.0);
                 ui.vertical_centered(|ui| {
@@ -2724,7 +2724,7 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
         .collapsible(false)
         .resizable(false)
         .placed_centered(ctx)
-        .frame(window_frame().corner_radius(CornerRadius::same(22)))
+        .frame(crate::settings::fresh_window_frame())
         .show(ctx, |ui| {
             crate::popup_drag_strip(ui, 30.0);
             ui.set_width(380.0);
@@ -2923,7 +2923,7 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
             .resizable(false)
             .collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .frame(window_frame().corner_radius(CornerRadius::same(22)))
+            .frame(crate::settings::fresh_window_frame())
             .show(ctx, |ui| {
                 ui.set_max_width(280.0);
                 ui.vertical_centered(|ui| {
@@ -3418,44 +3418,17 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                     } else {
                         &[GenFamily::Sdxl, GenFamily::Anima, GenFamily::Krea2, GenFamily::Flux, GenFamily::ZImage]
                     };
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    let menu_id = ui.id().with("family_menu");
-                    // Point down while the menu is open, then flip to a right-
-                    // pointing arrow once it closes — so clicking it visibly "moves".
-                    let arrow_src = if egui::Popup::is_id_open(ui.ctx(), menu_id) {
-                        egui::include_image!("../icons/arrow_drop_down.svg")
-                    } else {
-                        egui::include_image!("../icons/arrow_right.svg")
-                    };
-                    let arrow = egui::Image::new(arrow_src)
-                        .fit_to_exact_size(egui::vec2(18.0, 18.0))
-                        .tint(TEXT());
-                    let resp = ui
-                        .add(
-                            egui::Button::image_and_text(
-                                arrow,
-                                RichText::new(state.family.title()).color(TEXT()).strong().size(14.0),
-                            )
-                            .frame(false)
-                            .sense(egui::Sense::click()),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    egui::Popup::menu(&resp)
-                        .id(menu_id)
-                        .align(egui::RectAlign::BOTTOM_START)
-                        .frame(menu_frame())
-                        .show(|ui| {
-                            ui.set_min_width(150.0);
-                            round_menu_rows(ui);
-                            for &fam in options {
-                                if ui.selectable_label(state.family == fam, fam.title()).clicked() {
-                                    if state.family != fam {
-                                        state.family_switch = Some(fam);
-                                    }
-                                    ui.close();
+                    // The Settings window's dropdown pill and list.
+                    crate::settings::pill_combo(ui, "family_menu", 170.0, state.family.title(), |ui| {
+                        for &fam in options {
+                            if crate::settings::dropdown_option(ui, fam.title(), None, None, state.family == fam).clicked() {
+                                if state.family != fam {
+                                    state.family_switch = Some(fam);
                                 }
+                                ui.close();
                             }
-                        });
+                        }
+                    });
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let color = if state.status_err {
@@ -3531,8 +3504,10 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                 ui.label("Flux dev is a gated model: accept its license on Hugging Face and paste a token.");
                 crate::arrow_link(ui, "Manage tokens", "https://huggingface.co/settings/tokens", None);
             });
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut state.hf_token).password(true).desired_width(f32::INFINITY),
+            let resp = crate::settings::pill_field(
+                ui,
+                f32::INFINITY,
+                egui::TextEdit::singleline(&mut state.hf_token).password(true),
             );
             if resp.lost_focus() {
                 crate::pixal3d::save_hf_token(&state.hf_token);
@@ -3661,7 +3636,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                         egui::Popup::menu(&add_resp)
                             .id(menu_id)
                             .align(egui::RectAlign::TOP_START)
-                            .frame(menu_frame())
+                            .frame(crate::settings::dropdown_frame())
                             .show(|ui| {
                                 ui.set_min_width(150.0);
                                 round_menu_rows(ui);
@@ -4040,16 +4015,6 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
     }
 }
 
-/// Rounded-22 card frame for the prompt-box popup menus (+ menu, model list),
-/// matching the app's panel styling.
-fn menu_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(FLOAT())
-        .corner_radius(CornerRadius::same(22))
-        .inner_margin(Margin::same(12))
-        .stroke(egui::Stroke::new(1.0_f32, EDGE()))
-}
-
 /// Round the hover highlight of menu rows (egui's default is square).
 fn round_menu_rows(ui: &mut egui::Ui) {
     let radius = CornerRadius::same(6);
@@ -4101,23 +4066,21 @@ fn model_selector(ui: &mut egui::Ui, state: &mut GenerateState) {
     egui::Popup::menu(&resp)
         .id(menu_id)
         .align(egui::RectAlign::TOP_END)
-        .frame(menu_frame())
+        .frame(crate::settings::dropdown_frame())
         .show(|ui| {
-            ui.set_min_width(240.0);
-            round_menu_rows(ui);
+            // Fixed: the rows fill the list's width, so an open-ended one
+            // stretched across the window.
+            ui.set_width(260.0);
+            ui.spacing_mut().item_spacing.y = 3.0;
             // Built-in (downloadable) model variants. Selecting one clears any
             // custom-checkpoint override.
             for &m in GenModel::all_for(state.family) {
                 let selected = state.checkpoint.is_none() && state.model == m;
                 let missing_on_host = match (&state.remote_host, &state.remote_catalog) {
-                    (Some(host), Some(cat)) if !cat.ready.contains(&m) => Some(host.clone()),
+                    (Some(host), Some(cat)) if !cat.ready.contains(&m) => Some(format!("not set up on {host}")),
                     _ => None,
                 };
-                let label = match &missing_on_host {
-                    Some(host) => RichText::new(format!("{}  ·  not set up on {host}", m.label())).color(MUTED()),
-                    None => RichText::new(m.label()),
-                };
-                if ui.selectable_label(selected, label).clicked() {
+                if crate::settings::dropdown_option(ui, m.label(), None, missing_on_host.as_deref(), selected).clicked() {
                     state.model = m;
                     state.checkpoint = None;
                     state.steps = m.default_steps();
@@ -4157,15 +4120,15 @@ fn model_selector(ui: &mut egui::Ui, state: &mut GenerateState) {
                 }
                 for (file, _) in &compatible {
                     let selected = sel.as_deref() == Some(file.as_str());
-                    if ui.selectable_label(selected, ckpt_display_name(file)).clicked() {
+                    if crate::settings::dropdown_option(ui, ckpt_display_name(file), None, None, selected).clicked() {
                         pick = Some(file.clone());
                     }
                 }
                 if show_other {
                     for (file, base) in &others {
                         let selected = sel.as_deref() == Some(file.as_str());
-                        let label = format!("{}  ·  {}", ckpt_display_name(file), base.label());
-                        let resp = ui.selectable_label(selected, RichText::new(label).color(MUTED()));
+                        let resp =
+                            crate::settings::dropdown_option(ui, ckpt_display_name(file), None, Some(base.label()), selected);
                         if resp.clicked() {
                             pick = Some(file.clone());
                         }
@@ -4184,10 +4147,14 @@ fn model_selector(ui: &mut egui::Ui, state: &mut GenerateState) {
 
                 if !others.is_empty() {
                     ui.separator();
-                    let mut v = state.show_other_ckpts;
-                    if ui.checkbox(&mut v, RichText::new("Show other-family checkpoints").size(11.0)).changed() {
-                        state.show_other_ckpts = v;
-                    }
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Show other-family checkpoints").color(TEXT()).size(12.0));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add_space(4.0);
+                            crate::settings::switch(ui, &mut state.show_other_ckpts);
+                        });
+                    });
                 }
             }
         });

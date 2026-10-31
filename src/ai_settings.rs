@@ -39,13 +39,18 @@ pub fn window(ctx: &egui::Context, llm: &mut LlmState, settings: &mut Settings) 
     // Same fixed size rule as the main Settings window (kept on the screen
     // at large interface sizes).
     let (win_w, win_h) = crate::settings::settings_window_size(ctx.content_rect());
+    // Under Liquid Glass it takes the main Settings window's look.
+    let liquid = crate::theme::liquid_markers().is_some();
+    if liquid {
+        crate::settings::begin_main_look();
+    }
     egui::Window::new("AI Settings")
         .id(egui::Id::new("ai_settings_window"))
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .frame(crate::settings::window_frame())
+        .frame(crate::settings::fresh_window_frame())
         .fixed_size(egui::vec2(win_w, win_h))
         .show(ctx, |ui| {
             let radius = egui::CornerRadius::same(10);
@@ -131,6 +136,9 @@ pub fn window(ctx: &egui::Context, llm: &mut LlmState, settings: &mut Settings) 
             let rect = row_resp.response.rect;
             ui.painter().vline(rect.left() + 144.0, rect.y_range(), egui::Stroke::new(1.0_f32, EDGE()));
         });
+    if liquid {
+        crate::settings::end_main_look();
+    }
     if want_close {
         llm.gen_settings_open = false;
     }
@@ -299,13 +307,16 @@ fn memory_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
         let id = ui.id().with("persona_draft");
         let mut draft: String =
             ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| llm.memory.header.persona.clone());
-        let resp = ui.add_enabled(
-            !llm.memory.load_failed,
-            egui::TextEdit::multiline(&mut draft)
-                .hint_text("Nothing yet — the AI writes this after your first chats.")
-                .desired_rows(3)
-                .desired_width(f32::INFINITY),
-        );
+        let resp = ui
+            .add_enabled_ui(!llm.memory.load_failed, |ui| {
+                crate::settings::well_box(
+                    ui,
+                    egui::TextEdit::multiline(&mut draft)
+                        .hint_text("Nothing yet — the AI writes this after your first chats.")
+                        .desired_rows(3),
+                )
+            })
+            .inner;
         if resp.lost_focus() {
             llm.memory.set_persona(draft.trim());
             ui.data_mut(|d| d.remove::<String>(id));
@@ -661,29 +672,31 @@ fn roleplay_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) 
                 ui.vertical(|ui| {
                     ui.set_width(w);
                     field_label(ui, "AI's name");
-                    changed |= ui
-                        .add(egui::TextEdit::singleline(&mut rp.ai_name).hint_text("e.g. Mira").desired_width(w))
-                        .lost_focus();
+                    changed |=
+                        crate::settings::pill_field(ui, w, egui::TextEdit::singleline(&mut rp.ai_name).hint_text("e.g. Mira"))
+                            .lost_focus();
                 });
                 ui.add_space(12.0);
                 ui.vertical(|ui| {
                     ui.set_width(w);
                     field_label(ui, "Your name");
-                    changed |= ui
-                        .add(egui::TextEdit::singleline(&mut rp.user_name).hint_text("What it calls you").desired_width(w))
-                        .lost_focus();
+                    changed |= crate::settings::pill_field(
+                        ui,
+                        w,
+                        egui::TextEdit::singleline(&mut rp.user_name).hint_text("What it calls you"),
+                    )
+                    .lost_focus();
                 });
             });
             row_sep(ui);
             field_label(ui, "Persona");
-            changed |= ui
-                .add(
-                    egui::TextEdit::multiline(&mut rp.persona)
-                        .desired_rows(4)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Who is the AI? Looks, personality, the world you're in…"),
-                )
-                .lost_focus();
+            changed |= crate::settings::well_box(
+                ui,
+                egui::TextEdit::multiline(&mut rp.persona)
+                    .desired_rows(4)
+                    .hint_text("Who is the AI? Looks, personality, the world you're in…"),
+            )
+            .lost_focus();
         });
         if changed {
             rp.save();

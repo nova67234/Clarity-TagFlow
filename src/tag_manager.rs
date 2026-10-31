@@ -395,11 +395,16 @@ pub fn show(
                             // Dropdown fills the remaining width to the left, and
                             // lists only models whose files are actually installed
                             // (checked on disk when the dropdown is opened).
-                            egui::ComboBox::from_id_salt("ai_model_combo")
-                                .width(ui.available_width())
-                                .selected_text(&state.ai_model)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut state.ai_model, "Select AI...".to_string(), "Select AI...");
+                            let shown = state.ai_model.clone();
+                            crate::settings::pill_combo(ui, "ai_model_combo", f32::INFINITY, &shown, |ui| {
+                                    let mut pick = |ui: &mut egui::Ui, name: &str| {
+                                        let on = state.ai_model == name;
+                                        if crate::settings::dropdown_option(ui, name, None, None, on).clicked() {
+                                            state.ai_model = name.to_string();
+                                            ui.close();
+                                        }
+                                    };
+                                    pick(ui, "Select AI...");
                                     let installed = crate::ai_models::installed_models();
                                     if installed.is_empty() {
                                         // "No models — ⚙ → Get Models", with real
@@ -421,7 +426,7 @@ pub fn show(
                                         });
                                     } else {
                                         for m in installed {
-                                            ui.selectable_value(&mut state.ai_model, m.name().to_string(), m.name());
+                                            pick(ui, m.name());
                                         }
                                     }
                                 });

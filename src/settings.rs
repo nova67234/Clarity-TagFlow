@@ -368,6 +368,7 @@ pub fn show(
     // The sections, cards and rows the tabs draw (here, in Link and in
     // Updates) take the Find Issues look while this window is drawn.
     FRESH.set(true);
+    MAIN.set(true);
     egui::Window::new("Settings")
         .id(egui::Id::new("settings_window"))
         .title_bar(false) // custom header inside (matches the other popups)
@@ -483,6 +484,7 @@ pub fn show(
             );
         });
     FRESH.set(false);
+    MAIN.set(false);
 
     settings.open = !want_close;
 }
@@ -1519,6 +1521,24 @@ pub(crate) fn hint(ui: &mut egui::Ui, text: &str) {
 /// ringed in the accent colour while it's being typed in. `width` may be
 /// `f32::INFINITY` (all there is).
 pub(crate) fn pill_field(ui: &mut egui::Ui, width: f32, edit: egui::TextEdit<'_>) -> egui::Response {
+    let edge = if liquid_main() { EDGE() } else { egui::Color32::TRANSPARENT };
+    pill_field_in(ui, width, edit, well_fill(), edge)
+}
+
+/// [`pill_field`] in the left panel's search-bar colours (PANEL fill, faint
+/// EDGE outline), for text boxes on cards rather than in Settings rows.
+pub(crate) fn panel_pill_field(ui: &mut egui::Ui, width: f32, edit: egui::TextEdit<'_>) -> egui::Response {
+    pill_field_in(ui, width, edit, PANEL(), EDGE())
+}
+
+/// A [`pill_field`] filled `fill`, outlined `edge` until it has focus.
+fn pill_field_in(
+    ui: &mut egui::Ui,
+    width: f32,
+    edit: egui::TextEdit<'_>,
+    fill: egui::Color32,
+    edge: egui::Color32,
+) -> egui::Response {
     let h = 32.0;
     let w = if width.is_finite() { width } else { ui.available_width() };
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
@@ -1537,10 +1557,40 @@ pub(crate) fn pill_field(ui: &mut egui::Ui, width: f32, edit: egui::TextEdit<'_>
             .vertical_align(egui::Align::Center)
             .desired_width(inner.width()),
     );
+    let ring = if resp.has_focus() { crate::theme::selection_outline() } else { edge };
+    ui.painter().set(
+        bg,
+        egui::epaint::RectShape::new(rect, h / 2.0, fill, egui::Stroke::new(1.0_f32, ring), egui::StrokeKind::Inside),
+    );
+    resp
+}
+
+/// A multi-line text box to match [`pill_field`]: the same sunk fill and
+/// accent ring, with rounded corners instead of round ends. Full width.
+pub(crate) fn well_box(ui: &mut egui::Ui, edit: egui::TextEdit<'_>) -> egui::Response {
+    // As in pill_field: the well's slot first, filled in once the size and
+    // focus are known.
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let out = egui::Frame::NONE.inner_margin(egui::Margin::symmetric(14, 9)).show(ui, |ui| {
+        ui.add(
+            edit.frame(egui::Frame::NONE)
+                .margin(egui::Margin::ZERO)
+                .font(egui::FontId::proportional(13.0))
+                .text_color(TEXT())
+                .desired_width(f32::INFINITY),
+        )
+    });
+    let resp = out.inner;
     let ring = if resp.has_focus() { crate::theme::selection_outline() } else { egui::Color32::TRANSPARENT };
     ui.painter().set(
         bg,
-        egui::epaint::RectShape::new(rect, h / 2.0, well_fill(), egui::Stroke::new(1.0_f32, ring), egui::StrokeKind::Inside),
+        egui::epaint::RectShape::new(
+            out.response.rect,
+            12.0,
+            well_fill(),
+            egui::Stroke::new(1.0_f32, ring),
+            egui::StrokeKind::Inside,
+        ),
     );
     resp
 }
@@ -1548,7 +1598,11 @@ pub(crate) fn pill_field(ui: &mut egui::Ui, width: f32, edit: egui::TextEdit<'_>
 /// Find Issues' folder field and list: sunk below the cards (darker in dark
 /// themes, greyer in light ones).
 fn well_fill() -> egui::Color32 {
-    if crate::theme::is_light() {
+    // Under Liquid Glass the Settings window's wells (text boxes, dropdowns,
+    // lists) take the downloader's text-box colour instead.
+    if liquid_main() {
+        PANEL()
+    } else if crate::theme::is_light() {
         FLOAT().lerp_to_gamma(TEXT(), 0.07)
     } else {
         FLOAT().lerp_to_gamma(egui::Color32::BLACK, 0.28)
@@ -1566,12 +1620,39 @@ fn fresh() -> bool {
     FRESH.get()
 }
 
+thread_local! {
+    /// The main Settings window (not Create Backup) is being drawn.
+    static MAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Draw what follows with the main Settings window's look (Find Issues'
+/// cards and, under Liquid Glass, glass cards and wells) until
+/// [`end_main_look`]. For AI Settings under Liquid Glass.
+pub(crate) fn begin_main_look() {
+    FRESH.set(true);
+    MAIN.set(true);
+}
+
+/// Ends [`begin_main_look`].
+pub(crate) fn end_main_look() {
+    FRESH.set(false);
+    MAIN.set(false);
+}
+
+/// The main Settings window, under Liquid Glass.
+fn liquid_main() -> bool {
+    MAIN.get() && crate::theme::liquid_markers().is_some()
+}
+
 /// Draw `f` with the Find Issues look, as the Settings window is (for other
 /// popups in that style: Create Backup).
 pub(crate) fn fresh_look<R>(f: impl FnOnce() -> R) -> R {
     let was = FRESH.replace(true);
+    // Under Liquid Glass, also the main window's glass cards and wells.
+    let was_main = MAIN.replace(crate::theme::liquid_markers().is_some());
     let out = f();
     FRESH.set(was);
+    MAIN.set(was_main);
     out
 }
 
@@ -1583,7 +1664,13 @@ pub(crate) fn bold(size: f32) -> egui::FontId {
 /// Find Issues' cards: the window's colour lifted a little toward the text
 /// colour (lighter in dark themes, a touch greyer in light ones).
 fn card_fill() -> egui::Color32 {
-    FLOAT().lerp_to_gamma(TEXT(), 0.035)
+    // Under Liquid Glass, the Settings window's cards are glass like the
+    // downloader's (PANEL is what Liquid Glass frosts).
+    if liquid_main() {
+        PANEL()
+    } else {
+        FLOAT().lerp_to_gamma(TEXT(), 0.035)
+    }
 }
 
 /// Find Issues' card outlines and dividers.
@@ -1664,7 +1751,7 @@ pub(crate) fn layout_dropdown<T: Copy + PartialEq>(
         return false;
     };
     let id = egui::Id::new(("settings_dropdown", id_salt));
-    let resp = dropdown_pill(ui, id, |p, rect, ink| {
+    let resp = dropdown_pill(ui, id, DROP_W, |p, rect, ink| {
         let glyph = egui::Rect::from_center_size(egui::pos2(rect.left() + 21.0, rect.center().y), egui::vec2(15.0, 12.0));
         paint_layout_glyph(p, glyph, icon, ink);
         p.text(
@@ -1726,7 +1813,7 @@ pub(crate) fn pill_dropdown<T: Copy + PartialEq>(
         return false;
     };
     let id = egui::Id::new(("settings_dropdown", id_salt));
-    let resp = dropdown_pill(ui, id, |p, rect, _| {
+    let resp = dropdown_pill(ui, id, DROP_W, |p, rect, _| {
         let mut x = rect.left() + 15.0;
         if let Some(c) = dot {
             paint_dot(p, egui::pos2(rect.left() + 19.0, rect.center().y), c);
@@ -1750,6 +1837,52 @@ pub(crate) fn pill_dropdown<T: Copy + PartialEq>(
     changed
 }
 
+/// A dropdown in the Settings look for lists of any kind: a pill `width`
+/// wide (`f32::INFINITY`: all there is) showing `label`, opening a list that
+/// `add` fills, usually with [`dropdown_option`]s (close it with
+/// `ui.close()` on a pick).
+pub(crate) fn pill_combo(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    width: f32,
+    label: &str,
+    add: impl FnOnce(&mut egui::Ui),
+) -> egui::Response {
+    let id = egui::Id::new(("settings_dropdown", id_salt));
+    let w = if width.is_finite() { width } else { ui.available_width() };
+    let resp = dropdown_pill(ui, id, w, |p, rect, _| {
+        let text = p.layout_no_wrap(label.to_owned(), egui::FontId::proportional(13.0), TEXT());
+        // Clipped short of the chevron.
+        let clip = egui::Rect::from_min_max(rect.min, egui::pos2(rect.right() - 30.0, rect.bottom()));
+        p.with_clip_rect(clip.intersect(p.clip_rect()))
+            .galley(egui::pos2(rect.left() + 15.0, rect.center().y - text.size().y / 2.0), text, TEXT());
+    });
+    dropdown_list(&resp, id, w.max(140.0), add);
+    resp
+}
+
+/// [`pill_combo`] over `(value, name)` choices. True when the choice changed.
+pub(crate) fn pill_choice<T: PartialEq + Clone>(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    width: f32,
+    current: &mut T,
+    options: &[(T, &str)],
+) -> bool {
+    let label = options.iter().find(|o| o.0 == *current).or(options.first()).map_or("", |o| o.1);
+    let mut changed = false;
+    pill_combo(ui, id_salt, width, label, |ui| {
+        for (value, name) in options {
+            if dropdown_option(ui, name, None, None, *current == *value).clicked() {
+                changed |= *current != *value;
+                *current = value.clone();
+                ui.close();
+            }
+        }
+    });
+    changed
+}
+
 /// The closed dropdown: a sunk pill (the pill text fields' well) with
 /// `content` painted inside and a chevron that turns up while it's open, the
 /// pill then ringed in the accent colour with a soft halo. `content` gets
@@ -1757,11 +1890,12 @@ pub(crate) fn pill_dropdown<T: Copy + PartialEq>(
 fn dropdown_pill(
     ui: &mut egui::Ui,
     id: egui::Id,
+    width: f32,
     content: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
 ) -> egui::Response {
     let open = egui::Popup::is_id_open(ui.ctx(), id);
     let t = ui.ctx().animate_bool(id.with("chevron"), open);
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(DROP_W, DROP_H), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, DROP_H), egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
@@ -1770,12 +1904,15 @@ fn dropdown_pill(
         if t > 0.01 {
             p.rect_stroke(rect, r, egui::Stroke::new(3.0 * t, drop_accent().gamma_multiply(0.18 * t)), egui::StrokeKind::Outside);
         }
+        // Under Liquid Glass every dropdown is glass, as the main Settings
+        // window's are.
+        let well = if crate::theme::liquid_markers().is_some() { PANEL() } else { well_fill() };
         let fill = if open {
-            sunk_deeper(well_fill())
+            sunk_deeper(well)
         } else if hot {
-            well_fill().lerp_to_gamma(TEXT(), 0.04)
+            well.lerp_to_gamma(TEXT(), 0.04)
         } else {
-            well_fill()
+            well
         };
         let edge = if open {
             drop_accent_ink().gamma_multiply(0.65)

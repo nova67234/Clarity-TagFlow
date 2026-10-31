@@ -208,7 +208,14 @@ fn glassify_with(ctx: &egui::Context, markers: &Markers) {
                 for i in 0..list.next_idx().0 {
                     list.mutate_shape(egui::layers::ShapeIdx(i), |s| {
                         let clip = s.clip_rect;
-                        swap(&mut s.shape, markers, &mut placed, clip);
+                        let mut reach = Rect::NOTHING;
+                        swap(&mut s.shape, markers, &mut placed, clip, &mut reach);
+                        // A surface its panel shows whole casts its shadow
+                        // past the panel's edge too: clipped there, the shadow
+                        // ended in a hard, square-cornered line.
+                        if reach.is_positive() {
+                            s.clip_rect = clip.union(reach);
+                        }
                     });
                 }
             }
@@ -225,9 +232,10 @@ fn nested_tint(light: bool, opacity: f32) -> Color32 {
 
 /// Glass in place of `shape` if it's a marked rectangle — or holds one (a
 /// frame's shadow and fill come together, and then the shadow goes too).
-/// `placed`: the glass already on this layer; `clip`: where the shape shows.
-/// Whether it did.
-fn swap(shape: &mut Shape, markers: &Markers, placed: &mut Vec<Rect>, clip: Rect) -> bool {
+/// `placed`: the glass already on this layer; `clip`: where the shape shows;
+/// `reach`: grows to take in the shadows of the surfaces shown whole. Whether
+/// it did.
+fn swap(shape: &mut Shape, markers: &Markers, placed: &mut Vec<Rect>, clip: Rect, reach: &mut Rect) -> bool {
     match shape {
         Shape::Rect(r) if r.blur_width <= 0.0 && r.angle == 0.0 => match markers.kind(r.fill) {
             // On glass by the part that shows: a card scrolled partly out of
@@ -238,7 +246,12 @@ fn swap(shape: &mut Shape, markers: &Markers, placed: &mut Vec<Rect>, clip: Rect
             }
             Some((kind, opacity)) => {
                 placed.push(r.rect);
-                *shape = Shape::Callback(callback(r.rect, r.corner_radius, Style::of(kind, markers.light), opacity));
+                let cb = callback(r.rect, r.corner_radius, Style::of(kind, markers.light), opacity);
+                // Scrolled partly out of sight, it stays clipped.
+                if clip.expand(0.5).contains_rect(r.rect) {
+                    *reach = reach.union(cb.rect);
+                }
+                *shape = Shape::Callback(cb);
                 true
             }
             None => false,
@@ -246,7 +259,7 @@ fn swap(shape: &mut Shape, markers: &Markers, placed: &mut Vec<Rect>, clip: Rect
         Shape::Vec(shapes) => {
             let mut glass = false;
             for s in shapes.iter_mut() {
-                glass |= swap(s, markers, placed, clip);
+                glass |= swap(s, markers, placed, clip, reach);
             }
             if glass {
                 shapes.retain(|s| !matches!(s, Shape::Rect(r) if r.blur_width > 0.0));
@@ -668,18 +681,23 @@ mod tests {
         Shape::rect_filled(Rect::from_min_size(pos2(10.0, 20.0), vec2(200.0, 100.0)), 22, fill)
     }
 
+    /// For tests that don't look at `swap`'s reach.
+    fn no_reach() -> Rect {
+        Rect::NOTHING
+    }
+
     /// Only the marked fills become glass; a frame's shadow goes with it,
     /// and an unmarked frame keeps its own.
     #[test]
     fn marked_surfaces_become_glass() {
         let mut panel = rect(MARKERS.panel);
-        assert!(swap(&mut panel, &MARKERS, &mut Vec::new(), Rect::EVERYTHING));
+        assert!(swap(&mut panel, &MARKERS, &mut Vec::new(), Rect::EVERYTHING, &mut no_reach()));
         let Shape::Callback(cb) = &panel else { panic!("not glass: {panel:?}") };
         let margin = Style::of(Kind::Panel, false).margin();
         assert_eq!(cb.rect, Rect::from_min_size(pos2(10.0, 20.0), vec2(200.0, 100.0)).expand(margin));
 
         let mut plain = rect(Color32::from_rgb(30, 30, 30));
-        assert!(!swap(&mut plain, &MARKERS, &mut Vec::new(), Rect::EVERYTHING));
+        assert!(!swap(&mut plain, &MARKERS, &mut Vec::new(), Rect::EVERYTHING, &mut no_reach()));
         assert!(matches!(plain, Shape::Rect(_)));
 
         let shadow = egui::epaint::Shadow { offset: [0, 4], blur: 14, spread: 0, color: Color32::from_black_alpha(110) };
@@ -691,13 +709,13 @@ mod tests {
             ])
         };
         let mut window = framed(MARKERS.float);
-        assert!(swap(&mut window, &MARKERS, &mut Vec::new(), Rect::EVERYTHING));
+        assert!(swap(&mut window, &MARKERS, &mut Vec::new(), Rect::EVERYTHING, &mut no_reach()));
         let Shape::Vec(v) = &window else { panic!() };
         assert_eq!(v.len(), 1, "the frame's shadow went: {v:?}");
         assert!(matches!(v[0], Shape::Callback(_)));
 
         let mut card = framed(Color32::from_rgb(40, 40, 40));
-        assert!(!swap(&mut card, &MARKERS, &mut Vec::new(), Rect::EVERYTHING));
+        assert!(!swap(&mut card, &MARKERS, &mut Vec::new(), Rect::EVERYTHING, &mut no_reach()));
         let Shape::Vec(v) = &card else { panic!() };
         assert_eq!(v.len(), 2, "an ordinary card keeps its shadow");
     }
@@ -710,12 +728,12 @@ mod tests {
             egui::epaint::RectShape::filled(Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0)), 2, MARKERS.panel)
                 .with_blur_width(6.0),
         );
-        assert!(!swap(&mut glow, &MARKERS, &mut Vec::new(), Rect::EVERYTHING));
+        assert!(!swap(&mut glow, &MARKERS, &mut Vec::new(), Rect::EVERYTHING, &mut no_reach()));
         let mut turned = Shape::Rect(
             egui::epaint::RectShape::filled(Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0)), 2, MARKERS.panel)
                 .with_angle(0.3),
         );
-        assert!(!swap(&mut turned, &MARKERS, &mut Vec::new(), Rect::EVERYTHING));
+        assert!(!swap(&mut turned, &MARKERS, &mut Vec::new(), Rect::EVERYTHING, &mut no_reach()));
     }
 
     /// A surface fading in or out is still glass — of the right kind,
@@ -759,11 +777,29 @@ mod tests {
         let panel = Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 100.0));
         let card = Rect::from_min_max(pos2(10.0, 80.0), pos2(90.0, 140.0));
         let mut shape = Shape::rect_filled(card, 8, MARKERS.panel);
-        assert!(!swap(&mut shape, &MARKERS, &mut vec![panel], panel.shrink(4.0)));
+        assert!(!swap(&mut shape, &MARKERS, &mut vec![panel], panel.shrink(4.0), &mut no_reach()));
         assert!(matches!(&shape, Shape::Rect(r) if r.fill == nested_tint(false, 1.0)), "{shape:?}");
         // Where it shows off the panel, it's glass of its own.
         let mut shape = Shape::rect_filled(card, 8, MARKERS.panel);
-        assert!(swap(&mut shape, &MARKERS, &mut vec![panel], Rect::EVERYTHING));
+        assert!(swap(&mut shape, &MARKERS, &mut vec![panel], Rect::EVERYTHING, &mut no_reach()));
+    }
+
+    /// A surface shown whole casts its shadow past its clip (cut off there,
+    /// it ended in a hard, square-cornered line); one partly out of sight
+    /// stays clipped.
+    #[test]
+    fn whole_surfaces_shadow_past_their_clip() {
+        let surface = Rect::from_min_size(pos2(10.0, 20.0), vec2(200.0, 100.0));
+        let margin = Style::of(Kind::Panel, false).margin();
+        let mut reach = Rect::NOTHING;
+        let mut shape = Shape::rect_filled(surface, 12, MARKERS.panel);
+        assert!(swap(&mut shape, &MARKERS, &mut Vec::new(), surface, &mut reach));
+        assert_eq!(reach, surface.expand(margin));
+
+        let mut reach = Rect::NOTHING;
+        let mut shape = Shape::rect_filled(surface, 12, MARKERS.panel);
+        assert!(swap(&mut shape, &MARKERS, &mut Vec::new(), surface.shrink(20.0), &mut reach));
+        assert!(!reach.is_positive(), "partly hidden: {reach:?}");
     }
 
     /// Floating surfaces are a little more frosted and cast a deeper shadow

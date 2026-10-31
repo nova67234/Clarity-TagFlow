@@ -25,7 +25,7 @@ use eframe::egui;
 use suppaftp::native_tls::TlsConnector;
 use suppaftp::{NativeTlsConnector, NativeTlsFtpStream};
 
-use crate::theme::{ACCENT1, EDGE, FIELD, FLOAT, MUTED, PANEL, TEXT};
+use crate::theme::{ACCENT1, EDGE, FIELD, MUTED, PANEL, TEXT};
 
 /// Everything needed to open one connection. Snapshotted from `Settings` (+ the
 /// decrypted password) when an operation starts, so background threads never
@@ -455,19 +455,7 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .frame(
-            egui::Frame::new()
-                .fill(FLOAT())
-                .corner_radius(egui::CornerRadius::same(16))
-                .inner_margin(egui::Margin::same(18))
-                .stroke(egui::Stroke::new(1.0_f32, EDGE()))
-                .shadow(egui::epaint::Shadow {
-                    offset: [0, 6],
-                    blur: 20,
-                    spread: 0,
-                    color: egui::Color32::from_black_alpha(150),
-                }),
-        )
+        .frame(crate::settings::fresh_window_frame())
         .show(ctx, |ui| {
             ui.set_width(430.0);
 

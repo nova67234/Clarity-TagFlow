@@ -1259,13 +1259,25 @@ fn shade(c: Color32, t: f32) -> Color32 {
 /// The cards: the window's colour lifted a little toward the text colour
 /// (lighter in dark themes, a touch greyer in light ones).
 fn card_fill() -> Color32 {
-    FLOAT().lerp_to_gamma(TEXT(), 0.035)
+    // Under Liquid Glass, glass like the main Settings window's cards (PANEL
+    // is what Liquid Glass frosts).
+    if liquid() {
+        crate::theme::PANEL()
+    } else {
+        FLOAT().lerp_to_gamma(TEXT(), 0.035)
+    }
+}
+
+fn liquid() -> bool {
+    crate::theme::liquid_markers().is_some()
 }
 
 /// The folder field and the list: sunk below the cards (darker in dark
 /// themes, greyer in light ones).
 fn well_fill() -> Color32 {
-    if crate::theme::is_light() {
+    if liquid() {
+        crate::theme::PANEL()
+    } else if crate::theme::is_light() {
         FLOAT().lerp_to_gamma(TEXT(), 0.07)
     } else {
         FLOAT().lerp_to_gamma(Color32::BLACK, 0.28)

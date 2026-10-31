@@ -237,14 +237,13 @@ fn show_body(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<
         );
         crate::settings::row_sep(ui);
         crate::settings::row(ui, "Resolution", None, |ui| {
-            egui::ComboBox::from_id_salt("pixal3d_res")
-                .width(100.0)
-                .selected_text(state.resolution.to_string())
-                .show_ui(ui, |ui| {
-                    for r in [512, 1024, 1536] {
-                        ui.selectable_value(&mut state.resolution, r, r.to_string());
-                    }
-                });
+            crate::settings::pill_choice(
+                ui,
+                "pixal3d_res",
+                110.0,
+                &mut state.resolution,
+                &[(512, "512"), (1024, "1024"), (1536, "1536")],
+            );
         });
         crate::settings::row_sep(ui);
         crate::settings::row(
@@ -283,14 +282,13 @@ fn show_body(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<
         int_slider_row(ui, "Simplify (tris)", &mut state.decimation, 5_000..=200_000, DEFAULT_DECIMATION);
         crate::settings::row_sep(ui);
         crate::settings::row(ui, "Texture size", None, |ui| {
-            egui::ComboBox::from_id_salt("pixal3d_texsize")
-                .width(100.0)
-                .selected_text(state.texture_size.to_string())
-                .show_ui(ui, |ui| {
-                    for t in [512, 1024, 2048] {
-                        ui.selectable_value(&mut state.texture_size, t, t.to_string());
-                    }
-                });
+            crate::settings::pill_choice(
+                ui,
+                "pixal3d_texsize",
+                110.0,
+                &mut state.texture_size,
+                &[(512, "512"), (1024, "1024"), (2048, "2048")],
+            );
         });
         crate::settings::row_sep(ui);
         crate::settings::row(
@@ -468,14 +466,12 @@ fn settings_popup(anchor: &egui::Response, state: &mut Pixal3DState) {
                     "HF token",
                     Some("Optional — every model comes from public sources."),
                     |ui| {
-                        let resp = ui
-                            .add(
-                                egui::TextEdit::singleline(&mut state.hf_token)
-                                    .password(true)
-                                    .desired_width(150.0)
-                                    .margin(Margin::symmetric(8, 5)),
-                            )
-                            .on_hover_ui(|ui| {
+                        let resp = crate::settings::pill_field(
+                            ui,
+                            150.0,
+                            egui::TextEdit::singleline(&mut state.hf_token).password(true),
+                        )
+                        .on_hover_ui(|ui| {
                                 ui.set_max_width(260.0);
                                 ui.label(
                                     "Only add a token if you want to use your own gated model — \

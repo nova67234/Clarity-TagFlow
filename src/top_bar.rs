@@ -856,7 +856,7 @@ pub fn folder_popup(
         .collapsible(false)
         .resizable(false)
         .placed_at([x, y])
-        .frame(popup_frame())
+        .frame(crate::settings::fresh_window_frame())
         .show(ctx, |ui| {
             // Only the top strip drags the popup — not stray drags on the body.
             crate::popup_drag_strip(ui, 30.0);
@@ -1019,18 +1019,3 @@ fn menu_row(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
     }
 }
 
-/// A themed frame for the folder popup — same card styling as the other
-/// popups, but with the softer rounded-22 corners of the gallery detail view.
-fn popup_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(FLOAT())
-        .corner_radius(CornerRadius::same(22))
-        .inner_margin(egui::Margin::same(18))
-        .stroke(Stroke::new(1.0_f32, EDGE()))
-        .shadow(egui::epaint::Shadow {
-            offset: [0, 6],
-            blur: 20,
-            spread: 0,
-            color: Color32::from_black_alpha(150),
-        })
-}

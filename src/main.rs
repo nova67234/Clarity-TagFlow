@@ -1282,19 +1282,7 @@ impl ViewerApp {
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .frame(
-                    egui::Frame::new()
-                        .fill(FLOAT())
-                        .corner_radius(CornerRadius::same(16))
-                        .inner_margin(Margin::same(18))
-                        .stroke(Stroke::new(1.0_f32, EDGE()))
-                        .shadow(egui::epaint::Shadow {
-                            offset: [0, 6],
-                            blur: 20,
-                            spread: 0,
-                            color: Color32::from_black_alpha(150),
-                        }),
-                )
+                .frame(crate::settings::fresh_window_frame())
                 .show(ctx, |ui| {
                     ui.set_width(320.0);
                     ui.heading(egui::RichText::new("Open Zip").color(TEXT()).strong().size(17.0));
@@ -1311,14 +1299,10 @@ impl ViewerApp {
                         .size(11.0),
                     );
                     ui.add_space(8.0);
-                    let resp = ui.add_sized(
-                        egui::vec2(ui.available_width(), 30.0),
-                        egui::TextEdit::singleline(&mut prompt.password)
-                            .password(true)
-                            .hint_text("Password")
-                            // Centre the text in the 30px box (a sized TextEdit
-                            // top-aligns its one line by default).
-                            .vertical_align(egui::Align::Center),
+                    let resp = crate::settings::pill_field(
+                        ui,
+                        f32::INFINITY,
+                        egui::TextEdit::singleline(&mut prompt.password).password(true).hint_text("Password"),
                     );
                     if !prompt.focused {
                         resp.request_focus();

@@ -391,7 +391,7 @@ pub fn show(
         .resizable(false)
         .placed_centered(ctx)
         .fixed_size([win_w, win_h])
-        .frame(window_frame())
+        .frame(crate::settings::fresh_window_frame())
         .show(ctx, |ui| {
             // Only the top strip drags the popup — not stray drags on the body.
             crate::popup_drag_strip(ui, 30.0);
@@ -960,16 +960,3 @@ fn draw_image(
     }
 }
 
-fn window_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(FLOAT())
-        .corner_radius(egui::CornerRadius::same(22))
-        .inner_margin(egui::Margin::same(18))
-        .stroke(egui::Stroke::new(1.0_f32, EDGE()))
-        .shadow(egui::epaint::Shadow {
-            offset: [0, 6],
-            blur: 24,
-            spread: 0,
-            color: egui::Color32::from_black_alpha(160),
-        })
-}

@@ -170,11 +170,7 @@ fn settings_tab(ui: &mut egui::Ui, s: &mut TagManagerSettings) {
     });
 
     section(ui, "Tag blacklist", |ui| {
-        ui.add(
-            egui::TextEdit::multiline(&mut s.blacklist)
-                .desired_width(f32::INFINITY)
-                .desired_rows(3),
-        );
+        crate::settings::well_box(ui, egui::TextEdit::multiline(&mut s.blacklist).desired_rows(3));
         ui.add_space(3.0);
         ui.label(
             egui::RichText::new("Tags the AI never adds — comma or newline separated.")

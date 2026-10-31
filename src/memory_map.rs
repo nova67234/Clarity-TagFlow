@@ -410,7 +410,7 @@ pub fn window(ctx: &egui::Context, llm: &mut crate::llm::LlmState) {
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .frame(crate::settings::window_frame())
+        .frame(crate::settings::fresh_window_frame())
         .fixed_size(size)
         .show(ctx, |ui| {
             let store = match map.kind {
@@ -583,11 +583,7 @@ impl MapState {
     fn filters(&mut self, ui: &mut egui::Ui, store: &MemoryStore) {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("Search memories")
-                    .desired_width(220.0),
-            );
+            crate::settings::pill_field(ui, 220.0, egui::TextEdit::singleline(&mut self.search).hint_text("Search memories"));
             ui.add_space(6.0);
             for (ti, topic) in store.topics.iter().enumerate() {
                 let on = !self.hidden.contains(&topic.name);
@@ -951,9 +947,9 @@ impl MapState {
         };
         caption(ui, "EDIT MEMORY");
         field_label(ui, "Title");
-        ui.add(egui::TextEdit::singleline(&mut self.draft_title).desired_width(f32::INFINITY));
+        crate::settings::pill_field(ui, f32::INFINITY, egui::TextEdit::singleline(&mut self.draft_title));
         field_label(ui, "Details");
-        ui.add(egui::TextEdit::multiline(&mut self.draft_text).desired_rows(5).desired_width(f32::INFINITY));
+        crate::settings::well_box(ui, egui::TextEdit::multiline(&mut self.draft_text).desired_rows(5));
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             let ok = !self.draft_title.trim().is_empty();
@@ -1016,35 +1012,33 @@ impl MapState {
                 }
             }
         }
-        egui::ComboBox::from_id_salt("memory_new_topic")
-            .width(ui.available_width())
-            .selected_text(shown)
-            .show_ui(ui, |ui| {
-                for name in &choices {
-                    ui.selectable_value(&mut self.draft_topic, name.clone(), name);
+        crate::settings::pill_combo(ui, "memory_new_topic", f32::INFINITY, &shown, |ui| {
+            let names = choices.iter().map(|n| (n.as_str(), n.as_str())).chain([(NEW, "New topic…")]);
+            for (value, name) in names {
+                if crate::settings::dropdown_option(ui, name, None, None, self.draft_topic == value).clicked() {
+                    self.draft_topic = value.to_string();
+                    ui.close();
                 }
-                ui.selectable_value(&mut self.draft_topic, NEW.to_string(), "New topic…");
-            });
+            }
+        });
         let new_topic = self.draft_topic == NEW || self.draft_topic.is_empty();
         if new_topic {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.draft_new_topic)
-                    .hint_text("Topic name, e.g. a project")
-                    .desired_width(f32::INFINITY),
+            crate::settings::pill_field(
+                ui,
+                f32::INFINITY,
+                egui::TextEdit::singleline(&mut self.draft_new_topic).hint_text("Topic name, e.g. a project"),
             );
         }
         field_label(ui, "Title");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.draft_title)
-                .hint_text("A short headline")
-                .desired_width(f32::INFINITY),
+        crate::settings::pill_field(
+            ui,
+            f32::INFINITY,
+            egui::TextEdit::singleline(&mut self.draft_title).hint_text("A short headline"),
         );
         field_label(ui, "Details");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.draft_text)
-                .hint_text("What should the AI remember?")
-                .desired_rows(4)
-                .desired_width(f32::INFINITY),
+        crate::settings::well_box(
+            ui,
+            egui::TextEdit::multiline(&mut self.draft_text).hint_text("What should the AI remember?").desired_rows(4),
         );
         ui.add_space(6.0);
         let topic = if new_topic { self.draft_new_topic.trim().to_string() } else { self.draft_topic.clone() };

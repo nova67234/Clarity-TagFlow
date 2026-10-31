@@ -300,7 +300,7 @@ pub(super) fn notes_window(ctx: &egui::Context, llm: &mut LlmState) {
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .frame(crate::settings::window_frame())
+        .frame(crate::settings::fresh_window_frame())
         .fixed_size(egui::vec2(w, h))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {

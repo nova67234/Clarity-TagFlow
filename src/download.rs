@@ -807,9 +807,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloaderState) {
             } else {
                 ("Start Download", ACCENT1())
             };
+            // Round ends, like the text boxes above it.
             let btn = egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE).strong())
                 .fill(fill)
-                .corner_radius(egui::CornerRadius::same(14));
+                .corner_radius(egui::CornerRadius::same((size.y / 2.0) as u8));
             if ui.add_sized(size, btn).clicked() {
                 if state.running {
                     state.cancel.store(true, Ordering::SeqCst);
@@ -1405,61 +1406,30 @@ fn wallhaven_options(ui: &mut egui::Ui, enabled: bool, wh: &mut crate::wallhaven
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Sort").color(TEXT()));
         ui.add_enabled_ui(enabled, |ui| {
-            let label = crate::wallhaven::SORTINGS
-                .iter()
-                .find(|(v, _)| *v == wh.sorting)
-                .map_or("Date added", |(_, l)| *l);
-            egui::ComboBox::from_id_salt("wallhaven_sorting")
-                .width(112.0)
-                .selected_text(label)
-                .show_ui(ui, |ui| {
-                    for (v, l) in crate::wallhaven::SORTINGS {
-                        ui.selectable_value(&mut wh.sorting, v.to_string(), l);
-                    }
-                });
+            let options: Vec<(String, &str)> =
+                crate::wallhaven::SORTINGS.iter().map(|(v, l)| (v.to_string(), *l)).collect();
+            crate::settings::pill_choice(ui, "wallhaven_sorting", 140.0, &mut wh.sorting, &options);
         });
         if wh.sorting == "toplist" {
             ui.add_space(12.0);
             ui.label(egui::RichText::new("Range").color(TEXT()));
             ui.add_enabled_ui(enabled, |ui| {
-                let label = crate::wallhaven::TOP_RANGES
-                    .iter()
-                    .find(|(v, _)| *v == wh.top_range)
-                    .map_or("Last month", |(_, l)| *l);
-                egui::ComboBox::from_id_salt("wallhaven_toprange")
-                    .width(112.0)
-                    .selected_text(label)
-                    .show_ui(ui, |ui| {
-                        for (v, l) in crate::wallhaven::TOP_RANGES {
-                            ui.selectable_value(&mut wh.top_range, v.to_string(), l);
-                        }
-                    });
+                let options: Vec<(String, &str)> =
+                    crate::wallhaven::TOP_RANGES.iter().map(|(v, l)| (v.to_string(), *l)).collect();
+                crate::settings::pill_choice(ui, "wallhaven_toprange", 140.0, &mut wh.top_range, &options);
             });
         }
     });
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        ui.scope(|ui| {
-            ui.visuals_mut().extreme_bg_color = FIELD();
+        ui.add_enabled_ui(enabled, |ui| {
             ui.label(egui::RichText::new("Min res").color(TEXT()))
                 .on_hover_text("Only wallpapers at least this large, e.g. 1920x1080. Blank = any size.");
-            ui.add_enabled(
-                enabled,
-                egui::TextEdit::singleline(&mut wh.atleast)
-                    .hint_text("any")
-                    .desired_width(78.0)
-                    .margin(egui::Margin::symmetric(8, 5)),
-            );
+            crate::settings::panel_pill_field(ui, 100.0, egui::TextEdit::singleline(&mut wh.atleast).hint_text("any"));
             ui.add_space(12.0);
             ui.label(egui::RichText::new("Ratios").color(TEXT()))
                 .on_hover_text("Comma-separated aspect ratios, e.g. 16x9,16x10. Blank = any shape.");
-            ui.add_enabled(
-                enabled,
-                egui::TextEdit::singleline(&mut wh.ratios)
-                    .hint_text("any")
-                    .desired_width(90.0)
-                    .margin(egui::Margin::symmetric(8, 5)),
-            );
+            crate::settings::panel_pill_field(ui, 112.0, egui::TextEdit::singleline(&mut wh.ratios).hint_text("any"));
         });
     });
     ui.add_space(8.0);
@@ -1536,13 +1506,7 @@ fn field_label(ui: &mut egui::Ui, label: &str) {
 /// A full-width text field with the theme's FIELD well background so it stands
 /// out against the PANEL section card (PANEL-on-PANEL made the box invisible).
 fn field_edit(ui: &mut egui::Ui, enabled: bool, edit: egui::TextEdit<'_>) {
-    ui.scope(|ui| {
-        ui.visuals_mut().extreme_bg_color = FIELD();
-        ui.add_enabled(
-            enabled,
-            edit.desired_width(f32::INFINITY).margin(egui::Margin::symmetric(10, 6)),
-        );
-    });
+    ui.add_enabled_ui(enabled, |ui| crate::settings::panel_pill_field(ui, f32::INFINITY, edit));
 }
 
 /// Validate the form and spawn the background worker.

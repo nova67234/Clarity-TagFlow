@@ -24,7 +24,7 @@ use std::time::Duration;
 use eframe::egui;
 
 use crate::slider::PillSlider;
-use crate::theme::{EDGE, FIELD, FLOAT, MUTED, PANEL, TEXT};
+use crate::theme::{EDGE, FIELD, MUTED, PANEL, TEXT};
 
 const USER_AGENT: &str = "Clarity TagFlow (Civitai resource lookup)";
 const API_PING: &str = "https://civitai.com/api/v1/models?limit=1";
@@ -779,19 +779,7 @@ fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
         .collapsible(false)
         .resizable(false)
         .placed_centered(ctx)
-        .frame(
-            egui::Frame::new()
-                .fill(FLOAT())
-                .corner_radius(egui::CornerRadius::same(16))
-                .inner_margin(egui::Margin::same(18))
-                .stroke(egui::Stroke::new(1.0_f32, EDGE()))
-                .shadow(egui::epaint::Shadow {
-                    offset: [0, 6],
-                    blur: 20,
-                    spread: 0,
-                    color: egui::Color32::from_black_alpha(150),
-                }),
-        )
+        .frame(crate::settings::fresh_window_frame())
         .show(ctx, |ui| {
             // Only the top strip drags the popup — not stray drags on the body.
             crate::popup_drag_strip(ui, 30.0);
@@ -837,15 +825,14 @@ fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
             // popup saves as it changes — there is no Save button; close with
             // the ✕ or by clicking outside.
             crate::settings::section(ui, "API key", |ui| {
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut state.api_key)
-                            .password(true)
-                            .desired_width(f32::INFINITY)
-                            .margin(egui::Margin::symmetric(10, 8))
-                            .hint_text("Paste your Civitai API key"),
-                    )
-                    .changed()
+                if crate::settings::pill_field(
+                    ui,
+                    f32::INFINITY,
+                    egui::TextEdit::singleline(&mut state.api_key)
+                        .password(true)
+                        .hint_text("Paste your Civitai API key"),
+                )
+                .changed()
                 {
                     save_civitai_key(&state.api_key);
                 }
@@ -955,19 +942,7 @@ fn folders_popup(ctx: &egui::Context, state: &mut CivitaiState) {
         .collapsible(false)
         .resizable(false)
         .placed_centered(ctx)
-        .frame(
-            egui::Frame::new()
-                .fill(FLOAT())
-                .corner_radius(egui::CornerRadius::same(16))
-                .inner_margin(egui::Margin::same(18))
-                .stroke(egui::Stroke::new(1.0_f32, EDGE()))
-                .shadow(egui::epaint::Shadow {
-                    offset: [0, 6],
-                    blur: 20,
-                    spread: 0,
-                    color: egui::Color32::from_black_alpha(150),
-                }),
-        )
+        .frame(crate::settings::fresh_window_frame())
         .show(ctx, |ui| {
             crate::popup_drag_strip(ui, 30.0);
             ui.set_width(440.0);
@@ -1026,14 +1001,12 @@ fn folders_popup(ctx: &egui::Context, state: &mut CivitaiState) {
                             *state.download_dirs.get_mut(cat) = dir.display().to_string();
                             dirs_changed = true;
                         }
-                    dirs_changed |= ui
-                        .add(
-                            egui::TextEdit::singleline(state.download_dirs.get_mut(cat))
-                                .desired_width(f32::INFINITY)
-                                .margin(egui::Margin::symmetric(10, 6))
-                                .hint_text("Folder for this type"),
-                        )
-                        .changed();
+                    dirs_changed |= crate::settings::pill_field(
+                        ui,
+                        f32::INFINITY,
+                        egui::TextEdit::singleline(state.download_dirs.get_mut(cat)).hint_text("Folder for this type"),
+                    )
+                    .changed();
                 });
                 ui.add_space(8.0);
             }
