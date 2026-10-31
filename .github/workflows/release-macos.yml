@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   macos:
-    runs-on: macos-14 # Apple Silicon runner.
+    runs-on: macos-15 # Apple Silicon runner.
     steps:
       - uses: actions/checkout@v5
 

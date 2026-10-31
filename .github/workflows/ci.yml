@@ -43,7 +43,7 @@ jobs:
         run: cargo test --all-targets --no-default-features --features llm,avif
 
   macos:
-    runs-on: macos-14 # Apple Silicon, like the release build.
+    runs-on: macos-15 # Apple Silicon, like the release build.
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
