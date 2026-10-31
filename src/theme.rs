@@ -21,6 +21,13 @@
 //!   [`Backdrop`], both pushed in via [`set_glass_config`] and painted by
 //!   [`paint_background`]. The panel colours are fixed, so changing the background
 //!   recolours the gutters/backdrop without changing the glass tint itself.
+//! - **Liquid Glass** — real glass (src/liquid_glass.rs): panels, windows,
+//!   popups and menus frost, tint and refract what's behind them, catch the
+//!   light on their rims and cast soft shadows. Dark or light, over the same
+//!   configurable background as Glass (its own backdrop setting, flowing
+//!   colours by default). Its panel and floating-surface colours are markers
+//!   that [`crate::liquid_glass::glassify`] swaps for glass each frame; they
+//!   read as plain translucent panels wherever that can't happen.
 
 use eframe::egui::{self, Color32, CornerRadius};
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
@@ -34,6 +41,7 @@ pub enum Theme {
     Space,
     Aurora,
     Glass,
+    LiquidGlass,
 }
 
 /// The background style painted behind the [`Theme::Glass`] panels. Persisted in
@@ -48,6 +56,9 @@ pub enum Backdrop {
     Starfield,
     /// Drifting pastel aurora blobs over the background colour.
     Aurora,
+    /// Vivid colours flowing slowly over the background colour — what Liquid
+    /// Glass shows off best.
+    Flow,
 }
 
 /// Build a translucent [`Color32`] from straight (un-premultiplied) RGBA. egui
@@ -71,6 +82,9 @@ const fn glass(r: u8, g: u8, b: u8, a: u8) -> Color32 {
 struct Palette {
     bg: Color32,
     panel: Color32,
+    /// Windows, popups, menus and tooltips ([`FLOAT`]): the panel colour,
+    /// except in Liquid Glass, where it marks floating glass.
+    float: Color32,
     field: Color32,
     field2: Color32,
     text: Color32,
@@ -84,12 +98,16 @@ struct Palette {
     /// Translucent panels with a user-configurable background (the Glass theme).
     /// When set, [`paint_background`] paints the configured colour + backdrop.
     glass: bool,
+    /// Real glass (Liquid Glass): `panel` and `float` are the markers
+    /// [`crate::liquid_glass::glassify`] swaps for it.
+    liquid: bool,
 }
 
 /// The original dark palette — identical values to the previous inline consts.
 static DARK: Palette = Palette {
     bg: Color32::from_rgb(24, 24, 26),
     panel: Color32::from_rgb(32, 32, 34),
+    float: Color32::from_rgb(32, 32, 34),
     field: Color32::from_rgb(45, 47, 50),
     field2: Color32::from_rgb(58, 60, 64),
     text: Color32::from_rgb(235, 235, 235),
@@ -102,12 +120,14 @@ static DARK: Palette = Palette {
     starfield: false,
     aurora: false,
     glass: false,
+    liquid: false,
 };
 
 /// A soft light palette: off-white surfaces, dark ink text, deeper accents.
 static LIGHT: Palette = Palette {
     bg: Color32::from_rgb(244, 245, 247),
     panel: Color32::from_rgb(255, 255, 255),
+    float: Color32::from_rgb(255, 255, 255),
     field: Color32::from_rgb(238, 240, 243),
     field2: Color32::from_rgb(226, 229, 234),
     text: Color32::from_rgb(28, 29, 32),
@@ -120,6 +140,7 @@ static LIGHT: Palette = Palette {
     starfield: false,
     aurora: false,
     glass: false,
+    liquid: false,
 };
 
 /// A space palette: identical to the Dark theme's panels (same colours and faint
@@ -129,6 +150,7 @@ static LIGHT: Palette = Palette {
 static SPACE: Palette = Palette {
     bg: Color32::TRANSPARENT,
     panel: Color32::from_rgb(32, 32, 34),
+    float: Color32::from_rgb(32, 32, 34),
     field: Color32::from_rgb(45, 47, 50),
     field2: Color32::from_rgb(58, 60, 64),
     text: Color32::from_rgb(235, 235, 235),
@@ -141,6 +163,7 @@ static SPACE: Palette = Palette {
     starfield: true,
     aurora: false,
     glass: false,
+    liquid: false,
 };
 
 /// An aurora palette: the light-mode counterpart to Space. Identical to the Light
@@ -150,6 +173,7 @@ static SPACE: Palette = Palette {
 static AURORA: Palette = Palette {
     bg: Color32::TRANSPARENT,
     panel: Color32::from_rgb(255, 255, 255),
+    float: Color32::from_rgb(255, 255, 255),
     field: Color32::from_rgb(238, 240, 243),
     field2: Color32::from_rgb(226, 229, 234),
     text: Color32::from_rgb(28, 29, 32),
@@ -161,6 +185,7 @@ static AURORA: Palette = Palette {
     starfield: false,
     aurora: true,
     glass: false,
+    liquid: false,
 };
 
 /// A glass palette: dark, but the panels are *translucent* (~70% opaque) so the
@@ -171,6 +196,7 @@ static AURORA: Palette = Palette {
 static GLASS: Palette = Palette {
     bg: Color32::TRANSPARENT,
     panel: glass(42, 44, 50, 180),
+    float: glass(42, 44, 50, 180),
     field: glass(60, 62, 68, 195),
     field2: glass(72, 74, 80, 195),
     text: Color32::from_rgb(235, 235, 235),
@@ -183,6 +209,7 @@ static GLASS: Palette = Palette {
     starfield: false,
     aurora: false,
     glass: true,
+    liquid: false,
 };
 
 /// The light-mode Glass palette: the same frosted-glass treatment, but the panels
@@ -193,6 +220,7 @@ static GLASS: Palette = Palette {
 static GLASS_LIGHT: Palette = Palette {
     bg: Color32::TRANSPARENT,
     panel: glass(246, 247, 250, 185),
+    float: glass(246, 247, 250, 185),
     // Noticeably darker than `panel` (and a touch more opaque) so input wells
     // stay visible on the frosted white cards — at the old 233-ish values a
     // text box vanished into the panel.
@@ -208,9 +236,51 @@ static GLASS_LIGHT: Palette = Palette {
     starfield: false,
     aurora: false,
     glass: true,
+    liquid: false,
 };
 
-/// 0 = Dark, 1 = Light, 2 = Space, 3 = Aurora, 4 = Glass.
+/// Liquid Glass, dark. `panel` and `float` are markers for real glass (see
+/// [`liquid_markers`]) — chosen so that, if they're ever painted as they are,
+/// they're plain dark translucent panels. Fields and controls are Apple's
+/// system fills: grey at a low opacity, which reads on any glass.
+static LIQUID: Palette = Palette {
+    bg: Color32::TRANSPARENT,
+    panel: glass(28, 30, 38, 171),
+    float: glass(44, 46, 58, 182),
+    field: glass(118, 118, 128, 61),
+    field2: glass(118, 118, 128, 82),
+    text: Color32::from_rgb(242, 242, 245),
+    muted: Color32::from_rgb(190, 193, 200),
+    accent1: Color32::from_rgb(64, 140, 255),
+    accent2: Color32::from_rgb(90, 200, 245),
+    edge: Color32::TRANSPARENT,
+    is_dark: true,
+    starfield: false,
+    aurora: false,
+    glass: true,
+    liquid: true,
+};
+
+/// Liquid Glass, light: white glass, dark ink.
+static LIQUID_LIGHT: Palette = Palette {
+    bg: Color32::TRANSPARENT,
+    panel: glass(246, 247, 250, 171),
+    float: glass(225, 230, 245, 182),
+    field: glass(118, 118, 128, 36),
+    field2: glass(118, 118, 128, 52),
+    text: Color32::from_rgb(28, 28, 31),
+    muted: Color32::from_rgb(88, 90, 98),
+    accent1: Color32::from_rgb(10, 110, 235),
+    accent2: Color32::from_rgb(20, 140, 200),
+    edge: Color32::TRANSPARENT,
+    is_dark: false,
+    starfield: false,
+    aurora: false,
+    glass: true,
+    liquid: true,
+};
+
+/// 0 = Dark, 1 = Light, 2 = Space, 3 = Aurora, 4 = Glass, 5 = Liquid Glass.
 static ACTIVE: AtomicU8 = AtomicU8::new(0);
 
 /// Whether the Glass theme uses its light palette ([`GLASS_LIGHT`]) instead of
@@ -284,9 +354,27 @@ pub fn chat_aurora_ink() -> Option<Color32> {
     (backdrop == Backdrop::Aurora).then_some(Color32::from_rgb(12, 13, 16))
 }
 
-/// True while a Glass theme (dark or light panels) is active.
+/// True while a Glass theme (dark or light panels) is active — Liquid Glass
+/// included.
 pub fn is_glass() -> bool {
     palette().glass
+}
+
+/// Under Liquid Glass, the colours that mark its panels and floating
+/// surfaces this frame (see [`crate::liquid_glass::glassify`]).
+pub fn liquid_markers() -> Option<crate::liquid_glass::Markers> {
+    let p = palette();
+    p.liquid.then(|| markers_of(p))
+}
+
+fn markers_of(p: &Palette) -> crate::liquid_glass::Markers {
+    crate::liquid_glass::Markers { panel: p.panel, float: p.float, light: !p.is_dark }
+}
+
+/// Liquid Glass's markers, light or dark, whatever theme is active.
+#[cfg(test)]
+pub(crate) fn liquid_markers_for(light: bool) -> crate::liquid_glass::Markers {
+    markers_of(if light { &LIQUID_LIGHT } else { &LIQUID })
 }
 
 /// The user's AI-chat icon-colour override, if enabled.
@@ -311,6 +399,7 @@ pub fn set(theme: Theme) {
         Theme::Space => 2,
         Theme::Aurora => 3,
         Theme::Glass => 4,
+        Theme::LiquidGlass => 5,
     };
     ACTIVE.store(v, Ordering::Relaxed);
 }
@@ -324,6 +413,7 @@ pub fn set_glass_config(rgb: [u8; 3], backdrop: Backdrop, light: bool) {
         Backdrop::Solid => 0u32,
         Backdrop::Starfield => 1,
         Backdrop::Aurora => 2,
+        Backdrop::Flow => 3,
     };
     let packed = (b << 24) | ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32;
     GLASS_CONFIG.store(packed, Ordering::Relaxed);
@@ -337,6 +427,7 @@ fn glass_config() -> (Color32, Backdrop) {
     let backdrop = match (p >> 24) & 0xff {
         1 => Backdrop::Starfield,
         2 => Backdrop::Aurora,
+        3 => Backdrop::Flow,
         _ => Backdrop::Solid,
     };
     (color, backdrop)
@@ -351,6 +442,7 @@ pub fn current() -> Theme {
         2 => Theme::Space,
         3 => Theme::Aurora,
         4 => Theme::Glass,
+        5 => Theme::LiquidGlass,
         _ => Theme::Dark,
     }
 }
@@ -420,6 +512,13 @@ fn palette() -> &'static Palette {
                 &GLASS
             }
         }
+        5 => {
+            if GLASS_LIGHT_ON.load(Ordering::Relaxed) {
+                &LIQUID_LIGHT
+            } else {
+                &LIQUID
+            }
+        }
         _ => &DARK,
     }
 }
@@ -436,10 +535,11 @@ pub fn PANEL() -> Color32 {
 
 /// Fill for surfaces that float over the UI: windows, popups, menus and
 /// tooltips. The panel colour — so in the Glass themes they're glass too,
-/// see-through like the panels (by design: don't make them opaque).
+/// see-through like the panels (by design: don't make them opaque) — and in
+/// Liquid Glass the marker for floating glass.
 #[allow(non_snake_case)]
 pub fn FLOAT() -> Color32 {
-    palette().panel
+    palette().float
 }
 
 /// For a separate OS window with nothing of the app behind it (the voice
@@ -499,20 +599,28 @@ pub fn EDGE() -> Color32 {
 /// [`paint_background`]. Floating cards (e.g. the chat's input card) paint
 /// this as an opaque underlay beneath the ordinary translucent [`PANEL`] fill:
 /// the card then matches the other glass panels exactly, while content
-/// scrolled beneath it can't show through. No-op outside the Glass theme.
+/// scrolled beneath it can't show through. No-op outside the Glass theme —
+/// and in Liquid Glass, whose real glass shows what's scrolled beneath it,
+/// frosted and bent, as it should (unless the GPU can't draw it).
 pub fn paint_glass_patch(ctx: &egui::Context, painter: &egui::Painter, clip: egui::Rect) {
     let p = palette();
-    if !p.glass {
+    if !p.glass || crate::liquid_glass::active() {
         return;
     }
     let painter = painter.with_clip_rect(clip);
     let (color, backdrop) = glass_config();
     painter.rect_filled(clip, 0.0, color);
-    let full = ctx.content_rect();
+    draw_backdrop(ctx, &painter, ctx.content_rect(), backdrop);
+}
+
+/// Draw `backdrop` over whatever base `painter` already has, laid out over
+/// `full` (the whole window).
+fn draw_backdrop(ctx: &egui::Context, painter: &egui::Painter, full: egui::Rect, backdrop: Backdrop) {
     match backdrop {
         Backdrop::Solid => {}
-        Backdrop::Starfield => draw_starfield(ctx, &painter, full),
-        Backdrop::Aurora => draw_aurora_blobs(ctx, &painter, full),
+        Backdrop::Starfield => draw_starfield(ctx, painter, full),
+        Backdrop::Aurora => draw_aurora_blobs(ctx, painter, full),
+        Backdrop::Flow => draw_flow(ctx, painter, full),
     }
 }
 
@@ -540,7 +648,7 @@ pub fn apply(ctx: &egui::Context) {
     v.panel_fill = p.bg;
     // egui's own windows, popups, menus and tooltips (combo-box lists, the
     // colour picker): glass in the Glass themes — see FLOAT.
-    v.window_fill = p.panel;
+    v.window_fill = p.float;
     v.extreme_bg_color = p.field; // text-edit background
     v.override_text_color = Some(p.text);
     // Selection highlight follows the theme accent, but Aurora uses its pink so
@@ -558,6 +666,32 @@ pub fn apply(ctx: &egui::Context) {
         &mut v.widgets.open,
     ] {
         w.corner_radius = CornerRadius::same(8);
+    }
+
+    // Liquid Glass: controls are glass chips — Apple's system fills, grey at
+    // a low opacity (lighter on dark glass, darker on light), stronger on
+    // hover and press, with a faint light rim; text in the palette's ink.
+    if p.liquid {
+        let ink = p.text;
+        let chip = |a: u8| {
+            if p.is_dark { Color32::from_rgba_unmultiplied(160, 160, 172, a) } else { Color32::from_rgba_unmultiplied(118, 118, 128, a) }
+        };
+        let rim = egui::Stroke::new(1.0_f32, if p.is_dark { Color32::from_white_alpha(22) } else { Color32::from_white_alpha(120) });
+        let tune = |w: &mut egui::style::WidgetVisuals, fill: Color32| {
+            w.bg_fill = fill;
+            w.weak_bg_fill = fill;
+            w.fg_stroke.color = ink;
+            w.bg_stroke = rim;
+        };
+        let (idle, hover, down) = if p.is_dark { (54, 80, 108) } else { (30, 46, 64) };
+        tune(&mut v.widgets.inactive, chip(idle));
+        tune(&mut v.widgets.hovered, chip(hover));
+        tune(&mut v.widgets.active, chip(down));
+        tune(&mut v.widgets.open, chip(hover));
+        v.override_text_color = None;
+        v.widgets.noninteractive.fg_stroke.color = ink;
+        set_visuals(ctx, v);
+        return;
     }
 
     // Light glass gets its own QUIET widget styling instead of the Light theme's
@@ -707,11 +841,98 @@ fn paint_glass(ctx: &egui::Context) {
     let rect = ctx.content_rect();
     let painter = ctx.layer_painter(egui::LayerId::background());
     painter.rect_filled(rect, 0.0, color);
-    match backdrop {
-        Backdrop::Solid => {}
-        Backdrop::Starfield => draw_starfield(ctx, &painter, rect),
-        Backdrop::Aurora => draw_aurora_blobs(ctx, &painter, rect),
+    draw_backdrop(ctx, &painter, rect, backdrop);
+}
+
+/// Draw the flowing colours over whatever base `painter` already has: a few
+/// big, saturated colour fields drifting on slow orbits, blended smoothly
+/// into each other and the base — a mesh with a colour at each vertex, so
+/// the gradients are smooth, with no rings or banding. The light palette
+/// gets paler fields. Shared by the Glass and Liquid Glass backdrops.
+fn draw_flow(ctx: &egui::Context, painter: &egui::Painter, rect: egui::Rect) {
+    let t = ctx.input(|i| i.time) as f32;
+    let dark = palette().is_dark;
+    let fields = flow_fields(t, rect, dark);
+    // The base the fields blend into: whatever's under the mesh, so the mesh
+    // carries its own copy of it (the Glass background colour).
+    let (base, _) = glass_config();
+    let base = [base.r() as f32, base.g() as f32, base.b() as f32];
+    const COLS: u32 = 36;
+    const ROWS: u32 = 24;
+    let mut mesh = egui::Mesh::default();
+    for j in 0..=ROWS {
+        for i in 0..=COLS {
+            let pos = egui::pos2(
+                rect.left() + rect.width() * i as f32 / COLS as f32,
+                rect.top() + rect.height() * j as f32 / ROWS as f32,
+            );
+            mesh.colored_vertex(pos, flow_color(pos, base, &fields));
+        }
     }
+    for j in 0..ROWS {
+        for i in 0..COLS {
+            let a = j * (COLS + 1) + i;
+            mesh.add_triangle(a, a + 1, a + COLS + 1);
+            mesh.add_triangle(a + 1, a + COLS + 2, a + COLS + 1);
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+}
+
+/// One of the flowing colour fields: where its centre is, how far it
+/// reaches, its colour and how strongly it's laid.
+struct Field {
+    center: egui::Pos2,
+    radius: f32,
+    color: [f32; 3],
+    strength: f32,
+}
+
+/// The fields at time `t` over `rect`.
+fn flow_fields(t: f32, rect: egui::Rect, dark: bool) -> Vec<Field> {
+    // Electric blue, violet, magenta, amber, teal, sky.
+    const COLORS: [[f32; 3]; 6] = [
+        [40.0, 105.0, 255.0],
+        [138.0, 70.0, 255.0],
+        [255.0, 60.0, 160.0],
+        [255.0, 150.0, 50.0],
+        [0.0, 195.0, 170.0],
+        [70.0, 190.0, 255.0],
+    ];
+    let span = rect.width().max(rect.height()).max(1.0);
+    COLORS
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let i = i as u32;
+            let speed = 0.035 + 0.04 * hash01(i, 31);
+            let phase = hash01(i, 32) * std::f32::consts::TAU;
+            let (ax, ay) = (0.12 + 0.76 * hash01(i, 33), 0.12 + 0.76 * hash01(i, 34));
+            let orbit = 0.16 + 0.1 * hash01(i, 35);
+            let center = egui::pos2(
+                rect.left() + rect.width() * (ax + orbit * (t * speed + phase).cos()),
+                rect.top() + rect.height() * (ay + orbit * 0.8 * (t * speed * 1.3 + phase).sin()),
+            );
+            // Light: the same hues, washed toward white.
+            let color = if dark { c } else { c.map(|v| v + (255.0 - v) * 0.35) };
+            Field { center, radius: span * (0.26 + 0.1 * hash01(i, 36)), color, strength: if dark { 0.85 } else { 0.75 } }
+        })
+        .collect()
+}
+
+/// The flowing colour at `pos`: each field laid over `base` by how near its
+/// centre `pos` is (a Gaussian falloff).
+fn flow_color(pos: egui::Pos2, base: [f32; 3], fields: &[Field]) -> Color32 {
+    let mut c = base;
+    for f in fields {
+        let d2 = (pos - f.center).length_sq() / (f.radius * f.radius);
+        let w = (-d2 * 1.6).exp() * f.strength;
+        for (ck, fk) in c.iter_mut().zip(f.color) {
+            *ck += (fk - *ck) * w;
+        }
+    }
+    Color32::from_rgb(c[0].round() as u8, c[1].round() as u8, c[2].round() as u8)
 }
 
 /// Draw the twinkling starfield over whatever base `painter` already has. Shared
@@ -875,7 +1096,7 @@ mod tests {
 
     #[test]
     fn glass_config_round_trips() {
-        for backdrop in [Backdrop::Solid, Backdrop::Starfield, Backdrop::Aurora] {
+        for backdrop in [Backdrop::Solid, Backdrop::Starfield, Backdrop::Aurora, Backdrop::Flow] {
             for light in [false, true] {
                 set_glass_config([10, 200, 255], backdrop, light);
                 let (c, b) = glass_config();
@@ -900,11 +1121,19 @@ mod tests {
     }
 
     /// Windows and popups are the panel colour in every theme — in Glass
-    /// that's see-through, on purpose.
+    /// that's see-through, on purpose — except Liquid Glass, where they're
+    /// floating glass with a marker of their own.
     #[test]
     fn floating_surfaces_are_panels() {
-        assert_eq!(FLOAT(), palette().panel);
+        for p in [&DARK, &LIGHT, &SPACE, &AURORA, &GLASS, &GLASS_LIGHT] {
+            assert_eq!(p.float, p.panel);
+            assert!(!p.liquid);
+        }
         assert!(GLASS.panel.a() < 255 && GLASS_LIGHT.panel.a() < 255);
+        for p in [&LIQUID, &LIQUID_LIGHT] {
+            assert_ne!(p.float, p.panel);
+            assert!(p.liquid && p.glass);
+        }
     }
 
     #[test]

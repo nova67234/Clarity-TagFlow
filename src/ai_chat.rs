@@ -378,7 +378,12 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
     if llm.detail_reason.is_some() && !llm.detail_notice_done {
         input_h += 36.0;
     }
-    let msgs_h = (ui.available_height() - input_h).max(80.0);
+    // Liquid Glass: the messages run on under the card, which shows them
+    // frosted through its glass as they scroll by (the list ends with room
+    // for the card, so the last message still rests above it).
+    let under_glass = crate::liquid_glass::active();
+    let shown_h = (ui.available_height() - input_h).max(80.0);
+    let msgs_h = if under_glass { ui.available_height().max(80.0) } else { shown_h };
 
     egui::ScrollArea::vertical()
         .id_salt("ai_chat_msgs")
@@ -387,12 +392,17 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
         .stick_to_bottom(true)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            // Keep scrolling while a text selection is dragged past the edge.
-            crate::drag_select_autoscroll(ui);
+            // Keep scrolling while a text selection is dragged past the edge
+            // (under Liquid Glass, past the card's top: it's over the rest).
+            let mut shown = ui.clip_rect();
+            if under_glass {
+                shown.max.y -= input_h;
+            }
+            crate::drag_select_autoscroll_in(ui, shown);
             ui.add_space(12.0);
             let chat = &llm.chats[llm.active_chat];
             if chat.msgs.is_empty() {
-                ui.add_space(msgs_h * 0.42);
+                ui.add_space(shown_h * 0.42);
                 let hint = if llm.tag_images && llm.tag_target.is_some() {
                     "Ask the AI to tag this image, fix its tags or describe it — changes save right \
                      away, with Undo under each reply"
@@ -437,7 +447,7 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                     }
                 });
             });
-            ui.add_space(6.0);
+            ui.add_space(if under_glass { 6.0 + input_h } else { 6.0 });
         });
 
     // --- Bottom input card ---
@@ -489,7 +499,8 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
             // panels' translucent PANEL fill — matching the top bar and chat
             // list exactly — without messages scrolled beneath showing through.
             // Uses last frame's rect (stored below); the one-frame lag while the
-            // card grows is invisible. No-op outside Glass.
+            // card grows is invisible. No-op outside Glass, and in Liquid
+            // Glass, where the card is real glass over the messages.
             if let Some((r, _)) = llm.input_rect {
                 crate::theme::paint_glass_patch(ui.ctx(), ui.painter(), r);
             }

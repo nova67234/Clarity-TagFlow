@@ -107,7 +107,11 @@ pub struct Settings {
     /// hangs on this matching the audio).
     pub ai_voice_ref_text: String,
     /// The active app colour theme (Dark / Light). Applied on launch and live
-    /// whenever changed from the Appearance tab.
+    /// whenever changed from the Appearance tab. Liquid Glass is saved as
+    /// Glass plus `liquid_glass`: a build that doesn't know Liquid Glass then
+    /// still loads these settings (in Glass) instead of failing on the name
+    /// and starting over with none of them.
+    #[serde(serialize_with = "theme_on_disk")]
     pub theme: Theme,
     /// The overall UI layout (classic panels, or full-window gallery).
     pub layout: Layout,
@@ -118,8 +122,17 @@ pub struct Settings {
     /// Which animated backdrop the Glass theme paints over `glass_bg`.
     pub glass_backdrop: Backdrop,
     /// Light-mode Glass: the frosted panels turn translucent white with dark-grey
-    /// text/icons. Off keeps the original dark glass.
+    /// text/icons. Off keeps the original dark glass. Liquid Glass uses it too.
     pub glass_light: bool,
+    /// The backdrop Liquid Glass paints over `glass_bg` (its own, so each
+    /// glass theme keeps its pick): flowing colours by default, which real
+    /// glass shows off best. Only Liquid Glass offers those, so a build
+    /// without them never finds them in `glass_backdrop`.
+    pub liquid_backdrop: Backdrop,
+    /// In the saved file only: the theme is Liquid Glass, saved as Glass
+    /// (see `theme`). Set by [`Settings::for_saving`], read back by
+    /// [`Settings::loaded`].
+    liquid_glass: bool,
     /// Use a custom colour for the AI chat's message text instead of the theme's
     /// text colour — for theme combinations where the chat is hard to read
     /// (e.g. light text over Aurora's bright glow). Edited in the Appearance tab.
@@ -226,6 +239,38 @@ pub fn effective_ui_scale(ctx: &egui::Context, settings: &Settings) -> f32 {
     s.clamp(0.75, 3.0)
 }
 
+impl Settings {
+    /// The backdrop the active glass theme paints: Liquid Glass has its own.
+    pub fn backdrop(&self) -> Backdrop {
+        if self.theme == Theme::LiquidGlass { self.liquid_backdrop } else { self.glass_backdrop }
+    }
+
+    /// The settings as loaded from the saved file: Liquid Glass back from
+    /// how it's saved (see `theme`).
+    pub fn loaded(mut self) -> Settings {
+        if self.liquid_glass && self.theme == Theme::Glass {
+            self.theme = Theme::LiquidGlass;
+        }
+        self
+    }
+
+    /// The settings, ready to save (see `theme`).
+    pub fn for_saving(&mut self) -> &Settings {
+        self.liquid_glass = self.theme == Theme::LiquidGlass;
+        self
+    }
+}
+
+/// How [`Settings::theme`] is saved: Liquid Glass as Glass (see there).
+fn theme_on_disk<S: serde::Serializer>(theme: &Theme, s: S) -> Result<S::Ok, S::Error> {
+    use serde::Serialize as _;
+    match theme {
+        Theme::LiquidGlass => Theme::Glass,
+        other => *other,
+    }
+    .serialize(s)
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -257,6 +302,8 @@ impl Default for Settings {
             glass_bg: [20, 22, 34],
             glass_backdrop: Backdrop::default(),
             glass_light: false,
+            liquid_backdrop: Backdrop::Flow,
+            liquid_glass: false,
             ai_chat_text_enabled: false,
             // A dark ink — the useful pick for the "light text on a light
             // theme" case that motivates this setting.
@@ -648,7 +695,10 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
         row(
             ui,
             "Colour theme",
-            Some("Space and Aurora are animated; Glass is translucent. Applies instantly."),
+            Some(
+                "Space and Aurora are animated; Glass is translucent; Liquid Glass frosts and bends what's \
+                 behind it. Applies instantly.",
+            ),
             |ui| {
                 // Each theme's dot: its surface, or the colour it's known by.
                 let dot = |r, g, b| Some(egui::Color32::from_rgb(r, g, b));
@@ -662,6 +712,7 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
                         (Theme::Space, "Space", dot(38, 36, 92), None),
                         (Theme::Aurora, "Aurora", dot(235, 130, 175), None),
                         (Theme::Glass, "Glass", dot(110, 150, 200), None),
+                        (Theme::LiquidGlass, "Liquid Glass", dot(150, 120, 255), None),
                     ],
                 );
             },
@@ -708,12 +759,18 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
 
     // Glass-only controls: panel brightness, background colour, backdrop
     // animation. Hidden for the other themes, which they don't affect.
-    if settings.theme == Theme::Glass {
-        section(ui, "Glass", |ui| {
+    // Liquid Glass has the same, with a backdrop of its own.
+    let liquid = settings.theme == Theme::LiquidGlass;
+    if settings.theme == Theme::Glass || liquid {
+        section(ui, if liquid { "Liquid Glass" } else { "Glass" }, |ui| {
             row(
                 ui,
                 "Panels",
-                Some("Dark is the classic glass; Light is frosted white."),
+                Some(if liquid {
+                    "Dark glass or light glass. Either way it frosts and bends what's behind it."
+                } else {
+                    "Dark is the classic glass; Light is frosted white."
+                }),
                 |ui| {
                     pill_dropdown(
                         ui,
@@ -736,18 +793,25 @@ fn appearance_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             row(
                 ui,
                 "Backdrop",
-                Some("An optional animation over the background colour."),
+                Some(if liquid {
+                    "What the glass shows off: an animation over the background colour."
+                } else {
+                    "An optional animation over the background colour."
+                }),
                 |ui| {
-                    pill_dropdown(
-                        ui,
-                        "glass_backdrop",
-                        &mut settings.glass_backdrop,
-                        &[
-                            (Backdrop::Solid, "Solid", None, None),
-                            (Backdrop::Starfield, "Starfield", None, None),
-                            (Backdrop::Aurora, "Aurora glow", None, None),
-                        ],
-                    );
+                    let options = [
+                        (Backdrop::Solid, "Solid", None, None),
+                        (Backdrop::Starfield, "Starfield", None, None),
+                        (Backdrop::Aurora, "Aurora glow", None, None),
+                        (Backdrop::Flow, "Flowing colours", None, None),
+                    ];
+                    if liquid {
+                        pill_dropdown(ui, "liquid_backdrop", &mut settings.liquid_backdrop, &options);
+                    } else {
+                        // Not flowing colours: Glass's pick is saved where
+                        // older builds read it (see `liquid_backdrop`).
+                        pill_dropdown(ui, "glass_backdrop", &mut settings.glass_backdrop, &options[..3]);
+                    }
                 },
             );
         });
@@ -1886,9 +1950,10 @@ fn drop_accent_ink() -> egui::Color32 {
 }
 
 /// The open list's panel: a little below the window in dark themes, the
-/// window's own white in light ones.
+/// window's own white in light ones — and in Liquid Glass, glass like it.
 fn popover_fill() -> egui::Color32 {
-    if crate::theme::is_light() { FLOAT() } else { FLOAT().lerp_to_gamma(egui::Color32::BLACK, 0.18) }
+    let glass = crate::liquid_glass::active();
+    if glass || crate::theme::is_light() { FLOAT() } else { FLOAT().lerp_to_gamma(egui::Color32::BLACK, 0.18) }
 }
 
 /// The pill while its list is open: sunk a little deeper.
@@ -1910,5 +1975,54 @@ mod tests {
         // 1366 × 768 at 250%: 546 × 307 points.
         let (w, h) = settings_window_size(screen(546.4, 307.2));
         assert!(w + 36.0 <= 546.4 && h + 36.0 <= 307.2, "{w} × {h}");
+    }
+
+    /// Liquid Glass is saved as Glass plus a flag: a build that doesn't
+    /// know it still loads the settings (in Glass) instead of failing on the
+    /// name and starting over, and this one gets Liquid Glass back. Every
+    /// other theme is saved as itself.
+    #[test]
+    fn liquid_glass_is_saved_so_older_builds_still_load() {
+        use super::{Settings, Theme};
+        // Settings as an older build reads them: no Liquid Glass.
+        #[derive(serde::Deserialize, Default)]
+        #[serde(default)]
+        struct Older {
+            theme: OlderTheme,
+        }
+        #[allow(dead_code)]
+        #[derive(serde::Deserialize, Default, PartialEq, Debug)]
+        enum OlderTheme {
+            #[default]
+            Dark,
+            Light,
+            Space,
+            Aurora,
+            Glass,
+        }
+        // Saved the app's way: eframe's storage, in RON.
+        #[derive(Default)]
+        struct Memory(std::collections::HashMap<String, String>);
+        impl eframe::Storage for Memory {
+            fn get_string(&self, key: &str) -> Option<String> {
+                self.0.get(key).cloned()
+            }
+            fn set_string(&mut self, key: &str, value: String) {
+                self.0.insert(key.to_owned(), value);
+            }
+            fn flush(&mut self) {}
+        }
+        let save = |theme| {
+            let mut s = Settings { theme, ..Settings::default() };
+            let mut storage = Memory::default();
+            eframe::set_value(&mut storage, super::STORAGE_KEY, s.for_saving());
+            storage
+        };
+        let older = eframe::get_value::<Older>(&save(Theme::LiquidGlass), super::STORAGE_KEY);
+        assert_eq!(older.map(|o| o.theme), Some(OlderTheme::Glass));
+        for theme in [Theme::Dark, Theme::Light, Theme::Space, Theme::Aurora, Theme::Glass, Theme::LiquidGlass] {
+            let back = eframe::get_value::<Settings>(&save(theme), super::STORAGE_KEY).map(Settings::loaded);
+            assert_eq!(back.map(|s| s.theme), Some(theme));
+        }
     }
 }

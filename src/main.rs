@@ -133,6 +133,7 @@ mod generate;
 mod gif_info;
 mod left_browser;
 mod left_panel_settings;
+mod liquid_glass;
 // Link (Settings → Link): another PC on the network uses this one's models.
 mod link;
 // Local AI model (Settings → AI Model): Gemma 4 vision via llama.cpp, fully
@@ -219,7 +220,7 @@ fn main() -> eframe::Result {
             // Restore saved settings (if any) from eframe's persistent storage.
             if let Some(storage) = cc.storage
                 && let Some(saved) = eframe::get_value::<settings::Settings>(storage, settings::STORAGE_KEY) {
-                    app.settings = saved;
+                    app.settings = saved.loaded();
                     // Restore the last-used AI tagger model into the Tag Manager.
                     app.tag_manager.ai_model.clone_from(&app.settings.last_ai_model);
                     // Restore the Tag Manager's gear-popup preferences.
@@ -228,7 +229,7 @@ fn main() -> eframe::Result {
             // Apply the saved colour theme before the first paint so a Light-mode
             // user doesn't see a dark flash on launch. The Glass config (incl.
             // dark/light panels) must be pushed first — the palette reads it.
-            set_glass_config(app.settings.glass_bg, app.settings.glass_backdrop, app.settings.glass_light);
+            set_glass_config(app.settings.glass_bg, app.settings.backdrop(), app.settings.glass_light);
             crate::theme::set_chat_text(app.settings.ai_chat_text_enabled.then_some(app.settings.ai_chat_text));
             crate::theme::set_chat_icon(app.settings.ai_chat_icon_enabled.then_some(app.settings.ai_chat_icon));
             crate::theme::set_orb_color(app.settings.ai_orb_color_enabled.then_some(app.settings.ai_orb_color));
@@ -2018,6 +2019,9 @@ impl ViewerApp {
 
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Liquid Glass: once the frame's UI is done, the panels, windows and
+        // menus it painted become real glass (src/liquid_glass.rs).
+        let _glass = liquid_glass::at_frame_end(ui.ctx());
         // Interface size (Settings > Appearance). Applied before anything is laid
         // out so the whole UI, including fixed point sizes, scales together.
         {
@@ -2096,7 +2100,7 @@ impl eframe::App for ViewerApp {
         // Push the Glass theme's user-configurable background (colour + backdrop)
         // and its dark/light panel mode so the pickers update live; cheap, so
         // done every frame. Same for the AI chat's optional text-colour override.
-        set_glass_config(self.settings.glass_bg, self.settings.glass_backdrop, self.settings.glass_light);
+        set_glass_config(self.settings.glass_bg, self.settings.backdrop(), self.settings.glass_light);
         crate::theme::set_chat_text(self.settings.ai_chat_text_enabled.then_some(self.settings.ai_chat_text));
         crate::theme::set_chat_icon(self.settings.ai_chat_icon_enabled.then_some(self.settings.ai_chat_icon));
         crate::theme::set_orb_color(self.settings.ai_orb_color_enabled.then_some(self.settings.ai_orb_color));
@@ -2522,7 +2526,7 @@ impl eframe::App for ViewerApp {
             self.last_theme = self.settings.theme;
             self.last_glass_light = self.settings.glass_light;
             self.last_glass_bg = self.settings.glass_bg;
-            set_glass_config(self.settings.glass_bg, self.settings.glass_backdrop, self.settings.glass_light);
+            set_glass_config(self.settings.glass_bg, self.settings.backdrop(), self.settings.glass_light);
             set(self.settings.theme);
             apply(ui.ctx());
             ui.ctx().request_repaint();
@@ -2541,7 +2545,7 @@ impl eframe::App for ViewerApp {
 
     /// Persist settings to eframe's storage (called periodically and on exit).
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, settings::STORAGE_KEY, &self.settings);
+        eframe::set_value(storage, settings::STORAGE_KEY, self.settings.for_saving());
     }
 
     /// Closing the app saves a tag edit still open in the Details panel or
@@ -2937,6 +2941,13 @@ pub(crate) fn edge_scroll_done(ui: &mut egui::Ui, child: &egui::Ui, gutter: f32)
 /// scroll viewport, with speed scaling by how far past the edge the pointer is.
 pub(crate) fn drag_select_autoscroll(ui: &mut egui::Ui) {
     let clip = ui.clip_rect();
+    drag_select_autoscroll_in(ui, clip);
+}
+
+/// [`drag_select_autoscroll`] for a viewport whose visible part is `clip`
+/// rather than the whole of it (under Liquid Glass the AI chat's messages run
+/// on under its composer, and the scrolling starts at the composer).
+pub(crate) fn drag_select_autoscroll_in(ui: &mut egui::Ui, clip: egui::Rect) {
     let (down, origin, pos) = ui.input(|i| {
         (i.pointer.primary_down(), i.pointer.press_origin(), i.pointer.latest_pos())
     });
