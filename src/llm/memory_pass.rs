@@ -197,6 +197,9 @@ struct Job {
     answer: String,
     /// The pictures its lines number, for the album.
     pictures: Vec<std::path::PathBuf>,
+    /// The memories whose details it was shown whole (see
+    /// `MemoryStore::pass_seen`): only theirs does it rewrite.
+    seen: Vec<u64>,
     /// Save now queued it to load the model, and the load isn't done: its
     /// progress so far.
     loading: bool,
@@ -508,7 +511,7 @@ impl Books<'_> {
         let now = Instant::now();
         match out {
             Some(out) if self.memory.revision == job.revision => {
-                self.finish(job.target, &out, &job.pictures);
+                self.finish(job.target, &out, &job.pictures, &job.seen);
                 self.pass.retry_at = None;
             }
             // The memory changed while the pass ran: it read the old one, so
@@ -528,15 +531,16 @@ impl Books<'_> {
         }
     }
 
-    /// Write down what a pass decided and mark what it read as read.
-    fn finish(&mut self, target: Target, out: &memory::PassOutput, pictures: &[std::path::PathBuf]) {
+    /// Write down what a pass decided and mark what it read as read. `seen`:
+    /// the memories whose details it was shown whole.
+    fn finish(&mut self, target: Target, out: &memory::PassOutput, pictures: &[std::path::PathBuf], seen: &[u64]) {
         // A part set aside is read after newer chats: the summary stays
         // theirs.
         let aside = matches!(target, Target::Pending(i) if self.pass.pending.get(i).is_some_and(|p| p.aside));
         let applied = if aside {
-            self.memory.apply_pass(&memory::PassOutput { summary: String::new(), ..out.clone() })
+            self.memory.apply_pass(&memory::PassOutput { summary: String::new(), ..out.clone() }, seen)
         } else {
-            self.memory.apply_pass(out)
+            self.memory.apply_pass(out, seen)
         };
         let kept = self.keep_pictures(&out.keep, pictures);
         self.pass.save_blocked = None;
@@ -1338,6 +1342,7 @@ impl LlmState {
             }
         };
         let mut head = self.memory.pass_head(&next.touched, next.extends_summary, next.pictures.len());
+        let seen = self.memory.pass_seen(&next.touched);
         if next.older {
             head.push_str(OLDER_PART);
         }
@@ -1404,6 +1409,7 @@ impl LlmState {
                 rx,
                 answer: String::new(),
                 pictures: next.pictures,
+                seen,
                 loading: load,
                 progress: None,
             });
@@ -1470,6 +1476,7 @@ mod tests {
             rx,
             answer: String::new(),
             pictures: Vec::new(),
+            seen: Vec::new(),
             loading: false,
             progress: None,
         });
@@ -2109,7 +2116,7 @@ mod tests {
             ..Default::default()
         };
         let mut books = Books { pass: &mut pass, memory: &mut memory, chats: &mut chats, active: Some(7) };
-        books.finish(Target::Chat { id: 7, upto: 2 }, &out, &pictures);
+        books.finish(Target::Chat { id: 7, upto: 2 }, &out, &pictures, &[]);
         let ti = books.memory.find_topic("Pictures").expect("the album's topic");
         let m = &books.memory.topics[ti].memories[0];
         assert_eq!(books.memory.topics[ti].memories.len(), 1);

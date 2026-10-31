@@ -8,7 +8,9 @@
 //!   (voice and self-notes), a rolling summary of the last chat, and the topic
 //!   **index** (names only, no content);
 //! * **one file per topic** (a project, a person, a preference area…) holding
-//!   that topic's memories, read only when a chat actually needs them.
+//!   that topic's memories. All of them are read when the memory opens (a
+//!   reply's lookup scores every memory); the split keeps a change cheap:
+//!   only that topic's file and the header are written again.
 //!
 //! The background update pass after a chat ends and the on-demand lookup
 //! during a chat are separate work (see the "AI Memory Across Chats" spec);
@@ -534,6 +536,12 @@ const PASS_LINE_CHARS: usize = 1500;
 /// Topics and stored titles a pass is shown, at most.
 const PASS_TOPICS: usize = 100;
 const PASS_TITLES: usize = 80;
+/// The stored memories' details a pass is shown, at most (approximate
+/// tokens: the newest memories' in the topics the chat touched).
+const PASS_DETAILS: usize = 1000;
+/// A memory's details as a pass writes them, at most (characters) — so a
+/// pass is only shown details this long whole, to write back changed.
+const MEMORY_TEXT: usize = 400;
 /// What one pass may change, at most.
 const PASS_MAX_REMEMBER: usize = 12;
 const PASS_MAX_FORGET: usize = 12;
@@ -715,7 +723,8 @@ fn luhn_ok(digits: &[u8]) -> bool {
 }
 
 /// Looks like a secret that must never be stored: a long run of letters and
-/// digits mixed without spaces (a key or token), a card number (13 to 19
+/// digits mixed without spaces that reads like a key or token (not like a
+/// model's file name: see [`reads_like_key`]), a card number (13 to 19
 /// digits, spaces and dashes between them allowed, that pass the card
 /// checksum), or a password, passcode, PIN, API key or the like being given
 /// ("password: …", "the API key is …", "my wifi password's hunter2", "PIN
@@ -733,8 +742,11 @@ pub(crate) fn looks_secret(s: &str) -> bool {
                 // A path or a web address isn't a key (base64 has slashes
                 // too, but with '+' or '=' padding)…
                 && (!w.contains('/') || w.contains('+') || w.ends_with('='))
-                // …nor is a file or site name (a dotted token, a JWT, is long).
+                // …nor is a file or site name (a dotted token, a JWT, is long)…
                 && (!w.contains('.') || n >= 40)
+                // …nor a model's, a checkpoint's or a LoRA's name
+                // ("flux1-dev-bnb-nf4-v2", "juggernautXL_v9Rdphoto2Lightning").
+                && reads_like_key(w)
                 // An AWS access key id may have a single digit.
                 || (n == 20
                     && (w.starts_with("AKIA") || w.starts_with("ASIA"))
@@ -769,9 +781,128 @@ pub(crate) fn looks_secret(s: &str) -> bool {
         "password", "passcode", "passwd", "passphrase", "passkey", "pin", "pin code", "pin number", "cvv", "cvc",
         "api key", "apikey", "api_key", "access token", "auth token", "private key", "secret key", "recovery code",
         "recovery phrase", "seed phrase", "wifi key", "wi-fi key", "network key", "security key", "door code",
-        "alarm code", "access code", "lock code", "secret", "pw",
+        "alarm code", "access code", "lock code", "secret", "pw", "wifi", "wi-fi",
     ];
     KEYS.iter().any(|key| lower.match_indices(key).any(|(i, _)| gives_secret(&lower, i, key)))
+}
+
+/// How API keys and tokens of well-known services start.
+const KEY_PREFIXES: &[&str] = &[
+    "sk-", "sk_", "pk_", "rk_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-", "xoxa-", "xoxb-",
+    "xoxp-", "xoxr-", "hf_", "r8_", "npm_", "gsk_", "AIza", "eyJ", "sq0atp-", "sq0csp-", "EAAA",
+];
+
+/// Words a password made of words has in it ("MySuperSecretPassword2024").
+const SECRET_INSIDE: &[&str] = &["pass", "pwd", "secret", "apikey"];
+
+/// `w`, a long run of letters, digits and `-_+/=.` (see [`looks_secret`]),
+/// reads like a key or a token rather than a name: it starts like a known
+/// key, has base64's `+` or `=`, has hexadecimal parts in a row (a hash, a
+/// UUID — after a prefix too —, many keys), has a random-looking stretch
+/// between its dashes and underscores (see [`random_run`]) or letters that
+/// flip between capitals and small ones all through it (see [`choppy`]),
+/// has "pass" or "secret" in it, or is a licence key's same-sized groups.
+/// A model's, checkpoint's or LoRA's file name is words and short version
+/// parts ("gemma-4-27b-it-Q4_K_M", "realisticVisionV60B1_v51HyperVAE").
+fn reads_like_key(w: &str) -> bool {
+    if KEY_PREFIXES.iter().any(|p| w.starts_with(p)) || w.contains('+') || w.ends_with('=') {
+        return true;
+    }
+    let parts: Vec<&str> = w.split(['-', '_', '.', '/', '+', '=']).filter(|p| !p.is_empty()).collect();
+    let (mut hex, mut most) = (0, 0);
+    for p in &parts {
+        hex = if p.bytes().all(|b| b.is_ascii_hexdigit()) { hex + p.len() } else { 0 };
+        most = most.max(hex);
+    }
+    if most >= 20 || parts.iter().any(|p| p.len() >= 16 && random_run(p)) || choppy(&parts) {
+        return true;
+    }
+    let lower = w.to_ascii_lowercase();
+    if SECRET_INSIDE.iter().any(|s| lower.contains(s)) {
+        return true;
+    }
+    parts.len() >= 4
+        && parts.iter().all(|p| p.len() == parts[0].len() && (4..=6).contains(&p.len()))
+        && !parts.iter().any(|p| pieces(p).any(|(piece, _)| wordy(piece)))
+}
+
+/// A stretch of letters and digits that looks random rather than like a
+/// name's words run together: less than half of it words ("Xk9pQzLmNvBwRtYs";
+/// "v9Rdphoto2Lightning" is mostly words), or numbers breaking it up three
+/// times or more. Without capitals (a lowercase key), more of it has to be
+/// words, and twice is enough.
+fn random_run(p: &str) -> bool {
+    let capitals = p.bytes().any(|b| b.is_ascii_uppercase());
+    let (mut words, mut numbers) = (0, 0);
+    for (piece, digits) in pieces(p) {
+        if digits {
+            numbers += 1;
+        } else if wordy(piece) {
+            words += piece.len();
+        }
+    }
+    let (share, breaks) = if capitals { (0.5, 3) } else { (0.7, 2) };
+    (words as f32) < share * p.len() as f32 || numbers >= breaks
+}
+
+/// The letters of `parts` (20 characters or more in all) flip between
+/// capitals and small letters all through them, as a random key's do: of
+/// their runs of small letters (three or more), nearly all are only one or
+/// two long. A name's words are longer ("QwenImageEdit",
+/// "wan2_1_t2v_14B_fp8_e4m3fn").
+fn choppy(parts: &[&str]) -> bool {
+    if parts.iter().map(|p| p.len()).sum::<usize>() < 20 {
+        return false;
+    }
+    let letters: Vec<u8> = parts.iter().flat_map(|p| p.bytes()).filter(u8::is_ascii_alphabetic).collect();
+    if !letters.iter().any(u8::is_ascii_uppercase) {
+        return false;
+    }
+    // The runs of small letters between the capitals (numbers left out).
+    let runs: Vec<usize> = letters.split(u8::is_ascii_uppercase).map(<[u8]>::len).filter(|&n| n > 0).collect();
+    runs.len() >= 3 && runs.iter().filter(|&&n| n <= 2).count() * 10 >= runs.len() * 7
+}
+
+/// The pieces of a stretch of ASCII letters and digits, split where camel
+/// case and numbers split it ("realisticVisionV60" → "realistic", "Vision",
+/// "V", "60"; "XLTurbo" → "XL", "Turbo"), each with whether it's a number.
+fn pieces(p: &str) -> impl Iterator<Item = (&str, bool)> {
+    let b = p.as_bytes();
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        if i >= b.len() {
+            return None;
+        }
+        let start = i;
+        let digits = b[i].is_ascii_digit();
+        if digits {
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+        } else if b[i].is_ascii_lowercase() || b.get(i + 1).is_some_and(u8::is_ascii_lowercase) {
+            // A word: a capital perhaps, then small letters.
+            i += 1;
+            while i < b.len() && b[i].is_ascii_lowercase() {
+                i += 1;
+            }
+        } else {
+            // Capitals, up to the one starting the next word.
+            while i < b.len() && b[i].is_ascii_uppercase() && !b.get(i + 1).is_some_and(u8::is_ascii_lowercase) {
+                i += 1;
+            }
+            i = i.max(start + 1);
+        }
+        Some((&p[start..i], digits))
+    })
+}
+
+/// A piece (see [`pieces`]) that reads like a word: three small letters or
+/// more, a capital perhaps before them, a vowel among them.
+fn wordy(piece: &str) -> bool {
+    let rest = piece.strip_prefix(|c: char| c.is_ascii_uppercase()).unwrap_or(piece);
+    rest.len() >= 3
+        && rest.bytes().all(|b| b.is_ascii_lowercase())
+        && piece.bytes().any(|b| b"aeiouyAEIOUY".contains(&b))
 }
 
 /// Words that say what a password is like, not what it is ("my password is
@@ -798,8 +929,21 @@ fn gives_secret(lower: &str, i: usize, key: &str) -> bool {
         return false; // "pink", "passwordless"
     }
     let rest = rest.trim_start();
+    // The wifi itself only counts when what it "is" reads like its password
+    // (eight characters at least, as wifi passwords are): "the wifi is
+    // SunnyDay2023", not "the wifi is slow", "Wifi: 1000Mbps fibre", "the
+    // wifi is WPA2-Personal" — nor "wifi 802.11ax", a standard.
+    let weak = matches!(key, "wifi" | "wi-fi");
+    let wifi = |w: &str| {
+        let v = w.trim_matches(|c: char| !c.is_alphanumeric());
+        v.chars().count() >= 8
+            && value_like(v, false)
+            && !v.contains(['.', '/'])
+            && !["wpa", "wep", "802"].iter().any(|p| v.starts_with(p))
+            && !["mbps", "gbps", "mbit", "gbit", "ghz", "mhz"].iter().any(|u| v.contains(u))
+    };
     if rest.starts_with(':') || rest.starts_with('=') {
-        return true;
+        return !weak || rest[1..].split_whitespace().next().is_some_and(wifi);
     }
     // A bare "secret" or "pw" is only ever given ("the secret is practice").
     if matches!(key, "secret" | "pw") {
@@ -807,7 +951,7 @@ fn gives_secret(lower: &str, i: usize, key: &str) -> bool {
     }
     let digits = matches!(key, "pin" | "pin code" | "pin number" | "cvv" | "cvc" | "door code" | "alarm code" | "access code" | "lock code");
     let words: Vec<&str> = rest.split_whitespace().take(8).collect();
-    if words.first().is_some_and(|w| value_like(w, digits)) {
+    if !weak && words.first().is_some_and(|w| value_like(w, digits)) {
         return true;
     }
     // "… is X", or after a short "for the wifi" / "on the router": "… is X",
@@ -825,6 +969,8 @@ fn gives_secret(lower: &str, i: usize, key: &str) -> bool {
                 && (v.ends_with("ed") || v.ends_with("ing") || v.ends_with("ly"));
             return if digits {
                 v.chars().filter(char::is_ascii_digit).count() >= 3
+            } else if weak {
+                wifi(&v)
             } else {
                 v.chars().count() >= 3 && !is_common(&v) && !NOT_VALUES.contains(&v.as_str()) && !describes
             };
@@ -884,13 +1030,62 @@ fn stem_into(w: &str, out: &mut String) -> bool {
     out.len() >= 3
 }
 
+/// The word `w` (stemmed to `stem`, when it was) may come from, into `out`:
+/// an -ed or -ing form's verb, when the ending took the verb's last "e"
+/// ("moved", "living" → "move", "live"), doubled its last letter
+/// ("planned", "running" → "plan", "run") or turned its "y" into "ie"
+/// ("studied" → "study"); an -ic word's noun ("allergic" → "allergy"). So "Is anyone living there after the move?" finds "Sister
+/// lives in Lisbon — Ana moved". A word itself never loses its "e": "Pete"
+/// isn't "pet", nor "plane" "plan".
+fn base_into(w: &str, stem: Option<&str>, out: &mut String) -> bool {
+    out.clear();
+    if !w.is_ascii() {
+        return false;
+    }
+    if let Some(stem) = stem.filter(|_| w.ends_with("ed") || w.ends_with("ing")) {
+        let b = stem.as_bytes();
+        let n = b.len();
+        let vowel = |i: usize| b"aeiou".contains(&b[i]) || (b[i] == b'y' && i > 0 && !b"aeiou".contains(&b[i - 1]));
+        if w.len() > 4 && w.ends_with("ied") {
+            // "studied", "married" → "study", "marry".
+            out.push_str(&w[..w.len() - 3]);
+            out.push('y');
+        } else if n >= 4 && b[n - 1] == b[n - 2] && b"bdgmnprt".contains(&b[n - 1]) {
+            out.push_str(&stem[..n - 1]);
+        } else if w.ends_with("ed") && b[n - 1] == b'e' {
+            // "agreed", "freed" → "agree", "free".
+            out.push_str(stem);
+            out.push('e');
+        } else {
+            // A short verb ending consonant, vowel, consonant: "mov",
+            // "liv", "shar" (not "visit", "walk", "play").
+            let groups = (0..n).filter(|&i| vowel(i) && (i == 0 || !vowel(i - 1))).count();
+            if n >= 3 && groups == 1 && !vowel(n - 1) && !b"wxy".contains(&b[n - 1]) && vowel(n - 2) && !vowel(n - 3) {
+                out.push_str(stem);
+                out.push('e');
+            } else {
+                return false;
+            }
+        }
+        return out.len() >= 3;
+    }
+    let n = w.len();
+    if n > 5 && w.ends_with("ic") {
+        out.push_str(&w[..n - 2]);
+        out.push('y');
+        return true;
+    }
+    false
+}
+
 /// Call `f` with each term to match memories by: each word of three or more
 /// letters or digits that isn't a common word, lowercased, then its stem
-/// (unless that's a common word: "likes" → "like"); Chinese, Japanese and
-/// Korean text as overlapping pairs of characters. A term can come more than
-/// once. Nothing is allocated per word: this runs over every memory.
+/// and the word it may come from (see [`base_into`]) — unless those are
+/// common words ("likes" → "like"); Chinese, Japanese and Korean text as
+/// overlapping pairs of characters. A term can come more than once. Nothing
+/// is allocated per word: this runs over every memory.
 fn each_term(text: &str, mut f: impl FnMut(&str)) {
-    let (mut word, mut stemmed, mut pair) = (String::new(), String::new(), String::new());
+    let (mut word, mut stemmed, mut base, mut pair) = (String::new(), String::new(), String::new(), String::new());
     for raw in text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
         let mut rest = raw;
         while let Some(first) = rest.chars().next() {
@@ -920,8 +1115,12 @@ fn each_term(text: &str, mut f: impl FnMut(&str)) {
                 continue;
             }
             f(&word);
-            if stem_into(&word, &mut stemmed) && !is_common(&stemmed) {
+            let has_stem = stem_into(&word, &mut stemmed);
+            if has_stem && !is_common(&stemmed) {
                 f(&stemmed);
+            }
+            if base_into(&word, has_stem.then_some(stemmed.as_str()), &mut base) && !is_common(&base) {
+                f(&base);
             }
         }
     }
@@ -1039,6 +1238,63 @@ pub(crate) fn redact_line(line: &str) -> String {
         return format!("{who}: {LEFT_OUT}");
     }
     out
+}
+
+/// The words of `s` to compare by: runs of letters and digits, lowercased,
+/// and each symbol or emoji on its own — not spaces or punctuation.
+fn word_tokens(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut word = String::new();
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            word.extend(c.to_lowercase());
+            continue;
+        }
+        if !word.is_empty() {
+            out.push(std::mem::take(&mut word));
+        }
+        // Punctuation, in any script: Latin-1's (« »), general (“ ” — …),
+        // CJK (。、), full-width (，), and emoji's style marks.
+        let punctuation = c.is_ascii_punctuation()
+            || matches!(c as u32,
+                0x00A1..=0x00BF | 0x2000..=0x206F | 0x3000..=0x303F | 0xFE00..=0xFE0F | 0xFE30..=0xFE4F
+                | 0xFF01..=0xFF0F | 0xFF1A..=0xFF20 | 0xFF3B..=0xFF40 | 0xFF5B..=0xFF65);
+        if !c.is_whitespace() && !punctuation {
+            out.push(c.to_string());
+        }
+    }
+    if !word.is_empty() {
+        out.push(word);
+    }
+    out
+}
+
+/// `whole` already says `part`, word for word: whole words, ignoring case,
+/// spacing and punctuation ("cat" isn't in "educated"), with symbols and
+/// emoji counting ("Favourite: 🦊" doesn't say "Favourite: 🐺").
+fn says_already(whole: &str, part: &str) -> bool {
+    let (w, p) = (word_tokens(whole), word_tokens(part));
+    !p.is_empty() && w.windows(p.len()).any(|window| window == p.as_slice())
+}
+
+/// `new` says everything `old` does, sentence for sentence — and more: so
+/// it can take `old`'s place ("Has a cat." in "Has a cat. Got a dog too."),
+/// unlike a sentence that only starts the same ("Has a cat allergy.").
+fn restates(new: &str, old: &str) -> bool {
+    let said: Vec<Vec<String>> = sentences(new).into_iter().map(word_tokens).filter(|s| !s.is_empty()).collect();
+    let mut olds = sentences(old).into_iter().map(word_tokens).filter(|s| !s.is_empty()).peekable();
+    olds.peek().is_some() && olds.all(|s| said.contains(&s))
+}
+
+/// "Sister Ana (2)" is kept beside "Sister Ana" (see
+/// [`MemoryStore::unique_title`]) — and "Top 10 (2)" beside "Top 10", while
+/// "Top 10" itself isn't beside "Top".
+fn beside(candidate: &str, title: &str) -> bool {
+    candidate
+        .trim()
+        .strip_suffix(')')
+        .and_then(|c| c.rsplit_once(" ("))
+        .is_some_and(|(base, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && same_words(base, title))
 }
 
 /// A pass prompt: `head` (see [`MemoryStore::pass_head`]), then the chat.
@@ -1281,12 +1537,26 @@ fn mend(s: &str) -> String {
 /// `"Loves "Alien", 1979"` and `"They said "hi", then left"` stay whole.
 fn ends_text(rest: &[char], in_list: bool) -> bool {
     let next = |from: usize| (from..rest.len()).find(|&j| !rest[j].is_whitespace());
-    // A key starts at `k`: a quoted name, then a colon — or a key cut off,
-    // with nothing closing after it (a `}` after it means the quote at `k`
-    // was inside the text, as in `"I'm "Nova""}`).
+    // A key starts at `k`: a quoted name, then a colon and then a value —
+    // any value after one of an answer's keys, and after a key the model
+    // made up (`"importance": "high"`) something only a value starts with,
+    // so `"Defined "foo", "bar": a placeholder."` stays whole. Or a key cut
+    // off, with nothing closing after it (a `}` after it means the quote at
+    // `k` was inside the text, as in `"I'm "Nova""}`).
     let key_at = |k: usize| match (k + 1..rest.len()).find(|&m| rest[m] == '"') {
         None => !rest[k + 1..].iter().any(|c| matches!(c, '}' | ']')),
-        Some(close) => next(close + 1).is_none_or(|m| rest[m] == ':'),
+        Some(close) => match next(close + 1) {
+            None => true,
+            Some(colon) if rest[colon] == ':' => {
+                let name: String = rest[k + 1..close].iter().collect();
+                ANSWER_KEYS.contains(&name.as_str())
+                    || next(colon + 1).is_none_or(|v| {
+                        let starts = |word: &str| rest[v..].iter().take(word.len()).copied().eq(word.chars());
+                        matches!(rest[v], '"' | '[' | '{' | '-' | '0'..='9') || ["true", "false", "null"].into_iter().any(starts)
+                    })
+            }
+            Some(_) => false,
+        },
     };
     let Some(j) = next(0) else { return true };
     match rest[j] {
@@ -1789,10 +2059,65 @@ impl MemoryStore {
         out
     }
 
+    /// The stored memories a pass is shown, as prompt lines, and the ones
+    /// whose details it sees whole: those in the topics the chat touched
+    /// (each topic once), the newest first, at most `PASS_TITLES` — each
+    /// with its details while they fit `PASS_DETAILS` tokens (and
+    /// `MEMORY_TEXT` characters: what a pass can write back), the rest by
+    /// title, a line for each topic. A change to a memory the pass saw whole
+    /// replaces its details; what it writes for any other is added to them,
+    /// or kept beside them (see [`apply_pass`](Self::apply_pass)): details a
+    /// pass never saw are never lost.
+    fn pass_memories(&self, touched: &[String]) -> (Vec<String>, Vec<u64>) {
+        let (mut lines, mut seen) = (Vec::new(), Vec::new());
+        let mut topics: Vec<usize> = Vec::new();
+        let (mut listed, mut used) = (0, 0);
+        for name in touched {
+            let Some(ti) = self.find_topic(name) else { continue };
+            if topics.contains(&ti) {
+                continue;
+            }
+            topics.push(ti);
+            let t = &self.topics[ti];
+            let topic = clean(&t.name, 60);
+            let mut newest: Vec<&Memory> = t.memories.iter().collect();
+            newest.sort_by_key(|m| std::cmp::Reverse(m.updated));
+            let mut titles: Vec<String> = Vec::new();
+            for m in newest.into_iter().take(PASS_TITLES.saturating_sub(listed)) {
+                listed += 1;
+                let (title, text) = (clean(&m.title, 120), clean(&m.text, MEMORY_TEXT));
+                let line = if text.is_empty() || same_words(&title, &text) {
+                    format!("- [{topic}] {title}")
+                } else {
+                    format!("- [{topic}] {title}: {text}")
+                };
+                let cost = approx_tokens(&line);
+                if m.text.trim().chars().count() <= MEMORY_TEXT && used + cost <= PASS_DETAILS {
+                    used += cost;
+                    lines.push(line);
+                    seen.push(m.id);
+                } else {
+                    titles.push(title);
+                }
+            }
+            if !titles.is_empty() {
+                lines.push(format!("- [{topic}] details not shown: {}", titles.join("; ")));
+            }
+        }
+        (lines, seen)
+    }
+
+    /// The memories a pass for the chat that `touched` these topics sees
+    /// whole (see [`pass_memories`](Self::pass_memories)), for
+    /// [`apply_pass`](Self::apply_pass).
+    pub(crate) fn pass_seen(&self, touched: &[String]) -> Vec<u64> {
+        self.pass_memories(touched).1
+    }
+
     /// A pass's instructions and what's already remembered (the topics, the
-    /// stored titles in the topics the chat touched, the AI's notes and the
-    /// last summary): the prompt up to the chat itself (see
-    /// [`assemble_pass`]).
+    /// stored memories in the topics the chat touched — see
+    /// [`pass_memories`](Self::pass_memories) —, the AI's notes and the last
+    /// summary): the prompt up to the chat itself (see [`assemble_pass`]).
     pub(crate) fn pass_head(&self, touched: &[String], extends_summary: bool, pictures: usize) -> String {
         use std::fmt::Write as _;
         let mut s = String::from(
@@ -1820,15 +2145,20 @@ impl MemoryStore {
             "\n- persona: your notes on yourself — the name the user gave you, if they did — and how \
              this user likes your replies, at most 3 sentences. Keep what still applies. Leave it \
              empty for no change.\n\
-             - remember: one fact per memory, with a title under 10 words and a sentence or two of \
-             detail. Only what the user said or clearly meant that will still matter in a later \
+             - remember: one fact per memory: a short title saying what it's about (\"Sister Ana\", \
+             \"Home city\", \"Favourite model\") rather than the fact itself, and a sentence or two \
+             of detail. Only what the user said or clearly meant that will still matter in a later \
              chat: who they are (their name too), the people and places in their life, their work \
              and projects, what they like and dislike, their plans — and always what they asked you \
              to remember. No small talk, and nothing about this chat itself. Reuse an existing topic \
-             when one fits; topics are broad (a person, a project, an interest). To change a stored \
-             memory, reuse its exact title. At most 12; none is fine.\n\
-             - forget: stored memories this chat showed are wrong or outdated, or that the user \
-             asked you to forget.\n\
+             when one fits; topics are broad (a person, a project, an interest). When a stored \
+             memory changes, reuse its exact title instead of adding another, and write its details \
+             again in full: they replace the old ones, so keep what still applies. (For one listed \
+             without its details, write only what's new: it's added to them.) At most 12; none is \
+             fine.\n\
+             - forget: stored memories this chat showed are wrong or outdated (one whose title is \
+             now wrong too: remember the corrected one under a new title), or that the user asked \
+             you to forget.\n\
              - Never store passwords, keys, card numbers or other secrets. If the user asked you \
              not to remember something, leave it out.\n",
         );
@@ -1861,27 +2191,13 @@ impl MemoryStore {
         } else {
             let _ = writeln!(s, "Topics: {}", topics.join(", "));
         }
-        let mut titles = 0;
-        let mut stored = String::new();
-        for name in touched {
-            let Some(ti) = self.find_topic(name) else { continue };
-            let t = &self.topics[ti];
-            let mut list: Vec<String> = Vec::new();
-            let mut newest: Vec<&Memory> = t.memories.iter().collect();
-            newest.sort_by_key(|m| std::cmp::Reverse(m.updated));
-            for m in newest {
-                if titles >= PASS_TITLES {
-                    break;
-                }
-                list.push(clean(&m.title, 120));
-                titles += 1;
-            }
-            if !list.is_empty() {
-                let _ = writeln!(stored, "- {}: {}", clean(&t.name, 60), list.join("; "));
-            }
-        }
+        let (stored, _) = self.pass_memories(touched);
         if !stored.is_empty() {
-            let _ = write!(s, "Stored titles in topics this chat touched:\n{stored}");
+            s.push_str("Stored memories in the topics this chat touched:\n");
+            for line in &stored {
+                s.push_str(line);
+                s.push('\n');
+            }
         }
         let persona = sanitize(&clip_tokens(&self.header.persona, NOTE_PERSONA));
         if !persona.is_empty() {
@@ -1900,16 +2216,21 @@ impl MemoryStore {
     /// is left out (a memory whole; from the summary and the notes, the
     /// sentence) — the prompt forbids them, this is the safety net — and so
     /// is a new memory saying what one already says word for word, and a
-    /// stored title given again with no details (it keeps its own). A title
-    /// the same answer both remembers and forgets is kept.
-    pub(crate) fn apply_pass(&mut self, out: &PassOutput) -> Applied {
+    /// stored title given again with no details (it keeps its own). A
+    /// changed memory's details are replaced when the pass saw them whole
+    /// (`seen`, see [`pass_seen`](Self::pass_seen)). Otherwise they're kept:
+    /// what it wrote is added to them (unless they say it already), or, with
+    /// no room left beside them, kept as a memory of its own next to it
+    /// ("Sister Ana (2)"). A title the same answer both remembers and
+    /// forgets is kept.
+    pub(crate) fn apply_pass(&mut self, out: &PassOutput, seen: &[u64]) -> Applied {
         let mut applied = Applied::default();
         if self.load_failed {
             return applied;
         }
         for (topic, title, text) in out.remember.iter().take(PASS_MAX_REMEMBER) {
             let topic = cut(if topic.trim().is_empty() { "General" } else { topic }, 40);
-            let text = cut(text, 400);
+            let text = cut(text, MEMORY_TEXT);
             let title = if title.trim().is_empty() {
                 cut(&crate::roleplay::title_from(&text), 80)
             } else {
@@ -1918,22 +2239,77 @@ impl MemoryStore {
             if title.is_empty() && text.is_empty() {
                 continue;
             }
-            let same_title = self
-                .find_topic(&topic)
-                .is_some_and(|ti| self.topics[ti].memories.iter().any(|m| same_words(&m.title, &title)));
+            // The stored memory it changes, if any: its id and details.
+            let stored = self.find_topic(&topic).and_then(|ti| {
+                self.topics[ti].memories.iter().find(|m| same_words(&m.title, &title)).map(|m| (m.id, m.text.clone()))
+            });
+            let same_title = stored.is_some();
             // A secret split over the fields ("Wifi password" / "hunter2")
             // counts too.
             let secret = looks_secret(&topic)
                 || looks_secret(&title)
                 || looks_secret(&text)
                 || looks_secret(&format!("{title} {text}"));
-            // A stored title with nothing new to say keeps what it says (the
-            // pass sees stored titles, not their details).
+            // A stored title with nothing new to say keeps what it says.
             let empty_update = same_title && text.is_empty();
             if secret || empty_update || (!same_title && self.contains_text(if text.is_empty() { &title } else { &text })) {
                 applied.skipped += 1;
                 continue;
             }
+            let (title, text) = match stored {
+                Some((id, old)) if !seen.contains(&id) && !old.trim().is_empty() => {
+                    // The memory and those kept beside it ("Sister Ana (2)"),
+                    // the newest last: what any of them says already counts.
+                    let mut kin: Vec<(String, String, i64)> = self
+                        .find_topic(&topic)
+                        .map(|ti| {
+                            self.topics[ti]
+                                .memories
+                                .iter()
+                                .filter(|m| same_words(&m.title, &title) || beside(&m.title, &title))
+                                .map(|m| (m.title.clone(), m.text.trim().to_string(), m.updated))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    kin.sort_by_key(|k| k.2);
+                    if kin.iter().any(|(_, said, _)| says_already(said, &text)) {
+                        applied.skipped += 1;
+                        continue;
+                    }
+                    let old = old.trim();
+                    let fits = |said: &str| said.chars().count() + 2 + text.chars().count() <= MEMORY_TEXT;
+                    // Added to the memory, or to the newest kept beside it,
+                    // where there's room — or kept beside it, on its own.
+                    let replaces = restates(&text, old); // all it said, and more
+                    let target = if replaces {
+                        None
+                    } else if fits(old) {
+                        Some((title.clone(), old.to_string()))
+                    } else {
+                        kin.iter()
+                            .rev()
+                            .find(|(t, said, _)| beside(t, &title) && fits(said))
+                            .map(|(t, said, _)| (t.clone(), said.clone()))
+                    };
+                    match target {
+                        None if replaces => (title, text),
+                        None => (self.unique_title(&topic, &title), text),
+                        Some((at, said)) => {
+                            let gap = if said.ends_with(['.', '!', '?', '…']) { " " } else { ". " };
+                            let joined = format!("{said}{gap}{text}");
+                            // Together, they mustn't make a secret ("… password" + "is hunter2"),
+                            // however they're read.
+                            let run_on = format!("{said} {text}");
+                            if [&joined, &run_on].iter().any(|t| looks_secret(t) || looks_secret(&format!("{at} {t}"))) {
+                                applied.skipped += 1;
+                                continue;
+                            }
+                            (at, joined)
+                        }
+                    }
+                }
+                _ => (title, text),
+            };
             if self.add_entry(&topic, &title, &text, true, None).is_some() {
                 applied.added += 1;
             }
@@ -2232,6 +2608,25 @@ mod tests {
             "pw: hunter2",
             "wifi key: abc12345",
             "AKIAIOSFODNN7EXAMPLE",
+            // Keys and tokens as services make them. (Fakes, split with
+            // concat! so GitHub's push protection doesn't take them for
+            // real ones.)
+            "a3f9c2e1b7d4058f6e2a9c1b3d7f0e4a",
+            "123e4567-e89b-12d3-a456-426614174000",
+            concat!("sk_", "live_51HxYzAbCdEfGhIjKlMnOp"),
+            concat!("hf_", "AbCdEfGhIjKlMnOpQrStUvWxYz1234"),
+            concat!("xox", "b-123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx"),
+            concat!("AIza", "SyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY"),
+            "Xk9pQzLmNvBwRtYsUaHcDeF2",
+            "q8zkmw2pfnr7tybs1lcx4d",
+            "VK7JG-NPHTM-C97JM-9MPGT-3V66T",
+            concat!("pat-", "na1-123e4567-e89b-12d3-a456-426614174000"),
+            "access-production-123e4567-e89b-12d3-a456-426614174000",
+            concat!("f3a9c2e1b7d4058f6e2a9c1b3d7f0e4a", "-us21"),
+            "Mk3_aQ7-xZpL2_bN9-tYcR4wE",
+            "MySuperSecretPassword2024",
+            "the cabin wifi is SunnyDayBeachHouse2023",
+            "Wifi: Sunny2023!x",
         ] {
             assert!(looks_secret(s), "{s}");
         }
@@ -2244,6 +2639,30 @@ mod tests {
             "Photos are in /home/alex/Pictures/2024",
             "Likes pink and pinball",
             "Runs Gemma 4 31B on an RTX 4090",
+            // Models, checkpoints and LoRAs by their file names.
+            "Runs gemma-4-27b-it-Q4_K_M locally",
+            "Prefers flux1-dev-bnb-nf4-v2 for portraits",
+            "Uses wan2_2_i2v_480p_14B_fp16 for video",
+            "Uses model Illustrious-XL-v1-0-fp16-pruned",
+            "Checkpoint juggernautXL_v9Rdphoto2Lightning",
+            "Favourite LoRA is detail_tweaker_xl_v1_2_beta3",
+            "Uses control_v11p_sd15_openpose in ComfyUI",
+            "Likes the realisticVisionV60B1_v51HyperVAE checkpoint",
+            "Tried ponyDiffusionV6XL_v6StartWithThisOne",
+            "hunyuan_video_720_cfgdistill_fp8_e4m3fn renders well",
+            "Edits with Qwen-Image-Edit-2509-Q4_K_M",
+            "Still likes chilloutmix_NiPrunedFp32Fix",
+            "Uses wan2_1_t2v_14B_fp8_e4m3fn and Wan2_1-I2V-14B-720P_fp8_e4m3fn",
+            "My wifi is slow",
+            "Wifi: fast fibre",
+            "Has wifi 2.4GHz only",
+            "Router supports wifi 802.11ax",
+            "Wifi: 1000Mbps fibre",
+            "The wifi is 5GHz-only",
+            "The wifi is WPA2-Personal",
+            "Uses wifi 2.4GHz/5GHz",
+            "The wifi is 1Gbit-fibre",
+            "The tokenizer_2_fp16_v1_5 file is missing",
             "IMG_20240512_123456.jpg is the favourite",
             "Visits my-favourite-site-2024.example.com",
             "Uses a password manager on 3 devices",
@@ -2280,6 +2699,27 @@ mod tests {
         assert!(terms("What do you remember about this?").is_empty());
         // A stem that's a common word doesn't count ("likes" → "like").
         assert_eq!(terms("She likes it, and wants more"), vec!["likes", "wants"]);
+        // Forms of a word find each other…
+        let share = |a: &str, b: &str| terms(a).iter().any(|t| terms(b).contains(t));
+        for (a, b) in [
+            ("living", "lives"),
+            ("moved", "move"),
+            ("moving", "moves"),
+            ("allergic", "allergies"),
+            ("planned", "plans"),
+            ("running", "run"),
+            ("studied", "study"),
+            ("agreed", "agree"),
+            ("shared", "share"),
+        ] {
+            assert!(share(a, b), "{a} ~ {b}");
+        }
+        // …but a word never loses its "e": a name isn't a pet, a plane
+        // isn't a plan.
+        for (a, b) in [("Pete", "pet"), ("Tim", "time"), ("plane", "plan"), ("wine", "win"), ("cute", "cut"), ("site", "sit")] {
+            assert!(!share(a, b), "{a} ~ {b}");
+        }
+        assert_eq!(terms("visiting"), vec!["visiting", "visit"]);
     }
 
     /// The memories a reply is shown: all of them while they fit, otherwise
@@ -2309,6 +2749,11 @@ mod tests {
         );
         assert!(s.relevant(&[("What do you remember?", 1.0)], 30, 5).len() < 5);
         assert!(s.relevant(&[("nothing matches this", 1.0)], 10_000, 2).is_empty());
+        // Other forms of the words count.
+        let allergy = s.relevant(&[("What are my allergies?", 1.0)], 10_000, 1);
+        assert_eq!(allergy[0].1.title, "Allergic to peanuts");
+        let moved = s.relevant(&[("Is anyone living there after the move?", 1.0)], 10_000, 1);
+        assert_eq!(moved[0].1.title, "Sister lives in Lisbon");
     }
 
     /// The note pinned before a reply: everything it should say, safe for
@@ -2404,6 +2849,28 @@ mod tests {
         let out = parse_pass(films).expect("films");
         assert_eq!(out.remember[0].2, "Loves \"Alien\", 1979 and \"Heat\", 1995.");
         assert_eq!(out.summary, "Film: \"Heat\": a classic, \"Up\", \"Big\" too");
+        // A quoted word, a comma, a quoted word and a colon inside a text:
+        // only an answer's own keys end it.
+        let made_up = "{\"remember\": [{\"topic\": \"Work\", \"title\": \"Job\", \"text\": \"Works at \"Acme\".\", \
+                       \"importance\": \"high\"}], \"summary\": \"Talked \"shop\".\", \"notes\": [1, 2]}";
+        let out = parse_pass(made_up).expect("made-up keys");
+        assert_eq!(out.remember[0].2, "Works at \"Acme\".");
+        assert_eq!(out.summary, "Talked \"shop\".");
+        for (answer, text) in [
+            (
+                "{\"remember\": [{\"topic\": \"Work\", \"title\": \"Terms\", \"text\": \"Defined \"foo\", \"bar\": a \
+                 placeholder.\"}]}",
+                "Defined \"foo\", \"bar\": a placeholder.",
+            ),
+            (
+                "{\"remember\": [{\"topic\": \"Test\", \"title\": \"Greeting\", \"text\": \"Said \"hello\", \"world\": a \
+                 test.\"}]}",
+                "Said \"hello\", \"world\": a test.",
+            ),
+        ] {
+            let out = parse_pass(answer).expect(text);
+            assert_eq!(out.remember[0].2, text);
+        }
         // A comma left out before the next key is put back.
         let out = parse_pass("{\"remember\": [{\"title\": \"Has a cat\" \"text\": \"A tabby.\"}]}").expect("comma");
         assert_eq!(out.remember, vec![(String::new(), "Has a cat".into(), "A tabby.".into())]);
@@ -2522,7 +2989,9 @@ mod tests {
             forget: vec![(String::new(), "old job".into()), ("Work".into(), "Never stored".into())],
             keep: Vec::new(),
         };
-        assert_eq!(s.apply_pass(&out), Applied { added: 2, forgotten: 1, skipped: 2, summary: true, persona: true });
+        // (The pass saw every stored memory whole.)
+        let every = |s: &MemoryStore| s.topics.iter().flat_map(|t| &t.memories).map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(s.apply_pass(&out, &every(&s)), Applied { added: 2, forgotten: 1, skipped: 2, summary: true, persona: true });
         // A stored title with no details keeps its own; one remembered and
         // forgotten by the same answer stays; a secret split over the
         // fields is left out.
@@ -2535,7 +3004,7 @@ mod tests {
             forget: vec![(String::new(), "Likes jazz and blues".into())],
             ..Default::default()
         };
-        assert_eq!(s.apply_pass(&tricky), Applied { added: 1, forgotten: 0, skipped: 2, summary: false, persona: false });
+        assert_eq!(s.apply_pass(&tricky, &every(&s)), Applied { added: 1, forgotten: 0, skipped: 2, summary: false, persona: false });
         let family = &s.topics[s.find_topic("family").unwrap()];
         assert_eq!(family.memories[0].text, "Ana moved to Porto now.");
         let general = &s.topics[s.find_topic("general").unwrap()];
@@ -2558,8 +3027,96 @@ mod tests {
         assert!(back.find_topic("Keys").is_none() && back.find_topic("Music").is_none());
         // An unreadable store takes nothing.
         let mut locked = MemoryStore { load_failed: true, ..Default::default() };
-        assert_eq!(locked.apply_pass(&out), Applied::default());
+        assert_eq!(locked.apply_pass(&out, &[]), Applied::default());
         assert!(locked.header.summary.is_empty());
+    }
+
+    /// A pass sees the stored memories' details (the newest, within a
+    /// budget) and rewrites the ones it saw; what it writes for one it saw
+    /// only the title of is added to its details, never put in their place.
+    #[test]
+    fn a_pass_keeps_details_it_never_saw() {
+        let _root = scratch_root("details");
+        let mut s = MemoryStore::load(MemoryKind::Main);
+        s.add("Family", "Sister Ana", "Ana is 30, works as a nurse and lives in Lisbon.");
+        let ana = s.topics[0].memories[0].id;
+        let touched = vec!["Family".to_string()];
+        let head = s.pass_head(&touched, false, 0);
+        assert!(head.contains("- [Family] Sister Ana: Ana is 30, works as a nurse and lives in Lisbon."), "{head}");
+        assert_eq!(s.pass_seen(&touched), vec![ana]);
+        let remember = |text: &str| PassOutput {
+            remember: vec![("Family".into(), "Sister Ana".into(), text.into())],
+            ..Default::default()
+        };
+        // Seen whole: what it writes replaces the details.
+        s.apply_pass(&remember("Ana is 30, a nurse, and moved to Porto."), &[ana]);
+        assert_eq!(s.topics[0].memories[0].text, "Ana is 30, a nurse, and moved to Porto.");
+        // Not seen: added to them — once.
+        s.apply_pass(&remember("She got married in June."), &[]);
+        assert_eq!(s.topics[0].memories[0].text, "Ana is 30, a nurse, and moved to Porto. She got married in June.");
+        assert_eq!(s.apply_pass(&remember("She got married in June."), &[]).skipped, 1, "it says so already");
+        // Whole words only, and emoji count.
+        assert!(!says_already("Lives with an educated cat", "cat lover") && says_already("Has a cat", "a CAT!"));
+        assert!(says_already("Loves 🦊", "🦊") && !says_already("Loves 🦊", "🐺"));
+        assert!(!says_already("Favourite: 🦊", "Favourite: 🐺"));
+        assert!(says_already("She said “yes” — happily…", "She said \"yes\"") && says_already("Loves ❤️", "Loves ❤"));
+        // Only a "(n)" is kept beside a memory: a title ending in a number
+        // is a memory of its own.
+        assert!(beside("Sister Ana (2)", "sister ana") && beside("Top 10 (3)", "Top 10"));
+        assert!(!beside("Top 10", "Top") && !beside("iPhone 15", "iPhone") && !beside("Sister Ana", "Sister Ana"));
+        // Only what says it all, sentence for sentence, takes its place.
+        assert!(restates("Has a cat. Got a dog too.", "Has a cat") && !restates("Has a cat allergy.", "Has a cat"));
+        s.add("Pets", "Cat", "Has a cat");
+        let cat = |text: &str| PassOutput { remember: vec![("Pets".into(), "Cat".into(), text.into())], ..Default::default() };
+        s.apply_pass(&cat("Has a cat allergy"), &[]);
+        assert_eq!(s.topics[s.find_topic("Pets").unwrap()].memories[0].text, "Has a cat. Has a cat allergy");
+        // What it adds mustn't make a secret with what's there.
+        s.add("Home", "Router", "The wifi password");
+        let router = |text: &str| PassOutput { remember: vec![("Home".into(), "Router".into(), text.into())], ..Default::default() };
+        assert_eq!(s.apply_pass(&router("is BlueSky2024"), &[]).skipped, 1);
+        // Long details (as written in the memory map) aren't shown, so
+        // aren't seen: with no room beside them, the news is kept on its own.
+        let long = "Ana's story, told at length. ".repeat(20);
+        s.add("Family", "Sister Ana", &long);
+        assert!(s.pass_head(&touched, false, 0).contains("- [Family] details not shown: Sister Ana"));
+        assert!(s.pass_seen(&touched).is_empty());
+        s.apply_pass(&remember("She moved to Porto."), &[]);
+        let family = &s.topics[s.find_topic("Family").unwrap()];
+        assert_eq!(family.memories[0].text, long.trim(), "never cut");
+        assert_eq!(
+            family.memories.iter().find(|m| m.title == "Sister Ana (2)").map(|m| m.text.as_str()),
+            Some("She moved to Porto.")
+        );
+        // Said again, it isn't kept twice; more news joins the one beside it.
+        assert_eq!(s.apply_pass(&remember("She moved to Porto."), &[]).skipped, 1);
+        s.apply_pass(&remember("She adopted a dog called Biscuit."), &[]);
+        let family = &s.topics[s.find_topic("Family").unwrap()];
+        assert!(family.memories.iter().all(|m| m.title != "Sister Ana (3)"));
+        assert_eq!(
+            family.memories.iter().find(|m| m.title == "Sister Ana (2)").map(|m| m.text.as_str()),
+            Some("She moved to Porto. She adopted a dog called Biscuit.")
+        );
+        // Up to what a pass writes back, details are shown whole.
+        s.add("Family", "Sister Ana", &"Ana is 30 and loves the sea, sailing and long walks. ".repeat(7));
+        assert!(s.topics[0].memories[0].text.chars().count() > 300);
+        assert!(s.pass_seen(&touched).contains(&ana));
+        // Past the budget, older memories show by title only: not seen (a
+        // shorter one that still fits keeps its details).
+        for i in 0..40 {
+            s.add("Family", &format!("Cousin {i}"), &"A long story about this cousin and all their adventures. ".repeat(3));
+        }
+        for m in &mut s.topics[0].memories {
+            if let Some(i) = m.title.strip_prefix("Cousin ").and_then(|i| i.parse::<i64>().ok()) {
+                m.updated = 1000 - i;
+            }
+        }
+        let oldest = s.topics[0].memories.iter().find(|m| m.title == "Cousin 39").map(|m| m.id).unwrap();
+        let head = s.pass_head(&touched, false, 0);
+        let hidden = head.lines().find(|l| l.starts_with("- [Family] details not shown: ")).expect("titles only");
+        assert!(hidden.contains("Cousin 39"), "{head}");
+        let seen = s.pass_seen(&touched);
+        assert!(seen.len() > 5 && !seen.contains(&oldest));
+        assert!(approx_tokens(&head) < 3000, "the prompt stays small: {}", approx_tokens(&head));
     }
 
     /// Forgetting by title works in any topic when the topic is unknown,
@@ -2591,8 +3148,8 @@ mod tests {
         assert!(head.starts_with("[Memory update. This is not a chat message.]"));
         assert!(head.contains("extend that summary"));
         assert!(head.contains("Topics: Garden (1), Work (1), Family (1)"));
-        assert!(head.contains("- Family: Sister lives in Lisbon"));
-        assert!(!head.contains("- Work:"), "only the touched topics' titles");
+        assert!(head.contains("- [Family] Sister lives in Lisbon: Ana moved to Lisbon."));
+        assert!(!head.contains("- [Work]"), "only the touched topics' memories");
         assert!(head.contains("Last summary ("));
         assert!(!s.pass_head(&[], false, 0).contains("extend that summary"));
         assert!(MemoryStore::default().pass_head(&[], false, 0).contains("Nothing yet."));
@@ -2601,7 +3158,7 @@ mod tests {
         assert!(prompt.ends_with("\nThe chat:\nUser: hi\nYou: Hello!\n\nNow reply with only the JSON object."));
         let touched = s.touched_topics("We talked about work and my sister", &["Garden".into(), "Gone".into()]);
         assert_eq!(touched, vec!["Garden", "Work", "Family"]);
-        assert!(s.pass_head(&touched, false, 0).contains("- Work: Builds <turn> apps"));
+        assert!(s.pass_head(&touched, false, 0).contains("- [Work] Builds <turn> apps: Apps."));
     }
 
     /// Chats left for the next run are kept encrypted, read back whole, and

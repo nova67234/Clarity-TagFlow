@@ -4797,7 +4797,7 @@ mod tests {
         assert!(!out.remember.is_empty(), "nothing remembered");
         let _root = crate::memory::scratch_root("llm_pass");
         let mut store = crate::memory::MemoryStore::load(crate::memory::MemoryKind::Main);
-        store.apply_pass(&out);
+        store.apply_pass(&out, &[]);
         let stored = store.topics.iter().flat_map(|t| &t.memories).map(|m| format!("{} {}", m.title, m.text));
         for text in stored.chain([store.header.summary.clone(), store.header.persona.clone()]) {
             assert!(!text.contains("hunter2"), "the password was stored: {text}");
