@@ -156,6 +156,7 @@ mod scan;
 mod sd_metadata;
 mod secret;
 mod settings;
+mod slider;
 mod spellcheck;
 mod splash;
 mod tag_manager;

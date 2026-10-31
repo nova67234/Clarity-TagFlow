@@ -15,6 +15,7 @@ use std::sync::Arc;
 use eframe::egui;
 use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText};
 
+use crate::slider::PillSlider;
 use crate::theme::*;
 
 const GREEN: Color32 = Color32::from_rgb(46, 160, 67);
@@ -382,6 +383,13 @@ enum RunnerMsg {
     /// header (drag-and-drop import of a workflow's tools).
     Nodes(String),
 }
+
+/// A LoRA's or embedding's weight until it's moved (also its slider's notch).
+const DEFAULT_STRENGTH: f32 = 1.0;
+/// The Size slider's starting value and notch.
+const DEFAULT_SIZE: i32 = 1024;
+/// The FPS slider's starting value and notch.
+const DEFAULT_FPS: i32 = 24;
 
 /// One LoRA found in ComfyUI's `models/loras/` dir, with its selection + weight.
 struct LoraEntry {
@@ -990,7 +998,7 @@ fn refresh_embeddings(state: &mut GenerateState, ctx: &egui::Context) {
                     sniffed: true,
                     selected: prev.map(|e| e.selected).unwrap_or(false),
                     negative: prev.map(|e| e.negative).unwrap_or(false),
-                    strength: prev.map(|e| e.strength).unwrap_or(1.0),
+                    strength: prev.map(|e| e.strength).unwrap_or(DEFAULT_STRENGTH),
                     thumb: prev.and_then(|e| e.thumb.clone()),
                     thumb_missing: prev.map(|e| e.thumb_missing).unwrap_or(false),
                     file: f.clone(),
@@ -1022,7 +1030,7 @@ fn refresh_embeddings(state: &mut GenerateState, ctx: &egui::Context) {
                     sniffed,
                     selected: prev.map(|e| e.selected).unwrap_or(false),
                     negative: prev.map(|e| e.negative).unwrap_or(false),
-                    strength: prev.map(|e| e.strength).unwrap_or(1.0),
+                    strength: prev.map(|e| e.strength).unwrap_or(DEFAULT_STRENGTH),
                     thumb: prev.and_then(|e| e.thumb.clone()),
                     thumb_missing: prev.map(|e| e.thumb_missing).unwrap_or(false),
                     file: f,
@@ -1549,14 +1557,7 @@ impl GenerateState {
             GenFamily::Wan | GenFamily::Ltx => (1280, 704),
             _ => (1024, 1024),
         };
-        // Default clip length (snapped to each model's stride later). Wan 2.2 5B at
-        // its native 1280×704 is heavy (~45 s/step on a 16 GB laptop), so default
-        // to a short 2-second clip (49 = 4·12+1) for a fast first run; LTX is far
-        // lighter, so it keeps the fuller 97-frame default.
-        let frames = match family {
-            GenFamily::Wan => 49,
-            _ => 97,
-        };
+        let frames = default_frames(family);
         Self {
             family,
             model,
@@ -1599,9 +1600,9 @@ impl GenerateState {
             stop_between_steps: false,
             below_h: 210.0,
             frames,
-            fps: 24,
+            fps: DEFAULT_FPS,
             i2v: false,
-            size: 1024,
+            size: DEFAULT_SIZE,
             lora_refresh_spin: None,
             prompt_rect: None,
             nodes_status: None,
@@ -1712,7 +1713,7 @@ fn refresh_loras(state: &mut GenerateState, ctx: &egui::Context) {
                 let prev = state.loras.iter().find(|l| l.file == *f);
                 LoraEntry {
                     selected: prev.map(|l| l.selected).unwrap_or(false),
-                    strength: prev.map(|l| l.strength).unwrap_or(1.0),
+                    strength: prev.map(|l| l.strength).unwrap_or(DEFAULT_STRENGTH),
                     base: *base,
                     sniffed: true,
                     info_open: prev.map(|l| l.info_open).unwrap_or(false),
@@ -1748,7 +1749,7 @@ fn refresh_loras(state: &mut GenerateState, ctx: &egui::Context) {
                 };
                 LoraEntry {
                     selected: prev.map(|l| l.selected).unwrap_or(false),
-                    strength: prev.map(|l| l.strength).unwrap_or(1.0),
+                    strength: prev.map(|l| l.strength).unwrap_or(DEFAULT_STRENGTH),
                     base,
                     sniffed,
                     info_open: prev.map(|l| l.info_open).unwrap_or(false),
@@ -2033,19 +2034,28 @@ fn lora_card(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui))
         .fill(fill)
         .corner_radius(CornerRadius::same(14))
         .inner_margin(Margin::same(10))
-        .stroke(stroke)
-        .show(ui, |ui| {
+        .stroke(stroke);
+    // The card (frame `r`) goes in a Ui whose click area sits *under* what's
+    // on it (it's registered first), so the controls on the card — the ℹ, the
+    // copy glyph, the weight slider's value pill and its double-click — get
+    // their own clicks, and a click anywhere else is the card's. Labels on it
+    // don't take clicks (they'd start a text selection instead); a card's
+    // details section turns that back on for its own text.
+    let card = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+        ui.style_mut().interaction.selectable_labels = false;
+        r.show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui);
         });
-    let rect = r.response.rect;
+    });
+    let rect = card.response.rect;
     // A whisper of a hover veil so unselected cards read as clickable.
     if !selected && ui.rect_contains_pointer(rect) {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(14), TEXT().gamma_multiply(0.04));
     }
     ui.add_space(6.0);
-    r.response
+    card.response
 }
 
 /// Blend `a` toward `b` by `t` (0..=1), per channel.
@@ -2113,8 +2123,8 @@ fn lora_row(
         }
     }
 
-    let mut info_rect: Option<egui::Rect> = None;
-    let mut copy_rect: Option<egui::Rect> = None;
+    let mut info_clicked = false;
+    let mut copy_clicked = false;
     let mut slider_rect: Option<egui::Rect> = None;
     let inner = lora_card(ui, l.selected, |ui| {
         ui.horizontal(|ui| {
@@ -2183,7 +2193,7 @@ fn lora_row(
                 if r.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
-                info_rect = Some(r.rect);
+                info_clicked = r.clicked();
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
                     ui.set_width(ui.available_width());
                     // One-line name, ellipsised so long file names can never
@@ -2213,8 +2223,11 @@ fn lora_row(
                     }
                     if l.selected {
                         ui.horizontal(|ui| {
+                            ui.set_min_height(crate::slider::HEIGHT);
                             ui.label(RichText::new("Weight").color(MUTED()).size(10.5));
-                            let sr = ui.add(egui::Slider::new(&mut l.strength, 0.0..=2.0));
+                            let sr = ui.add(
+                                PillSlider::new(&mut l.strength, 0.0..=2.0).default_value(DEFAULT_STRENGTH as f64),
+                            );
                             slider_rect = Some(sr.rect);
                         });
                     }
@@ -2236,11 +2249,11 @@ fn lora_row(
                 if info.triggers.is_empty() && info.facts.is_empty() {
                     ui.label(RichText::new("No metadata in this file.").color(MUTED()).size(10.5));
                 }
+                // The details' text can be selected (and copied).
+                ui.style_mut().interaction.selectable_labels = ui.ctx().global_style().interaction.selectable_labels;
                 if !info.triggers.is_empty() {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Trigger words").color(TEXT()).strong().size(11.0));
-                        // Image (not a Button) detected by position, since the
-                        // card-level interact swallows child button clicks.
                         let cr = ui
                             .add(
                                 egui::Image::new(egui::include_image!("../icons/copy.svg"))
@@ -2252,7 +2265,7 @@ fn lora_row(
                         if cr.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
-                        copy_rect = Some(cr.rect);
+                        copy_clicked = cr.clicked();
                     });
                     ui.add(egui::Label::new(
                         RichText::new(info.triggers.join(", ")).color(MUTED()).size(11.0),
@@ -2267,29 +2280,24 @@ fn lora_row(
             }
     });
     // Whole card clickable: the ℹ slot toggles details, the copy glyph copies
-    // triggers, the weight slider keeps its own drag, and a click anywhere else
-    // (de)selects the LoRA.
-    let resp = inner.interact(egui::Sense::click());
+    // triggers, the weight slider handles its own clicks and drags, and a
+    // click anywhere else (de)selects the LoRA.
+    let resp = inner;
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    if resp.clicked() {
-        let p = resp.interact_pointer_pos();
-        let hit = |r: Option<egui::Rect>| matches!((p, r), (Some(p), Some(r)) if r.contains(p));
-        if hit(info_rect) {
-            l.info_open = !l.info_open;
-            if l.info_open && l.info.is_none() && picker_host().is_none() {
-                l.info = Some(read_lora_info(&loras_dir.join(&l.file)));
-            }
-        } else if hit(copy_rect) {
-            if let Some(info) = &l.info {
-                let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(info.triggers.join(", ")));
-            }
-        } else if hit(slider_rect) {
-            // The slider handled its own drag.
-        } else {
-            l.selected = !l.selected;
+    if info_clicked {
+        l.info_open = !l.info_open;
+        if l.info_open && l.info.is_none() && picker_host().is_none() {
+            l.info = Some(read_lora_info(&loras_dir.join(&l.file)));
         }
+    }
+    if copy_clicked && let Some(info) = &l.info {
+        let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(info.triggers.join(", ")));
+    }
+    // A click in the weight row's gaps (beside the pill) isn't a (de)select.
+    if resp.clicked() && !resp.interact_pointer_pos().is_some_and(|p| slider_rect.is_some_and(|r| r.contains(p))) {
+        l.selected = !l.selected;
     }
 
     // Right-click menu (same Apple styling as the image viewer's): pick a
@@ -2998,8 +3006,8 @@ fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, tdir: &Path, off_fam
     let selected = e.selected;
     let negative = e.negative;
     let thumb = e.thumb.clone();
-    // Rects captured so the card-level click can route a hit to a control instead
-    // of toggling selection (the card swallows child clicks).
+    // Rects captured so a click on the card can route to the polarity pills
+    // (painted, not widgets) instead of toggling selection.
     let mut pos_rect = None;
     let mut neg_rect = None;
     let mut slider_rect = None;
@@ -3068,8 +3076,11 @@ fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, tdir: &Path, off_fam
                         neg_rect = Some(polarity_pill(ui, "Negative", negative, Color32::from_rgb(200, 80, 80)));
                     });
                     ui.horizontal(|ui| {
+                        ui.set_min_height(crate::slider::HEIGHT);
                         ui.label(RichText::new("Weight").color(MUTED()).size(10.5));
-                        let sr = ui.add(egui::Slider::new(&mut e.strength, 0.0..=2.0));
+                        let sr = ui.add(
+                            PillSlider::new(&mut e.strength, 0.0..=2.0).default_value(DEFAULT_STRENGTH as f64),
+                        );
                         slider_rect = Some(sr.rect);
                     });
                 }
@@ -3077,7 +3088,7 @@ fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, tdir: &Path, off_fam
         });
     });
 
-    let resp = inner.interact(egui::Sense::click());
+    let resp = inner;
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -3085,7 +3096,7 @@ fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, tdir: &Path, off_fam
         let p = resp.interact_pointer_pos();
         let hit = |r: Option<egui::Rect>| matches!((p, r), (Some(p), Some(r)) if r.contains(p));
         if hit(slider_rect) {
-            // The slider handled its own drag — don't toggle selection.
+            // In the weight row's gaps (the slider takes its own clicks).
         } else if hit(pos_rect) {
             e.selected = true;
             e.negative = false;
@@ -3811,14 +3822,14 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
     ui.add_space(8.0);
 
     // --- Settings. ---
-    slider(ui, "Steps", &mut state.steps, 1..=50);
-    slider(ui, "Guidance (CFG)", &mut state.cfg, 1.0..=8.0);
+    slider(ui, "Steps", &mut state.steps, 1..=50, state.model.default_steps() as f64);
+    slider(ui, "Guidance (CFG)", &mut state.cfg, 1.0..=8.0, state.model.default_cfg() as f64);
     // Video families (LTX / Wan): length + frame rate, grouped with the sliders
     // above the Size / aspect-ratio block. (The text/image-to-video mode toggle
     // sits below the aspect tiles, just above the seed row.)
     if state.family.is_video() {
-        slider(ui, "Frames", &mut state.frames, 25..=257);
-        slider(ui, "FPS", &mut state.fps, 8..=30);
+        slider(ui, "Frames", &mut state.frames, 25..=257, default_frames(state.family) as f64);
+        slider(ui, "FPS", &mut state.fps, 8..=30, DEFAULT_FPS as f64);
     }
     // Resolution: every family uses a single "Size" slider + quick aspect-ratio
     // tiles (square/landscape/portrait) instead of fine Width/Height sliders — the
@@ -3830,9 +3841,10 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
         // current selection tracks the slider live (snapped to the family's grid).
         let mut size = state.size;
         ui.horizontal(|ui| {
+            ui.set_min_height(crate::slider::HEIGHT);
             ui.label(RichText::new("Size").color(MUTED()).size(12.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add(egui::Slider::new(&mut size, 512..=2048).step_by(64.0));
+                ui.add(PillSlider::new(&mut size, 512..=2048).step_by(64.0).default_value(DEFAULT_SIZE as f64));
             });
         });
         if size != state.size {
@@ -4341,14 +4353,33 @@ fn aspect_tile(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, label: &str, dims
     resp.clicked()
 }
 
-/// Label + right-aligned slider row; works for both the f32 and i32 settings.
-fn slider<N: egui::emath::Numeric>(ui: &mut egui::Ui, label: &str, value: &mut N, range: std::ops::RangeInclusive<N>) {
+/// Label + right-aligned slider row, its notch at `default`; works for both
+/// the f32 and i32 settings.
+fn slider<N: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut N,
+    range: std::ops::RangeInclusive<N>,
+    default: f64,
+) {
     ui.horizontal(|ui| {
+        ui.set_min_height(crate::slider::HEIGHT);
         ui.label(RichText::new(label).color(MUTED()).size(12.0));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.add(egui::Slider::new(value, range));
+            ui.add(PillSlider::new(value, range).default_value(default));
         });
     });
+}
+
+/// A family's default clip length (snapped to each model's stride later). Wan
+/// 2.2 5B at its native 1280×704 is heavy (~45 s/step on a 16 GB laptop), so
+/// it defaults to a short 2-second clip (49 = 4·12+1) for a fast first run;
+/// LTX is far lighter, so it keeps the fuller 97-frame default.
+fn default_frames(family: GenFamily) -> i32 {
+    match family {
+        GenFamily::Wan => 49,
+        _ => 97,
+    }
 }
 
 /// A "<from> → <to>" mode label using the arrow_right_alt SVG glyph in place of a
@@ -7313,6 +7344,43 @@ mod ltx2_resolution_tests {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A card's click area lies under what's on it: the weight slider's pill
+    /// opens and its track's double-click resets, without (de)selecting the
+    /// card, and a click elsewhere on the card is the card's.
+    #[test]
+    fn card_controls_get_their_own_clicks() {
+        use crate::slider::rig::{self, Rig};
+
+        struct Card {
+            weight: f32,
+            card_clicks: u32,
+            slider: egui::Rect,
+            label: egui::Rect,
+        }
+        fn scene(ui: &mut egui::Ui, s: &mut Card) {
+            let card = lora_card(ui, true, |ui| {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(crate::slider::HEIGHT);
+                    s.label = ui.label("Weight").rect;
+                    ui.spacing_mut().slider_width = 120.0;
+                    s.slider = ui.add(PillSlider::new(&mut s.weight, 0.0..=2.0).default_value(1.0)).rect;
+                });
+            });
+            s.card_clicks += card.clicked() as u32;
+        }
+        let none = egui::Rect::NOTHING;
+        let mut rig = Rig::new(Card { weight: 0.5, card_clicks: 0, slider: none, label: none }, scene);
+        rig.type_in_pill(rig.state.slider, "1.5", egui::Key::Enter);
+        assert_eq!(rig.state.weight, 1.5, "the pill opened and took the typed weight");
+        rig.double_click(rig::track(rig.state.slider, 120.0, 0.2));
+        rig.idle();
+        assert_eq!(rig.state.weight, 1.0, "a double-click on the track reset it");
+        assert_eq!(rig.state.card_clicks, 0, "none of that was the card's");
+        rig.click(rig.state.label.center());
+        rig.idle();
+        assert_eq!(rig.state.card_clicks, 1, "a click on the card's label is the card's");
+    }
 
     fn job(model: GenModel) -> GenJob {
         GenJob {

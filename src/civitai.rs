@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use eframe::egui;
 
+use crate::slider::PillSlider;
 use crate::theme::{EDGE, FIELD, FLOAT, MUTED, PANEL, TEXT};
 
 const USER_AGENT: &str = "Clarity TagFlow (Civitai resource lookup)";
@@ -891,8 +892,9 @@ fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
                         ui.spacing_mut().slider_width = 110.0;
                         if ui
                             .add(
-                                egui::Slider::new(&mut state.thumb_size, THUMB_SIZE_MIN..=THUMB_SIZE_MAX)
-                                    .show_value(false),
+                                PillSlider::new(&mut state.thumb_size, THUMB_SIZE_MIN..=THUMB_SIZE_MAX)
+                                    .show_value(false)
+                                    .default_value(THUMB_SIZE_DEFAULT as f64),
                             )
                             .changed()
                         {

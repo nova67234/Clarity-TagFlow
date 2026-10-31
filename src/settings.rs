@@ -5,6 +5,7 @@
 use eframe::egui;
 
 use crate::left_panel_settings::MediaFilter;
+use crate::slider::PillSlider;
 use crate::theme::{Backdrop, Theme, EDGE, FLOAT, MUTED, PANEL, TEXT};
 
 /// Key under which the settings are saved in eframe's persistent storage.
@@ -275,14 +276,18 @@ fn theme_on_disk<S: serde::Serializer>(theme: &Theme, s: S) -> Result<S::Ok, S::
     .serialize(s)
 }
 
+/// Defaults the Viewer/Browser sliders also mark with their notch.
+const DEFAULT_PREFETCH_RADIUS: usize = 1;
+const DEFAULT_THUMBNAIL_SIZE: f32 = 300.0;
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             open: false,
             tab: SettingsTab::General,
-            prefetch_radius: 1,
+            prefetch_radius: DEFAULT_PREFETCH_RADIUS,
             unload_offscreen_thumbs: true,
-            thumbnail_size: 300.0,
+            thumbnail_size: DEFAULT_THUMBNAIL_SIZE,
             hd_thumbnails: false,
             confirm_before_delete: true,
             enable_extended_formats: false,
@@ -511,9 +516,10 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             Some("Images decoded ahead/behind the current one — smoother paging."),
             |ui| {
                 ui.spacing_mut().slider_width = 110.0;
-                // Air between the value box and the slider rail.
-                ui.spacing_mut().item_spacing.x = 10.0;
-                ui.add(egui::Slider::new(&mut settings.prefetch_radius, 0..=3));
+                ui.add(
+                    PillSlider::new(&mut settings.prefetch_radius, 0..=3)
+                        .default_value(DEFAULT_PREFETCH_RADIUS as f64),
+                );
             },
         );
     });
@@ -525,12 +531,11 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             Some("Largest height a tile can take in the list."),
             |ui| {
                 ui.spacing_mut().slider_width = 90.0;
-                // Air between the value box and the slider rail.
-                ui.spacing_mut().item_spacing.x = 10.0;
                 ui.add(
-                    egui::Slider::new(&mut settings.thumbnail_size, 120.0..=400.0)
+                    PillSlider::new(&mut settings.thumbnail_size, 120.0..=400.0)
                         .step_by(10.0)
-                        .suffix(" px"),
+                        .suffix(" px")
+                        .default_value(DEFAULT_THUMBNAIL_SIZE as f64),
                 );
             },
         );
@@ -1362,10 +1367,17 @@ const ROW_CONTROL_W: f32 = 180.0;
 /// One settings row: the label (with an optional muted description wrapping
 /// beneath it) on the left, `control` right-aligned — macOS style.
 pub(crate) fn row(ui: &mut egui::Ui, label: &str, sub: Option<&str>, control: impl FnOnce(&mut egui::Ui)) {
+    // A lone label centres on a control that stands taller than it (a
+    // slider). The control's height is only known once it's laid out, so the
+    // label's top padding is last frame's, kept under the row's own id (the
+    // next auto id: rows with the same label in sibling cards each get theirs).
+    let pad_id = ui.next_auto_id().with("row_label_pad");
+    let pad = if sub.is_none() { ui.data(|d| d.get_temp::<f32>(pad_id)).unwrap_or(0.0) } else { 0.0 };
     ui.horizontal(|ui| {
         let text_w = ui.available_width() - ROW_CONTROL_W;
-        ui.vertical(|ui| {
+        let text = ui.vertical(|ui| {
             ui.set_width(text_w);
+            ui.add_space(pad);
             if fresh() {
                 // A bold label over a muted line, as in Find Issues.
                 ui.label(egui::RichText::new(label).color(TEXT()).font(bold(13.5)));
@@ -1381,7 +1393,15 @@ pub(crate) fn row(ui: &mut egui::Ui, label: &str, sub: Option<&str>, control: im
                 }
             }
         });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control);
+        let control = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control);
+        if sub.is_none() {
+            let label_h = text.response.rect.height() - pad;
+            let want = ((control.response.rect.height() - label_h) / 2.0).max(0.0);
+            if (want - pad).abs() > 0.5 {
+                ui.data_mut(|d| d.insert_temp(pad_id, want));
+                ui.ctx().request_repaint();
+            }
+        }
     });
 }
 
@@ -2028,6 +2048,44 @@ mod tests {
         for theme in [Theme::Dark, Theme::Light, Theme::Space, Theme::Aurora, Theme::Glass, Theme::LiquidGlass] {
             let back = eframe::get_value::<Settings>(&save(theme), super::STORAGE_KEY).map(Settings::loaded);
             assert_eq!(back.map(|s| s.theme), Some(theme));
+        }
+    }
+
+    /// A row's lone label centres on a control taller than it (a slider) —
+    /// also when another card has a row with the same label beside a control
+    /// of another height — and the repaints that takes stop.
+    #[test]
+    fn row_labels_centre_on_their_controls_and_settle() {
+        use crate::slider::{PillSlider, rig::Rig};
+
+        struct Rows {
+            value: f32,
+            on: bool,
+            slider: egui::Rect,
+            check: egui::Rect,
+        }
+        fn scene(ui: &mut egui::Ui, s: &mut Rows) {
+            ui.set_width(520.0);
+            for card in 0..2 {
+                egui::Frame::new().show(ui, |ui| {
+                    super::row(ui, "Size", None, |ui| {
+                        if card == 0 {
+                            s.slider = ui.add(PillSlider::new(&mut s.value, 0.0..=10.0)).rect;
+                        } else {
+                            s.check = ui.checkbox(&mut s.on, "").rect;
+                        }
+                    });
+                });
+            }
+        }
+        let none = egui::Rect::NOTHING;
+        let mut rig = Rig::new(Rows { value: 0.0, on: false, slider: none, check: none }, scene);
+        rig.idle();
+        assert!(!rig.repaint, "settled");
+        let labels = rig.texts("Size");
+        assert_eq!(labels.len(), 2);
+        for (label, control) in labels.iter().zip([rig.state.slider, rig.state.check]) {
+            assert!((label.center().y - control.center().y).abs() < 1.0, "{label:?} beside {control:?}");
         }
     }
 }

@@ -23,6 +23,7 @@ use std::time::SystemTime;
 use eframe::egui;
 use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText};
 
+use crate::slider::PillSlider;
 use crate::theme::{ACCENT1, EDGE, MUTED, PANEL, TEXT};
 
 const GREEN: Color32 = Color32::from_rgb(46, 160, 67);
@@ -74,6 +75,13 @@ pub struct Pixal3DState {
     pub last_glb: Option<PathBuf>,
 }
 
+/// The Pixal3D space's defaults for the quality and GLB knobs — also where
+/// their sliders' notches sit.
+const DEFAULT_GUIDANCE: f32 = 7.5;
+const DEFAULT_TEX_GUIDANCE: f32 = 1.0;
+const DEFAULT_STEPS: i32 = 12;
+const DEFAULT_DECIMATION: i32 = 50_000;
+
 impl Default for Pixal3DState {
     fn default() -> Self {
         Self {
@@ -81,13 +89,13 @@ impl Default for Pixal3DState {
             seed: 0,
             randomize_seed: true,
             resolution: 1024,
-            ss_guidance: 7.5,
-            ss_steps: 12,
-            shape_guidance: 7.5,
-            shape_steps: 12,
-            tex_guidance: 1.0,
-            tex_steps: 12,
-            decimation: 50_000,
+            ss_guidance: DEFAULT_GUIDANCE,
+            ss_steps: DEFAULT_STEPS,
+            shape_guidance: DEFAULT_GUIDANCE,
+            shape_steps: DEFAULT_STEPS,
+            tex_guidance: DEFAULT_TEX_GUIDANCE,
+            tex_steps: DEFAULT_STEPS,
+            decimation: DEFAULT_DECIMATION,
             texture_size: 1024,
             hf_token: load_hf_token(),
             low_vram: true,
@@ -257,22 +265,22 @@ fn show_body(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<
 
     // --- Quality card: guidance/steps for the three pipeline stages. ---
     crate::settings::section(ui, "Quality", |ui| {
-        slider_row(ui, "Sparse guidance", &mut state.ss_guidance, 0.0..=12.0);
+        slider_row(ui, "Sparse guidance", &mut state.ss_guidance, 0.0..=12.0, DEFAULT_GUIDANCE);
         crate::settings::row_sep(ui);
-        int_slider_row(ui, "Sparse steps", &mut state.ss_steps, 1..=50);
+        int_slider_row(ui, "Sparse steps", &mut state.ss_steps, 1..=50, DEFAULT_STEPS);
         crate::settings::row_sep(ui);
-        slider_row(ui, "Shape guidance", &mut state.shape_guidance, 0.0..=12.0);
+        slider_row(ui, "Shape guidance", &mut state.shape_guidance, 0.0..=12.0, DEFAULT_GUIDANCE);
         crate::settings::row_sep(ui);
-        int_slider_row(ui, "Shape steps", &mut state.shape_steps, 1..=50);
+        int_slider_row(ui, "Shape steps", &mut state.shape_steps, 1..=50, DEFAULT_STEPS);
         crate::settings::row_sep(ui);
-        slider_row(ui, "Texture guidance", &mut state.tex_guidance, 0.0..=12.0);
+        slider_row(ui, "Texture guidance", &mut state.tex_guidance, 0.0..=12.0, DEFAULT_TEX_GUIDANCE);
         crate::settings::row_sep(ui);
-        int_slider_row(ui, "Texture steps", &mut state.tex_steps, 1..=50);
+        int_slider_row(ui, "Texture steps", &mut state.tex_steps, 1..=50, DEFAULT_STEPS);
     });
 
     // --- GLB extraction card. ---
     crate::settings::section(ui, "GLB Extraction", |ui| {
-        int_slider_row(ui, "Simplify (tris)", &mut state.decimation, 5_000..=200_000);
+        int_slider_row(ui, "Simplify (tris)", &mut state.decimation, 5_000..=200_000, DEFAULT_DECIMATION);
         crate::settings::row_sep(ui);
         crate::settings::row(ui, "Texture size", None, |ui| {
             egui::ComboBox::from_id_salt("pixal3d_texsize")
@@ -492,19 +500,21 @@ fn settings_popup(anchor: &egui::Response, state: &mut Pixal3DState) {
     state.settings_open = open && !esc;
 }
 
-/// A Settings-style row holding a right-aligned float slider.
-fn slider_row(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
+/// A Settings-style row holding a right-aligned float slider (its notch at
+/// `default`).
+fn slider_row(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, default: f32) {
     crate::settings::row(ui, label, None, |ui| {
         ui.spacing_mut().slider_width = 90.0;
-        ui.add(egui::Slider::new(value, range).fixed_decimals(1));
+        ui.add(PillSlider::new(value, range).fixed_decimals(1).default_value(default as f64));
     });
 }
 
-/// A Settings-style row holding a right-aligned integer slider.
-fn int_slider_row(ui: &mut egui::Ui, label: &str, value: &mut i32, range: std::ops::RangeInclusive<i32>) {
+/// A Settings-style row holding a right-aligned integer slider (its notch at
+/// `default`).
+fn int_slider_row(ui: &mut egui::Ui, label: &str, value: &mut i32, range: std::ops::RangeInclusive<i32>, default: i32) {
     crate::settings::row(ui, label, None, |ui| {
         ui.spacing_mut().slider_width = 90.0;
-        ui.add(egui::Slider::new(value, range));
+        ui.add(PillSlider::new(value, range).default_value(default as f64));
     });
 }
 

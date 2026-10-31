@@ -17,6 +17,7 @@ use eframe::egui;
 
 use crate::llm::LlmState;
 use crate::settings::{card, row, row_sep, section, switch, Settings};
+use crate::slider::PillSlider;
 use crate::theme::*;
 
 /// Which tab the AI Settings window shows (not persisted).
@@ -136,7 +137,7 @@ pub fn window(ctx: &egui::Context, llm: &mut LlmState, settings: &mut Settings) 
 }
 
 /// A slider sized to sit in a settings row's control slot.
-fn row_slider(ui: &mut egui::Ui, slider: egui::Slider<'_>) {
+fn row_slider(ui: &mut egui::Ui, slider: PillSlider<'_>) {
     ui.spacing_mut().slider_width = 110.0;
     ui.add(slider);
 }
@@ -145,33 +146,56 @@ fn row_slider(ui: &mut egui::Ui, slider: egui::Slider<'_>) {
 /// the next message (main.rs mirrors them onto `LlmState` each frame).
 fn replies_tab(ui: &mut egui::Ui, settings: &mut Settings) {
     let p = &mut settings.ai_gen;
+    // Each knob's notch sits at its default.
+    let d = crate::llm::GenParams::default();
     section(ui, "Replies", |ui| {
         row(
             ui,
             "Temperature",
             Some("Randomness: 0 is focused and repeatable, 1 is Gemma's recommended default, 2 gets wild."),
-            |ui| row_slider(ui, egui::Slider::new(&mut p.temperature, 0.0..=2.0).step_by(0.05).fixed_decimals(2)),
+            |ui| {
+                row_slider(
+                    ui,
+                    PillSlider::new(&mut p.temperature, 0.0..=2.0)
+                        .step_by(0.05)
+                        .fixed_decimals(2)
+                        .default_value(d.temperature as f64),
+                )
+            },
         );
         row_sep(ui);
         row(
             ui,
             "Top-K",
             Some("Pick each word from only the K most likely candidates. Lower is safer. Default 64."),
-            |ui| row_slider(ui, egui::Slider::new(&mut p.top_k, 1..=128)),
+            |ui| row_slider(ui, PillSlider::new(&mut p.top_k, 1..=128).default_value(d.top_k as f64)),
         );
         row_sep(ui);
         row(
             ui,
             "Top-P",
             Some("Or by probability: drop unlikely words past this share. Lower is safer. Default 0.95."),
-            |ui| row_slider(ui, egui::Slider::new(&mut p.top_p, 0.05..=1.0).step_by(0.01).fixed_decimals(2)),
+            |ui| {
+                row_slider(
+                    ui,
+                    PillSlider::new(&mut p.top_p, 0.05..=1.0)
+                        .step_by(0.01)
+                        .fixed_decimals(2)
+                        .default_value(d.top_p as f64),
+                )
+            },
         );
         row_sep(ui);
         row(
             ui,
             "Max reply length",
             Some("The longest answer the AI may write, in tokens (about ¾ of a word each). Default 3072."),
-            |ui| row_slider(ui, egui::Slider::new(&mut p.max_tokens, 256..=8192).step_by(64.0)),
+            |ui| {
+                row_slider(
+                    ui,
+                    PillSlider::new(&mut p.max_tokens, 256..=8192).step_by(64.0).default_value(d.max_tokens as f64),
+                )
+            },
         );
     });
     // The thinking level lives in GenParams too, but it has its own control
