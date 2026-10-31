@@ -809,7 +809,7 @@ impl ViewerApp {
         dib.extend_from_slice(&(rgba.len() as u32).to_le_bytes()); // biSizeImage
         dib.extend_from_slice(&[0u8; 16]); // ppm + palette fields, all zero
         for y in (0..h as usize).rev() {
-            for px in rgba[y * row..(y + 1) * row].chunks_exact(4) {
+            for px in rgba[y * row..(y + 1) * row].as_chunks::<4>().0 {
                 let a = px[3] as u32;
                 let blend = |c: u8| ((c as u32 * a + 255 * (255 - a)) / 255) as u8;
                 dib.extend_from_slice(&[blend(px[2]), blend(px[1]), blend(px[0]), 0xFF]);

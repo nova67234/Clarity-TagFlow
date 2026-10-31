@@ -372,8 +372,10 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 fn decode_utf16(bytes: &[u8], big_endian: bool) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| if big_endian { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) })
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&c| if big_endian { u16::from_be_bytes(c) } else { u16::from_le_bytes(c) })
         .collect();
     String::from_utf16_lossy(&units)
 }
@@ -1248,21 +1250,21 @@ fn comfy_prompt_into(prompt_json: &str, out: &mut DroppedMeta) {
         match class_type {
             "EmptyLatentImage" | "EmptySD3LatentImage" => {
                 if out.width.is_none() {
-                    out.width = inputs.get("width").and_then(&as_i).filter(|&w| w > 0);
+                    out.width = inputs.get("width").and_then(as_i).filter(|&w| w > 0);
                 }
                 if out.height.is_none() {
-                    out.height = inputs.get("height").and_then(&as_i).filter(|&h| h > 0);
+                    out.height = inputs.get("height").and_then(as_i).filter(|&h| h > 0);
                 }
             }
             "KSampler" | "KSamplerAdvanced" => {
                 if out.seed.is_none() {
-                    out.seed = inputs.get("seed").and_then(&as_i).or_else(|| inputs.get("noise_seed").and_then(&as_i));
+                    out.seed = inputs.get("seed").and_then(as_i).or_else(|| inputs.get("noise_seed").and_then(as_i));
                 }
                 if out.steps.is_none() {
-                    out.steps = inputs.get("steps").and_then(&as_i);
+                    out.steps = inputs.get("steps").and_then(as_i);
                 }
                 if out.cfg.is_none() {
-                    out.cfg = inputs.get("cfg").and_then(&as_f);
+                    out.cfg = inputs.get("cfg").and_then(as_f);
                 }
                 if out.positive.trim().is_empty() {
                     let p = trace_prompt(nodes, inputs.get("positive"));
@@ -1280,17 +1282,17 @@ fn comfy_prompt_into(prompt_json: &str, out: &mut DroppedMeta) {
             // Custom-sampling video/DiT graphs split the KSampler's job across
             // nodes; the seed and step count live here instead.
             "RandomNoise" if out.seed.is_none() => {
-                out.seed = inputs.get("noise_seed").and_then(&as_i);
+                out.seed = inputs.get("noise_seed").and_then(as_i);
             }
             "BasicScheduler" if out.steps.is_none() => {
-                out.steps = inputs.get("steps").and_then(&as_i);
+                out.steps = inputs.get("steps").and_then(as_i);
             }
             "SamplerCustom" | "SamplerCustomAdvanced" => {
                 if out.seed.is_none() {
-                    out.seed = inputs.get("noise_seed").and_then(&as_i);
+                    out.seed = inputs.get("noise_seed").and_then(as_i);
                 }
                 if out.cfg.is_none() {
-                    out.cfg = inputs.get("cfg").and_then(&as_f);
+                    out.cfg = inputs.get("cfg").and_then(as_f);
                 }
                 // The conditioning links sit either directly on the node
                 // (SamplerCustom) or on its guider (CFGGuider / BasicGuider).
@@ -1302,7 +1304,7 @@ fn comfy_prompt_into(prompt_json: &str, out: &mut DroppedMeta) {
                             pos = gi.get("positive").or_else(|| gi.get("conditioning")).cloned();
                             neg = gi.get("negative").cloned();
                             if out.cfg.is_none() {
-                                out.cfg = gi.get("cfg").and_then(&as_f);
+                                out.cfg = gi.get("cfg").and_then(as_f);
                             }
                         }
                 if out.positive.trim().is_empty() {
@@ -1321,7 +1323,7 @@ fn comfy_prompt_into(prompt_json: &str, out: &mut DroppedMeta) {
             ct if ct.contains("LoraLoader") => {
                 if let Some(name) = inputs.get("lora_name").and_then(|v| v.as_str())
                     && !name.is_empty() {
-                        let strength = inputs.get("strength_model").and_then(&as_f).unwrap_or(1.0) as f32;
+                        let strength = inputs.get("strength_model").and_then(as_f).unwrap_or(1.0) as f32;
                         out.loras.push((name.to_string(), strength));
                     }
             }

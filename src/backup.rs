@@ -1043,7 +1043,7 @@ mod tests {
 
         let file = std::fs::File::open(dir.join("backups").join("set (2).zip")).unwrap();
         let mut zip = zip::ZipArchive::new(file).unwrap();
-        let mut got: Vec<String> = zip.file_names().map(String::from).collect();
+        let mut got: Vec<String> = zip.file_names().map(|n| n.unwrap().into_owned()).collect();
         got.sort();
         assert_eq!(got, ["cat.jpg", "cat.png", "cat.txt"]);
         let mut text = String::new();
@@ -1073,7 +1073,7 @@ mod tests {
         // Nothing trails the end-of-central-directory record (no comment).
         assert_eq!(&bytes[bytes.len() - 22..bytes.len() - 18], b"PK\x05\x06");
         let mut zip = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
-        assert_eq!(zip.file_names().collect::<Vec<_>>(), ["ok.txt"]);
+        assert_eq!(zip.file_names().map(|n| n.unwrap().into_owned()).collect::<Vec<_>>(), ["ok.txt"]);
         let mut text = String::new();
         std::io::Read::read_to_string(&mut zip.by_name("ok.txt").unwrap(), &mut text).unwrap();
         assert_eq!(text, "fine");

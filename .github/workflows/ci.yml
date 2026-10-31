@@ -65,9 +65,12 @@ jobs:
       # ort-sys unpacks ONNX Runtime into ~/Library/Caches, outside target/:
       # cache it too, or a restored target/ points the link at a folder that
       # isn't there (`cargo check` never noticed; the Link tests link).
+      # v2: v1's caches were built on macOS 14, and build scripts there
+      # recorded its Xcode 15.4 paths, which macOS 15 runners don't have
+      # (`library 'clang_rt.osx' not found`).
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: v1-rust
+          prefix-key: v2-rust
           cache-directories: ~/Library/Caches/ort.pyke.io
       # Compile-check the macOS target â€” this is the path the v5.3.2 cfg break
       # would have failed on. --all-targets also type-checks the test modules.

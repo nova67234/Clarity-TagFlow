@@ -192,8 +192,10 @@ fn rename_over(from: &Path, to: &Path) -> std::io::Result<()> {
 pub fn decode(bytes: &[u8]) -> (String, Encoding) {
     let utf16 = |body: &[u8], le: bool| {
         let units = body
-            .chunks_exact(2)
-            .map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) });
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| if le { u16::from_le_bytes(c) } else { u16::from_be_bytes(c) });
         char::decode_utf16(units).map(|c| c.unwrap_or('\u{FFFD}')).collect::<String>()
     };
     if let Some(body) = bytes.strip_prefix(&[0xFF, 0xFE]) {

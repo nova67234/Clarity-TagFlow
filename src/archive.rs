@@ -61,7 +61,8 @@ pub fn open_archive(zip_path: &Path, password: &str) -> Result<Vec<PathBuf>, Ope
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_string();
+        // A name that doesn't decode is skipped, like an unreadable entry.
+        let Ok(name) = entry.name().map(|n| n.into_owned()) else { continue };
         // Only names that stay inside the archive. An absolute one
         // ("/etc/x.png", "C:\…") makes `zip_path.join` a REAL path — listed as
         // an ordinary file, so Edit/Move/Delete acted on it — and `..` can

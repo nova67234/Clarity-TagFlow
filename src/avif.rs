@@ -62,7 +62,7 @@ pub fn decode_avif(path: &std::path::Path) -> Option<RgbaImage> {
     if let Some(alpha_obu) = &parsed.alpha_item
         && let Some((alpha, aw, ah)) = decode_gray(alpha_obu)
             && aw == w && ah == h {
-                for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+                for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     px[3] = alpha[i];
                 }
             }

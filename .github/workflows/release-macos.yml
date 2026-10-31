@@ -30,6 +30,10 @@ jobs:
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
+        # Not the macOS 14 runners' caches: build scripts there recorded
+        # Xcode 15.4 paths, which macOS 15 runners don't have.
+        with:
+          prefix-key: v2-rust
 
       # Video playback (libVLC) is Windows-only here, so build without it.
       - name: Build (Apple Silicon)
