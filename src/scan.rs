@@ -1422,8 +1422,8 @@ fn delete_finding(state: &mut ScanState, i: usize) {
 }
 
 /// Open `path` in the OS default application (to review a flagged file, or
-/// a moved duplicate).
-fn open_in_default(path: &Path) {
+/// a moved duplicate; the chat opens web research notes with it too).
+pub(crate) fn open_in_default(path: &Path) {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;

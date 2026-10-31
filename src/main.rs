@@ -150,6 +150,7 @@ mod pixal3d;
 #[cfg(not(target_os = "macos"))]
 mod scene3d;
 mod raw_preview;
+mod research;
 mod right_details;
 mod scan;
 mod sd_metadata;
@@ -2427,6 +2428,7 @@ impl eframe::App for ViewerApp {
         self.llm.detailed_vision = self.settings.ai_detailed_vision;
         self.llm.krea_prompts = self.settings.ai_krea_prompts;
         self.llm.tag_images = self.settings.ai_tag_images;
+        self.llm.web_research = self.settings.ai_web_research;
         self.llm.params = self.settings.ai_gen;
         self.llm.set_model(self.settings.ai_gemma_model);
         self.llm.set_memory_enabled(self.settings.ai_memory_enabled);

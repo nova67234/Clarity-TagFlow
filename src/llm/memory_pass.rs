@@ -1442,6 +1442,7 @@ mod tests {
             remember,
             picture_memory: false,
             shared_with: Vec::new(),
+            research: None,
         }
     }
 

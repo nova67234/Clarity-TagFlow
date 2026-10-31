@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "Clarity_TagFlow"
-version = "6.2.1-alpha"
+version = "6.2.2-alpha"
 dependencies = [
  "arboard",
  "avif-parse",
@@ -32,6 +32,7 @@ dependencies = [
  "native-tls",
  "ort",
  "png 0.18.1",
+ "pulldown-cmark",
  "rav1d",
  "resvg",
  "rfd",
@@ -49,6 +50,7 @@ dependencies = [
  "twemoji-assets",
  "unicode-segmentation",
  "ureq",
+ "url",
  "vlc-rs",
  "whisper-rs",
  "winresource",

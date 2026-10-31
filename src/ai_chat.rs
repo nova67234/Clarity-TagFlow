@@ -8,13 +8,19 @@
 //! chats button, and AI Settings behind the Tools menu's gear.
 //!
 //! All chat state (conversations, streaming reply, draft) lives on
-//! `LlmState` (src/llm.rs); this module only draws it.
+//! `LlmState` (src/llm.rs); this module only draws it. Web research's parts
+//! (the sources under a reply, the notes viewer) are in
+//! src/ai_chat/web_research.rs.
+
+mod web_research;
 
 use eframe::egui;
 use egui::Margin;
 
 use crate::llm::{ChatRole, LlmState};
 use crate::theme::*;
+
+pub use web_research::NotesView;
 
 /// Drag-and-drop accent — the blue the input card turns while a file is
 /// dragged over it (matches the generator prompt box's import blue).
@@ -101,6 +107,8 @@ pub fn show(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::setting
     // The gear's AI Settings window and the memory map it opens.
     crate::ai_settings::window(ui.ctx(), llm, settings);
     crate::memory_map::window(ui.ctx(), llm);
+    // A web lookup's notes, opened from under its reply.
+    web_research::notes_window(ui.ctx(), llm);
 
     // Click-to-enlarge overlay for message attachments, above everything.
     lightbox_ui(ui.ctx(), llm);
@@ -674,6 +682,8 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                 // Closed by a click outside, or by picking a chat.
                                 llm.chats_open &= open;
                             }
+                            // Web research is on: its globe (a click turns it off).
+                            web_research::composer_globe(ui, llm, settings);
                             // Remember across chats: the AI is writing down
                             // what a chat brought (sending anything stops it).
                             if !llm.running && llm.memory_activity() == crate::llm::MemoryActivity::Updating {
@@ -813,6 +823,8 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                                  Replies start slower. Always on with Krea 2 \
                                                  prompts.",
                                             );
+                                            crate::settings::row_sep(ui);
+                                            web_research::tools_row(ui, llm, settings);
                                         });
                                     });
                                 // Closed by a click outside, or by the gear
@@ -1053,6 +1065,9 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         ui.add_space(4.0);
     }
 
+    // Web research: what was looked up for this reply (shared, not copied).
+    let research = llm.chats[llm.active_chat].msgs[index].research.clone();
+
     // The thought channel (the 31B reasons before answering):
     // split live while the reply streams; a finished message keeps its
     // thoughts on the `thinking` field (llm.rs moves them there on Done).
@@ -1073,9 +1088,18 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
             ui.add(egui::Spinner::new().size(12.0).color(col));
             ui.label(egui::RichText::new(&llm.status).color(col).size(12.5));
         });
+        // The sources are in while the answer is still being written.
+        if let Some(report) = &research {
+            ui.add_space(4.0);
+            web_research::card(ui, llm, report, true);
+        }
         return;
     }
-    let mut shown = if streaming && llm.gen_roleplay {
+    let mut shown = if streaming && research.is_some() {
+        // A researched reply never carries out memory, picture or tag lines
+        // (llm/web.rs takes them out when it ends) — never shown either.
+        crate::ai_tagging::strip_lines(&crate::roleplay::strip_memory_lines(&body))
+    } else if streaming && llm.gen_roleplay {
         // Diary lines are extracted for real when the reply finishes; hide
         // them while it streams so they never flash up. (Whether it's a
         // role-play reply was settled when it was asked.)
@@ -1090,6 +1114,14 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
     } else {
         body.clone()
     };
+    // Its citations ("[2]") link to the sources; nothing else links out
+    // (worked out once, when the reply ends).
+    if let Some(report) = &research {
+        shown = match &report.display {
+            Some(display) if !streaming => display.clone(),
+            _ => crate::research::display_answer(&shown, &report.sources),
+        };
+    }
     if streaming && !shown.trim().is_empty() {
         shown.push('▌');
     }
@@ -1114,6 +1146,12 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
     }
     let has_text = !text.trim().is_empty();
 
+    // Web research: the sources the reply was written from, and its notes.
+    if let Some(report) = &research {
+        ui.add_space(6.0);
+        web_research::card(ui, llm, report, streaming);
+    }
+
     // Tag images: what this reply changed in the image's tags, with Undo.
     if let Some(change) = &tag_change {
         ui.add_space(4.0);
@@ -1129,7 +1167,12 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                 && msg_icon_button(ui, egui::include_image!("../icons/copy.svg"), 15.0, "Copy message", true)
                     .clicked()
             {
-                ui.ctx().copy_text(text.clone());
+                // A researched reply comes with its sources.
+                let copied = match &research {
+                    Some(report) => web_research::copy_text(&text, report),
+                    None => text.clone(),
+                };
+                ui.ctx().copy_text(copied);
             }
             let can_retry = !llm.running;
             if msg_icon_button(ui, egui::include_image!("../icons/retry.svg"), 15.0, "Regenerate this reply", can_retry)

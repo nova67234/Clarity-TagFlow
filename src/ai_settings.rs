@@ -10,6 +10,8 @@
 //!   store of their own (`MemoryKind::Roleplay`), kept apart from the main
 //!   memory, with the same map. The Tools menu's gear opens this tab while
 //!   role play is on.
+//! * **Web research:** the search service (and its key or address), how far
+//!   a lookup goes, and where its notes are saved (src/research.rs).
 
 use eframe::egui;
 
@@ -24,6 +26,7 @@ pub enum AiTab {
     Replies,
     Memory,
     Roleplay,
+    Research,
 }
 
 /// Draw the AI Settings window when it's open (`llm.gen_settings_open`).
@@ -73,9 +76,12 @@ pub fn window(ctx: &egui::Context, llm: &mut LlmState, settings: &mut Settings) 
                     ui.painter().hline(line.x_range(), line.center().y, egui::Stroke::new(1.0_f32, EDGE()));
                     ui.add_space(10.0);
                     ui.spacing_mut().item_spacing.y = 4.0;
-                    for (tab, label) in
-                        [(AiTab::Replies, "Replies"), (AiTab::Memory, "Memory"), (AiTab::Roleplay, "Role play")]
-                    {
+                    for (tab, label) in [
+                        (AiTab::Replies, "Replies"),
+                        (AiTab::Memory, "Memory"),
+                        (AiTab::Roleplay, "Role play"),
+                        (AiTab::Research, "Web research"),
+                    ] {
                         if crate::settings::side_tab(ui, llm.ai_settings_tab == tab, label, false) {
                             llm.ai_settings_tab = tab;
                         }
@@ -113,6 +119,7 @@ pub fn window(ctx: &egui::Context, llm: &mut LlmState, settings: &mut Settings) 
                                 AiTab::Replies => replies_tab(ui, settings),
                                 AiTab::Memory => memory_tab(ui, llm, settings),
                                 AiTab::Roleplay => roleplay_tab(ui, llm, settings),
+                                AiTab::Research => research_tab(ui, llm),
                             });
                         });
                     crate::edge_scroll_done(ui, &scroll_ui, SCROLL_GUTTER);
@@ -723,4 +730,196 @@ fn roleplay_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) 
             },
         );
     });
+}
+
+/// A one-line text box in a row's control slot that edits through a draft:
+/// what's typed is handed to `commit` when the box loses focus (Enter, Tab
+/// or a click elsewhere), so a half-typed value is never used or saved.
+fn draft_field(
+    ui: &mut egui::Ui,
+    salt: &str,
+    shown: &str,
+    hint: &str,
+    password: bool,
+    commit: impl FnOnce(&str),
+) -> egui::Response {
+    let id = ui.id().with(("draft_field", salt));
+    let mut draft: String = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| shown.to_string());
+    let resp = crate::settings::pill_field(
+        ui,
+        172.0,
+        egui::TextEdit::singleline(&mut draft).hint_text(hint).password(password).char_limit(512),
+    );
+    if resp.lost_focus() {
+        commit(draft.trim());
+        ui.data_mut(|d| d.remove::<String>(id));
+    } else if resp.has_focus() {
+        ui.data_mut(|d| d.insert_temp(id, draft));
+    }
+    resp
+}
+
+/// Web research: which service the chat searches (and its key or address),
+/// how far a lookup goes, and where the notes go. Saved, to a file of their
+/// own, as soon as something changes.
+fn research_tab(ui: &mut egui::Ui, llm: &mut LlmState) {
+    use crate::research::{Depth, Provider};
+    let before = llm.research.clone();
+    let r = &mut llm.research;
+
+    section(ui, "Search with", |ui| {
+        let about = match r.provider {
+            Provider::Wikipedia => "Wikipedia's own search, articles read in full. Free, nothing to set up.",
+            Provider::Tavily => "A web search made for AI. A free key covers 1,000 searches a month.",
+            Provider::Brave => "Brave's independent web search. Needs a key from Brave's API site.",
+            Provider::Searxng => "Your own SearXNG server: a private metasearch of many engines.",
+        };
+        row(ui, "Service", Some(about), |ui| {
+            crate::settings::pill_dropdown(
+                ui,
+                "research_provider",
+                &mut r.provider,
+                &[
+                    (Provider::Wikipedia, "Wikipedia", None, Some("Free, no setup")),
+                    (Provider::Tavily, "Tavily", None, Some("Free key")),
+                    (Provider::Brave, "Brave Search", None, Some("Needs a key")),
+                    (Provider::Searxng, "SearXNG", None, Some("Your server")),
+                ],
+            );
+        });
+        row_sep(ui);
+        let stored = if cfg!(windows) { "Stored encrypted on this computer." } else { "Stored on this computer." };
+        match r.provider {
+            Provider::Wikipedia => {
+                let lang = r.wiki_lang.clone();
+                row(ui, "Language", Some("Which Wikipedia to search: en, de, fr, es, ja…"), |ui| {
+                    draft_field(ui, "wiki_lang", &lang, "en", false, |v| {
+                        r.wiki_lang = if v.is_empty() { "en".to_string() } else { v.to_ascii_lowercase() };
+                    });
+                });
+            }
+            Provider::Tavily | Provider::Brave => {
+                let (name, url) = if r.provider == Provider::Tavily {
+                    ("Tavily", "https://app.tavily.com/home")
+                } else {
+                    ("Brave Search", "https://api-dashboard.search.brave.com/")
+                };
+                let has = r.has_key(r.provider);
+                let hint = if has { "Key saved" } else { "Paste your key" };
+                let sub = if has { format!("{stored} Paste a new one to replace it.") } else { stored.to_string() };
+                let provider = r.provider;
+                row(ui, "API key", Some(sub.as_str()), |ui| {
+                    // Never shown: a saved key stays saved until another is
+                    // pasted (or it's removed below).
+                    draft_field(ui, &format!("key_{name}"), "", hint, true, |v| {
+                        if !v.is_empty() {
+                            match provider {
+                                Provider::Tavily => r.set_tavily_key(v),
+                                _ => r.set_brave_key(v),
+                            }
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    crate::arrow_link(ui, &format!("Get a {name} key"), url, Some(11.0));
+                    if has {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(egui::RichText::new("Remove key").size(11.5)).clicked() {
+                                match provider {
+                                    Provider::Tavily => r.set_tavily_key(""),
+                                    _ => r.set_brave_key(""),
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+            Provider::Searxng => {
+                let addr = r.searxng_url.clone();
+                row(
+                    ui,
+                    "Server address",
+                    Some("Its JSON results must be on (search: formats: json in its settings.yml)."),
+                    |ui| {
+                        draft_field(ui, "searxng_url", &addr, "http://localhost:8888", false, |v| {
+                            r.searxng_url = v.to_string();
+                        });
+                    },
+                );
+            }
+        }
+        // What's still missing (a key is asked for right above).
+        let why = match r.provider {
+            Provider::Tavily | Provider::Brave if !r.has_key(r.provider) => {
+                Some("paste a key above to start searching".to_string())
+            }
+            _ => r.missing(),
+        };
+        if let Some(why) = why {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(format!("Not ready: {why}.")).color(egui::Color32::from_rgb(210, 70, 70)).size(11.5));
+        }
+        row_sep(ui);
+        row(
+            ui,
+            "Depth",
+            Some(match r.depth {
+                Depth::Quick => "One round of searches, a few pages read. Quickest.",
+                Depth::Thorough => "Up to three rounds: after each, the AI looks again for what's still missing.",
+            }),
+            |ui| {
+                crate::settings::pill_dropdown(
+                    ui,
+                    "research_depth",
+                    &mut r.depth,
+                    &[
+                        (Depth::Quick, "Quick", None, Some("One round of searches")),
+                        (Depth::Thorough, "Thorough", None, Some("Up to three rounds")),
+                    ],
+                );
+            },
+        );
+    });
+
+    section(ui, "Notes", |ui| {
+        let folder = r.notes_folder();
+        row(ui, "Notes folder", Some(&folder.display().to_string()), |ui| {
+            if ui.button(egui::RichText::new("Change…").size(12.5)).clicked()
+                && let Some(dir) = rfd::FileDialog::new().set_directory(&folder).pick_folder()
+            {
+                r.notes_dir = dir.to_string_lossy().into_owned();
+            }
+            ui.add_space(6.0);
+            if ui.button(egui::RichText::new("Open").size(12.5)).on_hover_text("Open the folder").clicked() {
+                let _ = std::fs::create_dir_all(&folder);
+                crate::scan::open_in_default(&folder);
+            }
+        });
+        crate::settings::hint(
+            ui,
+            "Every lookup is saved here as a Markdown file: the question, the searches, the answer, \
+             and the exact text the AI was given from each page. Open one from under its reply.",
+        );
+        if !r.notes_dir.trim().is_empty() && ui.button(egui::RichText::new("Use the default folder").size(11.5)).clicked() {
+            r.notes_dir.clear();
+        }
+    });
+
+    section(ui, "Privacy and safety", |ui| {
+        for line in [
+            "Only the searches the AI writes go to the service you picked; the pages it reads are \
+             downloaded straight from this computer. Nothing else is sent.",
+            "Web pages are treated as untrusted. Nothing they say can reach this computer or your home \
+             network, text they hide from readers is dropped, and a reply written from them can't save \
+             memories, keep pictures or change tags — it links only to the pages it read.",
+            "Off in Tag images. Notes are plain files: edit or delete them whenever you like.",
+        ] {
+            ui.label(egui::RichText::new(line).color(TEXT()).size(12.0));
+            ui.add_space(4.0);
+        }
+    });
+
+    if llm.research != before {
+        llm.research.save();
+    }
 }
