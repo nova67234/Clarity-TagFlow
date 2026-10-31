@@ -125,6 +125,16 @@ whisper-rs = { version = "0.16", optional = true }
 # PNG/DIBV5 — Chromium-based browsers only ever request CF_DIB when pasting an
 # image, so without it Chrome/Edge paste nothing. Already in the tree as
 # arboard's Windows backend, so this adds no build cost.
+# Paint-callback type (CallbackFn) + raw GL access, for rendering into
+# eframe's GL context: the 3D viewer (three-d, below) and Liquid Glass
+# (src/liquid_glass.rs, on every platform). Pinned to the same versions
+# eframe 0.34 already uses (and builds on macOS too), so no extra build cost.
+[dependencies.egui_glow]
+version = "0.34"
+
+[dependencies.glow]
+version = "0.17"
+
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4"
 
@@ -138,10 +148,6 @@ clipboard-win = "5.4"
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 three-d = { version = "0.19", default-features = false }
 three-d-asset = { version = "0.10", default-features = false, features = ["gltf", "png", "jpeg"] }
-# Paint-callback type (CallbackFn) + raw GL access for rendering three-d into
-# eframe's context. Pinned to the same versions eframe 0.34 already uses.
-egui_glow = "0.34"
-glow = "0.17"
 
 # Optimize llama.cpp's Rust shim even in dev (the C++ itself is always a
 # cmake Release build); mainly this keeps token streaming snappy in dev runs.
