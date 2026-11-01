@@ -12,6 +12,7 @@
 //! (the sources under a reply, the notes viewer) are in
 //! src/ai_chat/web_research.rs.
 
+mod tools_menu;
 mod web_research;
 
 use eframe::egui;
@@ -57,6 +58,8 @@ pub fn claims_drop(llm: &crate::llm::LlmState, ctx: &egui::Context) -> bool {
 
 pub fn show(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::settings::Settings) {
     llm.poll(ui.ctx());
+    // Where this view starts: under the top bar (a panel inside `ui`).
+    let view_top = ui.available_rect_before_wrap().top();
 
     // Not usable yet — say why, centred, instead of an empty chat. With a
     // way out: this view replaces the whole browser, and Settings only shows
@@ -104,9 +107,10 @@ pub fn show(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::setting
             conversation(ui, llm, settings);
         });
 
-    // The gear's AI Settings window and the memory map it opens.
+    // The gear's AI Settings window and the memory map it opens (kept under
+    // the top bar, where this view starts).
     crate::ai_settings::window(ui.ctx(), llm, settings);
-    crate::memory_map::window(ui.ctx(), llm);
+    crate::memory_map::window(ui.ctx(), llm, view_top);
     // A web lookup's notes, opened from under its reply.
     web_research::notes_window(ui.ctx(), llm);
 
@@ -333,28 +337,6 @@ pub(crate) fn set_mode(llm: &mut LlmState, settings: &mut crate::settings::Setti
         }
     }
     llm.new_chat();
-}
-
-/// One conversation mode's row in the Tools menu: label and switch, with a
-/// muted hint beneath.
-fn mode_row(
-    ui: &mut egui::Ui,
-    llm: &mut LlmState,
-    settings: &mut crate::settings::Settings,
-    mode: ChatMode,
-    label: &str,
-    hint: &str,
-) {
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).color(TEXT()).size(13.0));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let mut on = mode_on(llm, settings, mode);
-            if crate::settings::switch(ui, &mut on).changed() {
-                set_mode(llm, settings, mode, on);
-            }
-        });
-    });
-    crate::settings::hint(ui, hint);
 }
 
 /// The conversation column: scrollable bubbles + the bottom input pill, both
@@ -709,128 +691,7 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                     .on_hover_text(format!("The AI just saved {what} (AI Settings → Memory)."));
                                 ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
                             }
-                            if llm.tools_open {
-                                let mut open = llm.tools_open;
-                                egui::Popup::from_response(&tools_resp)
-                                    .open_bool(&mut open)
-                                    // Toggling a switch shouldn't dismiss the
-                                    // popup — only clicking outside it does.
-                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                                    .align(egui::RectAlign::TOP_START) // opens upward (card sits at the bottom)
-                                    .width(280.0)
-                                    .gap(8.0)
-                                    .frame(crate::float_card_frame(14))
-                                    .show(|ui| {
-                                        // Apple-style settings card: label + macOS
-                                        // switch per row, muted hint beneath, faint
-                                        // separator between rows (src/settings.rs).
-                                        // The header's gear opens AI Settings — on the
-                                        // Role play tab while role play is on.
-                                        ui.horizontal(|ui| {
-                                            ui.label(egui::RichText::new("TOOLS").color(MUTED()).strong().size(11.0));
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                let tip = if llm.roleplay.enabled {
-                                                    "Role play settings and memories"
-                                                } else {
-                                                    "AI settings"
-                                                };
-                                                if icon_button(ui, egui::include_image!("../icons/settings.svg"), 16.0, tip, true)
-                                                    .clicked()
-                                                {
-                                                    if llm.roleplay.enabled {
-                                                        llm.ai_settings_tab = crate::ai_settings::AiTab::Roleplay;
-                                                    }
-                                                    llm.gen_settings_open = true;
-                                                    llm.tools_open = false;
-                                                }
-                                            });
-                                        });
-                                        ui.add_space(5.0);
-                                        crate::settings::card(ui, |ui| {
-                                            mode_row(
-                                                ui,
-                                                llm,
-                                                settings,
-                                                ChatMode::Roleplay,
-                                                "Role playing",
-                                                "The AI plays a character with its own name, \
-                                                 persona and memories, kept apart from its main \
-                                                 memory. Set it up with the gear above.",
-                                            );
-                                            crate::settings::row_sep(ui);
-                                            ui.horizontal(|ui| {
-                                                ui.label(egui::RichText::new("Auto-speak replies").color(TEXT()).size(13.0));
-                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                    let mut on = settings.ai_auto_speak;
-                                                    if crate::settings::switch(ui, &mut on).changed() {
-                                                        settings.ai_auto_speak = on;
-                                                        llm.auto_speak = on;
-                                                    }
-                                                });
-                                            });
-                                            crate::settings::hint(
-                                                ui,
-                                                "Read every reply aloud the moment it \
-                                                 finishes — click any reply's listen \
-                                                 icon to stop.",
-                                            );
-                                            crate::settings::row_sep(ui);
-                                            mode_row(
-                                                ui,
-                                                llm,
-                                                settings,
-                                                ChatMode::Krea,
-                                                "Krea 2 prompts",
-                                                "Turn a picture — or an idea in words — \
-                                                 into a detailed prompt for Krea 2. Ask for \
-                                                 changes (\"make it night\") to rewrite it. \
-                                                 Reads pictures with Detailed vision.",
-                                            );
-                                            crate::settings::row_sep(ui);
-                                            mode_row(
-                                                ui,
-                                                llm,
-                                                settings,
-                                                ChatMode::TagImages,
-                                                "Tag images",
-                                                "Tag the open folder with the AI: the image on \
-                                                 the left, the Tag Manager on the right. The AI \
-                                                 sees each image's tags and can change them, \
-                                                 with Undo.",
-                                            );
-                                            crate::settings::row_sep(ui);
-                                            ui.horizontal(|ui| {
-                                                ui.label(egui::RichText::new("Detailed vision").color(TEXT()).size(13.0));
-                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                    // Forced on while the Krea 2
-                                                    // writer is (it relies on it).
-                                                    let forced = settings.ai_krea_prompts;
-                                                    let mut on = settings.ai_detailed_vision || forced;
-                                                    let resp = ui.add_enabled_ui(!forced, |ui| {
-                                                        crate::settings::switch(ui, &mut on)
-                                                    });
-                                                    if resp.inner.changed() {
-                                                        settings.ai_detailed_vision = on;
-                                                        llm.detailed_vision = on;
-                                                    }
-                                                });
-                                            });
-                                            crate::settings::hint(
-                                                ui,
-                                                "Show the AI the newest picture whole plus \
-                                                 a few close-up sections, so small details \
-                                                 (eyes, hands, text, jewelry) aren't missed. \
-                                                 Replies start slower. Always on with Krea 2 \
-                                                 prompts.",
-                                            );
-                                            crate::settings::row_sep(ui);
-                                            web_research::tools_row(ui, llm, settings);
-                                        });
-                                    });
-                                // Closed by a click outside, or by the gear
-                                // (which opens AI Settings instead).
-                                llm.tools_open &= open;
-                            }
+                            tools_menu::popup(&tools_resp, llm, settings);
                             let can_send = !llm.running
                                 && (!llm.draft.trim().is_empty() || llm.draft_image.is_some());
                             // While a reply streams the send icon becomes a stop

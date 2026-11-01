@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 
+mod clock;
 mod memory_pass;
 pub use memory_pass::MemoryActivity;
 mod web;
@@ -2125,6 +2126,14 @@ impl LlmState {
         // steer that.
         let research = self.web_research && !self.tag_images;
         self.gen_research = research;
+        // The date and time on this PC, in front of the message being
+        // answered (llm/clock.rs) — not for Krea 2 prompts or Tag images,
+        // which have no use for it. Web research adds it once its searches
+        // are planned, so it doesn't end up in them.
+        let clock = (!self.krea_prompts && !self.tag_images).then(|| clock::line(&chrono::Local::now()));
+        if !research && let Some(line) = &clock {
+            clock::stamp(&mut msgs, line);
+        }
         let asked = if research {
             let thinks = if remote.is_some() { crate::link::remote_chat_thinks() } else { self.model.thinks() };
             let model_label = match &remote {
@@ -2146,6 +2155,7 @@ impl LlmState {
                 settings: self.research.clone(),
                 thinks,
                 model_label,
+                clock,
             };
             web::spawn(job, tx)
         } else {

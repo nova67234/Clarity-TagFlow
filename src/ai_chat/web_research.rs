@@ -1,5 +1,5 @@
 //! Web research in the chat view (the looking up itself is src/research.rs):
-//! the Tools menu's switch and the composer's globe, the sources card under
+//! the Tools menu's card and the composer's globe, the sources card under
 //! a researched reply, and the window that shows a lookup's notes.
 
 use std::io::Read;
@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
+use super::tools_menu::{Badge, Ink, Shown};
 use crate::llm::LlmState;
 use crate::research::{Outcome, Provider, Report, Source};
 use crate::settings::Settings;
@@ -46,22 +47,20 @@ pub(super) fn active(settings: &Settings) -> bool {
     settings.ai_web_research && !settings.ai_tag_images
 }
 
-/// The Tools menu's row: the switch, what it does, and what's still missing
-/// before it can search.
-pub(super) fn tools_row(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
+/// The Tools menu's Web research card: held off while Tag images is on,
+/// what it searches, and what's still missing before it can.
+pub(super) fn tool_card(llm: &LlmState, settings: &Settings) -> Shown {
     let blocked = settings.ai_tag_images;
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Web research").color(TEXT()).size(13.0));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let mut on = active(settings);
-            let resp = ui.add_enabled_ui(!blocked, |ui| crate::settings::switch(ui, &mut on));
-            if resp.inner.changed() {
-                settings.ai_web_research = on;
-                llm.web_research = on;
-            }
-        });
-    });
-    let hint = if blocked {
+    let on = active(settings);
+    let missing = if on { llm.research.missing() } else { None };
+    let (line, ink) = if blocked {
+        ("Off while Tag images is on".to_string(), Ink::Muted)
+    } else if missing.is_some() {
+        ("Not set up yet".to_string(), Ink::Warn)
+    } else {
+        (format!("{} & citations", llm.research.provider.label()), Ink::Muted)
+    };
+    let about = if blocked {
         "Off while Tag images is on: nothing a web page says gets near your tags.".to_string()
     } else {
         format!(
@@ -71,15 +70,14 @@ pub(super) fn tools_row(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Se
             service_name(llm.research.provider)
         )
     };
-    crate::settings::hint(ui, &hint);
-    if active(settings)
-        && let Some(why) = llm.research.missing()
-    {
-        ui.add_space(2.0);
-        ui.add(
-            egui::Label::new(egui::RichText::new(format!("Not set up yet: {why} (the gear above).")).color(ERROR_RED).size(11.0))
-                .wrap(),
-        );
+    Shown {
+        on,
+        usable: !blocked,
+        line,
+        ink,
+        about,
+        problem: missing.map(|why| format!("Not set up yet: {why} (the gear above).")),
+        badge: if on { Badge::On } else { Badge::Off },
     }
 }
 

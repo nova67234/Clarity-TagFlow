@@ -34,6 +34,9 @@ pub(super) struct Job {
     pub thinks: bool,
     /// For the notes: which model answered.
     pub model_label: String,
+    /// The clock line for the answer (llm/clock.rs), kept out of the
+    /// planning so the searches aren't about the date.
+    pub clock: Option<String>,
 }
 
 /// Run `job` on a thread of its own; the reply comes on `tx` like any other.
@@ -108,10 +111,14 @@ fn run(job: Job, tx: Sender<Msg>) {
         return;
     }
 
-    // The answer: the request as sent, the sources after the user's words.
+    // The answer: the request as sent, the sources after the user's words,
+    // the clock before them.
     let mut msgs = job.msgs;
     if let (Some(i), Some(block)) = (last, block) {
         msgs[i].text.push_str(&block);
+    }
+    if let Some(line) = &job.clock {
+        super::clock::stamp(&mut msgs, line);
     }
     send(Msg::Status("Writing the answer…".to_string()));
     // A side question that ran into its length cap mustn't mark the reply.

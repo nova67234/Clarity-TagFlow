@@ -391,8 +391,9 @@ fn find(store: &MemoryStore, id: u64) -> Option<(usize, usize)> {
 }
 
 /// Draw the memory map window when it's open. "Ask about this" puts a
-/// question into the chat's input box and closes the map.
-pub fn window(ctx: &egui::Context, llm: &mut crate::llm::LlmState) {
+/// question into the chat's input box and closes the map. `top` is where
+/// the chat view starts (under the top bar).
+pub fn window(ctx: &egui::Context, llm: &mut crate::llm::LlmState, top: f32) {
     if !llm.memory_map.open {
         return;
     }
@@ -400,16 +401,19 @@ pub fn window(ctx: &egui::Context, llm: &mut crate::llm::LlmState) {
     map.ai_name = llm.roleplay.ai_display().to_string();
     let mut ask: Option<String> = None;
     let screen = ctx.content_rect();
+    let room = map_room(screen, top, llm.input_rect.map(|(card, _)| card));
+    // The frame's 18-point margins and 1-point edge, both sides.
+    const FRAME: f32 = 2.0 * (18.0 + 1.0);
     let size = egui::vec2(
-        (screen.width() - 120.0).clamp(640.0, 980.0),
-        (screen.height() - 140.0).clamp(420.0, 640.0),
+        (screen.width() - 120.0).clamp(640.0, 980.0).min(room.width() - FRAME).max(0.0),
+        (room.height() - FRAME).clamp(0.0, 640.0),
     );
     egui::Window::new("Memory map")
         .id(egui::Id::new("memory_map_window"))
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .anchor(egui::Align2::CENTER_CENTER, room.center() - screen.center())
         .frame(crate::settings::fresh_window_frame())
         .fixed_size(size)
         .show(ctx, |ui| {
@@ -431,6 +435,20 @@ pub fn window(ctx: &egui::Context, llm: &mut crate::llm::LlmState) {
         map.open = false;
     }
     llm.memory_map = map;
+}
+
+/// Where the map window may go: under the top bar (the chat view's `top`)
+/// and above the chat's input card, which floats over every window, with a
+/// small gap at each edge. On a short screen (or at a large interface size)
+/// the map shrinks to fit rather than run under them or off the screen.
+fn map_room(screen: Rect, top: f32, card: Option<Rect>) -> Rect {
+    const GAP: f32 = 10.0;
+    let bottom = card.map_or(screen.bottom(), |c| c.top()).min(screen.bottom());
+    let top = top.clamp(screen.top(), bottom);
+    Rect::from_min_max(
+        egui::pos2(screen.left() + GAP, top + GAP),
+        egui::pos2(screen.right() - GAP, (bottom - GAP).max(top + GAP)),
+    )
 }
 
 /// "Ask about this" puts its question in the chat box without throwing away
@@ -504,39 +522,41 @@ impl MapState {
         self.filters(ui, store);
         ui.add_space(8.0);
 
-        let avail = ui.available_size();
-        let detail_w = 280.0;
+        let avail = ui.available_size().max(Vec2::ZERO);
+        // 280 points, less in a narrow window so the brain keeps most of it.
+        let detail_w = 280.0_f32.min(avail.x * 0.42);
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 16.0;
-            self.canvas(ui, egui::vec2(avail.x - detail_w - 16.0, avail.y), store);
+            self.canvas(ui, egui::vec2((avail.x - detail_w - 16.0).max(0.0), avail.y), store);
             ui.vertical(|ui| {
                 ui.set_width(detail_w);
+                ui.set_max_width(detail_w);
                 ui.set_height(avail.y);
+                // The scrollbar rides in the window's margin, not over the
+                // panel's text.
+                const SCROLL_GUTTER: f32 = 12.0;
+                let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
                 egui::ScrollArea::vertical()
                     .id_salt("memory_detail")
                     .auto_shrink([false, false])
-                    .show(ui, |ui| self.detail(ui, store, ask));
+                    .show(&mut scroll_ui, |ui| {
+                        // Both: the width alone is only a minimum, and a
+                        // long line would widen the whole window.
+                        ui.set_width(detail_w);
+                        ui.set_max_width(detail_w);
+                        self.detail(ui, store, ask);
+                    });
+                crate::edge_scroll_done(ui, &scroll_ui, SCROLL_GUTTER);
             });
         });
     }
 
     /// Icon + title + counts on the left; "New memory" and close on the right.
+    /// The buttons are placed first, so a long title (a character's name) is
+    /// cut short before it reaches them.
     fn header(&mut self, ui: &mut egui::Ui, store: &MemoryStore) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            ui.add(
-                egui::Image::new(egui::include_image!("../icons/ai-brain.svg"))
-                    .fit_to_exact_size(egui::vec2(22.0, 22.0))
-                    .tint(TEXT()),
-            );
-            ui.label(egui::RichText::new(self.title()).color(TEXT()).strong().size(17.0));
-            let (n, t) = (store.count(), store.topics.len());
-            let counts = format!(
-                "{n} {} · {t} {}",
-                if n == 1 { "memory" } else { "memories" },
-                if t == 1 { "topic" } else { "topics" }
-            );
-            ui.label(egui::RichText::new(counts).color(MUTED()).size(12.5));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add(
@@ -563,6 +583,32 @@ impl MapState {
                         self.start_new(store);
                     }
                 }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Image::new(egui::include_image!("../icons/ai-brain.svg"))
+                            .fit_to_exact_size(egui::vec2(22.0, 22.0))
+                            .tint(TEXT()),
+                    );
+                    let (n, t) = (store.count(), store.topics.len());
+                    let counts = egui::RichText::new(format!(
+                        "{n} {} · {t} {}",
+                        if n == 1 { "memory" } else { "memories" },
+                        if t == 1 { "topic" } else { "topics" }
+                    ))
+                    .color(MUTED())
+                    .size(12.5);
+                    let counts_w = egui::WidgetText::from(counts.clone())
+                        .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::FontSelection::Default)
+                        .size()
+                        .x;
+                    let spacing = ui.spacing().item_spacing.x;
+                    let title_w = (ui.available_width() - counts_w - spacing).max(0.0);
+                    ui.scope(|ui| {
+                        ui.set_max_width(title_w);
+                        ui.add(egui::Label::new(egui::RichText::new(self.title()).color(TEXT()).strong().size(17.0)).truncate());
+                    });
+                    ui.label(counts);
+                });
             });
         });
     }
@@ -587,8 +633,7 @@ impl MapState {
             ui.add_space(6.0);
             for (ti, topic) in store.topics.iter().enumerate() {
                 let on = !self.hidden.contains(&topic.name);
-                let label = format!("{}  {}", topic.name, topic.memories.len());
-                if pill(ui, topic_color(ti), &label, on).clicked() {
+                if pill(ui, topic_color(ti), &topic.name, topic.memories.len(), on).clicked() {
                     if on {
                         self.hidden.push(topic.name.clone());
                     } else {
@@ -747,15 +792,17 @@ impl MapState {
         if let Some(i) = hovered {
             let n = &layout.nodes[i];
             if let Some(m) = store.topics[n.topic].memories.iter().find(|m| m.id == n.id) {
-                let mut title: String = m.title.chars().take(48).collect();
-                if m.title.chars().count() > 48 {
-                    title.push('…');
-                }
-                let galley = painter.layout_no_wrap(title, egui::FontId::proportional(12.5), TEXT());
                 let pad = egui::vec2(8.0, 4.0);
+                // Cut short to fit the canvas (with its 6-point inset).
+                let max_w = (rect.width() - 12.0 - pad.x * 2.0).clamp(24.0, 300.0);
+                let galley = elided(ui, &m.title, egui::FontId::proportional(12.5), TEXT(), max_w);
                 let mut chip = Rect::from_min_size(shown[i].pos + egui::vec2(12.0, -28.0), galley.size() + pad * 2.0);
                 if chip.right() > rect.right() - 6.0 {
                     chip = chip.translate(egui::vec2(-(chip.width() + 24.0), 0.0));
+                }
+                // Flipped left past the canvas's left edge: as far left as it goes.
+                if chip.left() < rect.left() + 6.0 {
+                    chip = chip.translate(egui::vec2(rect.left() + 6.0 - chip.left(), 0.0));
                 }
                 if chip.top() < rect.top() + 6.0 {
                     chip = chip.translate(egui::vec2(0.0, 40.0));
@@ -863,9 +910,13 @@ impl MapState {
                 ui.horizontal(|ui| {
                     let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 16.0), egui::Sense::hover());
                     ui.painter().circle_filled(r.center(), 4.0, topic_color(ti));
-                    ui.label(egui::RichText::new(&t.name).color(TEXT()).size(12.5));
+                    // The count first, from the right, so a long name is cut
+                    // short before it.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(egui::RichText::new(t.memories.len().to_string()).color(MUTED()).size(12.0));
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(&t.name).color(TEXT()).size(12.5)).truncate());
+                        });
                     });
                 });
             }
@@ -883,7 +934,9 @@ impl MapState {
         };
         let topic = &store.topics[ti];
         let m = &topic.memories[mi];
-        ui.horizontal(|ui| {
+        // When it doesn't all fit on one line (a long topic, a character's
+        // long name), the date wraps under the chip.
+        ui.horizontal_wrapped(|ui| {
             chip(ui, topic_color(ti), &topic.name);
             let when = if m.updated > m.created {
                 format!("Updated {}", format_date(m.updated))
@@ -895,7 +948,7 @@ impl MapState {
                 (true, MemoryKind::Main) => "by the AI".to_string(),
                 (true, MemoryKind::Roleplay) => format!("by {}", self.ai_name),
             };
-            ui.label(egui::RichText::new(format!("{when} · {who}")).color(MUTED()).size(11.5));
+            ui.add(egui::Label::new(egui::RichText::new(format!("{when} · {who}")).color(MUTED()).size(11.5)).wrap());
         });
         ui.add_space(4.0);
         ui.label(egui::RichText::new(&m.title).color(TEXT()).strong().size(15.0));
@@ -909,10 +962,13 @@ impl MapState {
                         .fit_to_exact_size(egui::vec2(14.0, 14.0))
                         .tint(MUTED()),
                 );
-                ui.label(
-                    egui::RichText::new("About a picture in the album (forgetting this deletes it)")
-                        .color(MUTED())
-                        .size(11.5),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("About a picture in the album (forgetting this deletes it)")
+                            .color(MUTED())
+                            .size(11.5),
+                    )
+                    .wrap(),
                 );
             });
         }
@@ -1067,20 +1123,30 @@ fn field_label(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).color(TEXT()).size(12.5));
 }
 
-/// A rounded topic chip: tinted fill, coloured name.
+/// A rounded topic chip: tinted fill, coloured name — cut short to fit the
+/// row (whole in the tooltip).
 fn chip(ui: &mut egui::Ui, color: Color32, label: &str) {
-    let galley = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(11.5), color);
+    let max_w = (ui.available_width() - 16.0).max(24.0);
+    let galley = elided(ui, label, egui::FontId::proportional(11.5), color, max_w);
     let size = galley.size() + egui::vec2(16.0, 6.0);
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    if galley.elided {
+        resp.on_hover_text(label);
+    }
     ui.painter().rect_filled(rect, CornerRadius::same(10), color.gamma_multiply(0.16));
     ui.painter().galley(rect.min + egui::vec2(8.0, 3.0), galley, color);
 }
 
-/// A topic filter pill: colour dot + name; dimmed when switched off.
-fn pill(ui: &mut egui::Ui, color: Color32, label: &str, on: bool) -> egui::Response {
+/// A topic filter pill: colour dot + name + count; dimmed when switched off.
+/// A long name is cut short (whole in the tooltip).
+fn pill(ui: &mut egui::Ui, color: Color32, name: &str, count: usize, on: bool) -> egui::Response {
     let text_col = if on { TEXT() } else { MUTED() };
-    let galley = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(12.0), text_col);
-    let size = egui::vec2(galley.size().x + 30.0, 24.0);
+    let font = egui::FontId::proportional(12.0);
+    let name = elided(ui, name, font.clone(), text_col, 200.0);
+    let count = ui.painter().layout_no_wrap(count.to_string(), font, text_col);
+    // The name and count are two spaces apart, as one label had them.
+    let gap = 7.0;
+    let size = egui::vec2(name.size().x + gap + count.size().x + 30.0, 24.0);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     let painter = ui.painter();
     if on {
@@ -1089,9 +1155,24 @@ fn pill(ui: &mut egui::Ui, color: Color32, label: &str, on: bool) -> egui::Respo
     let edge = if on { color.gamma_multiply(0.55) } else { EDGE() };
     painter.rect_stroke(rect, CornerRadius::same(12), Stroke::new(1.0_f32, edge), egui::StrokeKind::Inside);
     painter.circle_filled(egui::pos2(rect.left() + 13.0, rect.center().y), 4.0, if on { color } else { color.gamma_multiply(0.35) });
-    painter.galley(egui::pos2(rect.left() + 22.0, rect.center().y - galley.size().y / 2.0), galley, text_col);
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(if on { "Hide this topic" } else { "Show this topic" })
+    let tip = match (on, name.elided) {
+        (true, false) => "Hide this topic".to_string(),
+        (false, false) => "Show this topic".to_string(),
+        (true, true) => format!("{} — hide this topic", name.text()),
+        (false, true) => format!("{} — show this topic", name.text()),
+    };
+    let x = rect.left() + 22.0;
+    let count_x = x + name.size().x + gap;
+    painter.galley(egui::pos2(x, rect.center().y - name.size().y / 2.0), name, text_col);
+    painter.galley(egui::pos2(count_x, rect.center().y - count.size().y / 2.0), count, text_col);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip)
+}
+
+/// `text` on one line, cut short with "…" past `max_w`.
+fn elided(ui: &egui::Ui, text: &str, font: egui::FontId, color: Color32, max_w: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_w);
+    ui.fonts_mut(|f| f.layout_job(job))
 }
 
 #[cfg(test)]
@@ -1118,6 +1199,22 @@ mod tests {
         let mut draft = "Half a thought \n".to_string();
         add_question(&mut draft, "Q?");
         assert_eq!(draft, "Half a thought\nQ?");
+    }
+
+    /// The map keeps clear of the top bar and the chat's input card, and its
+    /// room never turns inside out when they leave none.
+    #[test]
+    fn room_clears_the_bar_and_the_card() {
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1366.0, 768.0));
+        let card = Rect::from_min_max(egui::pos2(300.0, 680.0), egui::pos2(1060.0, 754.0));
+        let room = map_room(screen, 102.0, Some(card));
+        assert!(room.top() >= 102.0 && room.bottom() <= card.top(), "{room:?}");
+        assert!(room.left() >= screen.left() && room.right() <= screen.right(), "{room:?}");
+        let room = map_room(screen, 102.0, None);
+        assert!(room.bottom() <= screen.bottom(), "{room:?}");
+        let squashed = Rect::from_min_max(egui::pos2(300.0, 90.0), egui::pos2(1060.0, 160.0));
+        let room = map_room(screen, 102.0, Some(squashed));
+        assert!(room.height() >= 0.0 && room.width() >= 0.0, "{room:?}");
     }
 
     /// The cloud is the same every run (seeded) and fills its quota.
