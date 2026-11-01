@@ -235,10 +235,10 @@ fn nested_tint(light: bool, opacity: f32) -> Color32 {
     tint.gamma_multiply(opacity)
 }
 
-/// A card on glass, caved in: [`nested_tint`] with a soft shadow along the
-/// inside of its top edge (the upper lip shading the well) and a faint light
-/// line along its bottom edge (the lower lip catching the light). Thin
-/// strips (a window's title bar) stay flat.
+/// A card on glass, caved in: [`nested_tint`] with a soft shadow inside its
+/// top edge (the upper lip shading the well) and a faint light along its
+/// bottom edge (the lower lip catching the light). Thin strips (a window's
+/// title bar) stay flat.
 fn sunken(r: &egui::epaint::RectShape, light: bool, opacity: f32) -> Shape {
     let fill = nested_tint(light, opacity);
     if r.rect.height() < 36.0 || r.rect.width() < 60.0 {
@@ -249,54 +249,67 @@ fn sunken(r: &egui::epaint::RectShape, light: bool, opacity: f32) -> Shape {
     let mut well = r.clone();
     well.fill = fill;
     well.stroke = egui::Stroke::NONE;
-    let mut shapes = vec![Shape::Rect(well)];
-    // Each edge is a smooth gradient: many fine, overlapping lines, each
-    // fainter than the last (a few separate ones showed as bands).
-    let mut fade = |top: bool, color: Color32, depth: f32, steps: usize| {
-        for i in 0..steps {
-            let f = i as f32 / steps as f32;
-            // Eased: strongest at the edge, gone smoothly by `depth`.
-            let k = (1.0 - f) * (1.0 - f);
-            let line = half_outline(r.rect, r.corner_radius, 0.5 + f * depth, top);
-            let width = 1.4 * depth / steps as f32 + 0.25;
-            shapes.push(Shape::line(line, egui::Stroke::new(width, color.gamma_multiply(k * opacity))));
-        }
-    };
-    // Per line: overlapping lines add up, so each is faint.
-    fade(true, Color32::from_black_alpha(if light { 9 } else { 30 }), 7.0, 14);
-    fade(false, Color32::from_white_alpha(if light { 40 } else { 8 }), 2.5, 5);
-    Shape::Vec(shapes)
+    let shade = Color32::from_black_alpha(if light { 34 } else { 100 }).gamma_multiply(opacity);
+    let glint = Color32::from_white_alpha(if light { 62 } else { 13 }).gamma_multiply(opacity);
+    Shape::Vec(vec![
+        Shape::Rect(well),
+        Shape::mesh(lip(r.rect, r.corner_radius, true, 7.0, shade)),
+        Shape::mesh(lip(r.rect, r.corner_radius, false, 2.5, glint)),
+    ])
 }
 
-/// The top (or bottom) half of `rect`'s rounded outline, `inset` inside it:
-/// from the middle of one side, round the corners, to the middle of the other.
-fn half_outline(rect: Rect, corners: CornerRadius, inset: f32, top: bool) -> Vec<egui::Pos2> {
+/// One smooth gradient (a mesh, coloured at its corners) inside the top (or
+/// bottom) edge of `rect`'s rounded outline: `color` at the edge, eased out
+/// by `depth` in. It's strongest where the edge faces straight up (down) and
+/// fades out round the corners, so it never runs down the sides: stacked
+/// lines there showed as stripes, and ended in a step at mid-height where
+/// the bottom's light took over.
+fn lip(rect: Rect, corners: CornerRadius, top: bool, depth: f32, color: Color32) -> egui::Mesh {
     use std::f32::consts::{FRAC_PI_2, PI};
-    let rc = rect.shrink(inset);
-    let most = rc.width().min(rc.height()) / 2.0;
-    let rad = |v: u8| (v as f32 - inset).clamp(0.0, most);
-    let mut pts = Vec::with_capacity(20);
-    let mut arc = |c: egui::Pos2, r: f32, from: f32| {
-        for i in 0..=8 {
-            let a = from + FRAC_PI_2 * i as f32 / 8.0;
-            pts.push(egui::pos2(c.x + r * a.cos(), c.y + r * a.sin()));
+    /// Insets from the edge to `depth`, and points along each corner.
+    const RINGS: u32 = 6;
+    const ARC: u32 = 10;
+    let mut mesh = egui::Mesh::default();
+    for ring in 0..=RINGS {
+        let f = ring as f32 / RINGS as f32;
+        let inset = f * depth;
+        let strength = (1.0 - f).powf(1.5);
+        let rc = rect.shrink(inset);
+        let most = rc.width().min(rc.height()) / 2.0;
+        let rad = |v: u8| (v as f32 - inset).clamp(0.0, most);
+        // The two corners, in order along the edge (the straight part of the
+        // edge runs between them).
+        let arcs = if top {
+            let (nw, ne) = (rad(corners.nw), rad(corners.ne));
+            [
+                (egui::pos2(rc.left() + nw, rc.top() + nw), nw, PI),
+                (egui::pos2(rc.right() - ne, rc.top() + ne), ne, PI + FRAC_PI_2),
+            ]
+        } else {
+            let (se, sw) = (rad(corners.se), rad(corners.sw));
+            [
+                (egui::pos2(rc.right() - se, rc.bottom() - se), se, 0.0),
+                (egui::pos2(rc.left() + sw, rc.bottom() - sw), sw, FRAC_PI_2),
+            ]
+        };
+        for (c, r, from) in arcs {
+            for i in 0..=ARC {
+                let (sin, cos) = (from + FRAC_PI_2 * i as f32 / ARC as f32).sin_cos();
+                // 1 where the edge faces straight up (down), 0 at a side.
+                let facing = if top { -sin } else { sin }.max(0.0);
+                mesh.colored_vertex(egui::pos2(c.x + r * cos, c.y + r * sin), color.gamma_multiply(strength * facing));
+            }
         }
-    };
-    let cy = rc.center().y;
-    if top {
-        let (nw, ne) = (rad(corners.nw), rad(corners.ne));
-        arc(egui::pos2(rc.left() + nw, rc.top() + nw), nw, PI);
-        arc(egui::pos2(rc.right() - ne, rc.top() + ne), ne, PI + FRAC_PI_2);
-        pts.insert(0, egui::pos2(rc.left(), cy));
-        pts.push(egui::pos2(rc.right(), cy));
-    } else {
-        let (se, sw) = (rad(corners.se), rad(corners.sw));
-        arc(egui::pos2(rc.right() - se, rc.bottom() - se), se, 0.0);
-        arc(egui::pos2(rc.left() + sw, rc.bottom() - sw), sw, FRAC_PI_2);
-        pts.insert(0, egui::pos2(rc.right(), cy));
-        pts.push(egui::pos2(rc.left(), cy));
     }
-    pts
+    let per_ring = 2 * (ARC + 1);
+    for ring in 0..RINGS {
+        let (out, inn) = (ring * per_ring, (ring + 1) * per_ring);
+        for k in 0..per_ring - 1 {
+            mesh.add_triangle(out + k, out + k + 1, inn + k);
+            mesh.add_triangle(out + k + 1, inn + k + 1, inn + k);
+        }
+    }
+    mesh
 }
 
 /// Glass in place of `shape` if it's a marked rectangle — or holds one (a
@@ -874,6 +887,30 @@ mod tests {
         // Where it shows off the panel, it's glass of its own.
         let mut shape = Shape::rect_filled(card, 8, MARKERS.panel);
         assert!(swap(&mut shape, &MARKERS, &mut vec![panel], Rect::EVERYTHING, &mut no_reach()));
+    }
+
+    /// A caved-in card's shading keeps to its top and bottom edges, in the
+    /// card: it never runs down the sides to meet in the middle (stacked
+    /// lines there showed as stripes, and a step at mid-height). Full colour
+    /// where the edge faces straight up (down), none at the sides.
+    #[test]
+    fn sunken_cards_shade_only_their_top_and_bottom() {
+        let card = Rect::from_min_size(pos2(10.0, 20.0), vec2(300.0, 120.0));
+        let color = Color32::from_black_alpha(100);
+        for (top, depth) in [(true, 7.0), (false, 2.5)] {
+            let mesh = lip(card, CornerRadius::same(18), top, depth, color);
+            assert!(!mesh.indices.is_empty());
+            for v in &mesh.vertices {
+                assert!(card.expand(0.01).contains(v.pos), "{v:?} outside the card");
+                // No further in than the corners reach…
+                let from_edge = if top { v.pos.y - card.top() } else { card.bottom() - v.pos.y };
+                assert!(from_edge <= 18.01, "{v:?} is {from_edge} in from its edge");
+                // …and clear where they meet the sides, so nothing steps there.
+                assert!(from_edge < 17.99 || v.color.a() == 0, "{v:?} shades a side");
+            }
+            let darkest = mesh.vertices.iter().map(|v| v.color.a()).max();
+            assert_eq!(darkest, Some(color.a()));
+        }
     }
 
     /// A surface shown whole casts its shadow past its clip (cut off there,

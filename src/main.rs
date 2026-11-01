@@ -113,6 +113,7 @@ mod bgremove;
 mod civitai;
 mod crash;
 mod depth;
+mod spatial;
 mod detect;
 mod dictate;
 mod emoji;

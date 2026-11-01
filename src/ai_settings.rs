@@ -119,7 +119,7 @@ pub fn window(ctx: &egui::Context, llm: &mut LlmState, settings: &mut Settings) 
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(&mut scroll_ui, |ui| {
-                            ui.set_width(ui.available_width() - SCROLL_GUTTER);
+                            ui.set_width((ui.available_width() - SCROLL_GUTTER).max(0.0));
                             // Scope ids by tab (see the main Settings window).
                             ui.push_id(llm.ai_settings_tab, |ui| match llm.ai_settings_tab {
                                 AiTab::Replies => replies_tab(ui, settings),

@@ -480,7 +480,7 @@ pub fn show(
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(&mut scroll_ui, |ui| {
-            ui.set_width(ui.available_width() - SCROLL_GUTTER);
+            ui.set_width((ui.available_width() - SCROLL_GUTTER).max(0.0));
             match &state.result {
                 Some(res) => render_result(ui, res, &state.downloads, &state.download_dirs, state.thumb_size, &mut download_req),
                 None => {

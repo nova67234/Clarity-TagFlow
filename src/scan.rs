@@ -882,7 +882,7 @@ fn list(ui: &mut egui::Ui, state: &ScanState, list_h: f32, act: &mut Actions) {
                 .auto_shrink([false, true])
                 .show_rows(ui, ROW_H, rows, |ui, range| {
                     // Keep the row ends clear of the scroll bar.
-                    ui.set_width(ui.available_width() - if scrolls { 10.0 } else { 0.0 });
+                    ui.set_width((ui.available_width() - if scrolls { 10.0 } else { 0.0 }).max(0.0));
                     for i in range {
                         finding_row(ui, &state.root, i, &state.findings[i], act);
                     }

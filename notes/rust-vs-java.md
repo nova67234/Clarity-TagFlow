@@ -44,8 +44,13 @@ Plus **Radiance HDR** (.hdr) with tone mapping. All decode off-thread.
 
 ### 3. Spatial Scene (depth parallax)
 An Apple-Photos-style **3D depth effect for ordinary photos**: Depth Anything
-V2 runs in ONNX to estimate a depth map, and the viewer warps the image on a
-96×64 mesh that follows the mouse with idle sway. Entirely new capability.
+V2 runs in ONNX to estimate a depth map, which is made into layers — the
+picture torn at its depth edges, over a background rebuilt behind the people
+and things in front (after Google's SLIDE and 3D Photo Inpainting) — and a
+shader draws them per pixel, following the mouse with idle sway, so the
+subject slides over what's behind it instead of the picture bending. (A
+96×64 warped mesh stands in where the shader can't run.) Entirely new
+capability.
 
 ### 4. AI background removal
 Right-click → **Remove Background**: BiRefNet (ONNX) computes a saliency

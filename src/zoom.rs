@@ -61,9 +61,10 @@ const DEPTH_FOLDER: &str = "depth-anything-v2-base-onnx";
 /// Shown when the depth model hasn't been downloaded yet.
 const MODEL_MISSING_MSG: &str =
     "Depth model not installed — Tag Manager Settings → Get Models → Depth (~370 MB).";
-/// Max screen-space shift (px) of the most-displaced depth layer. Kept small so
-/// the single-mesh warp reads as gentle depth rather than a stretchy rubber sheet
-/// (this mesh warps the texture; it can't move rigid layers like Apple's does).
+/// The plain mesh (where the Spatial Scene shader can't run): max screen-space
+/// shift (px) of the most-displaced depth layer. Kept small so the single-mesh
+/// warp reads as gentle depth rather than a stretchy rubber sheet (a mesh warps
+/// the texture; the shader moves the layers apart instead).
 const PARALLAX_PX: f32 = 10.0;
 /// Parallax mesh grid resolution (cells); vertices are `(GX+1)*(GY+1)`.
 const GX: usize = 96;
@@ -72,19 +73,23 @@ const GY: usize = 64;
 /// gradient across many cells so the subject moves more as a unit and silhouettes
 /// shear softly instead of stretching — the main lever against the "stretchy" look.
 const BLUR_PASSES: usize = 6;
-/// Depth maps kept for revisits (~1 MB each), least recently used dropped first.
-const DEPTH_CACHE: usize = 16;
+/// Scenes kept for revisits (up to ~9 MB each), least recently used dropped
+/// first.
+const DEPTH_CACHE: usize = 4;
+/// How long a scene takes to ease in from the flat picture (seconds).
+const EASE_IN: f64 = 0.5;
 
-/// State for the Spatial Scene depth-parallax viewer mode. The depth map for the
-/// current image is computed on a background thread, cached per path, and turned
-/// into a per-vertex displaced mesh that follows the mouse (with an idle sway).
+/// State for the Spatial Scene depth-parallax viewer mode. The current image's
+/// scene (its depth, made into layers — see `src/spatial.rs`) is made on a
+/// background thread, cached per path, and drawn moving with the mouse (with an
+/// idle sway).
 pub struct SpatialScene {
     /// Whether the parallax mode is currently engaged.
     pub active: bool,
-    /// Recent depth maps so re-entry / revisits are instant, least recently used
+    /// Recent scenes so re-entry / revisits are instant, least recently used
     /// first (at most [`DEPTH_CACHE`]). Each keeps the stamp of the file it was
-    /// computed from, checked when the image is selected again.
-    cache: Vec<(PathBuf, FileStamp, Arc<crate::depth::DepthMap>)>,
+    /// made from, checked when the image is selected again.
+    cache: Vec<(PathBuf, FileStamp, Arc<crate::spatial::Scene>)>,
     /// The depth estimator's worker (one thread, model kept loaded, only the
     /// newest request runs).
     worker: crate::depth::DepthWorker,
@@ -108,6 +113,8 @@ pub struct SpatialScene {
     /// per-frame mesh rebuild doesn't re-sample the depth map 6k× a frame.
     layers: Vec<f32>,
     layers_key: Option<PathBuf>,
+    /// The scene on screen and when it first showed (it eases in).
+    shown: Option<(u64, f64)>,
 }
 
 impl Default for SpatialScene {
@@ -124,13 +131,14 @@ impl Default for SpatialScene {
             download: None,
             layers: Vec::new(),
             layers_key: None,
+            shown: None,
         }
     }
 }
 
 impl SpatialScene {
-    /// `path`'s cached depth map, marked most recently used.
-    fn cached_depth(&mut self, path: &Path) -> Option<Arc<crate::depth::DepthMap>> {
+    /// `path`'s cached scene, marked most recently used.
+    fn cached_depth(&mut self, path: &Path) -> Option<Arc<crate::spatial::Scene>> {
         let i = self.cache.iter().position(|(p, ..)| p == path)?;
         let hit = self.cache.remove(i);
         let map = Arc::clone(&hit.2);
@@ -138,7 +146,7 @@ impl SpatialScene {
         Some(map)
     }
 
-    fn insert_depth(&mut self, path: PathBuf, stamp: FileStamp, map: crate::depth::DepthMap) {
+    fn insert_depth(&mut self, path: PathBuf, stamp: FileStamp, map: crate::spatial::Scene) {
         self.cache.retain(|(p, ..)| *p != path);
         self.cache.push((path, stamp, Arc::new(map)));
         if self.cache.len() > DEPTH_CACHE {
@@ -881,9 +889,9 @@ impl ZoomState {
         }
 
         match depth {
-            Some(map) => {
+            Some(scene) => {
                 let m = self.spatial_offset(ui, viewport, img, pointer, now);
-                self.paint_spatial(ui, viewport, img, tex, map.as_ref(), m);
+                self.paint_spatial(ui, viewport, img, tex, scene, m, now);
             }
             None => {
                 // Still generating, or it failed — show the flat image underneath.
@@ -988,11 +996,50 @@ impl ZoomState {
         self.spatial.layers_key = self.current.clone();
     }
 
-    /// Paint the image as a depth-displaced parallax mesh. Near pixels (`layer`
-    /// > 0) and far pixels (`layer` < 0) shift in opposite directions about the
-    /// >    mid-plane, anchored so the scene doesn't drift, producing the "peek
-    /// >    around" depth effect as `m` (the smoothed mouse/sway offset) changes.
+    /// Paint the scene seen from `m` (the smoothed mouse/sway offset): the
+    /// people and things in front slide over what's behind them, which is
+    /// rebuilt where they uncover it (see `src/spatial.rs`). What's at the
+    /// focus depth (the subject) stays put; the farther something is, the more
+    /// it moves with the pointer. Where the shader can't run, a plain mesh.
+    #[allow(clippy::too_many_arguments)]
     fn paint_spatial(
+        &mut self,
+        ui: &egui::Ui,
+        viewport: Rect,
+        img: Vec2,
+        tex: &egui::TextureHandle,
+        scene: Arc<crate::spatial::Scene>,
+        m: Vec2,
+        now: f64,
+    ) {
+        if crate::spatial::view::available() {
+            let rect = self.image_rect(viewport, img);
+            // Eased in from the flat picture, so it doesn't jump.
+            let since = match self.spatial.shown {
+                Some((id, t)) if id == scene.id => t,
+                _ => {
+                    self.spatial.shown = Some((scene.id, now));
+                    now
+                }
+            };
+            let k = ((now - since) / EASE_IN).clamp(0.0, 1.0) as f32;
+            let k = k * k * (3.0 - 2.0 * k);
+            let amp = crate::spatial::PARALLAX * rect.width().min(rect.height()) * k;
+            let shift = Vec2::new(-m.x * amp / rect.width(), -m.y * amp / rect.height());
+            // Bigger by as much as anything moves, so the edges never come into view.
+            let reach = scene.focus.max(1.0 - scene.focus);
+            let zoom = 1.0 / (1.0 - 2.0 * reach * crate::spatial::PARALLAX * k).max(0.5);
+            let look = crate::spatial::view::Look { shift, zoom, radius: 22.0 };
+            ui.painter().with_clip_rect(viewport).add(crate::spatial::view::callback(rect, scene, tex.id(), look));
+            return;
+        }
+        self.paint_spatial_mesh(ui, viewport, img, tex, &scene.depth, m);
+    }
+
+    /// The plain mesh: the image as a depth-displaced parallax mesh. Near
+    /// pixels (`layer` > 0) and far pixels (`layer` < 0) shift in opposite
+    /// directions about the mid-plane, anchored so the scene doesn't drift.
+    fn paint_spatial_mesh(
         &mut self,
         ui: &egui::Ui,
         viewport: Rect,
@@ -1208,11 +1255,12 @@ pub(crate) fn menu_sep(ui: &mut egui::Ui) {
 mod tests {
     use super::*;
 
-    fn map() -> crate::depth::DepthMap {
-        crate::depth::DepthMap { w: 1, h: 1, data: vec![0.5] }
+    fn map() -> crate::spatial::Scene {
+        let img = image::RgbImage::from_pixel(2, 2, image::Rgb([128, 128, 128]));
+        crate::spatial::build(&img, crate::depth::DepthMap { w: 1, h: 1, data: vec![0.5] })
     }
 
-    // Paging through images in Spatial mode keeps at most DEPTH_CACHE maps,
+    // Paging through images in Spatial mode keeps at most DEPTH_CACHE scenes,
     // dropping the least recently viewed.
     #[test]
     fn depth_cache_is_lru_capped() {
@@ -1228,7 +1276,7 @@ mod tests {
         assert!(s.cached_depth(Path::new("new.png")).is_some());
     }
 
-    // A depth map isn't reused for a file since re-created at the same path.
+    // A scene isn't reused for a file since re-created at the same path.
     #[test]
     fn depth_for_replaced_file_is_dropped() {
         let dir = std::env::temp_dir().join(format!("ctf_zoom_test_{}", std::process::id()));

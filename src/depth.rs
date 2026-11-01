@@ -2,8 +2,8 @@
 //!
 //! Runs **Depth Anything V2** (ONNX) through the `ort` crate — the same runtime
 //! the taggers use (see `src/tagger.rs`). It produces a normalized depth map
-//! (`0.0` = far, `1.0` = near) that `src/zoom.rs` turns into a depth-displaced
-//! parallax mesh.
+//! (`0.0` = far, `1.0` = near) that `src/spatial.rs` makes into layers that
+//! `src/zoom.rs` draws.
 //!
 //! The model is fetched via the AI Model Manager (the "Depth Anything V2 Small"
 //! catalog entry in `src/ai_models.rs`) into
@@ -90,13 +90,10 @@ impl DepthEstimator {
         Ok(Self { session, input_name, output_name })
     }
 
-    /// Estimate depth for the image at `path`. Decodes via the shared
-    /// [`crate::tagger::load_rgb_on_white`] (so AVIF/RAW/HDR work too), runs
-    /// inference, and min-max normalizes the relative inverse-depth output to
-    /// `0..1` (`1.0` = nearest).
-    pub fn estimate(&mut self, path: &Path) -> Result<DepthMap, String> {
-        let img = crate::tagger::load_rgb_on_white(path)?;
-        let data = preprocess(&img);
+    /// Estimate depth for `img`: run inference, and min-max normalize the
+    /// relative inverse-depth output to `0..1` (`1.0` = nearest).
+    pub fn estimate(&mut self, img: &RgbImage) -> Result<DepthMap, String> {
+        let data = preprocess(img);
         let shape = [1_i64, 3, DSIZE as i64, DSIZE as i64];
         let tensor = Tensor::from_array((shape, data)).map_err(|e| format!("Tensor: {e}"))?;
 
@@ -162,13 +159,14 @@ fn preprocess(img: &RgbImage) -> Vec<f32> {
 /// do. After that it ends, freeing the session; the next request reloads it.
 const IDLE_UNLOAD: Duration = Duration::from_secs(120);
 
-/// A finished estimate: the image it's for, and its depth map or an error.
-pub type DepthResult = (PathBuf, Result<DepthMap, String>);
+/// A finished scene: the image it's for, and the scene or an error.
+pub type DepthResult = (PathBuf, Result<crate::spatial::Scene, String>);
 
 /// Depth estimation for the Spatial Scene, off the UI thread: a single worker
 /// that keeps the model loaded between images and only ever runs the newest
-/// request. (A thread with a fresh ~370 MB session per image used to pile up
-/// when paging through images, several running at once.)
+/// request, then makes the picture and its depth into layers. (A thread with
+/// a fresh ~370 MB session per image used to pile up when paging through
+/// images, several running at once.)
 pub struct DepthWorker {
     shared: Arc<Shared>,
     tx: Sender<DepthResult>,
@@ -230,12 +228,15 @@ fn worker_loop(shared: &Shared, tx: &Sender<DepthResult>) {
     let mut loaded: Option<(PathBuf, DepthEstimator)> = None;
     while let Some(req) = next_request(shared) {
         let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Decoded once, for the depth and the layers (AVIF/RAW/HDR too).
+            let img = crate::tagger::load_rgb_on_white(&req.image)?;
             if !matches!(&loaded, Some((m, _)) if *m == req.model) {
                 loaded = None; // free the old session before loading another
                 loaded = Some((req.model.clone(), DepthEstimator::load(&req.model)?));
             }
             let (_, est) = loaded.as_mut().expect("loaded above");
-            est.estimate(&req.image)
+            let depth = est.estimate(&img)?;
+            Ok(crate::spatial::build(&img, depth))
         }));
         // A panic (say, in a decoder) mustn't end the worker and leave the
         // viewer on "Generating depth…": report it, reload the model next time.

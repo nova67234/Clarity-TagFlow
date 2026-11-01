@@ -459,7 +459,7 @@ pub fn show(
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(&mut scroll_ui, |ui| {
-                            ui.set_width(ui.available_width() - SCROLL_GUTTER);
+                            ui.set_width((ui.available_width() - SCROLL_GUTTER).max(0.0));
                             // Scope widget ids by tab: switches at the same
                             // layout position in two tabs would otherwise share
                             // an auto-id, and the animation state left behind by
@@ -1365,7 +1365,9 @@ pub(crate) fn row(ui: &mut egui::Ui, label: &str, sub: Option<&str>, control: im
     let pad_id = ui.next_auto_id().with("row_label_pad");
     let pad = if sub.is_none() { ui.data(|d| d.get_temp::<f32>(pad_id)).unwrap_or(0.0) } else { 0.0 };
     ui.horizontal(|ui| {
-        let text_w = ui.available_width() - ROW_CONTROL_W;
+        // Never negative: a window's first frame (still sizing itself) can
+        // have no room at all, and egui panics on a negative width.
+        let text_w = (ui.available_width() - ROW_CONTROL_W).max(0.0);
         let text = ui.vertical(|ui| {
             ui.set_width(text_w);
             ui.add_space(pad);
