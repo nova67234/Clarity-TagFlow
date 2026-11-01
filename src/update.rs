@@ -10,6 +10,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use crate::backup::{FLASH, FLASH_GREEN, FLASH_RED};
+use crate::scan::Pill;
 
 use eframe::egui;
 use egui::{Color32, CornerRadius, Margin, RichText, Stroke};
@@ -366,7 +367,7 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
                     if is_newer(&ri.tag, CURRENT) {
                         ui.label(RichText::new(format!("Update available — {}", ri.tag)).color(GREEN).strong());
                         ui.add_space(4.0);
-                        if flash_button(ui, "Download from GitHub", 170.0, &mut state.flash_download, FLASH_GREEN) {
+                        if flash_button(ui, "Download from GitHub", Pill::Accent, &mut state.flash_download, FLASH_GREEN, true) {
                             ui.ctx().open_url(egui::OpenUrl::new_tab(&ri.url));
                         }
                         ui.add_space(6.0);
@@ -469,18 +470,13 @@ pub fn updates_tab(ui: &mut egui::Ui, state: &mut UpdateState, settings: &mut Se
     // --- Footer: re-check + dismiss ---
     ui.add_space(2.0);
     ui.horizontal(|ui| {
-        let fired = ui
-            .add_enabled_ui(!checking, |ui| {
-                flash_button_rounded(ui, "Check now", 90.0, &mut state.flash_check, FLASH_GREEN, 16)
-            })
-            .inner;
-        if fired {
+        if flash_button(ui, "Check now", Pill::Outline, &mut state.flash_check, FLASH_GREEN, !checking) {
             do_check = true;
         }
         let can_dismiss = state.result.as_ref().map(|r| r.app_update() || r.comfy_update()).unwrap_or(false);
         if can_dismiss {
             ui.add_space(8.0);
-            if flash_button(ui, "Dismiss", 90.0, &mut state.flash_dismiss, FLASH_RED) {
+            if flash_button(ui, "Dismiss", Pill::Outline, &mut state.flash_dismiss, FLASH_RED, true) {
                 do_dismiss = true;
             }
         }
@@ -601,36 +597,19 @@ fn hint(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).color(MUTED()).size(11.0));
 }
 
-/// A Create Backup–style button: plain TEXT label at rest (corner-10, 14pt,
-/// 32px tall); on click it fills `flash_color` with white text for `FLASH`,
-/// then returns `true` once so the caller fires the action.
+/// A Create Backup–style button: Find Issues' pill (`kind`, src/scan.rs);
+/// on click it fills `flash_color` for `FLASH`, then returns `true` once so
+/// the caller fires the action. Greyed out unless `enabled`.
 fn flash_button(
     ui: &mut egui::Ui,
     label: &str,
-    width: f32,
+    kind: Pill,
     flash: &mut Option<Instant>,
     flash_color: Color32,
-) -> bool {
-    flash_button_rounded(ui, label, width, flash, flash_color, 10)
-}
-
-/// `flash_button` with a custom corner radius (16 = full pill at 32px tall).
-fn flash_button_rounded(
-    ui: &mut egui::Ui,
-    label: &str,
-    width: f32,
-    flash: &mut Option<Instant>,
-    flash_color: Color32,
-    radius: u8,
+    enabled: bool,
 ) -> bool {
     let flashing = flash.is_some();
-    let text = if flashing { Color32::WHITE } else { TEXT() };
-    let mut btn = egui::Button::new(RichText::new(label).color(text).size(14.0))
-        .corner_radius(CornerRadius::same(radius));
-    if flashing {
-        btn = btn.fill(flash_color);
-    }
-    if ui.add_sized([width, 32.0], btn).clicked() && !flashing {
+    if crate::scan::pill(ui, label, kind, flashing.then_some(flash_color), enabled).clicked() && !flashing {
         *flash = Some(Instant::now());
     }
     if flash.is_some_and(|t| t.elapsed() >= FLASH) {

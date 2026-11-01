@@ -8,6 +8,8 @@ use crate::left_panel_settings::MediaFilter;
 use crate::slider::PillSlider;
 use crate::theme::{Backdrop, Theme, EDGE, FLOAT, MUTED, PANEL, TEXT};
 
+mod glass_switch;
+
 /// Key under which the settings are saved in eframe's persistent storage.
 pub const STORAGE_KEY: &str = "clarity_tagflow_settings";
 
@@ -600,8 +602,8 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             |ui| {
                 if crate::age_gate::acknowledged() {
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        if ui.button("Reset").clicked() {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        if button(ui, "Reset").clicked() {
                             crate::age_gate::reset();
                         }
                         ui.label(
@@ -929,14 +931,7 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
             );
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
         } else if !llm.installed {
-            let btn = egui::Button::new(
-                egui::RichText::new(format!("Download {}", settings.ai_gemma_model.label()))
-                    .color(egui::Color32::WHITE)
-                    .strong(),
-            )
-            .fill(crate::theme::ACCENT1())
-            .corner_radius(egui::CornerRadius::same(255));
-            if ui.add_sized(egui::vec2(210.0, 32.0), btn).clicked() {
+            if accent_button(ui, &format!("Download {}", settings.ai_gemma_model.label())).clicked() {
                 llm.start_setup();
             }
             hint(
@@ -1072,7 +1067,8 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                 ui.label(egui::RichText::new("Voice sample (cloning)").color(TEXT()).size(12.5));
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Choose audio…").clicked()
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if button(ui, "Choose audio…").clicked()
                         && let Some(p) = rfd::FileDialog::new()
                             .add_filter("Audio", &["wav", "flac", "mp3", "ogg", "m4a"])
                             .pick_file()
@@ -1082,17 +1078,8 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                         }
                     // The floating always-on-top recorder: capture a voice off
                     // whatever is playing (YouTube, a game) as the sample.
-                    ui.add_space(6.0);
-                    let mic = egui::Button::image(
-                        egui::Image::new(egui::include_image!("../icons/mic.svg"))
-                            .fit_to_exact_size(egui::vec2(15.0, 15.0))
-                            .tint(crate::theme::icon_tint(TEXT())),
-                    );
-                    if ui
-                        .add(mic)
-                        .on_hover_text("Record what's playing (floating mic stays on top of other apps)")
-                        .clicked()
-                    {
+                    let mic = egui::include_image!("../icons/mic.svg");
+                    if icon_button(ui, mic, "Record what's playing (floating mic stays on top of other apps)").clicked() {
                         llm.voice.rec.open = true;
                     }
                     if !settings.ai_voice_ref_audio.is_empty() {
@@ -1100,8 +1087,15 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
-                        ui.label(egui::RichText::new(name).color(MUTED()).size(11.5));
-                        if ui.small_button("✕").on_hover_text("Remove the sample").clicked() {
+                        ui.add_space(2.0);
+                        // A long name is cut short (whole on hover), so the
+                        // remove button stays on the card.
+                        let name_w = (ui.available_width() - 32.0).max(40.0);
+                        ui.scope(|ui| {
+                            ui.set_max_width(name_w);
+                            ui.add(egui::Label::new(egui::RichText::new(name).color(MUTED()).size(11.5)).truncate());
+                        });
+                        if clear_button(ui, "Remove the sample").clicked() {
                             settings.ai_voice_ref_audio.clear();
                             llm.voice.ref_audio.clear();
                         }
@@ -1143,12 +1137,7 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                     });
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
                 } else {
-                    let btn = egui::Button::new(
-                        egui::RichText::new("Set up voice").color(egui::Color32::WHITE).strong(),
-                    )
-                    .fill(crate::theme::ACCENT1())
-                    .corner_radius(egui::CornerRadius::same(255));
-                    if ui.add_sized(egui::vec2(150.0, 32.0), btn).clicked() {
+                    if accent_button(ui, "Set up voice").clicked() {
                         llm.voice.start_setup(ui.ctx());
                     }
                     hint(
@@ -1204,7 +1193,7 @@ fn ftp_tab(ui: &mut egui::Ui, settings: &mut Settings, ftp: &mut crate::ftp::Ftp
         row_sep(ui);
         row(ui, "Port", None, |ui| {
             let mut port = settings.ftp_port as u32;
-            ui.add(egui::DragValue::new(&mut port).range(1..=65535));
+            pill_number(ui, 96.0, egui::DragValue::new(&mut port).range(1..=65535));
             settings.ftp_port = port as u16;
         });
         row_sep(ui);
@@ -1236,25 +1225,14 @@ fn ftp_tab(ui: &mut egui::Ui, settings: &mut Settings, ftp: &mut crate::ftp::Ftp
     section(ui, "Connection", |ui| {
         ftp.poll_test();
         row(ui, "Check the server details work", None, |ui| {
-            // A proper fixed-size accent button (like Civitai's Save), not a
-            // text-hugging sliver.
-            let btn = egui::Button::new(
-                egui::RichText::new(if ftp.testing() { "Testing…" } else { "Test connection" })
-                    .color(egui::Color32::WHITE)
-                    .strong(),
-            )
-            .fill(crate::theme::ACCENT1())
-            // A huge radius clamps to half the button height → a full pill.
-            .corner_radius(egui::CornerRadius::same(255));
-            if ui
-                .add_enabled_ui(!ftp.testing(), |ui| ui.add_sized(egui::vec2(150.0, 30.0), btn))
-                .inner
-                .clicked()
-            {
+            let testing = ftp.testing();
+            let label = if testing { "Testing…" } else { "Test connection" };
+            if crate::scan::pill(ui, label, crate::scan::Pill::Accent, None, !testing).clicked() {
                 let params = ftp.params(settings);
                 ftp.start_test(params);
             }
-            if ftp.testing() {
+            if testing {
+                ui.add_space(8.0);
                 ui.add(egui::Spinner::new().size(16.0).color(MUTED()));
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
             }
@@ -1287,7 +1265,9 @@ fn tab_button(ui: &mut egui::Ui, settings: &mut Settings, tab: SettingsTab, labe
 /// Settings): accent-filled when selected, flat otherwise, with an optional
 /// red dot. True when clicked.
 pub(crate) fn side_tab(ui: &mut egui::Ui, selected: bool, label: &str, badge: bool) -> bool {
-    let text_color = if selected { egui::Color32::WHITE } else { TEXT() };
+    // Under Liquid Glass the selected tab is a ring, not an accent fill.
+    let ringed = selected && crate::theme::liquid_markers().is_some();
+    let text_color = if selected && !ringed { egui::Color32::WHITE } else { TEXT() };
     let fresh = fresh();
     let resp = ui
         .scope(|ui| {
@@ -1302,7 +1282,16 @@ pub(crate) fn side_tab(ui: &mut egui::Ui, selected: bool, label: &str, badge: bo
                 // should stand out (accent fill below).
                 .stroke(egui::Stroke::NONE)
                 .min_size(egui::vec2(ui.available_width() - 10.0, 32.0));
-            if selected {
+            if ringed {
+                // A white ring on dark glass (a dark one on light glass, where
+                // white wouldn't show), with a faint sheen inside it.
+                let (ring, sheen) = if crate::theme::is_light() {
+                    (TEXT().gamma_multiply(0.55), egui::Color32::from_white_alpha(70))
+                } else {
+                    (egui::Color32::from_white_alpha(210), egui::Color32::from_white_alpha(14))
+                };
+                btn = btn.fill(sheen).stroke(egui::Stroke::new(1.5_f32, ring));
+            } else if selected {
                 btn = btn.fill(if fresh { crate::theme::selection_outline() } else { crate::theme::ACCENT1() });
             } else {
                 // Quiet row: no fill until the theme's hover styling kicks in.
@@ -1458,12 +1447,8 @@ fn override_pill(ui: &mut egui::Ui, enabled: &mut bool, rgb: &mut [u8; 3], theme
         *enabled = true;
     }
     if *enabled {
-        ui.add_space(8.0);
-        if ui
-            .add(egui::Button::new(egui::RichText::new("Reset").size(11.0)))
-            .on_hover_text("Back to the theme's colour")
-            .clicked()
-        {
+        ui.add_space(10.0);
+        if button(ui, "Reset").on_hover_text("Back to the theme's colour").clicked() {
             *enabled = false;
         }
     }
@@ -1484,7 +1469,8 @@ pub(crate) fn row_sep(ui: &mut egui::Ui) {
 }
 
 /// A macOS-style sliding toggle switch. Clicking flips `on`; the knob and
-/// track colour animate between states.
+/// track colour animate between states. Liquid Glass has its own: a glass
+/// knob on a glowing gradient track (src/settings/glass_switch.rs).
 pub(crate) fn switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(40.0, 22.0), egui::Sense::click());
     if resp.clicked() {
@@ -1492,6 +1478,11 @@ pub(crate) fn switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
         resp.mark_changed();
     }
     let t = ui.ctx().animate_bool(resp.id, *on);
+    if crate::theme::liquid_markers().is_some() {
+        let hover = ui.ctx().animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.12);
+        glass_switch::paint(ui.painter(), rect, t, hover);
+        return resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
     let off = if crate::theme::is_light() {
         egui::Color32::from_gray(200)
     } else {
@@ -1593,6 +1584,165 @@ pub(crate) fn well_box(ui: &mut egui::Ui, edit: egui::TextEdit<'_>) -> egui::Res
         ),
     );
     resp
+}
+
+/// A button in the Settings look: Find Issues' outline pill (src/scan.rs).
+/// The one thing a card is there for gets [`accent_button`] instead.
+pub(crate) fn button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    crate::scan::pill(ui, label, crate::scan::Pill::Outline, None, true)
+}
+
+/// Find Issues' accent pill: white bold text on the theme's accent.
+pub(crate) fn accent_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    crate::scan::pill(ui, label, crate::scan::Pill::Accent, None, true)
+}
+
+/// A round [`button`] holding an icon (the voice recorder by Choose audio).
+pub(crate) fn icon_button(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, tip: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tip));
+    let resp = resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
+    if ui.is_rect_visible(rect) {
+        let hot = resp.hovered() || resp.has_focus();
+        crate::scan::paint_outline(ui.painter(), rect, hot);
+        let tint = crate::theme::icon_tint(if hot { TEXT() } else { MUTED() });
+        let at = egui::Rect::from_center_size(rect.center(), egui::vec2(15.0, 15.0));
+        egui::Image::new(icon).tint(tint).paint_at(ui, at);
+    }
+    resp
+}
+
+/// A small round ×, outlined only under the pointer: takes away what's
+/// beside it (a picked file). The app's close icon rather than a "✕"
+/// character, which not every system's fonts have.
+pub(crate) fn clear_button(ui: &mut egui::Ui, tip: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tip));
+    let resp = resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
+    if ui.is_rect_visible(rect) {
+        let hot = resp.hovered() || resp.has_focus();
+        if hot {
+            ui.painter().rect_filled(rect, 12.0, TEXT().gamma_multiply(0.08));
+        }
+        let tint = crate::theme::icon_tint(if hot { TEXT() } else { MUTED() });
+        let at = egui::Rect::from_center_size(rect.center(), egui::vec2(14.0, 14.0));
+        egui::Image::new(egui::include_image!("../icons/close.svg")).tint(tint).paint_at(ui, at);
+    }
+    resp
+}
+
+/// A few short choices as one sunk pill (the [`pill_field`]s' well), the
+/// chosen one filled in the theme's accent (glass under Liquid Glass) and
+/// sliding over when it changes:
+/// Link's Off / Host / Receiver. Each choice is `seg_w` wide. True when the
+/// choice changed.
+pub(crate) fn segmented<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    current: &mut T,
+    options: &[(T, &str)],
+    seg_w: f32,
+) -> bool {
+    const H: f32 = 34.0;
+    const PAD: f32 = 3.0;
+    let id = ui.id().with(("segmented", id_salt));
+    let size = egui::vec2(seg_w * options.len() as f32 + 2.0 * PAD, H);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let seg = |i: f32| {
+        egui::Rect::from_min_size(rect.min + egui::vec2(PAD + i * seg_w, PAD), egui::vec2(seg_w, H - 2.0 * PAD))
+    };
+    let chosen = options.iter().position(|o| o.0 == *current).unwrap_or(0);
+    let mut changed = false;
+    let mut hovered = None;
+    for (i, (value, label)) in options.iter().enumerate() {
+        let resp = ui.interact(seg(i as f32), id.with(i), egui::Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, i == chosen, *label));
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if resp.hovered() {
+            hovered = Some(i);
+        }
+        if resp.clicked() && i != chosen {
+            *current = *value;
+            changed = true;
+        }
+    }
+    let at = ui.ctx().animate_value_with_time(id.with("at"), chosen as f32, 0.18);
+    if !ui.is_rect_visible(rect) {
+        return changed;
+    }
+    let p = ui.painter();
+    let well = if crate::theme::liquid_markers().is_some() { PANEL() } else { well_fill() };
+    p.rect_filled(rect, H / 2.0, well);
+    p.rect_stroke(rect, H / 2.0, egui::Stroke::new(1.0_f32, hairline()), egui::StrokeKind::Inside);
+    let r = (H - 2.0 * PAD) / 2.0;
+    if let Some(i) = hovered.filter(|&i| i != chosen) {
+        p.rect_filled(seg(i as f32), r, TEXT().gamma_multiply(0.06));
+    }
+    // The chosen one: the accent, or under Liquid Glass a frosted lens of
+    // glass raised out of the well.
+    let glass = crate::liquid_glass::active();
+    if glass {
+        let cb = crate::liquid_glass::callback(seg(at), egui::CornerRadius::from(r), segment_glass(), p.opacity());
+        p.add(egui::Shape::Callback(cb));
+    } else {
+        p.rect_filled(seg(at), r, crate::theme::selection_outline());
+    }
+    // The label of the chosen one: white on the accent, the text colour on
+    // the glass (white glass in Light would swallow white text).
+    let lit_ink = if glass { TEXT() } else { egui::Color32::WHITE };
+    for (i, (_, label)) in options.iter().enumerate() {
+        let lit = (1.0 - (at - i as f32).abs()).clamp(0.0, 1.0);
+        let rest = if hovered == Some(i) { TEXT() } else { MUTED() };
+        p.text(seg(i as f32).center(), egui::Align2::CENTER_CENTER, *label, bold(12.5), mix(rest, lit_ink, lit));
+    }
+    changed
+}
+
+/// The glass of [`segmented`]'s chosen choice under Liquid Glass: a frosted
+/// lens whose rim bends the card behind it, with a soft shadow.
+fn segment_glass() -> crate::liquid_glass::Style {
+    let light = crate::theme::is_light();
+    crate::liquid_glass::Style {
+        blur: 2.5,
+        bezel: 7.0,
+        refract: 4.0,
+        tint: [1.0, 1.0, 1.0, if light { 0.72 } else { 0.2 }],
+        vibrancy: 0.25,
+        spec: 0.95,
+        shadow: [0.0, 2.5, 8.0, if light { 0.2 } else { 0.42 }],
+    }
+}
+
+/// A number box in the [`pill_field`]s' look (a sunk pill, ringed in the
+/// accent while it's typed in), `width` wide: the port fields. `value`
+/// keeps its own behaviour (its range, dragging or not).
+pub(crate) fn pill_number(ui: &mut egui::Ui, width: f32, value: egui::DragValue<'_>) -> egui::Response {
+    let well = if crate::theme::liquid_markers().is_some() { PANEL() } else { well_fill() };
+    let rest = if liquid_main() { EDGE() } else { egui::Color32::TRANSPARENT };
+    // Centred both ways, shown or being typed in.
+    let layout = egui::Layout::centered_and_justified(egui::Direction::TopDown);
+    ui.allocate_ui_with_layout(egui::vec2(width, 32.0), layout, |ui| {
+        let style = ui.style_mut();
+        style.spacing.interact_size = egui::vec2(width, 32.0);
+        style.spacing.button_padding = egui::vec2(14.0, 0.0);
+        let v = &mut style.visuals;
+        v.text_edit_bg_color = Some(well);
+        v.selection.stroke = egui::Stroke::new(1.0_f32, crate::theme::selection_outline());
+        // Explicit: the Light theme's widget text is white (for its blue
+        // buttons).
+        v.override_text_color = Some(TEXT());
+        let hot = TEXT().gamma_multiply(0.18);
+        for (w, edge) in [(&mut v.widgets.inactive, rest), (&mut v.widgets.hovered, hot), (&mut v.widgets.active, hot)] {
+            w.bg_fill = well;
+            w.weak_bg_fill = well;
+            w.bg_stroke = egui::Stroke::new(1.0_f32, edge);
+            w.fg_stroke.color = TEXT();
+            w.corner_radius = egui::CornerRadius::same(16);
+            w.expansion = 0.0;
+        }
+        ui.add(value)
+    })
+    .inner
 }
 
 /// Find Issues' folder field and list: sunk below the cards (darker in dark
@@ -2224,5 +2374,39 @@ mod tests {
         for (label, control) in labels.iter().zip([rig.state.slider, rig.state.check]) {
             assert!((label.center().y - control.center().y).abs() < 1.0, "{label:?} beside {control:?}");
         }
+    }
+
+    /// Clicking one of a [`super::segmented`]'s choices picks it, once;
+    /// clicking the one already picked changes nothing.
+    #[test]
+    fn a_segment_click_picks_it() {
+        use crate::slider::rig::Rig;
+        struct Mode {
+            value: u8,
+            changes: usize,
+            /// The app's fonts are in (it draws in the bold one).
+            fonts: bool,
+        }
+        fn scene(ui: &mut egui::Ui, s: &mut Mode) {
+            let options = [(0_u8, "Off"), (1, "Host"), (2, "Receiver")];
+            if s.fonts && super::segmented(ui, "mode", &mut s.value, &options, 84.0) {
+                s.changes += 1;
+            }
+        }
+        let mut rig = Rig::new(Mode { value: 0, changes: 0, fonts: false }, scene);
+        crate::install_fallback_fonts(&rig.ctx);
+        rig.state.fonts = true;
+        rig.idle();
+        let receiver = rig.texts("Receiver")[0].center();
+        rig.click(receiver);
+        rig.idle();
+        assert_eq!((rig.state.value, rig.state.changes), (2, 1));
+        rig.click(receiver);
+        rig.idle();
+        assert_eq!((rig.state.value, rig.state.changes), (2, 1), "already picked");
+        let off = rig.texts("Off")[0].center();
+        rig.click(off);
+        rig.idle();
+        assert_eq!((rig.state.value, rig.state.changes), (0, 2));
     }
 }

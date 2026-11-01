@@ -38,7 +38,7 @@ use serde_json::Value;
 
 pub(crate) use peer::{BlobSrc, Call, CallEvent, HostInfo, Incoming, Peer, Services};
 
-use crate::theme::{ACCENT1, MUTED, TEXT};
+use crate::theme::{MUTED, TEXT};
 
 /// What this PC does in Link.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -859,12 +859,16 @@ fn status_line(ui: &mut egui::Ui, color: egui::Color32, text: &str) {
     ui.label(egui::RichText::new(text).color(color).size(12.0));
 }
 
-/// A filled pill button (white text on the accent), like the other tabs'.
-fn pill(ui: &mut egui::Ui, text: &str, width: f32, enabled: bool) -> bool {
-    let btn = egui::Button::new(egui::RichText::new(text).color(egui::Color32::WHITE).strong())
-        .fill(ACCENT1())
-        .corner_radius(egui::CornerRadius::same(255));
-    ui.add_enabled_ui(enabled, |ui| ui.add_sized(egui::vec2(width, 28.0), btn)).inner.clicked()
+/// The room a list row's buttons take at its right end, gaps and all: its
+/// name and line wrap short of them.
+fn buttons_w(ui: &egui::Ui, labels: &[&str]) -> f32 {
+    labels.iter().map(|l| crate::scan::pill_width(ui, l, crate::scan::Pill::Outline) + 8.0).sum::<f32>() + 4.0
+}
+
+/// The accent pill (white bold text on the accent), like the other tabs';
+/// greyed out unless `enabled`. True when clicked.
+fn pill(ui: &mut egui::Ui, text: &str, enabled: bool) -> bool {
+    crate::scan::pill(ui, text, crate::scan::Pill::Accent, None, enabled).clicked()
 }
 
 fn ago(secs: u64) -> String {
@@ -882,23 +886,8 @@ fn ago(secs: u64) -> String {
 }
 
 fn mode_picker(ui: &mut egui::Ui, mode: &mut LinkMode) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        for (m, label) in [(LinkMode::Off, "Off"), (LinkMode::Host, "Host"), (LinkMode::Receiver, "Receiver")] {
-            let on = *mode == m;
-            let text = egui::RichText::new(label).color(if on { egui::Color32::WHITE } else { TEXT() }).strong();
-            let mut btn = egui::Button::new(text).corner_radius(egui::CornerRadius::same(255));
-            if on {
-                btn = btn.fill(ACCENT1());
-            }
-            if ui.add_sized(egui::vec2(78.0, 28.0), btn).clicked() && !on {
-                *mode = m;
-                changed = true;
-            }
-        }
-    });
-    changed
+    let modes = [(LinkMode::Off, "Off"), (LinkMode::Host, "Host"), (LinkMode::Receiver, "Receiver")];
+    crate::settings::segmented(ui, "link_mode", mode, &modes, 84.0)
 }
 
 /// The Link tab of the Settings window.
@@ -942,7 +931,7 @@ pub fn settings_tab(ui: &mut egui::Ui, settings: &mut crate::settings::Settings,
             section(ui, "Send files", |ui| {
                 for (key, name) in targets {
                     row(ui, &format!("Send a zip to {name}"), Some("Images and videos: right-click them in the browser"), |ui| {
-                        if ui.button("Choose zip…").clicked()
+                        if crate::settings::button(ui, "Choose zip…").clicked()
                             && let Some(path) = rfd::FileDialog::new().add_filter("Zip archive", &["zip"]).pick_file()
                         {
                             link.send(&key, vec![path]);
@@ -954,12 +943,13 @@ pub fn settings_tab(ui: &mut egui::Ui, settings: &mut crate::settings::Settings,
         section(ui, "Received files", |ui| {
             let dir = received_dir(&settings.link);
             row(ui, "Save files to", Some(&dir.display().to_string()), |ui| {
-                if ui.button("Change…").clicked()
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if crate::settings::button(ui, "Change…").clicked()
                     && let Some(d) = rfd::FileDialog::new().set_directory(&dir).pick_folder()
                 {
                     settings.link.received_folder = d.display().to_string();
                 }
-                if !settings.link.received_folder.is_empty() && ui.button("Default").clicked() {
+                if !settings.link.received_folder.is_empty() && crate::settings::button(ui, "Default").clicked() {
                     settings.link.received_folder.clear();
                 }
             });
@@ -1035,11 +1025,13 @@ fn host_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings, link: &m
                                 .color(MUTED())
                                 .size(11.5),
                         );
+                        ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            if ui.button("New code").clicked() {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            if crate::settings::button(ui, "New code").clicked() {
                                 shared.open_pairing();
                             }
-                            if ui.button("Stop").clicked() {
+                            if crate::settings::button(ui, "Stop").clicked() {
                                 shared.close_pairing();
                             }
                         });
@@ -1052,7 +1044,7 @@ fn host_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings, link: &m
                 );
             }
             None => {
-                if pill(ui, "Add a device", 140.0, true) {
+                if pill(ui, "Add a device", true) {
                     shared.open_pairing();
                 }
                 hint(ui, "Shows a code to type on the other PC. Paired devices are remembered.");
@@ -1145,13 +1137,14 @@ fn host_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings, link: &m
             };
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
+                    ui.set_max_width(ui.available_width() - buttons_w(ui, &["Forget"]));
                     ui.label(egui::RichText::new(&d.name).color(TEXT()).size(13.0)).on_hover_text(format!("Identity {fp}"));
                     ui.label(
                         egui::RichText::new(&sub).color(if live.is_some() { GREEN } else { MUTED() }).size(10.5),
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Forget").on_hover_text("It has to pair again to use this PC").clicked() {
+                    if crate::settings::button(ui, "Forget").on_hover_text("It has to pair again to use this PC").clicked() {
                         let _ = trust::Trust::update(&link_dir(), |t| t.devices.retain(|x| x.key != d.key));
                         if let Some(k) = crypto::from_hex(&d.key) {
                             shared.drop_device(&k);
@@ -1183,10 +1176,10 @@ fn receiver_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings, link
                     egui::TextEdit::singleline(&mut settings.link.host_addr).hint_text("192.168.1.23"),
                 );
                 if busy {
-                    if ui.button("Disconnect").clicked() {
+                    if crate::settings::button(ui, "Disconnect").clicked() {
                         link.disconnect();
                     }
-                } else if ui.button("Connect").clicked() {
+                } else if pill(ui, "Connect", true) {
                     let target = addr::with_port(&settings.link.host_addr, settings.link.port);
                     // A remembered host at that address reconnects without a code.
                     let t = trust::Trust::load(&link_dir());
@@ -1199,8 +1192,9 @@ fn receiver_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings, link
         });
         // On this network.
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
             let finding = link.finding.is_some();
-            if ui.add_enabled(!finding, egui::Button::new("Find hosts")).clicked() {
+            if crate::scan::pill(ui, "Find hosts", crate::scan::Pill::Outline, None, !finding).clicked() {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let port = settings.link.port;
                 let ctx = link.ctx.clone();
@@ -1223,10 +1217,11 @@ fn receiver_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings, link
         });
         for f in link.found.clone() {
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
                 ui.label(egui::RichText::new(&f.name).color(TEXT()).size(12.5)).on_hover_text(format!("Identity {}", f.fp));
                 ui.label(egui::RichText::new(&f.ip).color(MUTED()).size(11.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Use").clicked() {
+                    if crate::settings::button(ui, "Use").clicked() {
                         settings.link.host_addr = if f.port == addr::DEFAULT_PORT { f.ip.clone() } else { f.addr() };
                         let t = trust::Trust::load(&link_dir());
                         let known = t.hosts.iter().find(|h| {
@@ -1272,6 +1267,7 @@ fn receiver_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings, link
                 status_line(ui, TEXT(), &format!("{host} doesn't know this PC yet — enter the code it shows"));
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
                     let resp = crate::settings::pill_field(
                         ui,
                         110.0,
@@ -1279,7 +1275,7 @@ fn receiver_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings, link
                     );
                     let code = crypto::normalize_code(&link.code_input);
                     let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if (pill(ui, "Pair", 80.0, code.is_some()) || enter)
+                    if (pill(ui, "Pair", code.is_some()) || enter)
                         && let Some(code) = code
                     {
                         let target = link.client.as_ref().map(|c| c.target.clone()).unwrap_or_default();
@@ -1331,19 +1327,22 @@ fn receiver_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings, link
             let on = current.as_deref() == Some(h.key.as_str());
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
+                    let buttons: &[&str] = if on { &["Forget"] } else { &["Forget", "Connect"] };
+                    ui.set_max_width(ui.available_width() - buttons_w(ui, buttons));
                     ui.label(egui::RichText::new(&h.name).color(TEXT()).size(13.0)).on_hover_text(format!("Identity {fp}"));
                     let sub = if on { format!("{} · connected", h.addr) } else { format!("{} · last used {}", h.addr, ago(h.last_seen)) };
                     ui.label(egui::RichText::new(sub).color(if on { GREEN } else { MUTED() }).size(10.5));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Forget").on_hover_text("Pairing again will need a new code").clicked() {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if crate::settings::button(ui, "Forget").on_hover_text("Pairing again will need a new code").clicked() {
                         let _ = trust::Trust::update(&link_dir(), |t| t.hosts.retain(|x| x.key != h.key));
                         if on {
                             link.disconnect();
                         }
                         link.trust_read = None;
                     }
-                    if !on && ui.button("Connect").clicked() {
+                    if !on && crate::settings::button(ui, "Connect").clicked() {
                         settings.link.host_addr = h.addr.clone();
                         link.connect_known(h.key.clone(), h.addr.clone());
                     }
@@ -1361,7 +1360,7 @@ fn receiver_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings, link
 fn port_field(ui: &mut egui::Ui, port: &mut u16) {
     let mut p = *port as u32;
     let field = egui::DragValue::new(&mut p).range(1024..=65535).speed(0.0).update_while_editing(false);
-    if ui.add(field).changed() {
+    if crate::settings::pill_number(ui, 96.0, field).changed() {
         *port = p as u16;
     }
 }
@@ -1415,11 +1414,11 @@ pub fn offer_prompt(ctx: &egui::Context, link: &mut LinkState) {
             ui.checkbox(&mut always, format!("Always accept files from {}", offer.from));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if ui.add_sized(egui::vec2(100.0, 30.0), egui::Button::new("Decline")).clicked() {
+                if crate::settings::button(ui, "Decline").clicked() {
                     answer = Some(files::Answer::Decline);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if pill(ui, "Accept", 100.0, true) {
+                    if pill(ui, "Accept", true) {
                         answer = Some(files::Answer::Accept { always });
                     }
                 });

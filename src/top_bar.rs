@@ -474,14 +474,14 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool, update_bad
 /// buttons: theme fill and hover (no accent, no drop shadow) and the theme text
 /// color — just rendered at a fixed width.
 /// A top-bar action button with a leading SVG icon (tinted to the button's label
-/// colour so it matches in every theme).
+/// colour so it matches in every theme), pill-shaped.
 fn bar_button_icon(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, label: &str, width: f32) -> egui::Response {
     let tint = ui.visuals().widgets.inactive.fg_stroke.color;
     let img = egui::Image::new(icon).fit_to_exact_size(egui::vec2(16.0, 16.0)).tint(tint);
     ui.add_sized(
         egui::vec2(width, 34.0),
         egui::Button::image_and_text(img, egui::RichText::new(label).size(15.0))
-            .corner_radius(CornerRadius::same(12)),
+            .corner_radius(CornerRadius::same(17)), // half the height: a pill
     )
 }
 

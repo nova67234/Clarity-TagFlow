@@ -64,40 +64,43 @@ impl Style {
     /// The glass of `kind`, light or dark.
     pub fn of(kind: Kind, light: bool) -> Style {
         match (kind, light) {
+            // Apple-style: the rim does the work (a strong lens), the middle
+            // is only lightly frosted ("a softer scattering"), enough to keep
+            // text on it readable.
             (Kind::Panel, false) => Style {
-                blur: 14.0,
-                bezel: 24.0,
-                refract: 13.0,
-                tint: [0.06, 0.065, 0.08, 0.48],
+                blur: 8.0,
+                bezel: 40.0,
+                refract: 46.0,
+                tint: [0.06, 0.065, 0.08, 0.40],
                 vibrancy: 0.35,
-                spec: 0.55,
+                spec: 0.7,
                 shadow: [0.0, 8.0, 26.0, 0.30],
             },
             (Kind::Float, false) => Style {
-                blur: 18.0,
-                bezel: 22.0,
-                refract: 12.0,
-                tint: [0.07, 0.075, 0.09, 0.56],
+                blur: 11.0,
+                bezel: 38.0,
+                refract: 42.0,
+                tint: [0.07, 0.075, 0.09, 0.48],
                 vibrancy: 0.35,
-                spec: 0.6,
+                spec: 0.75,
                 shadow: [0.0, 12.0, 34.0, 0.42],
             },
             (Kind::Panel, true) => Style {
-                blur: 14.0,
-                bezel: 24.0,
-                refract: 13.0,
-                tint: [0.97, 0.975, 0.99, 0.52],
+                blur: 8.0,
+                bezel: 40.0,
+                refract: 46.0,
+                tint: [0.97, 0.975, 0.99, 0.44],
                 vibrancy: 0.25,
-                spec: 0.8,
+                spec: 0.9,
                 shadow: [0.0, 8.0, 26.0, 0.14],
             },
             (Kind::Float, true) => Style {
-                blur: 18.0,
-                bezel: 22.0,
-                refract: 12.0,
-                tint: [0.97, 0.975, 0.99, 0.6],
+                blur: 11.0,
+                bezel: 38.0,
+                refract: 42.0,
+                tint: [0.97, 0.975, 0.99, 0.52],
                 vibrancy: 0.25,
-                spec: 0.85,
+                spec: 0.95,
                 shadow: [0.0, 12.0, 34.0, 0.2],
             },
         }
@@ -226,8 +229,74 @@ fn glassify_with(ctx: &egui::Context, markers: &Markers) {
 /// A marked rectangle inside glass already placed on its layer (a window's
 /// title bar, a card on a panel) isn't glass on glass: it's this quiet tint.
 fn nested_tint(light: bool, opacity: f32) -> Color32 {
-    let tint = if light { Color32::from_white_alpha(90) } else { Color32::from_white_alpha(14) };
+    // On dark glass a card is a neutral dark grey, darker than what it's on,
+    // so its text stands out.
+    let tint = if light { Color32::from_white_alpha(90) } else { Color32::from_rgba_unmultiplied(30, 31, 34, 92) };
     tint.gamma_multiply(opacity)
+}
+
+/// A card on glass, caved in: [`nested_tint`] with a soft shadow along the
+/// inside of its top edge (the upper lip shading the well) and a faint light
+/// line along its bottom edge (the lower lip catching the light). Thin
+/// strips (a window's title bar) stay flat.
+fn sunken(r: &egui::epaint::RectShape, light: bool, opacity: f32) -> Shape {
+    let fill = nested_tint(light, opacity);
+    if r.rect.height() < 36.0 || r.rect.width() < 60.0 {
+        let mut flat = r.clone();
+        flat.fill = fill;
+        return Shape::Rect(flat);
+    }
+    let mut well = r.clone();
+    well.fill = fill;
+    well.stroke = egui::Stroke::NONE;
+    let mut shapes = vec![Shape::Rect(well)];
+    // Each edge is a smooth gradient: many fine, overlapping lines, each
+    // fainter than the last (a few separate ones showed as bands).
+    let mut fade = |top: bool, color: Color32, depth: f32, steps: usize| {
+        for i in 0..steps {
+            let f = i as f32 / steps as f32;
+            // Eased: strongest at the edge, gone smoothly by `depth`.
+            let k = (1.0 - f) * (1.0 - f);
+            let line = half_outline(r.rect, r.corner_radius, 0.5 + f * depth, top);
+            let width = 1.4 * depth / steps as f32 + 0.25;
+            shapes.push(Shape::line(line, egui::Stroke::new(width, color.gamma_multiply(k * opacity))));
+        }
+    };
+    // Per line: overlapping lines add up, so each is faint.
+    fade(true, Color32::from_black_alpha(if light { 9 } else { 30 }), 7.0, 14);
+    fade(false, Color32::from_white_alpha(if light { 40 } else { 8 }), 2.5, 5);
+    Shape::Vec(shapes)
+}
+
+/// The top (or bottom) half of `rect`'s rounded outline, `inset` inside it:
+/// from the middle of one side, round the corners, to the middle of the other.
+fn half_outline(rect: Rect, corners: CornerRadius, inset: f32, top: bool) -> Vec<egui::Pos2> {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let rc = rect.shrink(inset);
+    let most = rc.width().min(rc.height()) / 2.0;
+    let rad = |v: u8| (v as f32 - inset).clamp(0.0, most);
+    let mut pts = Vec::with_capacity(20);
+    let mut arc = |c: egui::Pos2, r: f32, from: f32| {
+        for i in 0..=8 {
+            let a = from + FRAC_PI_2 * i as f32 / 8.0;
+            pts.push(egui::pos2(c.x + r * a.cos(), c.y + r * a.sin()));
+        }
+    };
+    let cy = rc.center().y;
+    if top {
+        let (nw, ne) = (rad(corners.nw), rad(corners.ne));
+        arc(egui::pos2(rc.left() + nw, rc.top() + nw), nw, PI);
+        arc(egui::pos2(rc.right() - ne, rc.top() + ne), ne, PI + FRAC_PI_2);
+        pts.insert(0, egui::pos2(rc.left(), cy));
+        pts.push(egui::pos2(rc.right(), cy));
+    } else {
+        let (se, sw) = (rad(corners.se), rad(corners.sw));
+        arc(egui::pos2(rc.right() - se, rc.bottom() - se), se, 0.0);
+        arc(egui::pos2(rc.left() + sw, rc.bottom() - sw), sw, FRAC_PI_2);
+        pts.insert(0, egui::pos2(rc.right(), cy));
+        pts.push(egui::pos2(rc.left(), cy));
+    }
+    pts
 }
 
 /// Glass in place of `shape` if it's a marked rectangle — or holds one (a
@@ -241,7 +310,7 @@ fn swap(shape: &mut Shape, markers: &Markers, placed: &mut Vec<Rect>, clip: Rect
             // On glass by the part that shows: a card scrolled partly out of
             // sight past its panel's edge is still on the panel.
             Some((_, opacity)) if placed.iter().any(|p| p.expand(0.5).contains_rect(r.rect.intersect(clip))) => {
-                r.fill = nested_tint(markers.light, opacity);
+                *shape = sunken(r, markers.light, opacity);
                 false
             }
             Some((kind, opacity)) => {
@@ -375,8 +444,9 @@ fn paint(
     if cw <= 0 || ch <= 0 {
         return;
     }
-    // At half size: the frost hides it, and it's a quarter of the copying.
-    let side = |n: i32| ((n as u32 / 2).max(8).next_power_of_two() as i32).min(MAX_SIDE);
+    // At full size: the rim shows what it bends crisp (at half size it went
+    // soft, and read as frost rather than glass).
+    let side = |n: i32| ((n as u32).max(8).next_power_of_two() as i32).min(MAX_SIDE);
     let size = [side(cw), side(ch)];
     let lod = (blur * size[0] as f32 / cw as f32).max(1.0).log2();
 
@@ -596,13 +666,20 @@ vec3 frosted(vec2 at, float lod) {
 }
 
 // How far the rim shifts what's behind, as a share of `u_refract`, at `x`
-// across it (0 at the outer edge, 1 where the top is flat). The rim is
-// rounded like a lens, its slope easing off across its whole width, so what
-// passes under an edge is magnified as it nears it: about twice halfway
-// across (with the shift at about half the rim's width), more at the edge.
+// across it (0 at the outer edge, 1 where the top is flat). Apple's Liquid
+// Glass bends light rather than scattering it: the rim is a convex squircle
+// (height (1 - (1 - x)^4)^(1/4)), steep at the very edge and flattening fast,
+// and a ray through it refracts by Snell's law into glass of index 1.5. Most
+// of the bending is in the outer part of the rim, where what's behind is
+// squeezed into a thin, crisp band — the "water in the glass" look.
 float bend(float x) {
-    float u = 1.0 - x;
-    return u * u;
+    float u = clamp(1.0 - x, 0.0, 0.9999);
+    float u3 = u * u * u;
+    float slope = u3 * pow(max(1.0 - u3 * u, 1e-4), -0.75);
+    float t1 = atan(slope);
+    float t2 = asin(sin(t1) / 1.5);
+    // tan(90° - asin(1 / 1.5)): the most it bends, at the edge.
+    return tan(t1 - t2) / 1.118;
 }
 
 void main() {
@@ -629,14 +706,15 @@ void main() {
     // edge than the frosted middle.
     float shift = u_refract * bend(x);
     vec2 at = frag - n * shift;
-    float clear = pow(rim, 1.5);
-    float lod = mix(u_lod, min(u_lod, 1.0), clear);
+    // The rim is polished, so what it bends shows crisp.
+    float clear = pow(rim, 1.2);
+    float lod = mix(u_lod, 0.0, clear);
     vec3 c = frosted(at, lod);
-    // A hint of colour fringing where the rim bends most.
+    // Colour fringing where the rim bends most, as through water.
     float fringe = rim * rim;
     if (fringe > 0.002) {
-        vec2 ur = (at - n * shift * 0.12 - u_cap.xy) / u_cap.zw;
-        vec2 ub = (at + n * shift * 0.12 - u_cap.xy) / u_cap.zw;
+        vec2 ur = (at - n * shift * 0.2 - u_cap.xy) / u_cap.zw;
+        vec2 ub = (at + n * shift * 0.2 - u_cap.xy) / u_cap.zw;
         c.r = mix(c.r, textureLod(u_backdrop, ur, lod).r, fringe * 0.6);
         c.b = mix(c.b, textureLod(u_backdrop, ub, lod).b, fringe * 0.6);
     }
@@ -660,6 +738,11 @@ void main() {
     float spec = edge * (0.14 + 0.80 * t3 + 0.50 * a3)
         + sheen * (0.50 * t3 + 0.22 * a3);
     c = c * (1.0 - 0.10 * sheen * away) + vec3(spec * u_spec);
+    // The light that comes in through the lit rim gathers on the far side,
+    // a soft glow inside the rim away from the light (a caustic, as in a
+    // glass of water).
+    float caustic = rim * rim * (1.0 - rim) * 4.0 * a3;
+    c += vec3(0.10 * caustic * u_spec);
 
     c = clamp(c, 0.0, 1.0);
     o_color = (vec4(c * cover, cover) + vec4(0.0, 0.0, 0.0, shadow)) * u_opacity;
@@ -778,6 +861,15 @@ mod tests {
         let card = Rect::from_min_max(pos2(10.0, 80.0), pos2(90.0, 140.0));
         let mut shape = Shape::rect_filled(card, 8, MARKERS.panel);
         assert!(!swap(&mut shape, &MARKERS, &mut vec![panel], panel.shrink(4.0), &mut no_reach()));
+        // Caved in: the tinted well first, then its shading.
+        assert!(
+            matches!(&shape, Shape::Vec(v) if matches!(v.first(), Some(Shape::Rect(r)) if r.fill == nested_tint(false, 1.0))),
+            "{shape:?}"
+        );
+        // A thin strip on glass (a title bar) is the tint, flat.
+        let bar = Rect::from_min_size(pos2(10.0, 10.0), vec2(80.0, 24.0));
+        let mut shape = Shape::rect_filled(bar, 0, MARKERS.panel);
+        assert!(!swap(&mut shape, &MARKERS, &mut vec![panel], Rect::EVERYTHING, &mut no_reach()));
         assert!(matches!(&shape, Shape::Rect(r) if r.fill == nested_tint(false, 1.0)), "{shape:?}");
         // Where it shows off the panel, it's glass of its own.
         let mut shape = Shape::rect_filled(card, 8, MARKERS.panel);

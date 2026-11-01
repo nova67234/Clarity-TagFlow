@@ -97,6 +97,21 @@ confirmation, not a hover effect — hovering still shows the normal theme glow.
 - **Utility buttons** (e.g. "Get Models"): **110 × 30**, radius **12**.
 - **Icon-only buttons**: icon ~16–20px inside a borderless button.
 
+### Buttons in the Settings window (and its tabs in other files)
+The Settings window has Find Issues' look (sunk pill fields, pill dropdowns,
+glass cards under Liquid Glass), so a plain `ui.button(..)` there looks out of
+place: small and boxy, and solid blue in Light (pink in Aurora). Use the helpers
+in `src/settings.rs` instead:
+- `button(ui, "Forget")`: the outline pill (32 tall), for most actions.
+- `accent_button(ui, "Connect")`: the accent pill (34 tall), for the one thing
+  a card is there for. With a greyed-out state: `crate::scan::pill(..)`.
+- `icon_button(ui, icon, tip)`: a round outline button with an icon.
+  `clear_button(ui, tip)`: a small × to remove a picked file.
+- `segmented(ui, ..)`: a few short choices (Link's Off / Host / Receiver).
+- `pill_number(ui, width, DragValue)`: a number box that matches `pill_field`.
+- The window's tabs start with no horizontal spacing (`item_spacing.x` 0), so a
+  row with two things side by side sets its own (8–10).
+
 ---
 
 ## 4. Pop-up dialog layout (the standard recipe)

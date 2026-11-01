@@ -1167,13 +1167,25 @@ pub(crate) enum Pill {
     Outline,
 }
 
-/// A pill-shaped footer button, painted the same in every theme. `flash`
-/// fills it for the click-flash.
-pub(crate) fn pill(ui: &mut egui::Ui, label: &str, kind: Pill, flash: Option<Color32>, enabled: bool) -> egui::Response {
+/// A [`pill`]'s label laid out, and the pill's size.
+fn pill_layout(ui: &egui::Ui, label: &str, kind: Pill) -> (std::sync::Arc<egui::Galley>, egui::Vec2) {
     let font = if kind == Pill::Accent { bold(13.5) } else { egui::FontId::proportional(12.5) };
     let galley = ui.painter().layout_no_wrap(label.to_string(), font, Color32::PLACEHOLDER);
     let (pad, h) = if kind == Pill::Accent { (24.0, 34.0) } else { (17.0, 32.0) };
     let size = egui::vec2((galley.size().x + 2.0 * pad).max(if kind == Pill::Accent { 108.0 } else { 0.0 }), h);
+    (galley, size)
+}
+
+/// How wide a [`pill`] with `label` is (to leave room for one).
+pub(crate) fn pill_width(ui: &egui::Ui, label: &str, kind: Pill) -> f32 {
+    pill_layout(ui, label, kind).1.x
+}
+
+/// A pill-shaped footer button, painted the same in every theme. `flash`
+/// fills it for the click-flash.
+pub(crate) fn pill(ui: &mut egui::Ui, label: &str, kind: Pill, flash: Option<Color32>, enabled: bool) -> egui::Response {
+    let (galley, size) = pill_layout(ui, label, kind);
+    let h = size.y;
     let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(size, sense);
     let hot = enabled && (resp.hovered() || resp.has_focus());
@@ -1203,15 +1215,27 @@ pub(crate) fn pill(ui: &mut egui::Ui, label: &str, kind: Pill, flash: Option<Col
             };
             painter.rect_filled(rect, h / 2.0, fill);
         }
-        (Pill::Outline, None) => {
-            let fill = if hot { card_fill().lerp_to_gamma(TEXT(), 0.05) } else { card_fill() };
-            painter.rect_filled(rect, h / 2.0, fill);
-            let edge = if hot { TEXT().gamma_multiply(0.3) } else { hairline_strong() };
-            painter.rect_stroke(rect, h / 2.0, egui::Stroke::new(1.0_f32, edge), egui::StrokeKind::Inside);
-        }
+        (Pill::Outline, None) => paint_outline(painter, rect, hot),
     }
     painter.galley(rect.center() - galley.size() / 2.0, galley, ink);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp }
+}
+
+/// The outline pill's body over `rect` (round ends), lit up when `hot`
+/// (under the pointer or focused). For buttons of other shapes in its look:
+/// the round icon buttons in Settings.
+pub(crate) fn paint_outline(painter: &egui::Painter, rect: egui::Rect, hot: bool) {
+    let r = rect.height() / 2.0;
+    painter.rect_filled(rect, r, card_fill());
+    // The lift goes over the fill, not into it: under Liquid Glass the fill
+    // is the colour that turns into glass, and a mixed one would be drawn as
+    // it is — a dark pill on hover.
+    if hot {
+        painter.rect_filled(rect, r, TEXT().gamma_multiply(0.05));
+    }
+    let edge = if hot { TEXT().gamma_multiply(0.3) } else { hairline_strong() };
+    painter.rect_stroke(rect, r, egui::Stroke::new(1.0_f32, edge), egui::StrokeKind::Inside);
 }
 
 fn paint_icon_button(

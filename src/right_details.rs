@@ -786,8 +786,8 @@ pub fn show(
                                     let size = egui::vec2(btn_w, 35.0);
                                     let label = |t: &str| egui::RichText::new(t).size(15.0);
 
-                                    // Rounder corners than the default (8) for all the buttons.
-                                    let r = egui::CornerRadius::same(12);
+                                    // Pills: half the 35-point height (rounded up).
+                                    let r = egui::CornerRadius::same(18);
                                     ui.visuals_mut().widgets.inactive.corner_radius = r;
                                     ui.visuals_mut().widgets.hovered.corner_radius = r;
                                     ui.visuals_mut().widgets.active.corner_radius = r;
@@ -1802,7 +1802,7 @@ pub(crate) fn delete_confirm_dialog(
                 ui.add_space(16.0);
 
                 // Scope for checkbox to ensure it acts as a true square
-                // with slightly rounded 4px edges (instead of inheriting 12px pill curves)
+                // with slightly rounded 4px edges (instead of inheriting the pill curves)
                 ui.scope(|ui| {
                     let r = egui::CornerRadius::same(4);
                     ui.visuals_mut().widgets.inactive.corner_radius = r;
@@ -1824,8 +1824,8 @@ pub(crate) fn delete_confirm_dialog(
                     ui.add_space((ui.available_width() - total_w) / 2.0);
                     ui.spacing_mut().item_spacing.x = gap;
 
-                    // Add matching soft-corners to the inner action buttons
-                    let r = egui::CornerRadius::same(8);
+                    // Pills, like the panel's buttons: half their 30-point height.
+                    let r = egui::CornerRadius::same(15);
                     ui.visuals_mut().widgets.inactive.corner_radius = r;
                     ui.visuals_mut().widgets.hovered.corner_radius = r;
                     ui.visuals_mut().widgets.active.corner_radius = r;
