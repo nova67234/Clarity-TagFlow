@@ -775,7 +775,7 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
 /// lists, headings, code blocks) straight on the background, like current
 /// assistant UIs. A streaming reply shows a ▌ cursor.
 fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool) {
-    let (role, text, stored_thinking, image, doc, tag_image, tag_change) = {
+    let (role, text, stored_thinking, image, doc, tag_image, tag_change, goals) = {
         let m = &llm.chats[llm.active_chat].msgs[index];
         (
             m.role,
@@ -785,6 +785,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
             m.doc.clone(),
             m.tag_image.clone(),
             m.tag_change.clone(),
+            m.goals.clone(),
         )
     };
 
@@ -1077,6 +1078,12 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         tag_change_note(ui, llm, index, change);
     }
 
+    // Role play: goals this reply set, achieved or failed.
+    if !goals.is_empty() {
+        ui.add_space(4.0);
+        goal_note(ui, &goals);
+    }
+
     // Action row under every finished reply: copy / regenerate / listen
     // (copy and listen only when there's text to copy or read).
     if !streaming {
@@ -1129,6 +1136,33 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                     ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(11.0));
                 }
             }
+        });
+    }
+}
+
+/// Role play: one quiet line per goal a reply set, achieved or failed (the
+/// character's goals, src/roleplay.rs) — small, so the story stays in front.
+fn goal_note(ui: &mut egui::Ui, events: &[crate::roleplay::GoalEvent]) {
+    use crate::roleplay::GoalStatus;
+    for e in events {
+        let (icon, tint, what) = match e.status {
+            GoalStatus::Active => (egui::include_image!("../icons/flag.svg"), ACCENT1(), "New goal"),
+            GoalStatus::Achieved => {
+                (egui::include_image!("../icons/check_circle.svg"), egui::Color32::from_rgb(46, 160, 67), "Goal achieved")
+            }
+            GoalStatus::Failed => (egui::include_image!("../icons/x.svg"), MUTED(), "Goal failed"),
+        };
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.add(egui::Image::new(icon).fit_to_exact_size(egui::vec2(13.0, 13.0)).tint(tint));
+            let w = ui.available_width().min(560.0);
+            ui.scope(|ui| {
+                ui.set_max_width(w);
+                ui.add(
+                    egui::Label::new(egui::RichText::new(format!("{what}: {}", e.text)).color(MUTED()).size(11.5))
+                        .wrap(),
+                );
+            });
         });
     }
 }

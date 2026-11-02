@@ -661,6 +661,23 @@ fn roleplay_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) 
                 }
             },
         );
+        row_sep(ui);
+        let rp = &mut llm.roleplay;
+        ui.add_enabled_ui(!rp.load_failed, |ui| {
+            row(
+                ui,
+                "Date and time",
+                Some(
+                    "The character is told today's date and time on this computer with each message. \
+                     Turn it off for a story set in another time or world.",
+                ),
+                |ui| {
+                    if switch(ui, &mut rp.real_time).changed() {
+                        rp.save();
+                    }
+                },
+            );
+        });
     });
 
     section(ui, "Character", |ui| {
@@ -702,6 +719,8 @@ fn roleplay_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) 
             rp.save();
         }
     });
+
+    goals_section(ui, &mut llm.roleplay);
 
     let (n, topics) = (llm.rp_memory.count(), llm.rp_memory.topics.len());
     section(ui, "Memories", |ui| {
@@ -747,15 +766,19 @@ fn roleplay_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) 
         row(
             ui,
             "Clear role play memories",
-            Some("Deletes every role play memory and the pictures the AI kept, from this computer."),
+            Some("Deletes every role play memory, the character's goals and the pictures the AI kept, from this computer."),
             |ui| {
-                let enabled = !llm.rp_memory.load_failed && n > 0;
+                let enabled = !llm.rp_memory.load_failed && (n > 0 || !llm.roleplay.goals.is_empty());
                 if confirming {
                     let yes = egui::Button::new(egui::RichText::new("Delete all").color(egui::Color32::WHITE).size(12.5))
                         .fill(egui::Color32::from_rgb(180, 40, 40));
                     if ui.add(yes).clicked() {
                         llm.rp_memory.clear_all();
                         crate::roleplay::clear_album();
+                        if !llm.roleplay.goals.is_empty() {
+                            llm.roleplay.goals.clear();
+                            llm.roleplay.save();
+                        }
                         ui.data_mut(|d| d.remove::<bool>(confirm_id));
                     }
                     if ui.button(egui::RichText::new("Cancel").size(12.5)).clicked() {
@@ -767,6 +790,115 @@ fn roleplay_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) 
             },
         );
     });
+}
+
+/// Role play → Goals: the switch for the character's own goals, and the
+/// goals themselves — the ones it's working on, then the finished ones,
+/// newest first — each of which can be forgotten.
+fn goals_section(ui: &mut egui::Ui, rp: &mut crate::roleplay::RoleplayState) {
+    use crate::roleplay::GoalStatus;
+    section(ui, "Goals", |ui| {
+        let mut changed = false;
+        ui.add_enabled_ui(!rp.load_failed, |ui| {
+            row(
+                ui,
+                "Own goals",
+                Some(
+                    "The character sets goals of its own as the story unfolds — up to three at a \
+                     time — works toward them, and marks each one achieved or failed. A note under \
+                     the reply says when.",
+                ),
+                |ui| {
+                    changed |= switch(ui, &mut rp.own_goals).changed();
+                },
+            );
+            if rp.goals.is_empty() {
+                if rp.own_goals {
+                    row_sep(ui);
+                    ui.label(
+                        egui::RichText::new("No goals yet — the character sets them as the story gives it reasons.")
+                            .color(MUTED())
+                            .size(11.5),
+                    );
+                }
+                return;
+            }
+            row_sep(ui);
+            // Active first, in the order set; then the finished, newest first.
+            let mut order: Vec<usize> = (0..rp.goals.len()).collect();
+            order.sort_by_key(|&i| {
+                let g = &rp.goals[i];
+                match g.status {
+                    GoalStatus::Active => (0, g.set),
+                    _ => (1, -g.ended.unwrap_or(g.set)),
+                }
+            });
+            let mut forget = None;
+            for i in order {
+                if goal_row(ui, &rp.goals[i]) {
+                    forget = Some(i);
+                }
+            }
+            if let Some(i) = forget {
+                rp.goals.remove(i);
+                changed = true;
+            }
+            if rp.goals.iter().any(|g| g.status != GoalStatus::Active) {
+                ui.add_space(2.0);
+                if ui
+                    .button(egui::RichText::new("Clear finished").size(12.5))
+                    .on_hover_text("Forget the achieved and failed goals")
+                    .clicked()
+                {
+                    rp.goals.retain(|g| g.status == GoalStatus::Active);
+                    changed = true;
+                }
+            }
+        });
+        if changed {
+            rp.save();
+        }
+    });
+}
+
+/// One goal: its status icon, its words, and since when — or when and how it
+/// ended. True when its forget button was clicked.
+fn goal_row(ui: &mut egui::Ui, g: &crate::roleplay::Goal) -> bool {
+    use crate::roleplay::GoalStatus;
+    let date = |t: i64| crate::memory::format_date(t);
+    let (icon, tint, when) = match g.status {
+        GoalStatus::Active => (
+            egui::include_image!("../icons/flag.svg"),
+            ACCENT1(),
+            format!("Working on it since {}", date(g.set)),
+        ),
+        GoalStatus::Achieved => (
+            egui::include_image!("../icons/check_circle.svg"),
+            egui::Color32::from_rgb(46, 160, 67),
+            format!("Achieved {}", date(g.ended.unwrap_or(g.set))),
+        ),
+        GoalStatus::Failed => (
+            egui::include_image!("../icons/x.svg"),
+            MUTED(),
+            format!("Failed {}", date(g.ended.unwrap_or(g.set))),
+        ),
+    };
+    let meta = if g.outcome.is_empty() { when } else { format!("{when} — {}", g.outcome) };
+    let mut forget = false;
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.add(egui::Image::new(icon).fit_to_exact_size(egui::vec2(15.0, 15.0)).tint(tint));
+        let w = (ui.available_width() - 32.0).max(80.0);
+        ui.vertical(|ui| {
+            ui.set_width(w);
+            let ink = if g.status == GoalStatus::Failed { MUTED() } else { TEXT() };
+            ui.add(egui::Label::new(egui::RichText::new(&g.text).color(ink).size(12.5)).wrap());
+            ui.add(egui::Label::new(egui::RichText::new(meta).color(MUTED()).size(11.0)).wrap());
+        });
+        forget = crate::settings::clear_button(ui, "Forget this goal").clicked();
+    });
+    ui.add_space(4.0);
+    forget
 }
 
 /// A one-line text box in a row's control slot that edits through a draft:

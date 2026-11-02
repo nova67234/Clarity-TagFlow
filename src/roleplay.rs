@@ -16,6 +16,14 @@
 //! its persona's voice (facts, permissions, feelings, romance, promises,
 //! boundaries, key events).
 //!
+//! The character also has goals of its own: it sets them itself as the story
+//! gives it reasons (`GOAL: …`, at most three at a time), works toward them in
+//! character, and ends each one as achieved or failed (`GOAL_DONE: [G1] …` /
+//! `GOAL_FAILED: [G1] …`, by the numbers its prompt lists them with). They're
+//! kept with the character, shown in AI Settings → Role play, and noted under
+//! the reply that set or ended them. Both they and the real date and time
+//! (llm/clock.rs) can be switched off per character.
+//!
 //! The character itself (names, persona, on/off) persists to a JSON sidecar
 //! in the models dir. On Windows it is **encrypted at rest** (src/secret.rs —
 //! DPAPI, tied to the user account); on macOS/Linux it is only obfuscated (a
@@ -33,6 +41,65 @@ pub const MEMORY_TAG: &str = "MEMORY:";
 pub const KEEP_IMAGE_TAG: &str = "KEEP_IMAGE:";
 /// Sends a previously saved album image back into the chat.
 pub const SHOW_IMAGE_TAG: &str = "SHOW_IMAGE:";
+/// A goal the character sets itself.
+pub const GOAL_TAG: &str = "GOAL:";
+/// A goal that came true: `GOAL_DONE: [G1] how it happened`.
+pub const GOAL_DONE_TAG: &str = "GOAL_DONE:";
+/// A goal that can't come true any more: `GOAL_FAILED: [G1] why`.
+pub const GOAL_FAILED_TAG: &str = "GOAL_FAILED:";
+/// Every control-line prefix (hidden from the visible reply).
+const TAGS: [&str; 6] = [MEMORY_TAG, KEEP_IMAGE_TAG, SHOW_IMAGE_TAG, GOAL_TAG, GOAL_DONE_TAG, GOAL_FAILED_TAG];
+
+/// Goals the character pursues at once.
+pub const MAX_ACTIVE_GOALS: usize = 3;
+/// Finished goals kept (the oldest go first).
+const MAX_FINISHED_GOALS: usize = 50;
+/// Finished goals the prompt reminds the character of, newest first.
+const PROMPT_FINISHED_GOALS: usize = 5;
+/// A goal's length cap (a runaway line isn't a goal).
+const MAX_GOAL_CHARS: usize = 240;
+
+/// Where a goal stands.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GoalStatus {
+    Active,
+    Achieved,
+    Failed,
+}
+
+/// A goal the character set itself.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct Goal {
+    /// What it wants, in its own words.
+    pub text: String,
+    pub status: GoalStatus,
+    /// When it was set (Unix seconds).
+    pub set: i64,
+    /// When it was achieved or failed.
+    #[serde(default)]
+    pub ended: Option<i64>,
+    /// How it came true, or why it couldn't (the character's words; may be
+    /// empty).
+    #[serde(default)]
+    pub outcome: String,
+}
+
+/// What one reply did to the goals, for the note under it: a goal set
+/// (`Active`), achieved or failed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GoalEvent {
+    pub status: GoalStatus,
+    pub text: String,
+}
+
+/// A goal line from a reply, still unresolved.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GoalLine {
+    New(String),
+    Done(String),
+    Failed(String),
+}
 
 /// How many memories ride along in the prompt (newest kept).
 const PROMPT_MEMORIES: usize = 75;
@@ -61,14 +128,23 @@ pub struct Memory {
 }
 
 /// Persistent role-play state, owned by `LlmState` and saved to
-/// `models_root()/ai_chat_roleplay.json` on every change.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+/// `models_root()/ai_chat_roleplay.json` on every change. (A field missing
+/// from an older file takes its value from `Default` — the switches below
+/// are on there.)
+#[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct RoleplayState {
     pub enabled: bool,
     pub ai_name: String,
     pub user_name: String,
     pub persona: String,
+    /// The character sets goals of its own (see the module docs).
+    pub own_goals: bool,
+    /// Its goals, active and finished, in the order they were set.
+    pub goals: Vec<Goal>,
+    /// The character is told the date and time on this PC with every
+    /// message (llm/clock.rs). Off for stories set in another time or world.
+    pub real_time: bool,
     /// The old diary. Empty once [`migrate_diary`] has moved it into the
     /// role-play memory store.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -80,8 +156,39 @@ pub struct RoleplayState {
     pub load_failed: bool,
 }
 
+impl Default for RoleplayState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ai_name: String::new(),
+            user_name: String::new(),
+            persona: String::new(),
+            own_goals: true,
+            goals: Vec::new(),
+            real_time: true,
+            memories: Vec::new(),
+            load_failed: false,
+        }
+    }
+}
+
 fn store_path() -> std::path::PathBuf {
+    if cfg!(test) {
+        // Tests never read or overwrite the real character: each test thread
+        // has a file of its own in the temp folder.
+        return std::env::temp_dir().join(
+            format!("ctf_roleplay_test_{}_{:?}.json", std::process::id(), std::thread::current().id())
+                .replace(['(', ')'], ""),
+        );
+    }
     crate::tagger::models_root().join("ai_chat_roleplay.json")
+}
+
+/// This test thread's character file (see `store_path`), to read back or
+/// remove.
+#[cfg(test)]
+pub(crate) fn test_store_path() -> std::path::PathBuf {
+    store_path()
 }
 
 /// Delete every decrypted album copy (see src/album.rs).
@@ -247,6 +354,7 @@ impl RoleplayState {
              - The `{tag}` lines are stripped before {user} sees your reply; \
              never talk about the diary mechanism in the visible text.\n\
              \n\
+             {goals}\
              Your photo album:\n\
              - When {user} shares a picture that genuinely means something to \
              you — you love it, it touches you, it matters to your story — \
@@ -261,10 +369,110 @@ impl RoleplayState {
              park you showed me!\").\n\
              - These lines are also invisible to {user}.",
             thinking = thinking,
+            goals = self.goals_prompt(),
             tag = MEMORY_TAG,
             keep = KEEP_IMAGE_TAG,
             show = SHOW_IMAGE_TAG,
         )
+    }
+
+    /// The priming's goals block (empty with own goals off): the active
+    /// goals numbered [G1].. in the order they were set — the numbers the
+    /// character ends them by — the last few finished ones, and the rules.
+    fn goals_prompt(&self) -> String {
+        use std::fmt::Write as _;
+        if !self.own_goals {
+            return String::new();
+        }
+        let (ai, user) = (self.ai_display(), self.user_display());
+        let mut list = String::new();
+        for (n, g) in self.active_goals().enumerate() {
+            let _ = writeln!(list, "[G{}] {}", n + 1, g.text);
+        }
+        if list.is_empty() {
+            list = "(none yet — set one when the story gives you a reason)\n".to_string();
+        }
+        let mut finished: Vec<&Goal> = self.goals.iter().filter(|g| g.status != GoalStatus::Active).collect();
+        finished.sort_by_key(|g| std::cmp::Reverse(g.ended.unwrap_or(g.set)));
+        if !finished.is_empty() {
+            list.push_str("Finished recently:\n");
+            for g in finished.into_iter().take(PROMPT_FINISHED_GOALS) {
+                let how = if g.status == GoalStatus::Achieved { "achieved" } else { "failed" };
+                let _ = writeln!(list, "- {how}: {}", g.text);
+            }
+        }
+        format!(
+            "Your goals — things YOU want in your story with {user}, chosen by you:\n\
+             {list}\
+             \n\
+             Goal rules:\n\
+             - Want things, as {ai} would: something to do, find, learn, make, \
+             share or earn in your story with {user} — specific, and possible in \
+             this story. Keep one to {max} goals at a time; when you have fewer \
+             and the story gives you a reason, set one by ending your reply with \
+             `{goal} <the goal>`.\n\
+             - Work toward your goals in character: take steps, steer scenes \
+             toward them, ask for what you want — naturally, never forcing it; \
+             {user}'s choices always come first.\n\
+             - When a goal truly comes true in the story, end your reply with \
+             `{done} [G1] <how it happened>`; when it can't happen any more or \
+             no longer fits the story, `{failed} [G1] <why>` — with that goal's \
+             number. Never mark a goal done before it has really happened.\n\
+             - These lines are invisible to {user} too; never mention goals or \
+             their numbers in the visible text.\n\
+             \n",
+            max = MAX_ACTIVE_GOALS,
+            goal = GOAL_TAG,
+            done = GOAL_DONE_TAG,
+            failed = GOAL_FAILED_TAG,
+        )
+    }
+
+    /// The goals still being pursued, in the order they were set.
+    pub fn active_goals(&self) -> impl Iterator<Item = &Goal> {
+        self.goals.iter().filter(|g| g.status == GoalStatus::Active)
+    }
+
+    /// Act on a finished reply's goal lines: the endings first, by the
+    /// numbers the reply was primed with (the active goals in order, before
+    /// anything changed), then the new goals — no repeats, at most
+    /// MAX_ACTIVE_GOALS at a time. What changed comes back for the reply's
+    /// note; the caller saves.
+    pub fn apply_goals(&mut self, lines: &[GoalLine], now: i64) -> Vec<GoalEvent> {
+        let primed: Vec<usize> = (0..self.goals.len()).filter(|&i| self.goals[i].status == GoalStatus::Active).collect();
+        let mut events = Vec::new();
+        for line in lines {
+            let (status, content) = match line {
+                GoalLine::Done(c) => (GoalStatus::Achieved, c),
+                GoalLine::Failed(c) => (GoalStatus::Failed, c),
+                GoalLine::New(_) => continue,
+            };
+            let Some((i, outcome)) = goal_ref(content, &primed, &self.goals) else { continue };
+            let g = &mut self.goals[i];
+            g.status = status;
+            g.ended = Some(now);
+            g.outcome = outcome;
+            events.push(GoalEvent { status, text: g.text.clone() });
+        }
+        for line in lines {
+            let GoalLine::New(raw) = line else { continue };
+            let text = clean_goal(raw);
+            let repeat = self.active_goals().any(|g| same_goal(&g.text, &text));
+            if text.is_empty() || repeat || self.active_goals().count() >= MAX_ACTIVE_GOALS {
+                continue;
+            }
+            self.goals.push(Goal { text: text.clone(), status: GoalStatus::Active, set: now, ended: None, outcome: String::new() });
+            events.push(GoalEvent { status: GoalStatus::Active, text });
+        }
+        // A long story's finished goals: the oldest go.
+        let finished = self.goals.iter().filter(|g| g.status != GoalStatus::Active).count();
+        let mut extra = finished.saturating_sub(MAX_FINISHED_GOALS);
+        self.goals.retain(|g| {
+            let drop = extra > 0 && g.status != GoalStatus::Active;
+            extra -= usize::from(drop);
+            !drop
+        });
+        events
     }
 
     /// The model's scripted acknowledgement of the preamble (keeps the
@@ -413,16 +621,16 @@ pub struct Directives {
     pub keep_image: Option<String>,
     /// Album file name the AI wants to show back in chat.
     pub show_image: Option<String>,
+    /// Goals set, achieved or failed, in reply order.
+    pub goals: Vec<GoalLine>,
 }
 
-/// Pull all control lines (`MEMORY:` / `KEEP_IMAGE:` / `SHOW_IMAGE:`) out of
-/// a finished reply, returning them and removing them from the visible text.
+/// Pull all control lines (`MEMORY:` / `KEEP_IMAGE:` / `SHOW_IMAGE:` and the
+/// goal lines) out of a finished reply, returning them and removing them
+/// from the visible text.
 pub fn extract_directives(reply: &mut String) -> Directives {
     let mut d = Directives::default();
-    if !(reply.contains(MEMORY_TAG)
-        || reply.contains(KEEP_IMAGE_TAG)
-        || reply.contains(SHOW_IMAGE_TAG))
-    {
+    if !TAGS.iter().any(|t| reply.contains(t)) {
         return d;
     }
     let mut kept = Vec::new();
@@ -444,6 +652,14 @@ pub fn extract_directives(reply: &mut String) -> Directives {
             if !m.is_empty() {
                 d.show_image = Some(m);
             }
+        } else if let Some(rest) = t.strip_prefix(GOAL_TAG) {
+            if !rest.trim().is_empty() {
+                d.goals.push(GoalLine::New(rest.trim().to_string()));
+            }
+        } else if let Some(rest) = t.strip_prefix(GOAL_DONE_TAG) {
+            d.goals.push(GoalLine::Done(rest.trim().to_string()));
+        } else if let Some(rest) = t.strip_prefix(GOAL_FAILED_TAG) {
+            d.goals.push(GoalLine::Failed(rest.trim().to_string()));
         } else {
             kept.push(line);
         }
@@ -455,21 +671,100 @@ pub fn extract_directives(reply: &mut String) -> Directives {
 /// Hide control lines while a reply is still streaming (they're removed for
 /// real when the reply finishes).
 pub fn strip_memory_lines(text: &str) -> String {
-    if !(text.contains(MEMORY_TAG)
-        || text.contains(KEEP_IMAGE_TAG)
-        || text.contains(SHOW_IMAGE_TAG))
-    {
+    if !TAGS.iter().any(|t| text.contains(t)) {
         return text.to_string();
     }
     text.lines()
         .filter(|l| {
             let t = l.trim_start();
-            !(t.starts_with(MEMORY_TAG)
-                || t.starts_with(KEEP_IMAGE_TAG)
-                || t.starts_with(SHOW_IMAGE_TAG))
+            !TAGS.iter().any(|tag| t.starts_with(tag))
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Which goal a `GOAL_DONE:` / `GOAL_FAILED:` line ends, and the rest of the
+/// line (how it came true, or why not): by number — `[G2]`, `G2`, `#2` —
+/// among the goals the reply was primed with (`primed`, the active ones in
+/// order); else by its words; else the only one there is. Never one that
+/// already ended.
+fn goal_ref(content: &str, primed: &[usize], goals: &[Goal]) -> Option<(usize, String)> {
+    let open = |i: &usize| goals[*i].status == GoalStatus::Active;
+    let content = content.trim();
+    let s = content.strip_prefix('[').unwrap_or(content);
+    let s = s.strip_prefix(['G', 'g', '#']).unwrap_or(s);
+    let digits = s.chars().take_while(char::is_ascii_digit).count();
+    if digits > 0 {
+        let n: usize = s[..digits].parse().ok()?;
+        let i = *primed.get(n.checked_sub(1)?)?;
+        let rest = s[digits..].trim_start_matches([']', '.', ':', ')']);
+        return open(&i).then(|| (i, outcome_of(rest)));
+    }
+    let live: Vec<usize> = primed.iter().copied().filter(open).collect();
+    let best = live
+        .iter()
+        .map(|&i| (i, overlap(&goals[i].text, content)))
+        .max_by(|a, b| a.1.total_cmp(&b.1));
+    let outcome = |i: usize| if same_goal(&goals[i].text, content) { String::new() } else { outcome_of(content) };
+    match best {
+        Some((i, score)) if score >= 0.5 => Some((i, outcome(i))),
+        _ if live.len() == 1 => Some((live[0], outcome(live[0]))),
+        _ => None,
+    }
+}
+
+/// How a goal ended, as the line says it: leading separators off, capped.
+fn outcome_of(rest: &str) -> String {
+    cap(rest.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '-' | '—' | '–' | ':')).trim())
+}
+
+/// A new goal as written, tidied: no quotes or self-given number, one line,
+/// capped.
+fn clean_goal(raw: &str) -> String {
+    let mut t = raw.trim().trim_matches(|c| matches!(c, '"' | '`' | '“' | '”')).trim();
+    if let Some(rest) = t.strip_prefix('[')
+        && let Some((tag, after)) = rest.split_once(']')
+        && tag.trim_start_matches(['G', 'g']).chars().all(|c| c.is_ascii_digit())
+    {
+        t = after.trim();
+    }
+    cap(&t.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn cap(s: &str) -> String {
+    if s.chars().count() <= MAX_GOAL_CHARS {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(MAX_GOAL_CHARS).collect::<String>().trim_end())
+    }
+}
+
+/// The same goal in other words: the same words, or one wording inside the
+/// other.
+fn same_goal(a: &str, b: &str) -> bool {
+    let (na, nb) = (crate::memory::normalize(a), crate::memory::normalize(b));
+    crate::memory::same_words(a, b) || (na.len() >= 12 && nb.len() >= 12 && (na.contains(&nb) || nb.contains(&na)))
+}
+
+/// How much of a goal's wording a line repeats: the share of its words
+/// (three letters or more, not the commonest ones) that the line has too.
+fn overlap(goal: &str, line: &str) -> f32 {
+    const COMMON: [&str; 16] = [
+        "the", "and", "for", "with", "her", "his", "him", "them", "their", "our", "you", "your", "from", "into",
+        "that", "this",
+    ];
+    let words = |s: &str| -> std::collections::HashSet<String> {
+        crate::memory::normalize(s)
+            .split_whitespace()
+            .filter(|w| w.chars().count() >= 3 && !COMMON.contains(w))
+            .map(String::from)
+            .collect()
+    };
+    let (g, l) = (words(goal), words(line));
+    if g.is_empty() {
+        return 0.0;
+    }
+    g.intersection(&l).count() as f32 / g.len() as f32
 }
 
 #[cfg(test)]
@@ -630,5 +925,155 @@ SHOW_IMAGE: y"), "hi");
             "Andrew said I may call them Billie from…"
         );
         assert_eq!(title_from("Dr. Mills is Andrew's doctor."), "Dr. Mills is Andrew's doctor");
+    }
+
+    fn goal(text: &str, status: GoalStatus, set: i64) -> Goal {
+        let ended = (status != GoalStatus::Active).then_some(set + 1);
+        Goal { text: text.into(), status, set, ended, outcome: String::new() }
+    }
+
+    fn character(goals: Vec<Goal>) -> RoleplayState {
+        RoleplayState { ai_name: "Mira".into(), user_name: "Andrew".into(), goals, ..Default::default() }
+    }
+
+    /// Goal lines come out of the reply with the rest, and stay hidden
+    /// while it streams.
+    #[test]
+    fn goal_lines_extract_and_strip() {
+        let mut reply = "We made it to the top!\n\
+                         GOAL_DONE: [G1] We climbed the lighthouse at sunset.\n\
+                         GOAL_FAILED: [G2] The festival was cancelled.\n\
+                         GOAL: Learn to sail with Andrew\n\
+                         GOAL:   "
+            .to_string();
+        let d = extract_directives(&mut reply);
+        assert_eq!(reply, "We made it to the top!");
+        assert_eq!(
+            d.goals,
+            vec![
+                GoalLine::Done("[G1] We climbed the lighthouse at sunset.".into()),
+                GoalLine::Failed("[G2] The festival was cancelled.".into()),
+                GoalLine::New("Learn to sail with Andrew".into()),
+            ]
+        );
+        assert_eq!(strip_memory_lines("hi\nGOAL: x\nGOAL_DONE: [G1]\nGOAL_FAILED: [G2] y"), "hi");
+    }
+
+    /// New goals: no repeats in other words, at most three at a time.
+    #[test]
+    fn goals_are_set_without_repeats_and_capped() {
+        let mut rp = character(vec![]);
+        let lines = |v: &[&str]| v.iter().map(|t| GoalLine::New(t.to_string())).collect::<Vec<_>>();
+        let events = rp.apply_goals(&lines(&["\"Visit the lighthouse with Andrew\"", "visit the LIGHTHOUSE with Andrew!", "[G2] Learn to sail"]), 100);
+        assert_eq!(
+            events,
+            vec![
+                GoalEvent { status: GoalStatus::Active, text: "Visit the lighthouse with Andrew".into() },
+                GoalEvent { status: GoalStatus::Active, text: "Learn to sail".into() },
+            ]
+        );
+        let events = rp.apply_goals(&lines(&["Bake bread together", "Find the lost compass"]), 200);
+        assert_eq!(events.len(), 1, "a fourth goal waits");
+        assert_eq!(rp.active_goals().count(), MAX_ACTIVE_GOALS);
+        assert!(rp.goals.iter().all(|g| g.status == GoalStatus::Active && g.ended.is_none()));
+    }
+
+    /// Endings go by the numbers the reply was primed with — even after an
+    /// earlier line in the same reply ended another goal — else by the
+    /// goal's words, else to the only goal there is; never twice.
+    #[test]
+    fn goals_end_by_number_words_or_the_only_one() {
+        let primed = || {
+            character(vec![
+                goal("Visit the lighthouse with Andrew", GoalStatus::Active, 1),
+                goal("Old wish", GoalStatus::Achieved, 2),
+                goal("Learn to sail with Andrew", GoalStatus::Active, 3),
+                goal("Bake bread together", GoalStatus::Active, 4),
+            ])
+        };
+        let mut rp = primed();
+        let events = rp.apply_goals(
+            &[
+                GoalLine::Done("[G1] — we climbed it at sunset".into()),
+                GoalLine::Failed("[G3] the oven broke for good".into()),
+                GoalLine::Done("[G1] again".into()),
+                GoalLine::Done("G9 nothing there".into()),
+            ],
+            50,
+        );
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(rp.goals[0].status, GoalStatus::Achieved);
+        assert_eq!(rp.goals[0].outcome, "we climbed it at sunset");
+        assert_eq!(rp.goals[0].ended, Some(50));
+        assert_eq!(rp.goals[3].status, GoalStatus::Failed);
+        assert_eq!(rp.goals[2].status, GoalStatus::Active);
+
+        // No number: the goal whose words it shares most ("sail" and
+        // "andrew" of learn/sail/andrew), the whole line as the outcome.
+        let mut rp = primed();
+        rp.apply_goals(&[GoalLine::Done("Learned to sail at last: Andrew was so proud".into())], 60);
+        assert_eq!(rp.goals[2].status, GoalStatus::Achieved);
+        assert_eq!(rp.goals[0].status, GoalStatus::Active);
+
+        // Words that fit none, with several goals: nothing ends.
+        let mut rp = primed();
+        assert!(rp.apply_goals(&[GoalLine::Done("It happened!".into())], 70).is_empty());
+        // ...but with one goal left, it's that one.
+        let mut rp = character(vec![goal("Visit the lighthouse with Andrew", GoalStatus::Active, 1)]);
+        let events = rp.apply_goals(&[GoalLine::Done("We finally went there today".into())], 80);
+        assert_eq!(events, vec![GoalEvent { status: GoalStatus::Achieved, text: "Visit the lighthouse with Andrew".into() }]);
+        assert_eq!(rp.goals[0].outcome, "We finally went there today");
+        // A goal restated is no outcome.
+        let mut rp = character(vec![goal("Visit the lighthouse with Andrew", GoalStatus::Active, 1)]);
+        rp.apply_goals(&[GoalLine::Done("Visit the lighthouse with Andrew.".into())], 80);
+        assert_eq!(rp.goals[0].outcome, "");
+    }
+
+    /// A long story keeps its newest finished goals and every active one.
+    #[test]
+    fn finished_goals_are_capped() {
+        let mut goals: Vec<Goal> =
+            (0..MAX_FINISHED_GOALS as i64 + 5).map(|i| goal(&format!("Goal number {i}"), GoalStatus::Achieved, i)).collect();
+        goals.push(goal("Still going", GoalStatus::Active, 999));
+        let mut rp = character(goals);
+        rp.apply_goals(&[GoalLine::New("One more".into())], 1000);
+        assert_eq!(rp.goals.iter().filter(|g| g.status != GoalStatus::Active).count(), MAX_FINISHED_GOALS);
+        assert_eq!(rp.goals[0].text, "Goal number 5", "the oldest went");
+        assert_eq!(rp.active_goals().count(), 2);
+    }
+
+    /// The priming lists the active goals by number, the last finished ones
+    /// and the rules — and nothing about goals with own goals off.
+    #[test]
+    fn preamble_carries_goals_only_when_on() {
+        let mut rp = character(vec![
+            goal("Visit the lighthouse with Andrew", GoalStatus::Active, 1),
+            goal("Learn to sail", GoalStatus::Achieved, 2),
+            goal("Bake bread together", GoalStatus::Active, 3),
+        ]);
+        let p = rp.preamble(&MemoryStore::default());
+        assert!(p.contains("[G1] Visit the lighthouse with Andrew\n[G2] Bake bread together\n"), "{p}");
+        assert!(p.contains("- achieved: Learn to sail\n"));
+        assert!(p.contains("GOAL_DONE: [G1]") && p.contains("GOAL_FAILED: [G1]") && p.contains("`GOAL: <the goal>`"));
+        assert!(p.contains("Your photo album:"), "the album rules still follow");
+        let empty = character(vec![]).preamble(&MemoryStore::default());
+        assert!(empty.contains("(none yet"));
+        rp.own_goals = false;
+        let off = rp.preamble(&MemoryStore::default());
+        assert!(!off.contains("GOAL") && !off.contains("Visit the lighthouse"), "{off}");
+    }
+
+    /// A character saved before goals (and the time switch) existed reads
+    /// back with both on; goals survive the round trip.
+    #[test]
+    fn older_characters_get_goals_and_the_clock() {
+        let old: RoleplayState = serde_json::from_str(r#"{"enabled":true,"ai_name":"Mira","persona":"a sailor"}"#).unwrap();
+        assert!(old.own_goals && old.real_time && old.goals.is_empty());
+        let mut rp = character(vec![goal("Visit the lighthouse", GoalStatus::Failed, 7)]);
+        rp.goals[0].outcome = "storm season".into();
+        rp.real_time = false;
+        let back: RoleplayState = serde_json::from_str(&serde_json::to_string(&rp).unwrap()).unwrap();
+        assert_eq!(back.goals, rp.goals);
+        assert!(!back.real_time);
     }
 }

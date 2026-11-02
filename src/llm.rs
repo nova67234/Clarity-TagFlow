@@ -943,6 +943,8 @@ pub struct ChatMsg {
     pub tag_image: Option<PathBuf>,
     /// Tag images mode: the tag change a reply made, for its note and Undo.
     pub tag_change: Option<crate::ai_tagging::TagChange>,
+    /// Role play: goals this reply set, achieved or failed (its note).
+    pub goals: Vec<crate::roleplay::GoalEvent>,
     /// The memory pass may read it: sent (or answered) in an ordinary chat
     /// while Remember across chats was on — not in role play, Krea 2 prompts
     /// or Tag images (src/llm/memory_pass.rs).
@@ -1645,9 +1647,11 @@ impl LlmState {
                         // with Tag images below, only a reply the model ended
                         // itself is acted on: a stopped, cut-off or failed one
                         // may end mid-line ("MEMORY: Peter is allergic to"),
-                        // so its control lines are only hidden.
-                        if self.gen_roleplay && !inert {
-                            let complete = res.is_ok() && !stopped && !cut_off;
+                        // so its control lines are only hidden — as are an
+                        // inert reply's (written with PDFs in view; a
+                        // researched one has had them taken out already).
+                        if self.gen_roleplay {
+                            let complete = res.is_ok() && !stopped && !cut_off && !inert;
                             let mut directives = None;
                             let mut last_user_image = None;
                             if let Some(chat) = self
@@ -1693,6 +1697,23 @@ impl LlmState {
                                         .and_then(|c| c.msgs.last_mut())
                                     {
                                         m.image = img;
+                                    }
+                                }
+                                // Goals it set, achieved or failed: kept with
+                                // the character, and noted under the reply.
+                                // (With own goals off, the prompt never asks
+                                // for these; a stray line is just hidden.)
+                                if self.roleplay.own_goals && !d.goals.is_empty() && !self.roleplay.load_failed {
+                                    let events = self.roleplay.apply_goals(&d.goals, crate::memory::now());
+                                    if !events.is_empty() {
+                                        self.roleplay.save();
+                                        if let Some(m) = self
+                                            .gen_chat
+                                            .and_then(|id| self.chats.iter_mut().find(|c| c.id == id))
+                                            .and_then(|c| c.msgs.last_mut())
+                                        {
+                                            m.goals = events;
+                                        }
                                     }
                                 }
                             }
@@ -1922,6 +1943,7 @@ impl LlmState {
             doc,
             tag_image,
             tag_change: None,
+            goals: Vec::new(),
             remember,
             picture_memory,
             shared_with: Vec::new(),
@@ -2292,10 +2314,9 @@ impl LlmState {
         let with_docs = !self.tag_images && self.pin_docs(&mut msgs, &mut pinned, thinks, research);
         self.gen_docs = with_docs;
         // The date and time on this PC, in front of the message being
-        // answered (llm/clock.rs) — not for Krea 2 prompts or Tag images,
-        // which have no use for it. Web research adds it once its searches
-        // are planned, so it doesn't end up in them.
-        let clock = (!self.krea_prompts && !self.tag_images).then(|| clock::line(&chrono::Local::now()));
+        // answered (llm/clock.rs; see `wants_clock`). Web research adds it
+        // once its searches are planned, so it doesn't end up in them.
+        let clock = self.wants_clock().then(|| clock::line(&chrono::Local::now()));
         if !research && let Some(line) = &clock {
             clock::stamp(&mut msgs, line);
         }
@@ -2355,6 +2376,7 @@ impl LlmState {
                         doc: None,
                         tag_image: None,
                         tag_change: None,
+                        goals: Vec::new(),
                         // A reply written from web pages or with PDFs in
                         // view stays out of the memory and the album: a page
                         // could have put anything in it.
@@ -2408,6 +2430,15 @@ impl LlmState {
             },
             None => false,
         }
+    }
+
+    /// Whether the message being answered goes with the date and time on
+    /// this PC (llm/clock.rs): not for Krea 2 prompts or Tag images, which
+    /// have no use for it, nor in role play with Date and time switched off
+    /// — a story set in another time or world. (`gen_roleplay` is settled
+    /// for the reply by then.)
+    fn wants_clock(&self) -> bool {
+        !self.krea_prompts && !self.tag_images && !(self.gen_roleplay && !self.roleplay.real_time)
     }
 
     /// True while either voice backend is playing (or OmniVoice is still
@@ -4273,6 +4304,120 @@ mod worker {
 }
 
 #[cfg(test)]
+mod roleplay_goal_tests {
+    use super::*;
+    use crate::roleplay::{Goal, GoalEvent, GoalStatus, RoleplayState};
+    use std::sync::mpsc::Sender;
+
+    fn msg(role: ChatRole, text: &str) -> ChatMsg {
+        ChatMsg {
+            role,
+            text: text.to_string(),
+            thinking: None,
+            image: None,
+            doc: None,
+            tag_image: None,
+            tag_change: None,
+            goals: Vec::new(),
+            remember: false,
+            picture_memory: false,
+            shared_with: Vec::new(),
+            research: None,
+        }
+    }
+
+    /// A role-play reply streaming in from `tx`, the character holding
+    /// `goals`. (Under test the character's file is this test's own temp
+    /// file — see `roleplay::store_path`.)
+    fn role_play(goals: Vec<Goal>) -> (LlmState, Sender<Msg>) {
+        let mut llm = LlmState::default();
+        llm.roleplay =
+            RoleplayState { enabled: true, ai_name: "Mira".into(), user_name: "Andrew".into(), goals, ..Default::default() };
+        let id = llm.chats[llm.active_chat].id;
+        llm.chats[llm.active_chat].msgs.push(msg(ChatRole::User, "Race you to the top!"));
+        llm.chats[llm.active_chat].msgs.push(msg(ChatRole::Model, ""));
+        let (tx, rx) = std::sync::mpsc::channel();
+        llm.reply_rx = Some(rx);
+        llm.running = true;
+        llm.gen_chat = Some(id);
+        llm.gen_roleplay = true;
+        (llm, tx)
+    }
+
+    /// A finished reply's goal lines end and set goals: hidden from the
+    /// text, noted under it, and kept with the character on disk.
+    #[test]
+    fn a_role_play_reply_ends_and_sets_goals() {
+        let file = crate::roleplay::test_store_path();
+        let _ = std::fs::remove_file(&file);
+        let lighthouse = Goal {
+            text: "Visit the lighthouse with Andrew".into(),
+            status: GoalStatus::Active,
+            set: 1,
+            ended: None,
+            outcome: String::new(),
+        };
+        let (mut llm, tx) = role_play(vec![lighthouse]);
+        tx.send(Msg::Token(
+            "We made it to the top!\nGOAL_DONE: [G1] We climbed it at sunset.\nGOAL: Learn to sail with Andrew".into(),
+        ))
+        .unwrap();
+        tx.send(Msg::Done(Ok(()))).unwrap();
+        llm.poll(&egui::Context::default());
+
+        let m = llm.chats[llm.active_chat].msgs.last().unwrap();
+        assert_eq!(m.text, "We made it to the top!");
+        assert_eq!(
+            m.goals,
+            vec![
+                GoalEvent { status: GoalStatus::Achieved, text: "Visit the lighthouse with Andrew".into() },
+                GoalEvent { status: GoalStatus::Active, text: "Learn to sail with Andrew".into() },
+            ]
+        );
+        let back = RoleplayState::load();
+        assert_eq!(back.goals, llm.roleplay.goals);
+        assert_eq!(back.goals[0].outcome, "We climbed it at sunset.");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// Written with PDFs in view, a role-play reply acts on nothing — and
+    /// its control lines don't show either.
+    #[test]
+    fn a_reply_written_with_pdfs_hides_its_control_lines() {
+        let (mut llm, tx) = role_play(Vec::new());
+        llm.gen_docs = true;
+        let memories = llm.rp_memory.count();
+        tx.send(Msg::Token(
+            "Page 3 says the lighthouse is closed.\nMEMORY: [Facts] Andrew reads PDFs\nGOAL: Visit the lighthouse".into(),
+        ))
+        .unwrap();
+        tx.send(Msg::Done(Ok(()))).unwrap();
+        llm.poll(&egui::Context::default());
+
+        let m = llm.chats[llm.active_chat].msgs.last().unwrap();
+        assert_eq!(m.text, "Page 3 says the lighthouse is closed.");
+        assert!(m.goals.is_empty() && llm.roleplay.goals.is_empty());
+        assert_eq!(llm.rp_memory.count(), memories, "a memory was saved");
+    }
+
+    /// Role play's Date and time switch leaves the clock line out of its
+    /// replies only.
+    #[test]
+    fn role_play_can_leave_out_the_date_and_time() {
+        let mut llm = LlmState::default();
+        assert!(llm.wants_clock(), "an ordinary chat has it");
+        llm.gen_roleplay = true;
+        assert!(llm.wants_clock(), "on by default in role play");
+        llm.roleplay.real_time = false;
+        assert!(!llm.wants_clock(), "a timeless story doesn't");
+        llm.gen_roleplay = false;
+        assert!(llm.wants_clock(), "the switch is role play's alone");
+        llm.tag_images = true;
+        assert!(!llm.wants_clock());
+    }
+}
+
+#[cfg(test)]
 mod image_detail_tests {
     use super::*;
 
@@ -4338,6 +4483,7 @@ mod web_research_tests {
             doc: None,
             tag_image: None,
             tag_change: None,
+            goals: Vec::new(),
             remember: role == ChatRole::User,
             picture_memory: false,
             shared_with: Vec::new(),
@@ -5974,6 +6120,7 @@ mod pdf_tests {
             doc: doc.map(std::path::Path::to_path_buf),
             tag_image: None,
             tag_change: None,
+            goals: Vec::new(),
             remember: true,
             picture_memory: false,
             shared_with: Vec::new(),
