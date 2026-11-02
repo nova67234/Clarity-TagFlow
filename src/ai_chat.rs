@@ -1117,9 +1117,13 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
             }
             // Voice status belongs to the reply being read, not every reply.
             if llm.speak_target == Some((chat_id, index)) {
-                // First OmniVoice use loads the model — show that it's coming.
-                if llm.voice.loading || llm.voice.pending > 0 {
+                // Speech on its way with nothing playing yet (the model
+                // loading on first use, or the next sentence synthesizing).
+                if llm.voice.waiting() {
                     ui.add(egui::Spinner::new().size(14.0).color(MUTED()));
+                    if let Some(status) = llm.voice.status(ui.ctx()) {
+                        ui.add(egui::Label::new(egui::RichText::new(status).color(MUTED()).size(11.0)).truncate());
+                    }
                 }
                 if let Some(e) = &llm.voice.last_err {
                     ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(11.0));

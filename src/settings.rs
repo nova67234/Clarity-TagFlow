@@ -1054,6 +1054,40 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                         .strong()
                         .size(12.5),
                 );
+                if let Some(line) = llm.voice.runs_on_line() {
+                    ui.add(egui::Label::new(egui::RichText::new(line).color(MUTED()).size(11.5)).wrap());
+                }
+                // An install from before AMD support (or a new graphics card):
+                // the voice is on the CPU while a GPU could run it.
+                if let Some(gpu) = llm.voice.gpu_upgrade(ui.ctx()) {
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "Your {gpu} can run the voice several times faster than the CPU."
+                            ))
+                            .color(TEXT())
+                            .size(12.5),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(4.0);
+                    if accent_button(ui, "Set up for this GPU").clicked() {
+                        llm.voice.start_setup(ui.ctx());
+                    }
+                    hint(
+                        ui,
+                        if gpu.to_ascii_lowercase().contains("nvidia") {
+                            "Installs PyTorch for NVIDIA GPUs (a few GB); the voice \
+                             model isn't downloaded again."
+                        } else {
+                            "Installs AMD's PyTorch for Windows (ROCm 7.2.1, a few GB); \
+                             the voice model isn't downloaded again. Needs AMD \
+                             Software: Adrenalin Edition 26.2.2 or newer — if the GPU \
+                             can't run it, the voice stays on the CPU."
+                        },
+                    );
+                }
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("Voice").color(TEXT()).size(12.5));
                 ui.add_space(2.0);
@@ -1134,6 +1168,17 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                      wins over the description above; remove it to go back. \
                      An unusable sample falls back automatically.",
                 );
+
+                ui.add_space(8.0);
+                if button(ui, "Set up again").clicked() {
+                    llm.voice.start_setup(ui.ctx());
+                }
+                hint(
+                    ui,
+                    "Checks the graphics card again and repairs the install — \
+                     after a new GPU or driver, say. Keeps Python and the voice \
+                     model.",
+                );
             } else {
                 hint(
                     ui,
@@ -1156,9 +1201,11 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                     }
                     hint(
                         ui,
-                        "Downloads its own Python, GPU PyTorch and the \
-                         OmniVoice model (several GB — one time). Listen \
-                         falls back to the system voice until this is done.",
+                        "Downloads its own Python, PyTorch for the graphics \
+                         card (NVIDIA, or AMD Radeon RX 7000/9000 and Ryzen AI \
+                         graphics on Windows; otherwise the CPU) and the \
+                         OmniVoice model (several GB — one time). Listen falls \
+                         back to the system voice until this is done.",
                     );
                     if llm.voice.setup_failed {
                         ui.add_space(4.0);
