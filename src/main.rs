@@ -135,6 +135,8 @@ mod gif_info;
 mod left_browser;
 mod left_panel_settings;
 mod liquid_glass;
+// Live file updates (Settings → Files): the open folder's new images join the browser.
+mod live_folder;
 // Link (Settings → Link): another PC on the network uses this one's models.
 mod link;
 // Local AI model (Settings → AI Model): Gemma 4 vision via llama.cpp, fully
@@ -470,6 +472,18 @@ struct ViewerApp {
     last_center_rect: Option<egui::Rect>,
     /// App + ComfyUI update checker (drives the Updates tab and the gear's red dot).
     update: update::UpdateState,
+    /// Live file updates (Settings → Files): the watch on the open folder.
+    live: live_folder::LiveFolder,
+    /// The open folder's last listing folded into the browser — folded in
+    /// again once the selection moves off `live_kept`.
+    live_listing: Option<(PathBuf, Vec<PathBuf>)>,
+    /// The image on show when it was deleted elsewhere: it stays listed
+    /// (and on show) until you move on.
+    live_kept: Option<PathBuf>,
+    /// The browser's list changed in place this frame (Live file updates, a
+    /// rescan): the browser and the gallery keep their place instead of
+    /// starting again at the top as for a new list.
+    keep_list_place: bool,
 }
 
 impl Default for ViewerApp {
@@ -527,6 +541,10 @@ impl Default for ViewerApp {
             notice: None,
             last_center_rect: None,
             update: update::UpdateState::default(),
+            live: live_folder::LiveFolder::default(),
+            live_listing: None,
+            live_kept: None,
+            keep_list_place: false,
         }
     }
 }
@@ -641,6 +659,7 @@ impl ViewerApp {
         self.selected = None;
         self.settings.input_folder.clear();
         self.tag_search_cache.clear();
+        self.keep_list_place = false;
         self.update_filtered();
     }
 
@@ -656,6 +675,7 @@ impl ViewerApp {
         self.settings.input_folder = zip_path.display().to_string();
         self.selected = if self.images.is_empty() { None } else { Some(0) };
         self.tag_search_cache.clear();
+        self.keep_list_place = false;
         self.update_filtered();
     }
 
@@ -669,6 +689,7 @@ impl ViewerApp {
         self.settings.input_folder = dir.display().to_string();
         self.selected = if self.images.is_empty() { None } else { Some(0) };
         self.tag_search_cache.clear(); // tags belong to the previous folder
+        self.keep_list_place = false;
         self.update_filtered();
     }
 
@@ -1383,6 +1404,9 @@ impl ViewerApp {
         // and when the view closes.
         self.drop_from_stash(&removed);
         self.update_filtered();
+        // The browser keeps its place (the scroll follows the selection if
+        // that was the one removed).
+        self.keep_list_place = true;
         self.selected = if self.images.is_empty() {
             None
         } else {
@@ -1676,18 +1700,70 @@ impl ViewerApp {
     }
 
     /// Re-scan the current folder and try to keep the same image selected. Used
-    /// after the extended-format toggle changes and after a Deep Scan moves files.
+    /// after the extended-format toggle changes, after a Deep Scan moves files
+    /// and when files arrive over Link.
     fn rescan_current_folder(&mut self) {
         if let Some(dir) = self.current_folder.clone() {
             self.restore_folder_list();
             let keep = self.selected.and_then(|i| self.images.get(i).cloned());
             self.images = images_in_dir(&dir);
-            // Try to keep the same image selected across the re-scan.
-            self.selected = keep
-                .and_then(|p| self.images.iter().position(|q| *q == p))
-                .or(if self.images.is_empty() { None } else { Some(0) });
+            // Try to keep the same image selected across the re-scan — and
+            // then the browser's place too.
+            let kept = keep.and_then(|p| self.images.iter().position(|q| *q == p));
+            self.keep_list_place = kept.is_some();
+            self.selected = kept.or(if self.images.is_empty() { None } else { Some(0) });
             self.update_filtered();
         }
+    }
+
+    /// Live file updates: fold the open folder's last listing into the
+    /// browser (see [`Self::apply_live_listing`]).
+    fn fold_in_live_listing(&mut self) {
+        if let Some((dir, listing)) = self.live_listing.take() {
+            self.apply_live_listing(&dir, &listing);
+            // Kept only while it's still the open folder's.
+            if self.current_folder.as_deref() == Some(dir.as_path()) {
+                self.live_listing = Some((dir, listing));
+            }
+        }
+    }
+
+    /// Live file updates: fold `dir`'s `listing` into the browser (see
+    /// [`live_folder::merge`]). New images join in name order and ones
+    /// deleted elsewhere leave, but the same image stays selected — never
+    /// taken away, even when it's one of those deleted (it goes once you
+    /// move on) — so the viewer and the Details panel carry on as they were,
+    /// and the browser keeps its place.
+    fn apply_live_listing(&mut self, dir: &std::path::Path, listing: &[PathBuf]) {
+        // A generator view's own list is showing: the folder's waits.
+        if self.flux_active {
+            return;
+        }
+        // A listing for a folder since closed (or a zip opened over it).
+        if self.current_folder.as_deref() != Some(dir) || archive::active().is_some() {
+            self.live_kept = None;
+            return;
+        }
+        let keep = self.selected.and_then(|i| self.images.get(i)).cloned();
+        self.live_kept = keep
+            .clone()
+            .filter(|k| k.parent() == Some(dir) && listing.binary_search(k).is_err() && !k.exists());
+        let Some(merged) = live_folder::merge(&self.images, dir, listing, keep.as_deref(), std::path::Path::exists)
+        else {
+            return;
+        };
+        // A file at a path seen before (re-saved under a deleted one's name)
+        // is hashed afresh: it doesn't inherit that file's heart.
+        for p in merged.added.iter().chain(&merged.removed) {
+            self.favorites.forget(p);
+        }
+        for p in &merged.removed {
+            self.tag_search_cache.remove(p);
+        }
+        self.images = merged.images;
+        self.selected = keep.and_then(|k| self.images.iter().position(|p| *p == k));
+        self.keep_list_place = true;
+        self.update_filtered();
     }
 
     fn delete_selected(&mut self) {
@@ -2042,6 +2118,27 @@ impl eframe::App for ViewerApp {
                 self.rescan_current_folder();
             }
         }
+        // Live file updates (Settings → Files): images saved into the open
+        // folder join the browser; the selection, the image on show and the
+        // Details panel stay as they are. A generator view shows its own list
+        // — the folder's newest listing waits until it closes.
+        let watched = if self.settings.live_file_updates { self.current_folder.as_deref() } else { None };
+        let watching = watched.is_some();
+        self.live.watch(watched, ui.ctx());
+        if !watching {
+            self.live_listing = None;
+            self.live_kept = None;
+        }
+        if let Some(listing) = self.live.take(!self.flux_active) {
+            self.live_listing = Some(listing);
+            self.fold_in_live_listing();
+        } else if !self.flux_active
+            && let Some(kept) = &self.live_kept
+            && self.selected.and_then(|i| self.images.get(i)) != Some(kept)
+        {
+            // You've moved off the image deleted elsewhere: now it goes too.
+            self.fold_in_live_listing();
+        }
         // A model loaded only for Link devices goes when they haven't used
         // it for 10 minutes (this PC's own chat keeps it while it's on).
         if !self.settings.ai_chat
@@ -2246,6 +2343,7 @@ impl eframe::App for ViewerApp {
                 &mut self.video_previews,
                 &mut self.favorites,
                 self.settings.thumbnail_size,
+                self.keep_list_place,
             ) {
                 // Select the clicked tile (accent ring + arrow-key anchor) and
                 // open its detail popup.
@@ -2275,6 +2373,7 @@ impl eframe::App for ViewerApp {
             &mut self.favorites,
             self.settings.thumbnail_size,
             &mut self.settings.media_filter,
+            self.keep_list_place,
         );
 
         // A tile's right-click menu action — acts on that tile directly, the
@@ -2368,6 +2467,8 @@ impl eframe::App for ViewerApp {
         // 3. Central Panel (Fills remaining space)
         self.center(ui);
         } // end of the classic Panels layout
+        // The list views have seen this frame's in-place change.
+        self.keep_list_place = false;
 
         // Tag edits and undos the AI chat asked for (Tag images mode) — done
         // here because they touch the Tag Manager and the right panel.

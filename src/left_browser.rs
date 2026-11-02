@@ -40,7 +40,8 @@ pub enum TileAction {
     Send(usize, String),
 }
 
-/// Render the left browser panel.
+/// Render the left browser panel. `keep_place`: the list changed in place
+/// this frame (Live file updates) — the view stays where it is.
 ///
 /// Returns whether the search query changed this frame (so the main app knows
 /// to re-filter the list) and any action a tile's right-click menu requested.
@@ -57,6 +58,7 @@ pub fn show(
     favorites: &mut crate::favorites::Favorites,
     thumb_max_h: f32,
     media_filter: &mut crate::left_panel_settings::MediaFilter,
+    keep_place: bool,
 ) -> (bool, TileAction) {
     let mut search_changed = false;
     let mut action = TileAction::None;
@@ -158,7 +160,18 @@ pub fn show(
                     return;
                 }
 
-                action = thumbnail_list(ui, images, filtered, selected, thumbs, video_thumbs, video_previews, favorites, thumb_max_h);
+                action = thumbnail_list(
+                    ui,
+                    images,
+                    filtered,
+                    selected,
+                    thumbs,
+                    video_thumbs,
+                    video_previews,
+                    favorites,
+                    thumb_max_h,
+                    keep_place,
+                );
             });
         });
 
@@ -178,11 +191,13 @@ fn thumbnail_list(
     video_previews: &mut crate::video::VideoPreviews,
     favorites: &mut crate::favorites::Favorites,
     thumb_max_h: f32,
+    keep_place: bool,
 ) -> TileAction {
     let mut action = TileAction::None;
     // When the displayed set changes (a new folder is loaded, or the filter
     // changes) snap the scroll back to the top, instead of keeping the stale
-    // offset egui persists from the previous list.
+    // offset egui persists from the previous list — unless it changed in
+    // place (`keep_place`: files joined or left the same folder).
     let signature = list_signature(images, filtered);
     let sig_id = ui.id().with("thumb_list_signature");
     let list_changed = ui.memory_mut(|m| {
@@ -206,7 +221,7 @@ fn thumbnail_list(
     let mut scroll_area = egui::ScrollArea::vertical().auto_shrink([false, false]);
     // A list change snaps to the top — but if the selection also changed (e.g. a
     // new folder selects its first image) let the scroll-to-selected below win.
-    if list_changed && !selection_changed {
+    if list_changed && !selection_changed && !keep_place {
         scroll_area = scroll_area.vertical_scroll_offset(0.0);
     }
 
@@ -243,24 +258,35 @@ fn thumbnail_list(
 
     // Scroll anchoring: tiles above the view that finish decoding change
     // height (square placeholder → real shape) and used to shove the list
-    // around while scrolling up. Remember the top visible tile and its
-    // offset; when its offset moves, move the scroll position with it.
+    // around while scrolling up, and Live file updates add and remove tiles.
+    // Remember a tile on screen — the selected one while it's in view (new
+    // tiles mustn't push it away), else the top one — by file (its place in
+    // the list can change), and its offset; when its offset moves, move the
+    // scroll position with it, so what's on screen stays put.
     let anchor_id = ui.id().with("thumb_scroll_anchor");
-    let prev_anchor: Option<(usize, f32, f32)> = ui.data(|d| d.get_temp(anchor_id));
-    if !list_changed
+    let prev_anchor: Option<Anchor> = ui.data(|d| d.get_temp(anchor_id));
+    if (!list_changed || keep_place)
         && !selection_changed
-        && let Some((img_idx, old_off, old_scroll)) = prev_anchor
-        && let Some(row) = filtered.iter().position(|&i| i == img_idx)
-        && (offsets[row] - old_off).abs() > 0.5
+        && let Some(anchor) = prev_anchor
+        && let Some(row) = anchor.row_in(images, filtered)
+        && (offsets[row] - anchor.offset).abs() > 0.5
     {
-        scroll_area = scroll_area.vertical_scroll_offset((old_scroll + offsets[row] - old_off).max(0.0));
+        scroll_area = scroll_area.vertical_scroll_offset((anchor.scroll + offsets[row] - anchor.offset).max(0.0));
     }
 
     scroll_area
         .show_viewport(ui, |ui, viewport| {
-            // The top visible tile → next frame's scroll anchor.
-            if let Some(row) = (0..filtered.len()).find(|&r| offsets[r] + sizes[r].1 > viewport.min.y) {
-                let anchor = (filtered[row], offsets[row], viewport.min.y);
+            // The selected tile if it's in view, else the top visible tile →
+            // next frame's scroll anchor.
+            let in_view = |r: usize| offsets[r] + sizes[r].1 > viewport.min.y && offsets[r] < viewport.max.y;
+            let selected_row = (*selected).and_then(|s| filtered.iter().position(|&i| i == s)).filter(|&r| in_view(r));
+            if let Some(row) = selected_row.or_else(|| (0..filtered.len()).find(|&r| in_view(r))) {
+                let anchor = Anchor {
+                    path: images[filtered[row]].clone(),
+                    row,
+                    offset: offsets[row],
+                    scroll: viewport.min.y,
+                };
                 ui.data_mut(|d| d.insert_temp(anchor_id, anchor));
             }
             ui.set_min_height(total); // reserve the full scroll range
@@ -352,6 +378,26 @@ fn thumbnail_list(
             }
         });
     action
+}
+
+/// The browser's scroll anchor: a tile on screen (the selected one, else the
+/// top one), where it was in the list, its offset in the list and the scroll
+/// position then.
+#[derive(Clone)]
+struct Anchor {
+    path: PathBuf,
+    row: usize,
+    offset: f32,
+    scroll: f32,
+}
+
+impl Anchor {
+    /// The tile's row in the list now: where it was, unless the list changed
+    /// around it — then wherever it went (`None` once it's gone).
+    fn row_in(&self, images: &[PathBuf], filtered: &[usize]) -> Option<usize> {
+        let at = |r: usize| filtered.get(r).is_some_and(|&i| images[i] == self.path);
+        if at(self.row) { Some(self.row) } else { (0..filtered.len()).find(|&r| at(r)) }
+    }
 }
 
 /// A cheap fingerprint of the currently displayed list. Changes when a new

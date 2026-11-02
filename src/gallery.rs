@@ -24,7 +24,9 @@ const CORNER: u8 = 10;
 const DEFAULT_ASPECT: f32 = 1.0;
 
 /// Render the gallery into a central panel filling the area below the top bar.
-/// Returns the index of a clicked image (to open in the detail popup), if any.
+/// `keep_place`: the list changed in place this frame (Live file updates) —
+/// the view stays where it is. Returns the index of a clicked image (to open
+/// in the detail popup), if any.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut egui::Ui,
@@ -37,6 +39,7 @@ pub fn show(
     favorites: &mut crate::favorites::Favorites,
     // Target tile/column width, driven by the Thumbnail-size setting.
     target_col_w: f32,
+    keep_place: bool,
 ) -> Option<usize> {
     let mut clicked = None;
     egui::CentralPanel::default()
@@ -81,7 +84,8 @@ pub fn show(
             });
 
             let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
-            if list_changed {
+            // ...unless files joined or left the same folder (`keep_place`).
+            if list_changed && !keep_place {
                 scroll = scroll.vertical_scroll_offset(0.0);
             }
             // Widen into the panel's right margin so the scrollbar sits on the
@@ -90,23 +94,57 @@ pub fn show(
             // the left browser).
             const SCROLL_GUTTER: f32 = 12.0;
             let mut scroll_ui = crate::edge_scroll_ui(ui, SCROLL_GUTTER);
-            scroll.show(&mut scroll_ui, |ui| {
+            // Lay the tiles out first (cheap arithmetic) so the scroll anchor
+            // below can correct this frame.
+            let avail = scroll_ui.available_width() - SCROLL_GUTTER;
+            let target = target_col_w.clamp(120.0, 400.0);
+            let ncols = (((avail + GAP) / (target + GAP)).floor() as usize).max(1);
+            let col_w = (avail - GAP * (ncols as f32 - 1.0)) / ncols as f32;
+
+            // Masonry: place each image into the currently-shortest column,
+            // noting where each tile starts and how tall it is.
+            let mut columns: Vec<Vec<usize>> = vec![Vec::new(); ncols];
+            let mut heights = vec![0.0f32; ncols];
+            let mut tiles: Vec<(usize, f32, f32)> = Vec::with_capacity(filtered.len());
+            for &i in filtered {
+                let h = col_w * aspect_of(thumbs, video_thumbs, &images[i]);
+                let c = shortest(&heights);
+                columns[c].push(i);
+                tiles.push((i, heights[c], h));
+                heights[c] += h + GAP;
+            }
+
+            // Scroll anchoring, as in the left browser: tiles above the view
+            // change height as their thumbnails decode, and Live file updates
+            // add and remove tiles. The selected tile while it's in view, else
+            // the top visible one, keeps its place on screen (found by file).
+            let anchor_id = egui::Id::new("gallery_scroll_anchor");
+            let prev: Option<(PathBuf, usize, f32, f32)> = ui.data(|d| d.get_temp(anchor_id));
+            if (!list_changed || keep_place)
+                && let Some((path, k, old_top, old_scroll)) = prev
+                && let Some(top) = anchor_top(images, &tiles, &path, k)
+                && (top - old_top).abs() > 0.5
+            {
+                scroll = scroll.vertical_scroll_offset((old_scroll + top - old_top).max(0.0));
+            }
+
+            scroll.show_viewport(&mut scroll_ui, |ui, viewport| {
+                    // The selected tile if it's in view, else the top visible
+                    // tile → next frame's anchor.
+                    let in_view = |(_, (_, top, h)): &(usize, &(usize, f32, f32))| {
+                        top + h > viewport.min.y && *top < viewport.max.y
+                    };
+                    let chosen = tiles
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (i, ..))| Some(*i) == selected)
+                        .filter(in_view)
+                        .or_else(|| tiles.iter().enumerate().filter(in_view).min_by(|a, b| a.1.1.total_cmp(&b.1.1)));
+                    if let Some((k, &(i, top, _))) = chosen {
+                        ui.data_mut(|d| d.insert_temp(anchor_id, (images[i].clone(), k, top, viewport.min.y)));
+                    }
                     ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
                     ui.set_max_width(ui.available_width() - SCROLL_GUTTER);
-                    let avail = ui.available_width();
-                    let target = target_col_w.clamp(120.0, 400.0);
-                    let ncols = (((avail + GAP) / (target + GAP)).floor() as usize).max(1);
-                    let col_w = (avail - GAP * (ncols as f32 - 1.0)) / ncols as f32;
-
-                    // Masonry: place each image into the currently-shortest column.
-                    let mut columns: Vec<Vec<usize>> = vec![Vec::new(); ncols];
-                    let mut heights = vec![0.0f32; ncols];
-                    for &i in filtered {
-                        let a = aspect_of(thumbs, video_thumbs, &images[i]);
-                        let c = shortest(&heights);
-                        columns[c].push(i);
-                        heights[c] += col_w * a + GAP;
-                    }
 
                     ui.columns(ncols, |cols| {
                         for (ci, col_ui) in cols.iter_mut().enumerate() {
@@ -140,6 +178,13 @@ pub fn show(
                 });
         });
     clicked
+}
+
+/// Where the anchor tile (`path`, `k`th in the list last frame) starts now:
+/// it's checked where it was first, then looked for (the list changed).
+fn anchor_top(images: &[PathBuf], tiles: &[(usize, f32, f32)], path: &Path, k: usize) -> Option<f32> {
+    let is = |t: &&(usize, f32, f32)| images[t.0] == path;
+    tiles.get(k).filter(is).or_else(|| tiles.iter().find(is)).map(|t| t.1)
 }
 
 /// The floating search/filter pill shown over the Gallery in the bottom-right

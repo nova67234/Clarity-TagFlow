@@ -61,6 +61,10 @@ pub struct Settings {
     pub hd_thumbnails: bool,
     /// Ask for confirmation before deleting an image and its sidecar.
     pub confirm_before_delete: bool,
+    /// Live file updates: images saved into the open folder join the browser
+    /// as they arrive (and ones deleted elsewhere leave), without changing the
+    /// selection or the image on show. See `src/live_folder.rs`.
+    pub live_file_updates: bool,
     /// Recognise extended image formats (AVIF / HEIC / RAW) that rely on heavy C-library
     /// decoders. Off by default. Only has an effect when the app was *built* with
     /// the matching support compiled in (the `avif` / `heic` cargo features);
@@ -292,6 +296,7 @@ impl Default for Settings {
             thumbnail_size: DEFAULT_THUMBNAIL_SIZE,
             hd_thumbnails: false,
             confirm_before_delete: true,
+            live_file_updates: false,
             enable_extended_formats: false,
             last_ai_model: "Select AI...".to_string(),
             tag_manager: Default::default(),
@@ -570,6 +575,15 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut Settings) {
             Some("Ask before deleting an image and its .txt sidecar."),
             |ui| {
                 switch(ui, &mut settings.confirm_before_delete);
+            },
+        );
+        row_sep(ui);
+        row(
+            ui,
+            "Live file updates",
+            Some("New images in the open folder appear as they're saved."),
+            |ui| {
+                switch(ui, &mut settings.live_file_updates);
             },
         );
 
