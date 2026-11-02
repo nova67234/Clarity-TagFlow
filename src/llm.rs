@@ -945,6 +945,9 @@ pub struct ChatMsg {
     pub tag_change: Option<crate::ai_tagging::TagChange>,
     /// Role play: goals this reply set, achieved or failed (its note).
     pub goals: Vec<crate::roleplay::GoalEvent>,
+    /// Role play with thoughts in character: the character whose reply this
+    /// is — its thoughts are shown as that character's ("Mira's thoughts").
+    pub character: Option<String>,
     /// The memory pass may read it: sent (or answered) in an ordinary chat
     /// while Remember across chats was on — not in role play, Krea 2 prompts
     /// or Tag images (src/llm/memory_pass.rs).
@@ -1944,6 +1947,7 @@ impl LlmState {
             tag_image,
             tag_change: None,
             goals: Vec::new(),
+            character: None,
             remember,
             picture_memory,
             shared_with: Vec::new(),
@@ -2365,6 +2369,10 @@ impl LlmState {
         match asked {
             Ok(()) => {
                 self.reply_rx = Some(rx);
+                // Role play with thoughts in character: the thoughts are the
+                // character's, and its Thinking row says whose.
+                let character = (self.gen_roleplay && self.roleplay.thoughts_in_character)
+                    .then(|| self.roleplay.ai_display().to_string());
                 // The empty reply bubble the tokens stream into.
                 self.chats[self.active_chat]
                     .msgs
@@ -2377,6 +2385,7 @@ impl LlmState {
                         tag_image: None,
                         tag_change: None,
                         goals: Vec::new(),
+                        character,
                         // A reply written from web pages or with PDFs in
                         // view stays out of the memory and the album: a page
                         // could have put anything in it.
@@ -4319,6 +4328,7 @@ mod roleplay_goal_tests {
             tag_image: None,
             tag_change: None,
             goals: Vec::new(),
+            character: None,
             remember: false,
             picture_memory: false,
             shared_with: Vec::new(),
@@ -4398,6 +4408,39 @@ mod roleplay_goal_tests {
         assert_eq!(m.text, "Page 3 says the lighthouse is closed.");
         assert!(m.goals.is_empty() && llm.roleplay.goals.is_empty());
         assert_eq!(llm.rp_memory.count(), memories, "a memory was saved");
+    }
+
+    /// A role-play reply is the character's — its Thinking row says whose —
+    /// unless thoughts in character are off. (In a build without the AI,
+    /// where a web lookup still starts a reply, and ends it saying why.)
+    #[cfg(not(feature = "llm"))]
+    #[test]
+    fn a_role_play_reply_belongs_to_the_character() {
+        let ctx = egui::Context::default();
+        let notes = std::env::temp_dir().join(format!("ctf_rp_thoughts_{}", std::process::id()));
+        for (in_character, whose) in [(true, Some("Mira")), (false, None)] {
+            let mut llm = LlmState::default();
+            llm.roleplay = RoleplayState {
+                enabled: true,
+                ai_name: "Mira".into(),
+                thoughts_in_character: in_character,
+                ..Default::default()
+            };
+            llm.web_research = true;
+            llm.research.notes_dir = notes.to_string_lossy().into_owned();
+            llm.chats[0].msgs.push(msg(ChatRole::User, "Who won the regatta?"));
+            llm.begin_generation(&ctx);
+            let m = llm.chats[0].msgs.last().unwrap();
+            assert!(m.role == ChatRole::Model);
+            assert_eq!(m.character.as_deref(), whose);
+            let t0 = std::time::Instant::now();
+            while llm.running && t0.elapsed() < std::time::Duration::from_secs(20) {
+                llm.poll(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(!llm.running, "the reply never ended");
+        }
+        let _ = std::fs::remove_dir_all(&notes);
     }
 
     /// Role play's Date and time switch leaves the clock line out of its
@@ -4484,6 +4527,7 @@ mod web_research_tests {
             tag_image: None,
             tag_change: None,
             goals: Vec::new(),
+            character: None,
             remember: role == ChatRole::User,
             picture_memory: false,
             shared_with: Vec::new(),
@@ -6121,6 +6165,7 @@ mod pdf_tests {
             tag_image: None,
             tag_change: None,
             goals: Vec::new(),
+            character: None,
             remember: true,
             picture_memory: false,
             shared_with: Vec::new(),

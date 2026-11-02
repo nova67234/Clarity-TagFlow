@@ -1447,6 +1447,7 @@ mod tests {
             tag_image: None,
             tag_change: None,
             goals: Vec::new(),
+            character: None,
             remember,
             picture_memory: false,
             shared_with: Vec::new(),

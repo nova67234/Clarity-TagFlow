@@ -677,6 +677,21 @@ fn roleplay_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) 
                     }
                 },
             );
+            row_sep(ui);
+            row(
+                ui,
+                "Thoughts in character",
+                Some(
+                    "With a model that thinks before answering (Gemma 4 31B, Qwen3-VL 30B Thinking), \
+                     its thoughts are the character's inner voice — first person, in character — \
+                     instead of notes about the chat.",
+                ),
+                |ui| {
+                    if switch(ui, &mut rp.thoughts_in_character).changed() {
+                        rp.save();
+                    }
+                },
+            );
         });
     });
 

@@ -1347,6 +1347,23 @@ fn chat_markdown(
     });
 }
 
+/// The Thinking row's label: whose thoughts — a role-play character's when
+/// it thinks in character, "Mira's thoughts" — and, while they stream, how
+/// long so far.
+fn thoughts_label(character: Option<&str>, live: bool, secs: Option<u64>) -> String {
+    let label = match (character, live, secs) {
+        (Some(c), true, Some(s)) => format!("{c} is thinking… {s} s"),
+        (Some(c), true, None) => format!("{c} is thinking…"),
+        (Some(c), false, _) => format!("{c}'s thoughts"),
+        (None, true, Some(s)) => format!("Thinking… {s} s"),
+        (None, true, None) => "Thinking…".to_string(),
+        (None, false, _) => "Thoughts".to_string(),
+    };
+    // An unnamed character is "the AI": "The AI's thoughts".
+    let mut chars = label.chars();
+    chars.next().map(|f| f.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
 /// The collapsible "Thinking" row above a reply: the little AI orb, a muted
 /// label (pulsing softly while the thought still streams) and a chevron that
 /// rotates as the section opens. Clicking anywhere on it (orb included)
@@ -1373,11 +1390,14 @@ fn thinking_row(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, thinking: &
         }
 
         // While the thought streams, a seconds counter shows it hasn't
-        // stalled (Max can think for minutes on a partly-CPU 31B).
-        let label = match llm.gen_started.filter(|_| live) {
-            Some(t) => format!("Thinking… {} s", t.elapsed().as_secs()),
-            None if live => "Thinking…".to_string(),
-            None => "Thoughts".to_string(),
+        // stalled (Max can think for minutes on a partly-CPU 31B). In role
+        // play with thoughts in character they're the character's own.
+        let character = llm.chats[llm.active_chat].msgs.get(index).and_then(|m| m.character.clone());
+        let secs = llm.gen_started.filter(|_| live).map(|t| t.elapsed().as_secs());
+        let label = thoughts_label(character.as_deref(), live, secs);
+        let tip = match &character {
+            Some(c) => format!("See what {c} thought before answering"),
+            None => "See what the model thought before answering".to_string(),
         };
         // Muted like a caption normally; the chat text-colour override
         // (or the Aurora-glow black default) wins. While the thought streams
@@ -1394,9 +1414,7 @@ fn thinking_row(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, thinking: &
         );
         let size = egui::vec2(galley.size().x + 8.0 + 16.0, 22.0);
         let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-        let resp = resp
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text("See what the model thought before answering");
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip);
         if resp.clicked() {
             toggled = true;
         }
@@ -2590,6 +2608,20 @@ fn icon_button_tinted(
 }
 #[cfg(test)]
 mod tests {
+    /// The Thinking row names a role-play character's thoughts as its own
+    /// ("Mira's thoughts"); other replies keep the plain labels.
+    #[test]
+    fn thoughts_are_labelled_with_the_character() {
+        assert_eq!(thoughts_label(Some("Mira"), true, Some(12)), "Mira is thinking… 12 s");
+        assert_eq!(thoughts_label(Some("Mira"), true, None), "Mira is thinking…");
+        assert_eq!(thoughts_label(Some("Mira"), false, Some(3)), "Mira's thoughts");
+        assert_eq!(thoughts_label(Some("the AI"), false, None), "The AI's thoughts");
+        assert_eq!(thoughts_label(None, true, Some(4)), "Thinking… 4 s");
+        assert_eq!(thoughts_label(None, true, None), "Thinking…");
+        assert_eq!(thoughts_label(None, false, None), "Thoughts");
+    }
+
+    use super::thoughts_label;
     use super::thousands;
 
     /// The thinking chip's allowance reads "4,096 tok", not "4096 tok".

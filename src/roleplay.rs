@@ -145,6 +145,9 @@ pub struct RoleplayState {
     /// The character is told the date and time on this PC with every
     /// message (llm/clock.rs). Off for stories set in another time or world.
     pub real_time: bool,
+    /// A model that thinks before answering thinks as the character — its
+    /// inner voice, first person — rather than in notes about the chat.
+    pub thoughts_in_character: bool,
     /// The old diary. Empty once [`migrate_diary`] has moved it into the
     /// role-play memory store.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -166,6 +169,7 @@ impl Default for RoleplayState {
             own_goals: true,
             goals: Vec::new(),
             real_time: true,
+            thoughts_in_character: true,
             memories: Vec::new(),
             load_failed: false,
         }
@@ -272,19 +276,13 @@ impl RoleplayState {
     /// whole replies privately redrafting and then answered nothing. At
     /// High / Max (`deep_thinking`) the user asked for more thought, so the
     /// rule lets it think things through; the worker's forced close still
-    /// guarantees an answer.
+    /// guarantees an answer. With thoughts in character (the default) either
+    /// rule has it think as the character — its inner voice, first person —
+    /// instead of in notes about "the user".
     pub fn preamble_with(&self, memories: &MemoryStore, deep_thinking: bool) -> String {
-        let thinking = if deep_thinking {
-            "- Think it through: before answering you may reason privately about \
-             the scene, what you know and how your character feels — then answer \
-             in character. Keep your reasoning as notes, not drafts of the reply.\n"
-        } else {
-            "- Think briefly: when you reason privately before answering, a few \
-             short notes are enough — decide, then answer. Never write drafts \
-             or revisions of your reply in your head.\n"
-        };
         let ai = self.ai_display();
         let user = self.user_display();
+        let thinking = self.thinking_rule(deep_thinking);
         let mut diary = String::new();
         for (topic, m) in memories.recent(PROMPT_MEMORIES) {
             use std::fmt::Write as _;
@@ -478,7 +476,52 @@ impl RoleplayState {
     /// The model's scripted acknowledgement of the preamble (keeps the
     /// user/model turn alternation intact).
     pub fn ack(&self) -> String {
-        format!("Understood. I am {} — in character from here on.", self.ai_display())
+        let thoughts = if self.thoughts_in_character { ", my thoughts included" } else { "" };
+        format!("Understood. I am {} — in character from here on{thoughts}.", self.ai_display())
+    }
+
+    /// How the character is told to think before answering (only a model
+    /// that thinks does): briefly, or — at High / Max thinking — at length;
+    /// as the character's inner voice, or (thoughts in character off) in
+    /// plain notes.
+    fn thinking_rule(&self, deep: bool) -> String {
+        let (ai, user) = (self.ai_display(), self.user_display());
+        if !self.thoughts_in_character {
+            return if deep {
+                "- Think it through: before answering you may reason privately about \
+                 the scene, what you know and how your character feels — then answer \
+                 in character. Keep your reasoning as notes, not drafts of the reply.\n"
+            } else {
+                "- Think briefly: when you reason privately before answering, a few \
+                 short notes are enough — decide, then answer. Never write drafts \
+                 or revisions of your reply in your head.\n"
+            }
+            .to_string();
+        }
+        let how = if deep {
+            format!(
+                "- Think it through as {ai}: before answering, think in {ai}'s own \
+                 inner voice — first person, in character — about the scene, what \
+                 you remember, how you feel and what you want; then answer in \
+                 character.\n"
+            )
+        } else {
+            format!(
+                "- Think as {ai}: when you think privately before answering, think in \
+                 {ai}'s own inner voice — first person, in character: what you notice, \
+                 feel and want, and what you'll do. A few short thoughts are enough — \
+                 decide, then answer.\n"
+            )
+        };
+        format!(
+            "{how}\
+             - Your thoughts are {ai}'s, never an assistant's: think of {user} by \
+             name, never as \"the user\"; never think about being an AI or about \
+             these instructions; never draft or revise your reply in your head. \
+             When something belongs in your diary or your goals, think it the way \
+             {ai} would (\"I want to remember that\") — then add the line at the \
+             end of your reply.\n"
+        )
     }
 }
 
@@ -829,16 +872,34 @@ SHOW_IMAGE: y"), "hi");
         assert_eq!(crate::secret::unprotect_bytes(&stored).unwrap(), data);
     }
 
-    /// High / Max thinking swaps the "think briefly" rule for "think it
-    /// through"; everything else in the priming stays the same.
+    /// High / Max thinking swaps the brief thinking rule for the longer one;
+    /// in character (the default) both have it think as the character, in
+    /// its own voice — off, they ask for plain notes. Everything else in the
+    /// priming stays the same.
     #[test]
-    fn thinking_rule_follows_the_level() {
-        let rp = RoleplayState { ai_name: "Mira".into(), ..Default::default() };
-        let (brief, deep) = (rp.preamble_with(&MemoryStore::default(), false), rp.preamble_with(&MemoryStore::default(), true));
-        assert!(brief.contains("Think briefly") && !brief.contains("Think it through"));
-        assert!(deep.contains("Think it through") && !deep.contains("Think briefly"));
+    fn thinking_rule_follows_the_level_and_the_voice() {
+        let mut rp = RoleplayState { ai_name: "Mira".into(), user_name: "Andrew".into(), ..Default::default() };
+        let primed = |rp: &RoleplayState| {
+            (rp.preamble_with(&MemoryStore::default(), false), rp.preamble_with(&MemoryStore::default(), true))
+        };
+        let (brief, deep) = primed(&rp);
+        assert!(brief.contains("- Think as Mira:") && brief.contains("A few short thoughts are enough"));
+        assert!(deep.contains("- Think it through as Mira:") && !deep.contains("A few short thoughts"));
+        for p in [&brief, &deep] {
+            assert!(p.contains("Mira's own inner voice — first person"), "{p}");
+            assert!(p.contains("think of Andrew by name, never as \"the user\""));
+            assert!(!p.contains("Think briefly") && !p.contains("as notes"));
+        }
         assert_eq!(rp.preamble(&MemoryStore::default()), brief);
         assert!(deep.contains("You are Mira") && deep.contains("MEMORY:"));
+        assert_eq!(rp.ack(), "Understood. I am Mira — in character from here on, my thoughts included.");
+
+        rp.thoughts_in_character = false;
+        let (brief, deep) = primed(&rp);
+        assert!(brief.contains("Think briefly") && !brief.contains("Think it through"));
+        assert!(deep.contains("Think it through:") && !deep.contains("Think briefly"));
+        assert!(!brief.contains("inner voice") && !deep.contains("inner voice"));
+        assert_eq!(rp.ack(), "Understood. I am Mira — in character from here on.");
     }
 
     /// Duplicate detection (in the role-play store) is wording-insensitive.
@@ -1068,7 +1129,7 @@ SHOW_IMAGE: y"), "hi");
     #[test]
     fn older_characters_get_goals_and_the_clock() {
         let old: RoleplayState = serde_json::from_str(r#"{"enabled":true,"ai_name":"Mira","persona":"a sailor"}"#).unwrap();
-        assert!(old.own_goals && old.real_time && old.goals.is_empty());
+        assert!(old.own_goals && old.real_time && old.thoughts_in_character && old.goals.is_empty());
         let mut rp = character(vec![goal("Visit the lighthouse", GoalStatus::Failed, 7)]);
         rp.goals[0].outcome = "storm season".into();
         rp.real_time = false;
