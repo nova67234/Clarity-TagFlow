@@ -328,6 +328,27 @@ impl ImageDetail {
     }
 }
 
+/// From this much graphics memory an integrated GPU may try the higher Image
+/// detail levels — big unified-memory chips like Ryzen AI Max's Radeon 8060S,
+/// which have both the room and the speed. (llama.cpp counts an integrated
+/// GPU's own share plus the system memory it may borrow.) Smaller ones stay
+/// at Standard.
+#[cfg_attr(not(feature = "llm"), allow(dead_code))]
+const IGPU_DETAIL_MEMORY: usize = 16 * 1024 * 1024 * 1024;
+
+/// Whether the GPU the model runs on may try the higher Image detail levels
+/// at all: a graphics card, or an integrated GPU with IGPU_DETAIL_MEMORY. The
+/// free-memory check and the test encode then decide, the same for both.
+/// `Err` says why not.
+#[cfg_attr(not(feature = "llm"), allow(dead_code))]
+fn detail_gpu(integrated: bool, memory_total: usize) -> Result<(), &'static str> {
+    if !integrated || memory_total >= IGPU_DETAIL_MEMORY {
+        Ok(())
+    } else {
+        Err("higher image detail needs a graphics card, or an integrated GPU with 16 GB of graphics memory or more.")
+    }
+}
+
 /// How many of a chat's most recent messages are re-sent to the model each
 /// turn (the working memory — older messages are forgotten). Sized so ~25
 /// turns of conversation fit the 16k context with room for a long reply.
@@ -3940,7 +3961,8 @@ mod worker {
     }
 
     /// The three Image detail checks, run once per model load: (1) the
-    /// whole model is on a dedicated GPU, (2) enough free GPU memory per
+    /// whole model is on a graphics card, or on an integrated GPU with plenty
+    /// of memory (`super::detail_gpu`), (2) enough free GPU memory per
     /// `ImageDetail::free_needed` (skipped when the driver can't say), (3) a
     /// test image actually encodes — stepping down a level on failure.
     /// Takes the default (Standard) projector and returns the level to run,
@@ -3965,9 +3987,18 @@ mod worker {
         let capped = |why: &str| Some(format!("Running at Standard: {why}"));
         // CPU-only build, or no GPU device.
         let gpu = if super::BUILT_WITH_GPU { model_gpu() } else { None };
-        let Some(gpu) = gpu.filter(|g| g.device_type == T::Gpu) else {
-            return Ok((D::Standard, capped("higher image detail needs a dedicated graphics card."), standard));
+        let Some(gpu) = gpu.filter(|g| matches!(g.device_type, T::Gpu | T::IntegratedGpu)) else {
+            return Ok((
+                D::Standard,
+                capped("the AI runs on the CPU here, and higher image detail needs a GPU."),
+                standard,
+            ));
         };
+        // An integrated GPU only with plenty of memory (a Radeon 8060S, not
+        // a laptop's small shared slice).
+        if let Err(why) = super::detail_gpu(gpu.device_type == T::IntegratedGpu, gpu.memory_total) {
+            return Ok((D::Standard, capped(why), standard));
+        }
         // 1. Offload check: a model that didn't fit whole leaves no room.
         // (Tests can skip it to measure the higher levels on a big model.)
         let forced = cfg!(test) && std::env::var_os("CLARITY_FORCE_DETAIL_PROBE").is_some();
@@ -4238,6 +4269,25 @@ mod worker {
             .to_rgb8();
         MtmdBitmap::from_image_data(img.width(), img.height(), img.as_raw())
             .map_err(|e| format!("Load image: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod image_detail_tests {
+    use super::*;
+
+    const GB: usize = 1024 * 1024 * 1024;
+
+    /// Graphics cards and big integrated GPUs (Ryzen AI Max's 8060S reports
+    /// tens of GB) may try High/Maximum; a laptop's small integrated GPU
+    /// stays at Standard and says why.
+    #[test]
+    fn integrated_gpus_with_plenty_of_memory_qualify() {
+        assert!(detail_gpu(false, 8 * GB).is_ok());
+        assert!(detail_gpu(true, 96 * GB).is_ok());
+        assert!(detail_gpu(true, 16 * GB).is_ok());
+        let why = detail_gpu(true, 8 * GB).unwrap_err();
+        assert!(why.contains("16 GB"), "{why}");
     }
 }
 
