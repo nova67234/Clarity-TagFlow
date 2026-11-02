@@ -17,6 +17,10 @@ license = "MIT"
 eframe = { version = "0.34.2", features = ["persistence", "glow"] }
 serde = { version = "1", features = ["derive"] }
 image = { version = "0.25.10", features = ["png", "jpeg", "gif", "bmp", "webp", "ico", "tiff", "hdr"] }
+# PDFs in the AI chat (src/pdf.rs): text extraction and, for scanned PDFs,
+# page rendering. Pure Rust (MIT/Apache) — no PDF library to ship. Default
+# features off: colour management (`icc`) isn't needed to read a page.
+pdf_oxide = { version = "0.3.78", default-features = false, features = ["rendering", "legacy-crypto"] }
 rfd = "0.17.2"
 sysinfo = "0.39.2"
 egui_extras = { version = "0.34.3", features = ["svg"] }

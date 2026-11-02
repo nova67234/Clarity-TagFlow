@@ -31,7 +31,7 @@ const STOPWORDS: &[&str] = &[
 /// The words of `text` worth matching: lowercase, letters and digits, no
 /// stopwords. Runs of CJK characters (written without spaces) become
 /// overlapping character pairs.
-pub(super) fn terms(text: &str) -> Vec<String> {
+pub(crate) fn terms(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for word in text.split(|c: char| !c.is_alphanumeric()) {
         if word.is_empty() {
@@ -56,7 +56,7 @@ pub(super) fn terms(text: &str) -> Vec<String> {
     out
 }
 
-fn is_cjk(c: char) -> bool {
+pub(crate) fn is_cjk(c: char) -> bool {
     matches!(c, '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{ac00}'..='\u{d7af}'
         | '\u{f900}'..='\u{faff}')
 }

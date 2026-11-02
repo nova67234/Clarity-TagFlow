@@ -145,6 +145,8 @@ mod link;
 mod llm;
 mod mp4;
 mod net;
+// PDFs in the AI chat: reading them, and what of them the AI is shown.
+mod pdf;
 // Pixal3D image->3D requirement setup — Linux/Windows only (compiled out on macOS).
 #[cfg(not(target_os = "macos"))]
 mod pixal3d;

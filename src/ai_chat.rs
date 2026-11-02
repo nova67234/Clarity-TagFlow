@@ -401,7 +401,7 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                 } else if llm.krea_prompts {
                     "Attach a picture with + or describe an idea — get a Krea 2 prompt"
                 } else {
-                    "Ask AI anything — attach an image with +, or pick a workflow in Tools"
+                    "Ask AI anything — attach an image or a PDF with +, or pick a workflow in Tools"
                 };
                 ui.vertical_centered(|ui| {
                     ui.set_max_width(col_w);
@@ -467,15 +467,22 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
     let dropped: Vec<std::path::PathBuf> = ui.input(|i| {
         i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
     });
-    if !dropped.is_empty() && claims_drop(llm, ui.ctx())
-        && let Some(p) = dropped.into_iter().find(|p| {
-        crate::is_video(p)
-            || p.extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| DROP_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-    }) {
-        llm.draft_image = Some(p);
-        llm.run_err = None;
+    if !dropped.is_empty() && claims_drop(llm, ui.ctx()) {
+        // A PDF takes the draft's PDF slot (and starts being read); a
+        // picture or video its picture slot. Not in Tag images.
+        let tagging = llm.tag_images && llm.tag_target.is_some();
+        if let Some(p) = dropped.iter().find(|p| crate::pdf::is_pdf(p)).filter(|_| !tagging) {
+            attach_doc(llm, p.clone(), ui.ctx());
+        }
+        if let Some(p) = dropped.into_iter().find(|p| {
+            crate::is_video(p)
+                || p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| DROP_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        }) {
+            llm.draft_image = Some(p);
+            llm.run_err = None;
+        }
     }
 
     let screen = ui.ctx().content_rect();
@@ -552,6 +559,10 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                     ui.vertical(|ui| {
                         ui.set_width(col_w - 24.0);
 
+                        // The PDFs the AI reads with every message of this
+                        // chat, each with a ✕ to put it away.
+                        docs_in_use(ui, llm);
+
                         // Attached-media preview (rounded, with a remove ✕): image
                         // thumbnail, or a video's poster still with a play badge —
                         // a filename chip while the poster is still being captured.
@@ -579,6 +590,19 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                 {
                                     llm.draft_image = None;
                                     llm.draft_thumb = None;
+                                }
+                            });
+                            ui.add_space(6.0);
+                        }
+                        // An attached PDF: its first page, name and size —
+                        // or how reading it is going — with a remove ✕.
+                        if let Some(path) = llm.draft_doc.clone() {
+                            let state = crate::pdf::request(&path, ui.ctx());
+                            ui.horizontal(|ui| {
+                                doc_card(ui, llm, &path, &state, false);
+                                if remove_button(ui, 16.0, "Remove the PDF").clicked() {
+                                    llm.draft_doc = None;
+                                    llm.run_err = None;
                                 }
                             });
                             ui.add_space(6.0);
@@ -625,18 +649,24 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                             let attach_tip = if tagging {
                                 "Tag images sends the image on the left with every message"
                             } else {
-                                "Attach an image or video"
+                                "Attach an image, a video or a PDF"
                             };
                             if icon_button(ui, egui::include_image!("../icons/add.svg"), 20.0, attach_tip, !llm.running && !tagging)
                                 .clicked()
                                 && !tagging
                                 && let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"])
+                                .add_filter("Images, videos and PDFs", &[DROP_EXTS, VIDEO_PICK_EXTS, &["pdf"]].concat())
+                                .add_filter("Images", DROP_EXTS)
                                 .add_filter("Videos", VIDEO_PICK_EXTS)
+                                .add_filter("PDFs", &["pdf"])
                                 .pick_file()
                             {
-                                llm.draft_image = Some(path);
-                                llm.run_err = None;
+                                if crate::pdf::is_pdf(&path) {
+                                    attach_doc(llm, path, ui.ctx());
+                                } else {
+                                    llm.draft_image = Some(path);
+                                    llm.run_err = None;
+                                }
                             }
                             // Tools menu: extra chat abilities with on/off toggles.
                             let tools_resp = icon_button(ui, egui::include_image!("../icons/tools.svg"), 18.0, "Tools", true);
@@ -692,8 +722,14 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                 ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
                             }
                             tools_menu::popup(&tools_resp, llm, settings);
+                            // A PDF still being read (or that can't be) holds
+                            // the message back; its card says which.
+                            let doc_ready = llm.draft_doc.as_ref().is_none_or(|d| {
+                                matches!(crate::pdf::request(d, ui.ctx()), crate::pdf::State::Ready(_))
+                            });
                             let can_send = !llm.running
-                                && (!llm.draft.trim().is_empty() || llm.draft_image.is_some());
+                                && doc_ready
+                                && (!llm.draft.trim().is_empty() || llm.draft_image.is_some() || llm.draft_doc.is_some());
                             // While a reply streams the send icon becomes a stop
                             // button, same as the text-to-image view. With an
                             // empty draft only the mic shows; once there's
@@ -739,9 +775,17 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
 /// lists, headings, code blocks) straight on the background, like current
 /// assistant UIs. A streaming reply shows a ▌ cursor.
 fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool) {
-    let (role, text, stored_thinking, image, tag_image, tag_change) = {
+    let (role, text, stored_thinking, image, doc, tag_image, tag_change) = {
         let m = &llm.chats[llm.active_chat].msgs[index];
-        (m.role, m.text.clone(), m.thinking.clone(), m.image.clone(), m.tag_image.clone(), m.tag_change.clone())
+        (
+            m.role,
+            m.text.clone(),
+            m.thinking.clone(),
+            m.image.clone(),
+            m.doc.clone(),
+            m.tag_image.clone(),
+            m.tag_change.clone(),
+        )
     };
 
     if role == ChatRole::User {
@@ -803,6 +847,20 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                     ui.add_space(4.0);
                 }
             }
+            // The attached PDF: its card opens it.
+            if let Some(path) = &doc {
+                if image.is_some() {
+                    ui.add_space(4.0);
+                }
+                let state = crate::pdf::request(path, ui.ctx());
+                let resp = doc_card(ui, llm, path, &state, true);
+                if resp.clicked() {
+                    crate::scan::open_in_default(path);
+                }
+                if !text.is_empty() {
+                    ui.add_space(4.0);
+                }
+            }
 
             // Editing: the bubble becomes an in-place editor. Enter (or the
             // send icon) resends from here — everything after this message
@@ -829,7 +887,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                         ui.horizontal(|ui| {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 let can_send = !llm.running
-                                    && (!llm.edit_draft.trim().is_empty() || image.is_some());
+                                    && (!llm.edit_draft.trim().is_empty() || image.is_some() || doc.is_some());
                                 let send = msg_icon_button(
                                     ui,
                                     egui::include_image!("../icons/send.svg"),
@@ -1424,6 +1482,170 @@ fn paint_play_badge(ui: &mut egui::Ui, rect: egui::Rect) {
 
 /// Filename chip for an attachment with no thumbnail (an unreadable image, or
 /// a video whose poster is still being captured): a small type icon + name.
+/// Attach `path` (a PDF) to the draft and start reading it.
+fn attach_doc(llm: &mut LlmState, path: std::path::PathBuf, ctx: &egui::Context) {
+    crate::pdf::request(&path, ctx);
+    llm.draft_doc = Some(path);
+    llm.run_err = None;
+}
+
+/// A PDF attachment (`path`, read as far as `state` says): a small picture
+/// of its first page beside its name and size — or how reading it is going,
+/// or why it can't be read. Measured and painted as one piece, so it sits
+/// right in a right-aligned message as well as in the message box. In a
+/// sent message (`in_message`) it opens the PDF when clicked.
+fn doc_card(
+    ui: &mut egui::Ui,
+    llm: &mut LlmState,
+    path: &std::path::Path,
+    state: &crate::pdf::State,
+    in_message: bool,
+) -> egui::Response {
+    const PAD: f32 = 7.0;
+    const THUMB: egui::Vec2 = egui::vec2(36.0, 48.0);
+    const SPIN: f32 = 16.0;
+    let name = crate::ai_tagging::file_name(path);
+    let short: String = if name.chars().count() > 34 {
+        format!("{}…", name.chars().take(33).collect::<String>())
+    } else {
+        name.clone()
+    };
+    let thumb = match state {
+        crate::pdf::State::Ready(doc) => doc_thumb(ui.ctx(), llm, path, doc),
+        _ => None,
+    };
+    let (status, status_colour) = match state {
+        crate::pdf::State::Reading => ("Reading…".to_string(), MUTED()),
+        crate::pdf::State::Ready(doc) => (format!("PDF · {}", doc.describe()), MUTED()),
+        crate::pdf::State::Failed(why) => (format!("Couldn't read it: {why}"), egui::Color32::from_rgb(210, 70, 70)),
+    };
+    let spin = if matches!(state, crate::pdf::State::Reading) { SPIN } else { 0.0 };
+    let name_colour = if in_message { chat_text_override().unwrap_or(chat_text()) } else { TEXT() };
+    let icon_colour = if in_message { chat_icon_tint(MUTED()) } else { icon_tint(MUTED()) };
+    let painter = ui.painter();
+    let name_g = painter.layout(short, egui::FontId::proportional(13.0), name_colour, 250.0);
+    let status_g = painter.layout(status, egui::FontId::proportional(11.5), status_colour, 250.0 - spin);
+    let text = egui::vec2(
+        name_g.size().x.max(status_g.size().x + spin),
+        name_g.size().y + 2.0 + status_g.size().y,
+    );
+    let size = egui::vec2(PAD + THUMB.x + 9.0 + text.x + PAD + 3.0, PAD * 2.0 + THUMB.y.max(text.y));
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        egui::CornerRadius::same(12),
+        FIELD(),
+        egui::Stroke::new(1.0_f32, EDGE()),
+        egui::StrokeKind::Inside,
+    );
+    // The first page — or the PDF icon until it's drawn.
+    let slot = egui::Rect::from_min_size(egui::pos2(rect.left() + PAD, rect.center().y - THUMB.y / 2.0), THUMB);
+    match &thumb {
+        Some(tex) => {
+            let scale = (THUMB.x / tex.size_vec2().x).min(THUMB.y / tex.size_vec2().y);
+            let fit = egui::Rect::from_center_size(slot.center(), tex.size_vec2() * scale);
+            egui::Image::new(tex).corner_radius(egui::CornerRadius::same(3)).paint_at(ui, fit);
+        }
+        None => {
+            let icon = egui::Rect::from_center_size(slot.center(), egui::vec2(24.0, 24.0));
+            egui::Image::new(egui::include_image!("../icons/pdf.svg")).tint(icon_colour).paint_at(ui, icon);
+        }
+    }
+    let at = egui::pos2(slot.right() + 9.0, rect.center().y - text.y / 2.0);
+    let status_at = at + egui::vec2(spin, name_g.size().y + 2.0);
+    if spin > 0.0 {
+        let s = egui::Rect::from_min_size(at + egui::vec2(0.0, name_g.size().y + 3.0), egui::vec2(11.0, 11.0));
+        egui::Spinner::new().size(11.0).color(MUTED()).paint_at(ui, s);
+        ui.ctx().request_repaint();
+    }
+    let painter = ui.painter();
+    painter.galley(at, name_g, name_colour);
+    painter.galley(status_at, status_g, status_colour);
+    if in_message {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!("Open {name}"))
+    } else {
+        resp.on_hover_text(name)
+    }
+}
+
+/// A small ✕ (the app's x icon) that takes something away; `size` across.
+fn remove_button(ui: &mut egui::Ui, size: f32, tip: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size + 4.0, size + 4.0), egui::Sense::click());
+    let colour = if resp.hovered() { TEXT() } else { MUTED() };
+    egui::Image::new(egui::include_image!("../icons/x.svg"))
+        .tint(icon_tint(colour))
+        .paint_at(ui, egui::Rect::from_center_size(rect.center(), egui::vec2(size, size)));
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip)
+}
+
+/// The texture of a read PDF's first page (cached with the chat's other
+/// attachment pictures).
+fn doc_thumb(
+    ctx: &egui::Context,
+    llm: &mut LlmState,
+    path: &std::path::Path,
+    doc: &crate::pdf::Doc,
+) -> Option<egui::TextureHandle> {
+    if let Some(t) = llm.msg_thumbs.get(path) {
+        return t.clone();
+    }
+    let tex = doc
+        .preview
+        .clone()
+        .map(|img| ctx.load_texture(format!("ai-chat-pdf-{}", path.display()), img, Default::default()));
+    llm.msg_thumbs.insert(path.to_path_buf(), tex.clone());
+    tex
+}
+
+/// The PDFs the AI reads with every message of the active chat (but the
+/// one in the draft), as small chips, each with a ✕ that puts it away.
+fn docs_in_use(ui: &mut egui::Ui, llm: &mut LlmState) {
+    if llm.tag_images && llm.tag_target.is_some() {
+        return;
+    }
+    let docs: Vec<std::path::PathBuf> = llm.chats[llm.active_chat]
+        .docs()
+        .into_iter()
+        .filter(|d| llm.draft_doc.as_ref() != Some(d))
+        .collect();
+    if docs.is_empty() {
+        return;
+    }
+    let mut put_away = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+        ui.label(egui::RichText::new("Reading").color(MUTED()).size(11.5))
+            .on_hover_text("The AI reads these PDFs with every message in this chat.");
+        for d in &docs {
+            egui::Frame::new()
+                .fill(FIELD())
+                .stroke(egui::Stroke::new(1.0_f32, EDGE()))
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::symmetric(7, 2))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::hover());
+                    egui::Image::new(egui::include_image!("../icons/pdf.svg")).tint(icon_tint(MUTED())).paint_at(ui, rect);
+                    let name = crate::ai_tagging::file_name(d);
+                    let short: String = if name.chars().count() > 26 {
+                        format!("{}…", name.chars().take(25).collect::<String>())
+                    } else {
+                        name.clone()
+                    };
+                    ui.label(egui::RichText::new(short).color(TEXT()).size(11.5)).on_hover_text(name);
+                    if remove_button(ui, 12.0, "Put it away: the AI stops reading this PDF").clicked() {
+                        put_away = Some(d.clone());
+                    }
+                });
+        }
+    });
+    if let Some(d) = put_away {
+        llm.chats[llm.active_chat].docs_off.push(d);
+    }
+    ui.add_space(6.0);
+}
+
 fn media_chip(ui: &mut egui::Ui, path: &std::path::Path, tint: egui::Color32) {
     let name = path
         .file_name()

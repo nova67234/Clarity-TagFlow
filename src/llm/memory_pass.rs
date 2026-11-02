@@ -1443,6 +1443,7 @@ mod tests {
             text: text.to_string(),
             thinking: None,
             image: None,
+            doc: None,
             tag_image: None,
             tag_change: None,
             remember,

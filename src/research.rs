@@ -45,6 +45,8 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 pub(crate) use net::site_of;
+// PDFs in the chat rank and cut their text the same way (src/pdf.rs).
+pub(crate) use passages::{is_cjk, terms};
 pub(crate) use notes::{clean_answer, display_answer, write as write_notes};
 
 /// Which search service looks things up.
