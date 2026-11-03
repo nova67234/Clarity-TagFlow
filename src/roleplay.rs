@@ -101,8 +101,25 @@ pub enum GoalLine {
     Failed(String),
 }
 
-/// How many memories ride along in the prompt (newest kept).
-const PROMPT_MEMORIES: usize = 75;
+/// Room for the diary in the priming (approximate tokens) when nothing says
+/// otherwise — what the tests prime with; a reply gets [`diary_room`]'s.
+/// Every memory goes in while they all fit; past that, [`diary`] picks. (The
+/// priming is pinned: the worker drops the oldest chat turns to make room for
+/// it, so the diary can't grow without end.) It used to be the newest 75
+/// memories, which quietly lost the oldest ones — often the names, nicknames
+/// and permissions everything else rests on.
+const DIARY_TOKENS: usize = 3600;
+
+/// The diary's room for a reply: 35% of what the prompt may take once the
+/// reply (and a thinking model's thought) has its room — about 4,200 tokens
+/// at the default settings, some 145 one-sentence memories — the rest going
+/// to the rules, the persona and the chat; never under 1,500 or over 6,000.
+pub fn diary_room(prompt_room: usize) -> usize {
+    (prompt_room * 35 / 100).clamp(1500, 6000)
+}
+/// The categories that bind the character — who's called what, what it may
+/// and mustn't do, what it promised — kept while they fit half the room.
+const BINDING_TOPICS: [&str; 4] = ["Names", "Permissions", "Boundaries", "Promises"];
 
 /// The categories the AI files its memories under (`MEMORY: [Names] …`);
 /// they become the role-play memory map's topics.
@@ -263,11 +280,12 @@ impl RoleplayState {
     }
 
     /// The priming turn injected (pinned) before the chat history: the
-    /// character, and its newest memories from the role-play store, with
-    /// the default (brief) thinking rule — what the tests prime with.
+    /// character, and its memories from the role-play store, with the
+    /// default (brief) thinking rule and nothing being said yet — what the
+    /// tests prime with.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn preamble(&self, memories: &MemoryStore) -> String {
-        self.preamble_with(memories, false)
+        self.preamble_with(memories, false, &[], DIARY_TOKENS)
     }
 
     /// The priming turn, with the thinking rule matched to the chat's
@@ -278,23 +296,28 @@ impl RoleplayState {
     /// rule lets it think things through; the worker's forced close still
     /// guarantees an answer. With thoughts in character (the default) either
     /// rule has it think as the character — its inner voice, first person —
-    /// instead of in notes about "the user".
-    pub fn preamble_with(&self, memories: &MemoryStore, deep_thinking: bool) -> String {
+    /// instead of in notes about "the user". `said`: what's being said (the
+    /// newest message weighs most), which picks what a diary too long for
+    /// `room` tokens brings along (see [`diary`]).
+    pub fn preamble_with(
+        &self,
+        memories: &MemoryStore,
+        deep_thinking: bool,
+        said: &[(&str, f32)],
+        room: usize,
+    ) -> String {
         let ai = self.ai_display();
         let user = self.user_display();
         let thinking = self.thinking_rule(deep_thinking);
-        let mut diary = String::new();
-        for (topic, m) in memories.recent(PROMPT_MEMORIES) {
-            use std::fmt::Write as _;
-            let _ = write!(diary, "- [{topic}] ");
-            if let Some(img) = &m.image {
-                let _ = write!(diary, "[saved picture {img}] ");
-            }
-            diary.push_str(if m.text.trim().is_empty() { &m.title } else { &m.text });
-            diary.push('\n');
-        }
+        let (entries, left_out) = diary(memories, said, room);
+        let mut diary: String = entries.iter().map(|(topic, m)| diary_line(topic, m) + "\n").collect();
         if diary.is_empty() {
             diary = "(the diary is empty so far)\n".to_string();
+        } else if left_out > 0 {
+            diary.push_str(&format!(
+                "({left_out} older entries aren't shown here; they come back when the story turns to \
+                 them. Never make up what an entry you can't see says.)\n"
+            ));
         }
         let categories = TOPICS.join(", ");
         let persona = if self.persona.trim().is_empty() {
@@ -578,6 +601,54 @@ pub fn record(store: &mut MemoryStore, line: &str, by_ai: bool) -> bool {
 pub fn record_picture(store: &mut MemoryStore, name: String, why: &str) -> bool {
     let title = store.unique_title(PICTURES_TOPIC, &title_from(why));
     store.add_entry(PICTURES_TOPIC, &title, why, true, Some(name)).is_some()
+}
+
+/// One diary entry as the priming lists it: `- [Topic] text` (a kept
+/// picture's file name first, so the character can show it again).
+fn diary_line(topic: &str, m: &crate::memory::Memory) -> String {
+    let what = if m.text.trim().is_empty() { m.title.trim() } else { m.text.trim() };
+    match &m.image {
+        Some(img) => format!("- [{topic}] [saved picture {img}] {what}"),
+        None => format!("- [{topic}] {what}"),
+    }
+}
+
+/// The diary entries the priming carries, oldest first (the order the story
+/// happened in), and how many were left out. All of them while they fit
+/// `room` tokens; past that, first the binding ones (BINDING_TOPICS, newest
+/// first, up to half the room), then those that matter for what's being
+/// said (`said`, picked as the main memory picks them), then the newest.
+fn diary<'a>(
+    memories: &'a MemoryStore,
+    said: &[(&str, f32)],
+    room: usize,
+) -> (Vec<(&'a str, &'a crate::memory::Memory)>, usize) {
+    let all = memories.recent(usize::MAX);
+    let cost = |topic: &str, m: &crate::memory::Memory| crate::memory::approx_tokens(&diary_line(topic, m)) + 1;
+    if all.iter().map(|(t, m)| cost(t, m)).sum::<usize>() <= room {
+        return (all, 0);
+    }
+    let mut kept: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut used = 0;
+    let mut keep = |topic: &str, m: &crate::memory::Memory, room: usize| {
+        let c = cost(topic, m);
+        if !kept.contains(&m.id) && used + c <= room {
+            kept.insert(m.id);
+            used += c;
+        }
+    };
+    for (topic, m) in all.iter().rev().filter(|(t, _)| BINDING_TOPICS.contains(t)) {
+        keep(topic, m, room / 2);
+    }
+    for (topic, m) in memories.relevant(said, room, 40) {
+        keep(topic, m, room * 4 / 5);
+    }
+    for (topic, m) in all.iter().rev() {
+        keep(topic, m, room);
+    }
+    let shown: Vec<_> = all.iter().copied().filter(|(_, m)| kept.contains(&m.id)).collect();
+    let left_out = all.len() - shown.len();
+    (shown, left_out)
 }
 
 /// Delete every kept picture (clearing all role-play memories).
@@ -880,7 +951,10 @@ SHOW_IMAGE: y"), "hi");
     fn thinking_rule_follows_the_level_and_the_voice() {
         let mut rp = RoleplayState { ai_name: "Mira".into(), user_name: "Andrew".into(), ..Default::default() };
         let primed = |rp: &RoleplayState| {
-            (rp.preamble_with(&MemoryStore::default(), false), rp.preamble_with(&MemoryStore::default(), true))
+            (
+                rp.preamble_with(&MemoryStore::default(), false, &[], DIARY_TOKENS),
+                rp.preamble_with(&MemoryStore::default(), true, &[], DIARY_TOKENS),
+            )
         };
         let (brief, deep) = primed(&rp);
         assert!(brief.contains("- Think as Mira:") && brief.contains("A few short thoughts are enough"));
@@ -1136,5 +1210,73 @@ SHOW_IMAGE: y"), "hi");
         let back: RoleplayState = serde_json::from_str(&serde_json::to_string(&rp).unwrap()).unwrap();
         assert_eq!(back.goals, rp.goals);
         assert!(!back.real_time);
+    }
+
+    /// A diary of a hundred everyday entries goes in whole — the old cut kept
+    /// only the newest 75, so the first 25 were gone.
+    #[test]
+    fn a_diary_that_fits_goes_in_whole() {
+        let lines: Vec<String> = (0..100)
+            .map(|i| format!("On day {i} we walked along the harbour and counted the fishing boats."))
+            .collect();
+        let mut entries: Vec<(&str, &str)> = vec![("Names", "Andrew said I may call them Billie from now on.")];
+        entries.extend(lines.iter().map(|l| ("Story", l.as_str())));
+        let store = test_store(&entries);
+        let (shown, left_out) = diary(&store, &[], DIARY_TOKENS);
+        assert_eq!((shown.len(), left_out), (101, 0));
+        let p = character(vec![]).preamble(&store);
+        assert!(p.contains("- [Names] Andrew said I may call them Billie from now on.\n- [Story] On day 0 we"), "{p}");
+        assert!(!p.contains("older entries aren't shown"));
+    }
+
+    /// A diary too long for its room keeps what binds the character, what
+    /// the story turns to now, and the newest — in story order, within the
+    /// room — and says that the rest isn't shown.
+    #[test]
+    fn a_long_diary_keeps_what_binds_and_what_matters() {
+        let lines: Vec<String> = (0..400)
+            .map(|i| format!("On day {i} we walked along the harbour, counted the fishing boats and argued about the weather."))
+            .collect();
+        let mut entries: Vec<(&str, &str)> = vec![
+            ("Names", "Andrew said I may call them Billie from now on."),
+            ("Facts", "Andrew's old dog is called Pepper and hides under the bed when it thunders."),
+            ("Permissions", "Andrew let me steer the boat whenever the sea is calm."),
+        ];
+        entries.extend(lines.iter().map(|l| ("Story", l.as_str())));
+        let store = test_store(&entries);
+
+        let said = [("How is Pepper doing these days?", 1.0)];
+        let (shown, left_out) = diary(&store, &said, DIARY_TOKENS);
+        let texts: Vec<&str> = shown.iter().map(|(_, m)| m.text.as_str()).collect();
+        assert!(texts[0].contains("Billie") && texts[1].contains("Pepper") && texts[2].contains("steer"), "{:?}", &texts[..3]);
+        assert!(texts.last().unwrap().starts_with("On day 399 "), "the newest stays");
+        assert_eq!(shown.len() + left_out, store.count());
+        assert!(left_out > 0);
+        let used: usize = shown.iter().map(|(t, m)| crate::memory::approx_tokens(&diary_line(t, m)) + 1).sum();
+        assert!(used <= DIARY_TOKENS, "{used}");
+        // Story order: oldest first.
+        assert!(shown.windows(2).all(|w| w[0].1.created < w[1].1.created));
+
+        // Nothing about Pepper said: that old fact waits its turn, the
+        // binding ones don't.
+        let (shown, _) = diary(&store, &[("Shall we go sailing?", 1.0)], DIARY_TOKENS);
+        let texts: Vec<&str> = shown.iter().map(|(_, m)| m.text.as_str()).collect();
+        assert!(texts.iter().any(|t| t.contains("Billie")) && texts.iter().any(|t| t.contains("steer")));
+        assert!(!texts.iter().any(|t| t.contains("Pepper")));
+
+        let p = character(vec![]).preamble_with(&store, false, &said, DIARY_TOKENS);
+        assert!(p.contains(&format!("({left_out} older entries aren't shown here;")), "the note");
+        assert!(p.contains("Pepper"));
+    }
+
+    /// The diary's room follows what the prompt may take: at the defaults
+    /// (3,072-token replies, Medium thinking) well over a hundred entries;
+    /// a little at Max thinking with the longest replies; never unbounded.
+    #[test]
+    fn the_diary_room_is_a_share_of_the_prompt() {
+        let defaults = 16_384 - 3072 - (1024 + 192);
+        assert_eq!(diary_room(defaults), 4233);
+        assert_eq!(diary_room(16_384 - 8192 - (4096 + 192)), 1500);
+        assert_eq!(diary_room(100_000), 6000);
     }
 }

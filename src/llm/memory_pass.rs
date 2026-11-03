@@ -861,6 +861,28 @@ impl Books<'_> {
     }
 }
 
+
+/// What's being said in `chat`, for picking the memories that matter now
+/// (the main memory's note, and a long role-play diary): the newest user
+/// message counts most, the one before half, the last reply a little. Long
+/// ones count by their start — the matching runs on the UI thread.
+pub(super) fn said_now(chat: &super::Chat) -> [(&str, f32); 3] {
+    const QUERY_CHARS: usize = 2000;
+    let mut said = chat.msgs.iter().rev().filter(|m| m.role == ChatRole::User).map(|m| m.text.as_str());
+    let (last, before) = (said.next().unwrap_or(""), said.next().unwrap_or(""));
+    let reply = chat
+        .msgs
+        .iter()
+        .rev()
+        .find(|m| m.role == ChatRole::Model && !m.text.trim().is_empty())
+        .map_or("", |m| m.text.as_str());
+    [
+        (memory::head_chars(last, QUERY_CHARS), 1.0),
+        (memory::head_chars(before, QUERY_CHARS), 0.5),
+        (memory::head_chars(reply, QUERY_CHARS), 0.3),
+    ]
+}
+
 impl LlmState {
     /// The passes' bookkeeping over this chat state.
     fn books(&mut self) -> Books<'_> {
@@ -1059,23 +1081,8 @@ impl LlmState {
         let saved = self.memory_wanted();
         let host = crate::link::remote_chat().map(|(peer, _)| host_id(&peer));
         let recent = if saved { self.unsaved_lines(host.as_deref()) } else { Vec::new() };
-        // What's being said: the newest message counts most. Long ones count
-        // by their start (the matching runs on the UI thread).
-        const QUERY_CHARS: usize = 2000;
         let chat = &self.chats[self.active_chat];
-        let mut said = chat.msgs.iter().rev().filter(|m| m.role == ChatRole::User).map(|m| m.text.as_str());
-        let (last, before) = (said.next().unwrap_or(""), said.next().unwrap_or(""));
-        let reply = chat
-            .msgs
-            .iter()
-            .rev()
-            .find(|m| m.role == ChatRole::Model && !m.text.trim().is_empty())
-            .map_or("", |m| m.text.as_str());
-        let query = [
-            (memory::head_chars(last, QUERY_CHARS), 1.0),
-            (memory::head_chars(before, QUERY_CHARS), 0.5),
-            (memory::head_chars(reply, QUERY_CHARS), 0.3),
-        ];
+        let query = said_now(chat);
         let this_chat = self.mem_pass.summary_chat == Some(chat.id);
         let (mut note, shown) = self.memory.chat_brief(&query, this_chat, &recent)?;
         if !saved {

@@ -2264,10 +2264,16 @@ impl LlmState {
                 self.model.thinks()
             };
             let deep = thinks && matches!(self.params.thinking, ThinkLevel::High | ThinkLevel::Max);
-            msgs.insert(
-                0,
-                CmdMsg { user: true, text: self.roleplay.preamble_with(&self.rp_memory, deep), image: None },
-            );
+            // The diary's room: a share of what the prompt may take once the
+            // reply (and the thought) has its room, as the worker reckons it.
+            // A diary too long for it brings what binds the character, what
+            // matters for what's being said, and the newest (roleplay::diary).
+            let reserve = self.params.max_tokens
+                + if thinks && self.params.thinking != ThinkLevel::Off { self.params.thinking.budget() + 192 } else { 0 };
+            let room = crate::roleplay::diary_room(CONTEXT_TOKENS.saturating_sub(reserve));
+            let said = memory_pass::said_now(&self.chats[self.active_chat]);
+            let primer = self.roleplay.preamble_with(&self.rp_memory, deep, &said, room);
+            msgs.insert(0, CmdMsg { user: true, text: primer, image: None });
             pinned = 2;
         } else if self.tag_images {
             // The tagging brief: how to see the image and change its tags.
