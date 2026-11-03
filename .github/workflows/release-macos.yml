@@ -73,7 +73,10 @@ jobs:
           mkdir -p dmgroot
           cp -R "Clarity TagFlow.app" dmgroot/
           ln -s /Applications dmgroot/Applications
-          hdiutil create -volname "Clarity TagFlow" \
+          # An explicit size: hdiutil's own guess from -srcfolder came up short
+          # once the app grew ("No space left on device" inside the image).
+          size_mb=$(( $(du -sm dmgroot | cut -f1) * 13 / 10 + 50 ))
+          hdiutil create -volname "Clarity TagFlow" -size "${size_mb}m" \
             -srcfolder dmgroot -ov -format UDZO "ClarityTagFlow-macOS.dmg"
 
       - name: Upload .dmg artifact
