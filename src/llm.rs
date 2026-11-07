@@ -1220,7 +1220,19 @@ impl Drop for LlmState {
 /// One folder per running copy of the app (by process id): two copies working
 /// on the same picture never share a folder, nor delete each other's.
 fn ai_temp_dir() -> PathBuf {
-    ai_temp_root().join(std::process::id().to_string())
+    ai_temp_root().join(ai_temp_run())
+}
+
+/// This run's folder name in [`ai_temp_root`]: the process id. Under `cargo
+/// test` each test is a run of its own — all in one process, each on its own
+/// thread, and every test that drops an `LlmState` deletes its run's folder —
+/// so there the thread is in the name too. (Shared, `detail_tile_grids` lost
+/// its sections to other tests' cleanup mid-save.)
+fn ai_temp_run() -> String {
+    let run = std::process::id().to_string();
+    #[cfg(test)]
+    let run = format!("{run}-{:?}", std::thread::current().id()).replace(['(', ')'], "");
+    run
 }
 
 fn ai_temp_root() -> PathBuf {
@@ -1260,8 +1272,10 @@ fn clear_stale_ai_temp() {
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age > std::time::Duration::from_secs(3600))
     };
+    // Named here, not on the cleanup thread (under test the run's name
+    // depends on the thread).
+    let own = ai_temp_run();
     let _ = std::thread::Builder::new().name("ai-temp-cleanup".into()).spawn(move || {
-        let own = std::process::id().to_string();
         for entry in std::fs::read_dir(ai_temp_root()).into_iter().flatten().flatten() {
             if entry.file_name().to_string_lossy() == own {
                 continue;
@@ -5945,7 +5959,11 @@ mod tests {
     #[cfg(feature = "llm")]
     #[test]
     fn detail_tile_grids() {
-        let dir = std::env::temp_dir().join("clarity_tile_grid_test");
+        // This run's own folder: a fixed one was shared with any other test
+        // run going at the same time, and re-creating files there that the
+        // last run just deleted can fail on Windows (still delete-pending
+        // while a virus scanner holds them).
+        let dir = std::env::temp_dir().join(format!("clarity_tile_grid_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let count = |w: u32, h: u32| {
             let p = dir.join(format!("{w}x{h}.png"));
@@ -5969,6 +5987,8 @@ mod tests {
         assert_eq!(at(3000, 4500, ImageDetail::High), Some(2), "High: tall 2 down");
         assert_eq!(at(3600, 3600, ImageDetail::Maximum), None, "Maximum: no tiles");
         let _ = std::fs::remove_dir_all(&dir);
+        // The sections it cut (this test thread's AI temp folder).
+        clear_ai_temp();
     }
 
     /// Streamed text keeps characters split across tokens (no model needed):
