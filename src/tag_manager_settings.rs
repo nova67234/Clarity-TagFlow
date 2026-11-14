@@ -170,7 +170,14 @@ fn settings_tab(ui: &mut egui::Ui, s: &mut TagManagerSettings) {
     });
 
     section(ui, "Tag blacklist", |ui| {
-        crate::settings::well_box(ui, egui::TextEdit::multiline(&mut s.blacklist).desired_rows(3));
+        // Capped (about nine lines, then it scrolls): a long list made this
+        // pop-up taller than the window.
+        crate::settings::well_box_capped(
+            ui,
+            "tag_blacklist",
+            150.0,
+            egui::TextEdit::multiline(&mut s.blacklist).desired_rows(3),
+        );
         ui.add_space(3.0);
         ui.label(
             egui::RichText::new("Tags the AI never adds — comma or newline separated.")

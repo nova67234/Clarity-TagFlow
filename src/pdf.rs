@@ -333,22 +333,174 @@ fn cut(line: &str, max: usize) -> &str {
     &line[..at.max(1).min(line.len())]
 }
 
-/// About how many tokens `s` takes in the AI's prompt: ~3.5 characters a
-/// token in English, ~1 for Chinese, Japanese and Korean, in between for
-/// other scripts — on the high side, so a PDF never overflows.
+/// What a character is to the AI's tokenizer (see [`tokens`]) — by its code
+/// point alone.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Digit,
+    Lower,
+    Upper,
+    /// Accented Latin letters: Western Europe's (é, ü, ñ), Vietnamese's own
+    /// (ạ, ế, ở), and the rest (ł, ř, ş — and the rare ones of a font's
+    /// glyph table).
+    Latin1,
+    Viet,
+    LatinX,
+    Newline,
+    Space,
+    /// ASCII punctuation and symbols.
+    Punct,
+    /// Chinese, Japanese and Korean, their punctuation and full-width forms.
+    Cjk,
+    /// A letter of any other alphabet (Cyrillic, Greek, Arabic, Thai…).
+    Script,
+    /// Typographic punctuation, maths, arrows, box drawing, combining marks.
+    Symbol,
+    /// Emoji and mathematical letters (the plane above the first).
+    Astral,
+    /// Private-use characters (a symbol font's bullets and icons), and
+    /// `Rare`: the planes beyond — neither is in the vocabulary, so each is
+    /// spelled out in its bytes, a token apiece.
+    Private,
+    Rare,
+}
+
+fn kind(c: char) -> Kind {
+    let o = c as u32;
+    let within = |from: u32, to: u32| (from..=to).contains(&o);
+    match c {
+        '0'..='9' => Kind::Digit,
+        'a'..='z' => Kind::Lower,
+        'A'..='Z' => Kind::Upper,
+        '\n' => Kind::Newline,
+        ' ' | '\t' | '\r' | '\u{b}' | '\u{c}' => Kind::Space,
+        _ if c.is_ascii() => Kind::Punct,
+        _ if crate::research::is_cjk(c) || within(0x1100, 0x11FF) || within(0x3000, 0x303F) || within(0xFF00, 0xFFEF) => {
+            Kind::Cjk
+        }
+        _ if o >= 0x20000 => Kind::Rare,
+        _ if within(0xE000, 0xF8FF) => Kind::Private,
+        _ if o >= 0x10000 => Kind::Astral,
+        _ if within(0x1EA0, 0x1EFF) => Kind::Viet,
+        '×' | '÷' => Kind::Symbol,
+        _ if within(0xC0, 0xFF) => Kind::Latin1,
+        _ if within(0x100, 0x24F) || within(0x1E00, 0x1E9F) => Kind::LatinX,
+        _ if within(0x80, 0xBF)
+            || within(0x2B0, 0x36F)
+            || within(0x1D00, 0x1DFF)
+            || within(0x2000, 0x2BFF)
+            || within(0x2C60, 0x2C7F)
+            || within(0xFE00, 0xFE0F) =>
+        {
+            Kind::Symbol
+        }
+        _ => Kind::Script,
+    }
+}
+
+/// About how many tokens `s` takes in the AI's prompt — on the high side, so
+/// a PDF never overflows. It counts the way Gemma's tokenizer cuts text up
+/// (measured against it on some fifty kinds of text and the passages of real
+/// PDFs; a test holds a sample of each kind with its real count), in sevenths
+/// of a token:
+///
+/// - a word is one token, a long one more (2/7 for each letter past the
+///   fourth), a Capitalised or an ALL-CAPS one more again (names and
+///   abbreviations are cut into pieces), and each accented letter adds most
+///   of a token;
+/// - **every digit is a token of its own**, as is each character of a code
+///   that mixes letters and digits, each punctuation mark, each line break,
+///   and the space in front of a number or a symbol;
+/// - Chinese, Japanese and Korean take a little over a token a character,
+///   other alphabets about half, symbols and emoji one or more, and a
+///   character the vocabulary doesn't have (private-use glyphs, a font
+///   table's rarities) three or four.
+///
+/// (This used to be ~3.5 characters a token for everything in ASCII, which
+/// made a page of figures look a third its real size: a bank statement or
+/// a price list was taken to fit, shown whole, and overflowed the model —
+/// "This message is too long for the model".)
 pub fn tokens(s: &str) -> usize {
-    let units: usize = s
-        .chars()
-        .map(|c| {
-            if c.is_ascii() {
-                2
-            } else if crate::research::is_cjk(c) {
-                8
-            } else {
-                4
+    use Kind::*;
+    let cs: Vec<(char, Kind)> = s.chars().map(|c| (c, kind(c))).collect();
+    let at = |i: usize| cs.get(i).map(|&(_, k)| k);
+    let letter = |k: Option<Kind>| matches!(k, Some(Lower | Upper | Latin1 | Viet | LatinX | Script | Cjk));
+    // A non-ASCII letter with no letter on either side: a glyph on its own
+    // (a table of them), not part of a word.
+    let lone = |i: usize| matches!(at(i), Some(LatinX | Script)) && !(i > 0 && letter(at(i - 1))) && !letter(at(i + 1));
+    let wordy = |k: Kind| matches!(k, Digit | Lower | Upper | Latin1 | Viet | LatinX);
+
+    let mut units = 0;
+    let mut i = 0;
+    while i < cs.len() {
+        let (c, k) = cs[i];
+        if wordy(k) && !lone(i) {
+            // A run of letters and digits.
+            let start = i;
+            let (mut digits, mut caps, mut plain, mut accents) = (0, 0, 0usize, 0);
+            while i < cs.len() && wordy(cs[i].1) {
+                match cs[i].1 {
+                    Digit => digits += 1,
+                    Upper => {
+                        caps += 1;
+                        plain += 1;
+                    }
+                    Lower => plain += 1,
+                    Latin1 => accents += 6,
+                    Viet => accents += 3,
+                    _ => accents += 7,
+                }
+                i += 1;
             }
-        })
-        .sum();
+            units += if digits > 0 {
+                // A number, or a code of letters and digits: a token a character.
+                7 * (i - start)
+            } else {
+                let (free, each) = match caps {
+                    0 => (4, 2),
+                    1 => (3, 3),
+                    _ => (2, 4),
+                };
+                7 + each * plain.saturating_sub(free) + accents
+            };
+            continue;
+        }
+        let again = i > 0 && cs[i - 1].0 == c;
+        units += match k {
+            Newline => 7,
+            // A space joins the word after it; in front of a number, a
+            // symbol or a lone glyph it's a token of its own.
+            Space => match at(i + 1) {
+                Some(Digit | Symbol | Astral | Private | Rare) => 7,
+                Some(_) if lone(i + 1) => 7,
+                Some(Lower | Upper | Latin1 | Viet | LatinX) => 0,
+                _ => 2,
+            },
+            // A row of one mark (a contents page's dots, a ruled line) is
+            // a few tokens, not one a mark.
+            Punct | Symbol => {
+                if again {
+                    2
+                } else {
+                    7
+                }
+            }
+            Cjk => 8,
+            Astral => 10,
+            Private => 21,
+            Rare => 28,
+            // (A lone one: the others are in words.)
+            LatinX => 21,
+            _ => {
+                if lone(i) {
+                    7
+                } else {
+                    4
+                }
+            }
+        };
+        i += 1;
+    }
     units / 7 + 1
 }
 
@@ -915,6 +1067,89 @@ mod tests {
         assert!(tokens(&shown.text) < budget + 400, "{} tokens", tokens(&shown.text));
         // A skim reaches the end too.
         assert!(shown.text.contains("[Page 40"), "{}", &shown.text[..2000.min(shown.text.len())]);
+    }
+
+    /// The estimate beside the count Gemma's own tokenizer makes (measured
+    /// with its SentencePiece model) on the kinds of text PDFs hold. It is
+    /// never under — figures used to be sized at a third to a half of what
+    /// they take, so a statement or a price list overflowed the model — and
+    /// never as much as double, so ordinary documents keep their room.
+    #[test]
+    fn the_estimate_is_never_under_the_tokenizers_count() {
+        // What it is, a sample of it, and the tokens the tokenizer makes of it.
+        let samples: &[(&str, &str, usize)] = &[
+            ("a bank statement", "12 Oct 2026  CARD TESCO STORES 3042 LONDON GB  REF 00104729  -82.36  10349.82\n13 Oct 2026  DIRECT DEBIT THAMES WATER 4471902  REF 00209458  -41.07  10308.75", 99),
+            ("a spreadsheet", "79.19 158.38 237.57 316.76 395.95 475.14 554.33 633.52\n158.38 316.76 475.14 633.52 791.90 950.28 108.66 267.04", 110),
+            ("a price list", "10037-001  M4x0.8  131 pcs  0.0126  1.39  14.83\n10074-002  M5x1.0  262 pcs  0.0130  1.54  15.17", 79),
+            ("dates and times", "2026-11-10T14:32:05Z  10/11/2026 2:32 PM\n2026-12-01T09:07:13Z  1/12/2026 9:07 AM", 74),
+            ("phone numbers", "+44 (0)20 7946 0958, (555) 013-0077, 06 91 17 29 53", 49),
+            ("hashes and ids", "8f3a9c2e1b7d4f60 0x1f3a 550e8400-e29b-41d4-a716-446655440000", 60),
+            ("web addresses", "https://www.example.com/products/category-3/item_55433?ref=newsletter&utm_source=email&page=7#reviews", 37),
+            ("code", "for (i, x) in xs.iter().enumerate() {\n    println!(\"{i:>3}: {x}\");\n}", 27),
+            ("a table in Markdown", "| Widget 7 | 21 | 8.75 | 183.75 |\n| Widget 8 | 24 | 10.00 | 240.00 |", 48),
+            ("English prose", "The harbour was quiet that morning, and the fishing boats rocked gently against the pier while gulls argued over scraps.", 23),
+            ("short words", "It is as if we do not go to it at all, so I am in and he is up on it, or so we say to be of use.", 33),
+            ("single letters", "a b c d e f g h i j k l m n o p q r s t u v w x y z", 26),
+            ("names", "Katarzyna Wojciechowska, Bartholomew Featherstonehaugh, Oluwaseun Adebayo, Siobhan O'Callaghan", 28),
+            ("capitals", "CARD TESCO STORES LONDON GB AMAZON MKTPLACE PMTS SHELL WESTBOUND", 18),
+            ("French", "Hier soir, nous avons longuement marché le long du quai, compté les bateaux de pêche et discuté du temps jusqu'à ce que la pluie commence.", 36),
+            ("Polish", "Wczoraj wieczorem długo spacerowaliśmy wzdłuż nabrzeża, liczyliśmy łodzie rybackie i kłóciliśmy się o pogodę. Zażółć gęślą jaźń.", 49),
+            ("Vietnamese", "Tối hôm qua chúng tôi đi dạo rất lâu dọc bến cảng, đếm những chiếc thuyền đánh cá và tranh luận về thời tiết.", 32),
+            ("Russian", "Вчера вечером мы долго гуляли по набережной, считали рыбацкие лодки и спорили о погоде, пока не начался дождь.", 34),
+            ("Greek", "Χθες το βράδυ περπατήσαμε πολλή ώρα κατά μήκος της προκυμαίας και μετρήσαμε τα ψαροκάικα.", 40),
+            ("Chinese", "昨天傍晚我们沿着码头散步了很久，数着渔船，争论着天气，直到开始下雨。", 27),
+            ("Japanese", "昨日の夕方、私たちは港沿いを長い間散歩し、漁船を数えながら天気について話し合いました。", 27),
+            ("Korean", "어제 저녁 우리는 부두를 따라 오랫동안 산책하며 어선을 세고 날씨에 대해 이야기했습니다.", 30),
+            ("maths", "∀x ∈ ℝ: ∃y ≥ 0 such that x² ≤ y ⇒ √y ≥ |x|; 𝑓(𝑥) = 𝑒 𝑭 ⋅ 𝑑𝒓", 39),
+            ("typographic punctuation", "“Well,” she said — ‘perhaps’ … but no; it’s the café’s rule • item one • item two – and so on. §12, ©2026, 5°C, ±2%", 50),
+            ("emoji", "omg 😂😂😂 that is so cute 🥺❤\u{fe0f}✨ can't wait 🎉🎉 see you soon 😘👋", 23),
+            ("a contents page", "Chapter 3 The beginning of something . . . . . . . . . . . . 21\nSection 3.1 ........................................ 23", 35),
+            ("a symbol font's bullets", "\u{f0b7} First item of the list\n\u{f0b7} Second item, a little longer than the first", 17),
+            ("a font's glyph table", "1E5C Ṝ Ṝ Ṝ Ṝ Rdotbelowmacron\n1E5D ṝ ṝ ṝ ṝ rdotbelowmacron\nEA25 \u{ea25} \u{ea25} \u{ea25} \u{ea25}", 71),
+        ];
+        for &(what, text, real) in samples {
+            let est = tokens(text);
+            assert!(est >= real, "{what}: estimated at {est} tokens, really {real}");
+            assert!(est < real * 2, "{what}: estimated at {est} tokens, really {real}");
+        }
+    }
+
+    /// A PDF of figures is cut to its budget like any other. The tokenizer
+    /// makes a token of every digit, so the digits shown are a floor for what
+    /// the text really takes: at 3.5 characters a token, a price list was
+    /// shown at twice its budget and more.
+    #[test]
+    fn a_pdf_of_figures_keeps_to_its_budget() {
+        let pages: Vec<String> = (0..12)
+            .map(|p| {
+                let lines: Vec<String> = (0..45)
+                    .map(|i| {
+                        let n = p * 45 + i;
+                        format!(
+                            "{}-{:03}  M{}x0.8  {} pcs  0.{:04}  {}.{:02}  {}.{:02}",
+                            10000 + n * 37,
+                            n % 1000,
+                            3 + n % 9,
+                            100 + (n * 7) % 900,
+                            100 + (n * 13) % 9000,
+                            1 + n % 9,
+                            (n * 17) % 100,
+                            10 + n % 90,
+                            (n * 29) % 100
+                        )
+                    })
+                    .collect();
+                lines.join("\n")
+            })
+            .collect();
+        let refs: Vec<&str> = pages.iter().map(String::as_str).collect();
+        let path = test_pdf("prices.pdf", &refs);
+        let doc = Arc::new(read(&path).unwrap());
+        let budget = 3000;
+        let shown = context(&[(path, doc)], "What does part 10370-010 cost?", "", budget);
+        assert!(shown.text.contains("too long to show whole"));
+        let digits = shown.text.chars().filter(char::is_ascii_digit).count();
+        assert!(digits < budget + 400, "{digits} digits, a token each, in a budget of {budget}");
     }
 
     #[test]

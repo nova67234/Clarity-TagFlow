@@ -180,7 +180,10 @@ fn show_body(ui: &mut egui::Ui, state: &mut Pixal3DState, current_image: Option<
                 ui.label(RichText::new("Pixal3D").color(TEXT()).strong().size(14.0));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let color = if state.status_err { RED } else if state.running { ACCENT1() } else { GREEN };
-                    ui.label(RichText::new(&state.status).color(color).size(12.0));
+                    // The text keeps to the room the title and the orb
+                    // (30 + the 6 before it) leave it.
+                    let orb_room = 36.0 + ui.spacing().item_spacing.x;
+                    crate::settings::header_status(ui, &state.status, color, orb_room);
                     ui.add_space(6.0);
                     state.orb.set_state(if state.status_err {
                         crate::ai_orb::OrbState::Error

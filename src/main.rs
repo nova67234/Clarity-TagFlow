@@ -999,19 +999,41 @@ impl ViewerApp {
             Some(rect) => area.pivot(egui::Align2::CENTER_CENTER).fixed_pos(rect.center()),
             None => area.anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)),
         };
+        // The strip keeps to the picture area, with the same room for every
+        // message. Left to itself the area lays a message out in the size the
+        // previous one ended up with — a failure after "Cropping…" was
+        // squeezed into that one's width, a narrow column down the picture —
+        // and the status line, in a row, never wrapped at all: a long failure
+        // ran as one line over both side panels.
+        let max_w = match self.last_center_rect {
+            Some(rect) => (rect.width() - 32.0).clamp(160.0, 520.0),
+            None => 420.0,
+        };
+        // A message wraps in that width, on sixteen lines at most (then it
+        // ends in "…"): so the strip stays on screen in the smallest window,
+        // whatever the message.
+        let wrapped = |ui: &mut egui::Ui, text: &str| {
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let mut job =
+                egui::text::LayoutJob::simple(text.to_string(), font, ui.visuals().text_color(), ui.available_width());
+            job.wrap.max_rows = 16;
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            ui.add(egui::Label::new(galley));
+        };
         area
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_max_width(max_w);
                     if let Some((text, busy)) = &status {
                         ui.horizontal(|ui| {
                             if *busy {
                                 ui.add(egui::Spinner::new().size(16.0));
                             }
-                            ui.label(text.as_str());
+                            wrapped(ui, text);
                         });
                     }
                     if let Some(notice) = &notice {
-                        ui.label(notice.as_str());
+                        wrapped(ui, notice);
                     }
                 });
             });

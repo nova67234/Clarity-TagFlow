@@ -1218,8 +1218,25 @@ fn receiver_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings, link
         for f in link.found.clone() {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                ui.label(egui::RichText::new(&f.name).color(TEXT()).size(12.5)).on_hover_text(format!("Identity {}", f.fp));
-                ui.label(egui::RichText::new(&f.ip).color(MUTED()).size(11.0));
+                // The name is cut short where it would push the address and
+                // the button out (a PC with a long name widened the whole
+                // Settings window); the address keeps clear of the button.
+                let use_w = crate::scan::pill_width(ui, "Use", crate::scan::Pill::Outline) + ui.spacing().item_spacing.x;
+                let ip_w = ui
+                    .fonts_mut(|fonts| fonts.layout_no_wrap(f.ip.clone(), egui::FontId::proportional(11.0), MUTED()))
+                    .size()
+                    .x
+                    + ui.spacing().item_spacing.x;
+                ui.scope(|ui| {
+                    ui.set_max_width((ui.available_width() - ip_w - use_w).max(0.0));
+                    ui.add(egui::Label::new(egui::RichText::new(&f.name).color(TEXT()).size(12.5)).truncate())
+                })
+                .inner
+                .on_hover_text(format!("Identity {}", f.fp));
+                ui.scope(|ui| {
+                    ui.set_max_width((ui.available_width() - use_w).max(0.0));
+                    ui.add(egui::Label::new(egui::RichText::new(&f.ip).color(MUTED()).size(11.0)).truncate());
+                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if crate::settings::button(ui, "Use").clicked() {
                         settings.link.host_addr = if f.port == addr::DEFAULT_PORT { f.ip.clone() } else { f.addr() };

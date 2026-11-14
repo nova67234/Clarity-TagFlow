@@ -1571,6 +1571,50 @@ pub(crate) fn hint(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).color(MUTED()).size(if fresh() { 12.0 } else { 11.0 }));
 }
 
+/// The status line in a right-panel header bar (Tag Manager, the generators,
+/// Pixal3D), in a right-to-left row: right-aligned in what the row has left
+/// once `reserve` is kept for what follows it (the orb), on two rows at most,
+/// then cut short with "…" — the whole message shows on hover. A plain label
+/// never wraps in such a row, so a long message ran over the title or the
+/// model dropdown, and a longer one widened the whole panel over the picture.
+pub(crate) fn header_status(ui: &mut egui::Ui, text: &str, color: egui::Color32, reserve: f32) -> egui::Response {
+    let room = (ui.available_width() - reserve).max(0.0);
+    let mut job = egui::text::LayoutJob::simple(text.to_string(), egui::FontId::proportional(12.0), color, room);
+    job.wrap.max_rows = 2;
+    job.halign = egui::Align::RIGHT;
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    // A label given a cut-short galley shows the full text on hover itself.
+    ui.add(egui::Label::new(galley))
+}
+
+/// A "label: value" row of small text (`size` points, the label muted). On
+/// one line it's laid out as it always was; a value too long for that wraps
+/// in what's left of the row, beside a label kept to half of it. (Left to run
+/// on, a long value — an archive's name, a LoRA's note — widened the window
+/// its row is in.)
+pub(crate) fn label_value_row(ui: &mut egui::Ui, label: &str, value: &str, size: f32) {
+    let width = |text: &str| {
+        ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), egui::FontId::proportional(size), TEXT())).size().x
+    };
+    let fits = width(label) + ui.spacing().item_spacing.x + width(value) <= ui.available_width();
+    let label = egui::RichText::new(label).color(MUTED()).size(size);
+    let value = egui::RichText::new(value).color(TEXT()).size(size);
+    if fits {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            ui.label(value);
+        });
+    } else {
+        ui.horizontal_top(|ui| {
+            ui.scope(|ui| {
+                ui.set_max_width(ui.available_width() * 0.5);
+                ui.add(egui::Label::new(label).truncate());
+            });
+            ui.add(egui::Label::new(value).wrap());
+        });
+    }
+}
+
 /// A one-line text box as Find Issues' folder field has it: a sunk pill,
 /// ringed in the accent colour while it's being typed in. `width` may be
 /// `f32::INFINITY` (all there is).
@@ -1622,17 +1666,41 @@ fn pill_field_in(
 /// A multi-line text box to match [`pill_field`]: the same sunk fill and
 /// accent ring, with rounded corners instead of round ends. Full width.
 pub(crate) fn well_box(ui: &mut egui::Ui, edit: egui::TextEdit<'_>) -> egui::Response {
+    well_box_in(ui, edit, None)
+}
+
+/// [`well_box`] for a pop-up that sizes itself to its content: the box grows
+/// with its text up to `max_h`, then scrolls inside (`id_salt` names the
+/// scroll position). Uncapped, a long text made the pop-up taller than the
+/// window.
+pub(crate) fn well_box_capped(ui: &mut egui::Ui, id_salt: &str, max_h: f32, edit: egui::TextEdit<'_>) -> egui::Response {
+    well_box_in(ui, edit, Some((id_salt, max_h)))
+}
+
+fn well_box_in(ui: &mut egui::Ui, edit: egui::TextEdit<'_>, cap: Option<(&str, f32)>) -> egui::Response {
     // As in pill_field: the well's slot first, filled in once the size and
     // focus are known.
     let bg = ui.painter().add(egui::Shape::Noop);
     let out = egui::Frame::NONE.inner_margin(egui::Margin::symmetric(14, 9)).show(ui, |ui| {
-        ui.add(
-            edit.frame(egui::Frame::NONE)
-                .margin(egui::Margin::ZERO)
-                .font(egui::FontId::proportional(13.0))
-                .text_color(TEXT())
-                .desired_width(f32::INFINITY),
-        )
+        let edit = edit
+            .frame(egui::Frame::NONE)
+            .margin(egui::Margin::ZERO)
+            .font(egui::FontId::proportional(13.0))
+            .text_color(TEXT())
+            .desired_width(f32::INFINITY);
+        match cap {
+            None => ui.add(edit),
+            Some((id_salt, max_h)) => egui::ScrollArea::vertical()
+                .id_salt(id_salt)
+                .max_height(max_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    // Keep scrolling while a text selection is dragged past the edge.
+                    crate::drag_select_autoscroll(ui);
+                    ui.add(edit)
+                })
+                .inner,
+        }
     });
     let resp = out.inner;
     let ring = if resp.has_focus() { crate::theme::selection_outline() } else { egui::Color32::TRANSPARENT };
@@ -2180,7 +2248,7 @@ pub(crate) fn dropdown_option(
     selected: bool,
 ) -> egui::Response {
     let (rect, item) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
-    let item = item.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let mut item = item.on_hover_cursor(egui::CursorIcon::PointingHand);
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         paint_option_card(p, rect, 10, selected, item.hovered());
@@ -2190,18 +2258,27 @@ pub(crate) fn dropdown_option(
             x = rect.left() + 27.0;
         }
         let ink = if selected { TEXT() } else { TEXT().gamma_multiply(0.88) };
-        p.text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(12.5), ink);
+        // The name stops short of the note, of the tick, or of the row's
+        // end: a long one (a checkpoint's file name) ran out of the list's
+        // side.
+        let mut name_end = rect.right() - if selected { 30.0 } else { 11.0 };
         if let Some(note) = note {
-            p.text(
-                egui::pos2(rect.right() - 30.0, rect.center().y),
-                egui::Align2::RIGHT_CENTER,
-                note,
-                egui::FontId::proportional(11.5),
-                MUTED(),
-            );
+            let note = p.layout_no_wrap(note.to_string(), egui::FontId::proportional(11.5), MUTED());
+            let size = note.size();
+            let note_x = rect.right() - 30.0 - size.x;
+            p.galley(egui::pos2(note_x, rect.center().y - size.y / 2.0), note, MUTED());
+            name_end = note_x - 8.0;
         }
+        let mut job = egui::text::LayoutJob::simple_singleline(label.to_string(), egui::FontId::proportional(12.5), ink);
+        job.wrap = egui::text::TextWrapping::truncate_at_width((name_end - x).max(0.0));
+        let name = p.layout_job(job);
+        let cut = name.elided;
+        p.galley(egui::pos2(x, rect.center().y - name.size().y / 2.0), name, ink);
         if selected {
             paint_checkmark(p, egui::pos2(rect.right() - 14.0, rect.center().y), drop_accent_ink());
+        }
+        if cut {
+            item = item.on_hover_text(label);
         }
     }
     item
@@ -2471,5 +2548,112 @@ mod tests {
         rig.click(off);
         rig.idle();
         assert_eq!((rig.state.value, rig.state.changes), (0, 2));
+    }
+
+    /// A header's status line keeps to what its row has left: a long message
+    /// takes a second row and a longer one is cut short there. It never
+    /// comes nearer the title than the room kept for the orb, and the row
+    /// keeps its width. (A plain label doesn't wrap in such a row: it ran
+    /// over the title, then widened the panel.)
+    #[test]
+    fn a_header_status_keeps_to_its_room() {
+        use crate::slider::rig::Rig;
+        struct Header {
+            status: String,
+            row: egui::Rect,
+            title: egui::Rect,
+            line: egui::Rect,
+        }
+        const ORB: f32 = 44.0;
+        fn scene(ui: &mut egui::Ui, s: &mut Header) {
+            ui.set_width(360.0);
+            let row = ui.horizontal(|ui| {
+                s.title = ui.label("Tag Manager").rect;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    s.line = super::header_status(ui, &s.status, egui::Color32::GRAY, ORB).rect;
+                });
+            });
+            s.row = row.response.rect;
+        }
+        let none = egui::Rect::NOTHING;
+        let mut rig = Rig::new(Header { status: "Tags saved".into(), row: none, title: none, line: none }, scene);
+        let one_row = rig.state.line.height();
+        let failed = "Couldn't save the tags of this picture: the file is in use by another program. ";
+        for (repeats, rows) in [(1, 2.0), (2, 2.0), (6, 2.0)] {
+            rig.state.status = failed.repeat(repeats);
+            rig.frame(vec![]);
+            let s = &rig.state;
+            assert!(s.row.width() <= 360.5, "{repeats}: the row grew to {}", s.row.width());
+            assert!(s.line.left() >= s.title.right() + ORB, "{repeats}: {:?} runs into {:?}", s.line, s.title);
+            assert!((s.line.height() - rows * one_row).abs() < 1.0, "{repeats}: {} high", s.line.height());
+        }
+    }
+
+    /// A capped text box is the plain one until its text passes the cap,
+    /// then stays that tall and scrolls. (The Tag blacklist's pop-up grew
+    /// with every line, taller than the window.)
+    #[test]
+    fn a_capped_text_box_stops_growing() {
+        use crate::slider::rig::Rig;
+        struct Field {
+            text: String,
+            capped: bool,
+            height: f32,
+        }
+        const CAP: f32 = 150.0;
+        fn scene(ui: &mut egui::Ui, s: &mut Field) {
+            ui.set_width(300.0);
+            let edit = egui::TextEdit::multiline(&mut s.text).desired_rows(3);
+            if s.capped {
+                super::well_box_capped(ui, "capped", CAP, edit);
+            } else {
+                super::well_box(ui, edit);
+            }
+            s.height = ui.min_rect().height();
+        }
+        let mut rig = Rig::new(Field { text: String::new(), capped: false, height: 0.0 }, scene);
+        let mut height = |lines: usize, capped: bool| {
+            rig.state.text = (0..lines).map(|i| format!("tag_{i}\n")).collect();
+            rig.state.capped = capped;
+            rig.idle();
+            rig.state.height
+        };
+        assert_eq!(height(2, true), height(2, false), "the same box while the text is short");
+        assert!(height(40, false) > 2.0 * CAP, "the plain box grows with its text");
+        // The cap, and the box's padding around it.
+        let capped = height(40, true);
+        assert!((CAP..CAP + 20.0).contains(&capped), "{capped}");
+        assert_eq!(height(80, true), capped);
+    }
+
+    /// A dropdown row's name stops short of the note at its end. (A long
+    /// one — a checkpoint's file name — ran under the note and out of the
+    /// list's side.)
+    #[test]
+    fn a_long_dropdown_name_stops_at_its_note() {
+        use crate::slider::rig::Rig;
+        struct Row {
+            name: String,
+            rect: egui::Rect,
+            /// How wide the name is, drawn whole.
+            whole: f32,
+        }
+        fn scene(ui: &mut egui::Ui, s: &mut Row) {
+            ui.set_width(260.0);
+            s.rect = super::dropdown_option(ui, &s.name, None, Some("6.46 GB"), true).rect;
+            let font = egui::FontId::proportional(12.5);
+            s.whole = ui.fonts_mut(|f| f.layout_no_wrap(s.name.clone(), font, egui::Color32::WHITE)).mesh_bounds.width();
+        }
+        let long = "anExampleCheckpoint_withAVeryLongFileName_v12_fp16_pruned.safetensors";
+        let mut rig = Rig::new(Row { name: long.into(), rect: egui::Rect::NOTHING, whole: 0.0 }, scene);
+        let (name, note, row) = (rig.texts(long)[0], rig.texts("6.46 GB")[0], rig.state.rect);
+        assert!(name.width() < rig.state.whole, "cut short");
+        assert!(name.right() < note.left(), "{name:?} runs into {note:?}");
+        assert!(row.left() <= name.left() && note.right() <= row.right(), "{name:?} and {note:?} in {row:?}");
+        // A short one is drawn whole.
+        rig.state.name = "Illustrious".into();
+        rig.frame(vec![]);
+        let name = rig.texts("Illustrious")[0];
+        assert!((name.width() - rig.state.whole).abs() < 0.5, "{} wide of {}", name.width(), rig.state.whole);
     }
 }

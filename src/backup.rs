@@ -426,13 +426,19 @@ impl BackupState {
             let total = prog.total.load(Relaxed);
             let cur = prog.current.load(Relaxed);
             // The label, the count on the right, and Find Issues' thin bar.
+            // The count is laid out first and keeps its place; the label (the
+            // file being archived) has what's left and is cut short there — a
+            // long file name stretched the whole dialog, to a different
+            // width for every file.
             ui.horizontal(|ui| {
-                ui.label(RichText::new(label).color(MUTED()).size(12.0));
-                if total > 0 {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if total > 0 {
                         ui.label(RichText::new(format!("{cur} / {total}")).color(TEXT()).size(12.0));
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(RichText::new(label).color(MUTED()).size(12.0)).truncate());
                     });
-                }
+                });
             });
             ui.add_space(10.0);
             let frac = (total > 0).then(|| (cur as f32 / total as f32).clamp(0.0, 1.0));
@@ -554,12 +560,10 @@ fn hint(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).color(MUTED()).size(12.0));
 }
 
-/// A label : value row, used in the result summary.
+/// A label : value row, used in the result summary. A value too long for
+/// the row wraps in it (a long archive name widened the dialog).
 fn kv(ui: &mut egui::Ui, key: &str, value: &str) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("{key}:")).color(MUTED()).size(12.0));
-        ui.label(RichText::new(value).color(TEXT()).size(12.0));
-    });
+    crate::settings::label_value_row(ui, &format!("{key}:"), value, 12.0);
 }
 
 /// A single-line text field: Find Issues' sunk pill, the full width.
@@ -1078,5 +1082,34 @@ mod tests {
         std::io::Read::read_to_string(&mut zip.by_name("ok.txt").unwrap(), &mut text).unwrap();
         assert_eq!(text, "fine");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A result row's value wraps in what's left of its row. (A long archive
+    /// name widened the dialog.)
+    #[test]
+    fn a_long_result_value_wraps_in_its_row() {
+        use crate::slider::rig::Rig;
+        struct Row {
+            value: String,
+            used: egui::Rect,
+        }
+        fn scene(ui: &mut egui::Ui, s: &mut Row) {
+            ui.set_width(300.0);
+            kv(ui, "Archive", &s.value);
+            s.used = ui.min_rect();
+        }
+        let mut rig = Rig::new(Row { value: "backup.zip".into(), used: egui::Rect::NOTHING }, scene);
+        let one_row = rig.state.used.height();
+        assert_eq!(one_row, rig.ctx.global_style().spacing.interact_size.y, "a short value's row is as it always was");
+        for value in [
+            "clarity_tagflow_backup_of_the_whole_picture_collection_2026-11-11_14-32-05.zip",
+            "Clarity TagFlow backup of the whole picture collection, 11 November 2026, 14.32.05.zip",
+        ] {
+            rig.state.value = value.into();
+            rig.frame(vec![]);
+            let used = rig.state.used;
+            assert!(used.width() <= 300.5, "{value}: the row grew to {}", used.width());
+            assert!(used.height() > 1.5 * one_row, "{value}: on one row of {}", used.height());
+        }
     }
 }

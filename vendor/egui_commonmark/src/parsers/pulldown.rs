@@ -453,28 +453,22 @@ impl CommonMarkViewerInternal {
             let id = ui.id().with("_table").with(self.curr_table);
             self.curr_table += 1;
 
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                let Table { header, rows } = parse_table(events);
+            // A table's cells don't wrap, so one wider than the space it has
+            // scrolls sideways in a strip of its own. Left to spill, it
+            // widened the ui it was in: the text after it stopped wrapping
+            // where it should and ran on as far as the table did. A table
+            // that fits is drawn as it always was, with no strip around it:
+            // `fitted` is whether it did the last time (nothing yet for a
+            // new table, which starts in the strip).
+            let fits_id = id.with("fits");
+            let fitted = ui.data(|d| d.get_temp::<bool>(fits_id));
+            let room = ui.available_width();
+            let mut table = |ui: &mut Ui| {
+                let frame = egui::Frame::group(ui.style()).show(ui, |ui| {
+                    let Table { header, rows } = parse_table(events);
 
-                egui::Grid::new(id).striped(true).show(ui, |ui| {
-                    for col in header {
-                        ui.horizontal(|ui| {
-                            for (e, src_span) in col {
-                                let tmp_start =
-                                    std::mem::replace(&mut self.line.should_start_newline, false);
-                                let tmp_end =
-                                    std::mem::replace(&mut self.line.should_end_newline, false);
-                                self.event(ui, e, src_span, cache, options, max_width);
-                                self.line.should_start_newline = tmp_start;
-                                self.line.should_end_newline = tmp_end;
-                            }
-                        });
-                    }
-
-                    ui.end_row();
-
-                    for row in rows {
-                        for col in row {
+                    egui::Grid::new(id).striped(true).show(ui, |ui| {
+                        for col in header {
                             ui.horizontal(|ui| {
                                 for (e, src_span) in col {
                                     let tmp_start = std::mem::replace(
@@ -491,9 +485,51 @@ impl CommonMarkViewerInternal {
                         }
 
                         ui.end_row();
-                    }
+
+                        for row in rows {
+                            for col in row {
+                                ui.horizontal(|ui| {
+                                    for (e, src_span) in col {
+                                        let tmp_start = std::mem::replace(
+                                            &mut self.line.should_start_newline,
+                                            false,
+                                        );
+                                        let tmp_end = std::mem::replace(
+                                            &mut self.line.should_end_newline,
+                                            false,
+                                        );
+                                        self.event(ui, e, src_span, cache, options, max_width);
+                                        self.line.should_start_newline = tmp_start;
+                                        self.line.should_end_newline = tmp_end;
+                                    }
+                                });
+                            }
+
+                            ui.end_row();
+                        }
+                    });
                 });
-            });
+                frame.response.rect.width()
+            };
+            let width = if fitted == Some(true) {
+                table(ui)
+            } else {
+                egui::ScrollArea::horizontal()
+                    .id_salt(id.with("scroll"))
+                    .show(ui, table)
+                    .inner
+            };
+            // (A new table's first pass only sizes it up, too narrow to go
+            // by: it stays in the strip until it has been measured.)
+            let fits = fitted.is_some() && width <= room + 0.5;
+            if fitted != Some(fits) {
+                ui.data_mut(|d| d.insert_temp(fits_id, fits));
+                if fitted == Some(true) {
+                    // It has outgrown its space: this pass is drawn again,
+                    // with the table in its strip.
+                    ui.ctx().request_discard("a table outgrew its column");
+                }
+            }
 
             self.is_table = false;
             if events.peek().is_none() {

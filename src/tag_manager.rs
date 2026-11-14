@@ -336,7 +336,10 @@ pub fn show(
                                 egui::Color32::from_rgb(46, 160, 67)
                             };
                             // right_to_left: text first (rightmost), orb to its left.
-                            ui.label(egui::RichText::new(&state.status_msg).color(color).size(12.0));
+                            // The text keeps to the room the title and the orb
+                            // (30 + the 6 before it) leave it.
+                            let orb_room = 36.0 + ui.spacing().item_spacing.x;
+                            crate::settings::header_status(ui, &state.status_msg, color, orb_room);
                             ui.add_space(6.0);
                             // An error bursts the orb apart (red); a retry — i.e.
                             // going back to Thinking — re-forms it.

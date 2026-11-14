@@ -260,16 +260,26 @@ fn chat_list(ui: &mut egui::Ui, llm: &mut LlmState) {
             let selected = i == llm.active_chat;
             let title = llm.chats[i].title();
             ui.horizontal(|ui| {
-                // The title on the left (the empty right text takes the rest).
-                let mut btn = egui::Button::new(egui::RichText::new(title).color(TEXT()).size(13.0))
+                // The title on the left (the empty right text takes the rest),
+                // cut short at the button's edge: a chat that starts with a
+                // PDF is named after the file, and a long name stretched the
+                // popup (its delete icon with it).
+                let mut btn = egui::Button::new(egui::RichText::new(title.as_str()).color(TEXT()).size(13.0))
                     .right_text("")
+                    .truncate()
                     .corner_radius(egui::CornerRadius::same(18));
                 btn = if selected {
                     btn.fill(ACCENT1().gamma_multiply(0.15))
                 } else {
                     btn.fill(egui::Color32::TRANSPARENT)
                 };
-                if ui.add_sized(egui::vec2(title_w, 30.0), btn).clicked() {
+                let mut row = ui.add_sized(egui::vec2(title_w, 30.0), btn);
+                // Cut short (it wanted more room than it has): the whole
+                // title on hover.
+                if row.intrinsic_size().is_some_and(|full| full.x > row.rect.width() + 0.5) {
+                    row = row.on_hover_text(title.as_str());
+                }
+                if row.clicked() {
                     llm.select_chat(i);
                     llm.chats_open = false;
                 }
@@ -581,7 +591,14 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                                         paint_play_badge(ui, resp.rect);
                                     }
                                 } else {
-                                    media_chip(ui, &path, icon_tint(MUTED()));
+                                    // The name leaves room for the ✕ after it.
+                                    let x_w = ui
+                                        .fonts_mut(|f| f.layout_no_wrap("✕".to_string(), egui::FontId::proportional(11.0), MUTED()))
+                                        .size()
+                                        .x
+                                        + 2.0 * ui.spacing().button_padding.x
+                                        + ui.spacing().item_spacing.x;
+                                    media_chip(ui, &path, icon_tint(MUTED()), x_w);
                                 }
                                 if ui
                                     .add(egui::Button::new(egui::RichText::new("✕").color(MUTED()).size(11.0)).frame(false))
@@ -802,10 +819,18 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                             .fit_to_exact_size(egui::vec2(12.0, 12.0))
                             .tint(chat_icon_tint(MUTED())),
                     );
-                    ui.label(
-                        egui::RichText::new(crate::ai_tagging::file_name(path))
-                            .color(chat_text_override().unwrap_or(MUTED()))
-                            .size(11.5),
+                    // Cut short at the column's edge (the hover has the whole
+                    // path): a name wider than the column — a narrow one, with
+                    // the picture beside it — slid the conversation off to
+                    // the left.
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(crate::ai_tagging::file_name(path))
+                                .color(chat_text_override().unwrap_or(MUTED()))
+                                .size(11.5),
+                        )
+                        .truncate()
+                        .show_tooltip_when_elided(false),
                     )
                     .on_hover_text(path.display().to_string());
                 });
@@ -841,7 +866,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                         }
                     }
                     None => {
-                        media_chip(ui, path, chat_icon_tint(MUTED()));
+                        media_chip(ui, path, chat_icon_tint(MUTED()), 0.0);
                     }
                 }
                 if !text.is_empty() {
@@ -1133,7 +1158,13 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
                     }
                 }
                 if let Some(e) = &llm.voice.last_err {
-                    ui.label(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(11.0));
+                    // One line, like the status above; the rest on hover. The
+                    // engine's errors run long (PyTorch's out-of-memory one
+                    // is some 400 characters) and went off the window's edge.
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(11.0))
+                            .truncate(),
+                    );
                 }
             }
         });
@@ -1340,6 +1371,15 @@ fn chat_markdown(
         v.widgets.active.fg_stroke.color = chat_text();
         if dark_ink {
             v.hyperlink_color = egui::Color32::from_rgb(28, 110, 235);
+        }
+        // A table wider than the column scrolls sideways in its own strip
+        // (the vendored viewer): its bar gets a line of its own under the
+        // table, the handle showing without the pointer on it, so the table
+        // reads as one that scrolls and its last row stays clear of the bar.
+        {
+            let scroll = &mut ui.style_mut().spacing.scroll;
+            scroll.floating_allocated_width = 6.0;
+            scroll.dormant_handle_opacity = 0.5;
         }
         egui_commonmark::CommonMarkViewer::new()
             .render_math_fn(Some(&render_math))
@@ -1702,7 +1742,10 @@ fn docs_in_use(ui: &mut egui::Ui, llm: &mut LlmState) {
     ui.add_space(6.0);
 }
 
-fn media_chip(ui: &mut egui::Ui, path: &std::path::Path, tint: egui::Color32) {
+/// An attachment without a preview (a clip whose poster isn't ready, a file
+/// that can't be read any more): its icon and name on one line. `reserve` is
+/// the room to keep free after the name, for what the caller puts there.
+fn media_chip(ui: &mut egui::Ui, path: &std::path::Path, tint: egui::Color32, reserve: f32) {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -1715,7 +1758,14 @@ fn media_chip(ui: &mut egui::Ui, path: &std::path::Path, tint: egui::Color32) {
         };
         let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
         icon.tint(tint).paint_at(ui, rect);
-        ui.label(egui::RichText::new(name).color(MUTED()).size(11.5));
+        // Cut short at the edge of the message box / the column (the whole
+        // name on hover): a long one stretched the box past the window, or
+        // slid the conversation off to the left.
+        let room = (ui.available_width() - reserve).max(0.0);
+        ui.scope(|ui| {
+            ui.set_max_width(room);
+            ui.add(egui::Label::new(egui::RichText::new(name).color(MUTED()).size(11.5)).truncate());
+        });
     });
 }
 
@@ -2632,5 +2682,85 @@ mod tests {
         assert_eq!(thousands(1024), "1,024");
         assert_eq!(thousands(4096), "4,096");
         assert_eq!(thousands(1_234_567), "1,234,567");
+    }
+
+    use eframe::egui;
+
+    /// A table wider than the reply column scrolls sideways in a strip of
+    /// its own: the reply keeps to the column, and the text after the table
+    /// wraps there. (The table widened the column, so what followed ran on
+    /// in one line, off the window.) A table that fits is drawn straight
+    /// into the reply, as it always was.
+    #[test]
+    fn a_wide_table_keeps_the_reply_in_its_column() {
+        use crate::slider::rig::Rig;
+        struct Reply {
+            text: String,
+            cache: egui_commonmark::CommonMarkCache,
+            used: egui::Rect,
+        }
+        fn scene(ui: &mut egui::Ui, s: &mut Reply) {
+            ui.set_width(400.0);
+            super::chat_markdown(ui, &mut s.cache, &s.text, false);
+            s.used = ui.min_rect();
+        }
+        // How wide the part of the screen is that the table's first cell may draw in.
+        fn clip_width(rig: &Rig<Reply>) -> f32 {
+            let cell = rig.shapes.iter().find(|c| matches!(&c.shape, egui::Shape::Text(t) if t.galley.text() == "Date"));
+            cell.expect("the table's first cell").clip_rect.width()
+        }
+        let after = "After the table the reply goes on with a paragraph of ordinary text that is long enough to \
+                     need a few lines of the column.";
+        let small = format!("| Date | Paid in |\n|---|---|\n| 2026-11-11 | 1,234.56 |\n\n{after}");
+        let mut rig = Rig::new(Reply { text: small, cache: Default::default(), used: egui::Rect::NOTHING }, scene);
+        rig.idle();
+        let screen = clip_width(&rig);
+        assert!(screen > 600.0, "a table that fits is in no strip: its cells draw in {screen}");
+
+        let row = "| 2026-11-11 | A fairly long description of the item in this row | 1,234.56 | 7,890.12 | \
+                   a note about it | and one more |\n";
+        rig.state.text = format!(
+            "| Date | Description | Paid in | Paid out | Notes | More |\n|---|---|---|---|---|---|\n{}\n{after}",
+            row.repeat(3)
+        );
+        // Frame by frame the reply never spills, from the first one the
+        // table is too wide in; then the table is in its strip.
+        for _ in 0..4 {
+            rig.frame(vec![]);
+            assert!(rig.state.used.width() <= 400.5, "the reply is {} wide", rig.state.used.width());
+        }
+        let used = rig.state.used;
+        assert!(clip_width(&rig) < 410.0, "the table's cells draw in {}", clip_width(&rig));
+        let para = rig.texts(after);
+        assert_eq!(para.len(), 1);
+        assert!(para[0].right() <= used.left() + 400.5, "{:?} runs out of {used:?}", para[0]);
+        assert!(para[0].height() > 30.0, "{:?} is on one line", para[0]);
+    }
+
+    /// An attachment's name is cut short where its row ends, less the room
+    /// asked for after it (a draft's ✕). (A long file name stretched the
+    /// message box past the window.)
+    #[test]
+    fn a_long_attachment_name_keeps_to_its_row() {
+        use crate::slider::rig::Rig;
+        struct Chip {
+            name: String,
+            reserve: f32,
+            used: egui::Rect,
+        }
+        fn scene(ui: &mut egui::Ui, s: &mut Chip) {
+            ui.set_width(300.0);
+            super::media_chip(ui, std::path::Path::new(&s.name), egui::Color32::GRAY, s.reserve);
+            s.used = ui.min_rect();
+        }
+        let name = format!("{}.mp4", "a_clip_with_a_very_long_file_name_".repeat(6));
+        let mut rig = Rig::new(Chip { name: name.clone(), reserve: 0.0, used: egui::Rect::NOTHING }, scene);
+        for reserve in [0.0, 30.0] {
+            rig.state.reserve = reserve;
+            rig.frame(vec![]);
+            let (used, shown) = (rig.state.used, rig.texts(&name)[0]);
+            assert!(used.width() <= 300.5, "the row grew to {}", used.width());
+            assert!(shown.right() <= used.left() + 300.5 - reserve, "{shown:?} with {reserve} kept free");
+        }
     }
 }

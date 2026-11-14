@@ -2272,10 +2272,9 @@ fn lora_row(
                     ));
                 }
                 for (k, v) in &info.facts {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{k}:")).color(MUTED()).size(10.5));
-                        ui.add(egui::Label::new(RichText::new(v).color(TEXT()).size(10.5)));
-                    });
+                    // A value too long for the row wraps in it: a long one
+                    // (a note, a name) widened the whole window.
+                    crate::settings::label_value_row(ui, &format!("{k}:"), v, 10.5);
                 }
             }
     });
@@ -2355,6 +2354,10 @@ fn lora_row(
     want_delete
 }
 
+/// The tallest the negative prompt's text box gets before it scrolls inside
+/// (about twelve lines) — the popup then still fits the smallest app window.
+const NEGATIVE_BOX_MAX_H: f32 = 200.0;
+
 /// Negative-prompt editor popup (opened from the "+" menu). The text edits
 /// `state.negative` live, so closing the popup keeps whatever was typed — there's
 /// no explicit Save. Applied to the workflow's negative encoder at generation.
@@ -2401,22 +2404,32 @@ fn negative_popup(ctx: &egui::Context, state: &mut GenerateState) {
 
             // The editor, in an Apple-style rounded input well. Edits land
             // straight in state.negative (live save).
-            let out = egui::Frame::new()
+            egui::Frame::new()
                 .fill(FIELD())
                 .corner_radius(CornerRadius::same(14))
                 .stroke(egui::Stroke::new(1.0_f32, EDGE()))
                 .inner_margin(Margin::same(10))
                 .show(ui, |ui| {
-                    egui::TextEdit::multiline(&mut state.negative)
-                        .frame(egui::Frame::NONE)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(6)
-                        .hint_text("blurry, low quality, watermark, extra fingers…")
-                        .show(ui)
-                })
-                .inner;
-            // Spell-check the negative prompt too (right-click suggestions).
-            crate::spellcheck::attach(ui, &out, &mut state.negative, &mut state.neg_spell);
+                    // Grows with the text up to NEGATIVE_BOX_MAX_H, then
+                    // scrolls inside: a long negative prompt made the window
+                    // taller than the app, its title and buttons out of reach.
+                    egui::ScrollArea::vertical()
+                        .id_salt("gen_negative_text")
+                        .max_height(NEGATIVE_BOX_MAX_H)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            // Keep scrolling while a text selection is dragged past the edge.
+                            crate::drag_select_autoscroll(ui);
+                            let out = egui::TextEdit::multiline(&mut state.negative)
+                                .frame(egui::Frame::NONE)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(6)
+                                .hint_text("blurry, low quality, watermark, extra fingers…")
+                                .show(ui);
+                            // Spell-check the negative prompt too (right-click suggestions).
+                            crate::spellcheck::attach(ui, &out, &mut state.negative, &mut state.neg_spell);
+                        });
+                });
 
             ui.add_space(12.0);
             ui.horizontal(|ui| {
@@ -3438,7 +3451,10 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                     } else {
                         GREEN
                     };
-                    ui.label(RichText::new(&state.status).color(color).size(12.0));
+                    // The text keeps to the room the dropdown and the orb
+                    // (30 + the 6 before it) leave it.
+                    let orb_room = 36.0 + ui.spacing().item_spacing.x;
+                    crate::settings::header_status(ui, &state.status, color, orb_room);
                     ui.add_space(6.0);
                     state.orb.set_state(if state.status_err {
                         crate::ai_orb::OrbState::Error
@@ -3458,8 +3474,9 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
     if let Some(host) = state.remote_host.clone() {
         ui.horizontal(|ui| {
             ui.set_min_height(28.0);
-            ui.label(RichText::new(format!("Runs on {host}")).color(TEXT()).strong().size(12.5))
-                .on_hover_text("Settings → Link: this PC uses that PC's GPU and models");
+            // The note first, so it keeps its place at the right; the PC's
+            // name has what's left and is cut short there (a long name ran
+            // under the note and off the panel).
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let txt = match &state.remote_catalog {
                     None if catalog_error().is_some() => "Couldn't get its models",
@@ -3468,6 +3485,13 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                     Some(_) => "Its GPU and models",
                 };
                 ui.label(RichText::new(txt).color(MUTED()).size(11.0));
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(format!("Runs on {host}")).color(TEXT()).strong().size(12.5))
+                            .truncate(),
+                    )
+                    .on_hover_text("Settings → Link: this PC uses that PC's GPU and models");
+                });
             });
         });
     } else {

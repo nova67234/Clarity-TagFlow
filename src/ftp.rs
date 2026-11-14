@@ -376,6 +376,33 @@ fn join_remote(cwd: &str, child: &str) -> String {
     }
 }
 
+/// `path` as it fits in `max_w`: all of it, or its end after a "…" (cut at a
+/// folder where one fits).
+fn path_tail(ui: &egui::Ui, path: &str, font: &egui::FontId, max_w: f32) -> String {
+    let width = |s: &str| {
+        ui.fonts_mut(|f| f.layout_no_wrap(s.to_string(), font.clone(), egui::Color32::PLACEHOLDER)).size().x
+    };
+    if width(path) <= max_w {
+        return path.to_string();
+    }
+    // The longest tail that fits behind the "…": the tails get wider the
+    // earlier they start, so search for where the first fitting one starts.
+    let starts: Vec<usize> = path.char_indices().map(|(i, _)| i).chain([path.len()]).collect();
+    let fits = |at: usize| width(&format!("…{}", &path[starts[at]..])) <= max_w;
+    let (mut lo, mut hi) = (0, starts.len() - 1); // `lo` doesn't fit, `hi` (nothing but the "…") is the fallback
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if fits(mid) { hi = mid } else { lo = mid }
+    }
+    let tail = &path[starts[hi]..];
+    // Start at a folder rather than mid-name, when that loses little.
+    let tail = match tail.find('/') {
+        Some(slash) if slash > 0 && slash <= tail.len() / 3 => &tail[slash..],
+        _ => tail,
+    };
+    format!("…{tail}")
+}
+
 /// Parent of a "/"-rooted remote path ("/" stays "/").
 fn parent_remote(cwd: &str) -> String {
     let trimmed = cwd.trim_end_matches('/');
@@ -472,7 +499,10 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
                 } else {
                     format!("FTP {}", settings.ftp_host.trim())
                 };
-                ui.heading(egui::RichText::new(title).color(TEXT()).strong().size(17.0));
+                // The close button first, so it keeps its place; the title
+                // has what's left and is cut short there (a long host name
+                // widened the window). It stays at the top of the row, where
+                // the row itself put it.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add(egui::Button::image(
@@ -484,6 +514,12 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
                     {
                         open = false;
                     }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(title).heading().color(TEXT()).strong().size(17.0))
+                                .truncate(),
+                        );
+                    });
                 });
             });
             ui.add_space(10.0);
@@ -501,7 +537,19 @@ pub fn show_browser(ctx: &egui::Context, state: &mut FtpState, settings: &crate:
                 if up.clicked() && state.cwd != "/" {
                     navigate = Some(parent_remote(&state.cwd));
                 }
-                ui.label(egui::RichText::new(&state.cwd).color(MUTED()).size(12.5));
+                // A path wider than the row shows its end (the folder you're
+                // in) after a "…", the whole of it on hover: a deep folder
+                // widened the window, more with every level.
+                let shown = path_tail(ui, &state.cwd, &egui::FontId::proportional(12.5), ui.available_width());
+                let cut = shown != state.cwd;
+                let path = ui.add(
+                    egui::Label::new(egui::RichText::new(shown).color(MUTED()).size(12.5))
+                        .truncate()
+                        .show_tooltip_when_elided(false),
+                );
+                if cut {
+                    path.on_hover_text(&state.cwd);
+                }
             });
             ui.add_space(6.0);
 
@@ -896,5 +944,29 @@ mod tests {
             }
         }
         let _ = ftp.quit();
+    }
+
+    /// A path too wide for its row shows its end — the folder you're in —
+    /// after a "…", from a folder's start where that loses little.
+    #[test]
+    fn a_long_path_shows_its_end() {
+        let font = egui::FontId::proportional(12.5);
+        let deep = "/home/someone/pictures/2026/holidays/italy/florence/day-3/selected/edited";
+        let _ = egui::Context::default().run_ui(Default::default(), |ui| {
+            let width = |s: &str| {
+                ui.fonts_mut(|f| f.layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE)).size().x
+            };
+            assert_eq!(path_tail(ui, "/pub/pictures", &font, 300.0), "/pub/pictures");
+            assert_eq!(path_tail(ui, deep, &font, width(deep)), deep, "a path that just fits is shown whole");
+            for max_w in [40.0, 90.0, 150.0, 240.0, 330.0] {
+                let shown = path_tail(ui, deep, &font, max_w);
+                let tail = shown.strip_prefix('…').unwrap_or_else(|| panic!("{max_w}: {shown}"));
+                assert!(deep.ends_with(tail) && tail.len() < deep.len(), "{max_w}: {shown}");
+                assert!(width(&shown) <= max_w, "{max_w}: {shown} is {} wide", width(&shown));
+            }
+            assert!(path_tail(ui, deep, &font, 240.0).starts_with("…/"), "{}", path_tail(ui, deep, &font, 240.0));
+            assert!(path_tail(ui, deep, &font, 240.0).ends_with("/selected/edited"));
+            assert_eq!(path_tail(ui, deep, &font, 2.0), "…", "no room at all");
+        });
     }
 }
