@@ -84,6 +84,13 @@ jobs:
 
   windows:
     runs-on: windows-2022
+    env:
+      # Rust 1.100's Cargo lays the build folder out anew, and ort-sys's build
+      # script (2.0.0-rc.12) still finds the folder to copy DirectML.dll into by
+      # counting up from OUT_DIR: it lands in build\ and panics ("cannot find the
+      # path specified"). Cargo's temporary opt-out keeps the old layout; drop it
+      # once ort-sys follows the new one.
+      __CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT: "1"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

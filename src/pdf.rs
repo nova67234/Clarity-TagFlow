@@ -717,8 +717,8 @@ fn pick(
     // 2. The pages the message names, whole — up to half the room.
     for &page in named {
         for &d in texts {
-            for k in 0..docs[d].1.passages.len() {
-                if docs[d].1.passages[k].page + 1 == page {
+            for (k, passage) in docs[d].1.passages.iter().enumerate() {
+                if passage.page + 1 == page {
                     take(d, k, budget / 2, &mut picked);
                 }
             }

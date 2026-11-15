@@ -26,6 +26,13 @@ jobs:
       # has explicit dependency edges and builds it correctly. Needs the MSVC
       # dev environment, set up by the msvc-dev-cmd step below.
       CMAKE_GENERATOR: Ninja
+      # Rust 1.100's Cargo lays the build folder out anew, and ort-sys's build
+      # script (2.0.0-rc.12) still finds the folder to copy DirectML.dll into by
+      # counting up from OUT_DIR: it lands in build\ and panics ("cannot find the
+      # path specified"). Cargo's temporary opt-out keeps the old layout (the
+      # packaging step below also looks for the DLLs beside the exe); drop it
+      # once ort-sys follows the new one.
+      __CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT: "1"
     steps:
       - uses: actions/checkout@v5
 
@@ -150,7 +157,13 @@ jobs:
       - name: Build installer (Inno Setup)
         shell: pwsh
         run: |
-          $ver = ($env:GITHUB_REF_NAME -replace '^v','')
+          # A tag's build is that version; a manual run (on a branch) is
+          # Cargo.toml's.
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $ver = ($env:GITHUB_REF_NAME -replace '^v','')
+          } else {
+            $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          }
           if (-not $ver) { $ver = '0.0.0' }
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { throw "Inno Setup (ISCC.exe) not found at $iscc" }
