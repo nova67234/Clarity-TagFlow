@@ -815,6 +815,7 @@ fn message_key(msg: &ChatMsg, picture: Option<Option<[usize; 2]>>, width: f32, z
     msg.goals.len().hash(&mut hasher);
     msg.character.hash(&mut hasher);
     msg.research.is_some().hash(&mut hasher);
+    msg.krea_prompt.hash(&mut hasher);
     picture.hash(&mut hasher);
     width.to_bits().hash(&mut hasher);
     zoom.to_bits().hash(&mut hasher);
@@ -851,13 +852,16 @@ fn show_or_keep_room(
     true
 }
 
+/// The button under a Krea 2 prompt.
+const TO_IMAGE: &str = "Use in Text to Image";
+
 /// One conversation entry. User messages sit right in an accent-tinted
 /// bubble (corner radius 22) that hugs the text; the model's replies render
 /// with no bubble at all — just modern formatted markdown (real bold, bullet
 /// lists, headings, code blocks) straight on the background, like current
 /// assistant UIs. A streaming reply shows a ▌ cursor.
 fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool) {
-    let (role, text, stored_thinking, image, doc, tag_image, tag_change, goals) = {
+    let (role, text, stored_thinking, image, doc, tag_image, tag_change, goals, krea_prompt) = {
         let m = &llm.chats[llm.active_chat].msgs[index];
         (
             m.role,
@@ -868,6 +872,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
             m.tag_image.clone(),
             m.tag_change.clone(),
             m.goals.clone(),
+            m.krea_prompt,
         )
     };
 
@@ -1147,9 +1152,9 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
     if !shown.trim().is_empty() {
         chat_markdown(ui, &mut llm.md_cache, &shown, false);
     } else if !streaming && !thinking.is_empty() {
-        // Ended (stopped, or failed) while still thinking: no answer, only
-        // the thought (in the Thoughts row above) — say so rather than
-        // leave a blank.
+        // Ended (stopped, failed, or the model said nothing out loud) while
+        // still thinking: no answer, only the thought (in the Thoughts row
+        // above) — say so rather than leave a blank.
         ui.add_space(2.0);
         let col = chat_text_override().or_else(chat_aurora_ink).unwrap_or(MUTED());
         ui.label(egui::RichText::new("Ended while still thinking — no answer").color(col).size(12.5).italics());
@@ -1176,61 +1181,79 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
 
     // Action row under every finished reply: copy / regenerate / listen
     // (copy and listen only when there's text to copy or read).
+    // (Text to Image isn't in the macOS build.)
+    let to_image = krea_prompt && has_text && cfg!(not(target_os = "macos"));
     if !streaming {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            if has_text
-                && msg_icon_button(ui, egui::include_image!("../icons/copy.svg"), 15.0, "Copy message", true)
+            // A Krea 2 prompt's own button is at the row's far end — the
+            // bottom right corner under the prompt, apart from the icons,
+            // which keep clear of it.
+            let room = if to_image { crate::scan::pill_width(ui, TO_IMAGE, crate::scan::Pill::Outline) + 12.0 } else { 0.0 };
+            let icons = egui::vec2((ui.available_width() - room).max(0.0), 0.0);
+            ui.allocate_ui_with_layout(icons, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                if has_text
+                    && msg_icon_button(ui, egui::include_image!("../icons/copy.svg"), 15.0, "Copy message", true)
+                        .clicked()
+                {
+                    // A researched reply comes with its sources.
+                    let copied = match &research {
+                        Some(report) => web_research::copy_text(&text, report),
+                        None => text.clone(),
+                    };
+                    ui.ctx().copy_text(copied);
+                }
+                let can_retry = !llm.running;
+                if msg_icon_button(ui, egui::include_image!("../icons/retry.svg"), 15.0, "Regenerate this reply", can_retry)
                     .clicked()
-            {
-                // A researched reply comes with its sources.
-                let copied = match &research {
-                    Some(report) => web_research::copy_text(&text, report),
-                    None => text.clone(),
+                    && can_retry
+                {
+                    // Applied after the message list finishes drawing (this
+                    // mutates the list being iterated).
+                    llm.pending_retry = Some(index);
+                }
+                let speaking = llm.any_speaking();
+                let tip = if speaking {
+                    "Stop reading"
+                } else if llm.voice.installed {
+                    "Read aloud (OmniVoice)"
+                } else {
+                    "Read aloud"
                 };
-                ui.ctx().copy_text(copied);
-            }
-            let can_retry = !llm.running;
-            if msg_icon_button(ui, egui::include_image!("../icons/retry.svg"), 15.0, "Regenerate this reply", can_retry)
-                .clicked()
-                && can_retry
-            {
-                // Applied after the message list finishes drawing (this
-                // mutates the list being iterated).
-                llm.pending_retry = Some(index);
-            }
-            let speaking = llm.any_speaking();
-            let tip = if speaking {
-                "Stop reading"
-            } else if llm.voice.installed {
-                "Read aloud (OmniVoice)"
-            } else {
-                "Read aloud"
-            };
-            let chat_id = llm.chats[llm.active_chat].id;
-            if has_text && msg_icon_button(ui, egui::include_image!("../icons/listen.svg"), 15.0, tip, true).clicked() {
-                llm.speak_target = Some((chat_id, index));
-                llm.listen(&text, ui.ctx());
-            }
-            // Voice status belongs to the reply being read, not every reply.
-            if llm.speak_target == Some((chat_id, index)) {
-                // Speech on its way with nothing playing yet (the model
-                // loading on first use, or the next sentence synthesizing).
-                if llm.voice.waiting() {
-                    ui.add(egui::Spinner::new().size(14.0).color(MUTED()));
-                    if let Some(status) = llm.voice.status(ui.ctx()) {
-                        ui.add(egui::Label::new(egui::RichText::new(status).color(MUTED()).size(11.0)).truncate());
+                let chat_id = llm.chats[llm.active_chat].id;
+                if has_text && msg_icon_button(ui, egui::include_image!("../icons/listen.svg"), 15.0, tip, true).clicked() {
+                    llm.speak_target = Some((chat_id, index));
+                    llm.listen(&text, ui.ctx());
+                }
+                // Voice status belongs to the reply being read, not every reply.
+                if llm.speak_target == Some((chat_id, index)) {
+                    // Speech on its way with nothing playing yet (the model
+                    // loading on first use, or the next sentence synthesizing).
+                    if llm.voice.waiting() {
+                        ui.add(egui::Spinner::new().size(14.0).color(MUTED()));
+                        if let Some(status) = llm.voice.status(ui.ctx()) {
+                            ui.add(egui::Label::new(egui::RichText::new(status).color(MUTED()).size(11.0)).truncate());
+                        }
+                    }
+                    if let Some(e) = &llm.voice.last_err {
+                        // One line, like the status above; the rest on hover. The
+                        // engine's errors run long (PyTorch's out-of-memory one
+                        // is some 400 characters) and went off the window's edge.
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(11.0))
+                                .truncate(),
+                        );
                     }
                 }
-                if let Some(e) = &llm.voice.last_err {
-                    // One line, like the status above; the rest on hover. The
-                    // engine's errors run long (PyTorch's out-of-memory one
-                    // is some 400 characters) and went off the window's edge.
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(e).color(egui::Color32::from_rgb(210, 70, 70)).size(11.0))
-                            .truncate(),
-                    );
-                }
+            });
+            if to_image {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let tip = "Put this prompt in Text to Image, on Krea 2, and open it. That leaves the chat \
+                               and frees its model, so Krea 2 has the graphics card.";
+                    if crate::scan::pill(ui, TO_IMAGE, crate::scan::Pill::Outline, None, true).on_hover_text(tip).clicked() {
+                        llm.to_image = Some(text.clone());
+                    }
+                });
             }
         });
     }
@@ -1474,6 +1497,18 @@ fn thoughts_label(character: Option<&str>, live: bool, secs: Option<u64>) -> Str
     chars.next().map(|f| f.to_uppercase().chain(chars).collect()).unwrap_or_default()
 }
 
+/// Where a reply's Thoughts row keeps whether it's open.
+fn thoughts_open_id(chat_id: u64, index: usize) -> egui::Id {
+    egui::Id::new(("ai_thinking_open", chat_id, index))
+}
+
+/// Show message `index` of chat `chat_id` with its Thoughts row open: a
+/// reply that was only a thought (src/llm.rs), so what the model did write
+/// is in sight under the line saying it gave no answer.
+pub(crate) fn open_thoughts(ctx: &egui::Context, chat_id: u64, index: usize) {
+    ctx.data_mut(|d| d.insert_temp(thoughts_open_id(chat_id, index), true));
+}
+
 /// The collapsible "Thinking" row above a reply: the little AI orb, a muted
 /// label (pulsing softly while the thought still streams) and a chevron that
 /// rotates as the section opens. Clicking anywhere on it (orb included)
@@ -1481,7 +1516,7 @@ fn thoughts_label(character: Option<&str>, live: bool, secs: Option<u64>) -> Str
 /// with an orb-accent rule, rather than a boxed card.
 fn thinking_row(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, thinking: &str, live: bool) {
     let chat_id = llm.chats[llm.active_chat].id;
-    let open_id = egui::Id::new(("ai_thinking_open", chat_id, index));
+    let open_id = thoughts_open_id(chat_id, index);
     let mut open = ui.data_mut(|d| d.get_temp::<bool>(open_id).unwrap_or(false));
     let mut toggled = false;
     // Drives both the chevron rotation and the body fade, so open/close
@@ -3176,6 +3211,60 @@ mod tests {
         assert_eq!(rig.state.drawn, middle);
     }
 
+    /// A Krea 2 prompt has its own button, at the bottom right corner under
+    /// it — apart from the copy, retry and listen icons — which hands the
+    /// prompt over for Text to Image. Other replies haven't.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_krea_prompt_can_be_taken_to_text_to_image() {
+        use crate::llm::{ChatMsg, ChatRole, LlmState};
+        const PROMPT: &str = "A weathered lighthouse keeper in a navy wool sweater reads a creased letter by \
+                              the amber glow of a brass oil lamp, rain streaking the small window behind him.";
+        fn scene(ui: &mut egui::Ui, llm: &mut LlmState) {
+            ui.set_width(600.0);
+            let n = llm.chats[llm.active_chat].msgs.len();
+            for i in 0..n {
+                super::message(ui, llm, i, false);
+            }
+        }
+        let reply = |text: &str, krea_prompt: bool| ChatMsg {
+            role: ChatRole::Model,
+            text: text.to_string(),
+            thinking: None,
+            image: None,
+            doc: None,
+            tag_image: None,
+            tag_change: None,
+            goals: vec![],
+            character: None,
+            remember: false,
+            picture_memory: false,
+            shared_with: vec![],
+            research: None,
+            krea_prompt,
+        };
+        let mut llm = LlmState::default();
+        llm.chats[0].msgs.push(reply("Hi! Send me a picture or an idea.", false));
+        llm.chats[0].msgs.push(reply(PROMPT, true));
+        let mut rig = crate::slider::rig::Rig::new(llm, scene);
+        rig.screen = egui::vec2(640.0, 700.0);
+        rig.idle();
+
+        let buttons = rig.texts(super::TO_IMAGE);
+        assert_eq!(buttons.len(), 1, "under the prompt only");
+        let button = buttons[0];
+        // (The prompt wraps over several lines: one run of text.)
+        let prompt = run(&rig, PROMPT).0;
+        assert!(button.top() > prompt.bottom(), "{button:?} is under {prompt:?}");
+        assert!(button.top() < prompt.bottom() + 24.0, "right under it: {button:?} {prompt:?}");
+        assert!(button.right() > 560.0 && button.right() <= 600.0, "at the right end of the column: {button:?}");
+        assert!(button.left() > 380.0, "apart from the icons on the left: {button:?}");
+        assert!(rig.state.to_image.is_none());
+
+        rig.click(button.center());
+        assert_eq!(rig.state.to_image.as_deref(), Some(PROMPT));
+    }
+
     /// A message's key is what its height hangs on.
     #[test]
     fn a_messages_key_follows_what_it_says() {
@@ -3194,6 +3283,7 @@ mod tests {
             picture_memory: false,
             shared_with: vec![],
             research: None,
+            krea_prompt: false,
         };
         let key = |m: &ChatMsg| super::message_key(m, None, 600.0, 1.0);
         assert_eq!(key(&msg("a reply")), key(&msg("a reply")));

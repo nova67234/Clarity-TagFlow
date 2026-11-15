@@ -17,10 +17,22 @@
 //! for nothing but prompts, so a greeting got no reply at all.
 //!
 //! The brief rides along as a pinned priming turn (like role play's
-//! preamble), and pictures are read with Detailed Vision (src/llm.rs tiles
-//! the newest image) so small details make it into the prompt.
+//! preamble), and a picture is read with Detailed Vision when it's sent
+//! (src/llm.rs: the whole picture and close-up sections of it) so small
+//! details make it into the prompt. A change asked for afterwards ("make it
+//! night") gets the picture whole: the prompt already written carries the
+//! details, and reading every section again made each change as slow to
+//! start as the first prompt.
+//!
+//! A model that thinks first is told to keep that to notes ([`brief`]): left
+//! to itself it writes the whole prompt in its head and then again as the
+//! answer — twice the wait for the same words.
+//!
+//! A reply that is a prompt ([`is_prompt`]) can be taken to Text to Image
+//! from the chat.
 
-/// The priming turn pinned in front of the chat history.
+/// The priming turn pinned in front of the chat history, for a model that
+/// answers straight away (see [`brief`]).
 pub const BRIEF: &str = "[Krea 2 prompt writer]\n\
 You write prompts for Krea 2, a text-to-image model. Its text encoder is a \
 language model, so it understands natural, descriptive English prose — never \
@@ -78,3 +90,89 @@ introduction, no quotes around it, no markdown, no lists, nothing after it.";
 /// turn alternation intact).
 pub const ACK: &str = "Understood. When you send a picture, an idea or a change, I'll reply with only the \
                         Krea 2 prompt; otherwise I'll just talk with you.";
+
+/// The brief for the model that answers: for one that thinks first (`thinks`
+/// — the model does, and thinking isn't Off) with a rule about the thought,
+/// as role play has. At High and Max (`deep`) the user asked for more
+/// thought, so it may think the picture through — as notes all the same.
+pub fn brief(thinks: bool, deep: bool) -> String {
+    if !thinks {
+        return BRIEF.to_string();
+    }
+    let rule = if deep {
+        "- When you reason privately before answering, look the picture or the idea over thoroughly — \
+         but as notes of what you see and what to include, never as drafts of the prompt: the prompt \
+         is written once, in your answer."
+    } else {
+        "- Think briefly: when you reason privately before answering, a few short notes of what you \
+         see and what to include are enough — decide, then write. Never draft or revise the prompt \
+         in your head: it is written once, in your answer."
+    };
+    format!("{BRIEF}\n\nBefore you answer:\n{rule}")
+}
+
+/// A prompt is this many words at least (the brief asks for 90 to 200; what
+/// the model says when it's just talking is "a few sentences").
+const PROMPT_WORDS: usize = 60;
+/// With a picture sent, where a prompt is what's asked for.
+const PICTURE_PROMPT_WORDS: usize = 30;
+
+/// A finished reply, written with the brief, is a prompt rather than talk:
+/// one paragraph of a prompt's length (`picture`: the message it answers
+/// came with a picture).
+pub fn is_prompt(reply: &str, picture: bool) -> bool {
+    let reply = reply.trim();
+    let one_paragraph = !reply.lines().any(|line| line.trim().is_empty());
+    let words = reply.split_whitespace().count();
+    one_paragraph && words >= if picture { PICTURE_PROMPT_WORDS } else { PROMPT_WORDS }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A model that thinks is told to keep the thought to notes; one that
+    /// answers straight away gets the brief as it is.
+    #[test]
+    fn a_thinking_model_is_told_not_to_draft() {
+        assert_eq!(brief(false, false), BRIEF);
+        assert_eq!(brief(false, true), BRIEF);
+        let (quick, deep) = (brief(true, false), brief(true, true));
+        for b in [&quick, &deep] {
+            assert!(b.starts_with(BRIEF) && b.len() > BRIEF.len());
+            assert!(b.contains("written once, in your answer"), "{b}");
+        }
+        assert!(quick.contains("Think briefly") && !deep.contains("Think briefly"));
+        assert!(deep.contains("thoroughly"));
+    }
+
+    /// A prompt is one paragraph of some length; a greeting, thanks or an
+    /// answer in a few sentences isn't.
+    #[test]
+    fn a_prompt_is_told_from_talk() {
+        let prompt = "A weathered lighthouse keeper in a navy wool sweater sits at a scarred oak table, \
+                      reading a creased letter by the amber glow of a brass oil lamp. Rain streaks the \
+                      small window behind him, where a storm-grey sea heaves under a dark sky. His \
+                      silver beard catches the warm light, and deep lines frame his pale blue eyes. A \
+                      chipped enamel mug steams beside a coil of rope. Shot on a 50mm lens with a \
+                      shallow depth of field, a moody photograph in muted teal and amber.";
+        assert!(is_prompt(prompt, false) && is_prompt(prompt, true));
+        assert!(is_prompt(&format!("  {prompt}\n"), false));
+        for talk in [
+            "",
+            "Hi! Send me a picture or describe an idea and I'll turn it into a Krea 2 prompt.",
+            "You're welcome! Want me to change anything about it?",
+        ] {
+            assert!(!is_prompt(talk, false) && !is_prompt(talk, true), "{talk}");
+        }
+        // A short prompt for a picture still is one; the same words with no
+        // picture read as talk.
+        let short = "A grey tabby cat curled up asleep on a sunlit wooden windowsill beside a potted \
+                     fern, soft morning light, shallow depth of field, a cosy photograph in warm \
+                     honey tones with gentle shadows.";
+        assert!(is_prompt(short, true) && !is_prompt(short, false));
+        // An answer set out in parts isn't a prompt, however long.
+        let parts = format!("Here is what I changed:\n\n{prompt}");
+        assert!(!is_prompt(&parts, false) && !is_prompt(&parts, true));
+    }
+}

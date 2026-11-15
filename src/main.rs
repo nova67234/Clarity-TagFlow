@@ -2346,6 +2346,19 @@ impl eframe::App for ViewerApp {
                 self.ai_tag_image_panel(ui, &path, left_w);
             }
             ai_chat::show(ui, &mut self.llm, &mut self.settings);
+            // A Krea 2 prompt taken to Text to Image (the button under it):
+            // into Krea 2's prompt box, with that view open. The chat is
+            // left the way its switch in Settings leaves it — its model
+            // freed, so Krea 2 has the graphics card — and stays as it is
+            // for coming back to.
+            #[cfg(not(target_os = "macos"))]
+            if let Some(prompt) = self.llm.to_image.take() {
+                self.right_state.krea2.set_prompt(prompt);
+                self.right_state.view = right_details::RightView::Krea2;
+                self.settings.layout = settings::Layout::Panels;
+                self.settings.ai_chat = false;
+                self.llm.unload();
+            }
         } else
         // When the Gallery layout is active, replace the three panels with a
         // full-window masonry grid of the open folder's images.

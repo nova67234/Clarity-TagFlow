@@ -1586,6 +1586,13 @@ impl Default for GenerateState {
 }
 
 impl GenerateState {
+    /// Put `prompt` in the prompt box, in place of what's there: a Krea 2
+    /// prompt taken over from the AI chat (the button under it).
+    #[cfg_attr(target_os = "macos", allow(dead_code))] // no Text to Image there
+    pub fn set_prompt(&mut self, prompt: String) {
+        self.prompt = prompt;
+    }
+
     /// Build the state for a given model family (Flux or Z-Image).
     pub fn new(family: GenFamily) -> Self {
         let model = family.default_model();

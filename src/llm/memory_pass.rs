@@ -1459,6 +1459,7 @@ mod tests {
             picture_memory: false,
             shared_with: Vec::new(),
             research: None,
+            krea_prompt: false,
         }
     }
 

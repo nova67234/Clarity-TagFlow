@@ -42,26 +42,45 @@ fn service_name(provider: Provider) -> &'static str {
     }
 }
 
-/// Web research is on and can run (it never does in Tag images).
+/// Web research is on and can run (it never does in Tag images, nor with
+/// Krea 2 prompts).
 pub(super) fn active(settings: &Settings) -> bool {
-    settings.ai_web_research && !settings.ai_tag_images
+    settings.ai_web_research && held_off_by(settings).is_none()
 }
 
-/// The Tools menu's Web research card: held off while Tag images is on,
-/// what it searches, and what's still missing before it can.
+/// The tool that holds Web research off, if one does: Tag images (nothing a
+/// web page says gets near the tags) or Krea 2 prompts (a prompt describes
+/// a picture or an idea — there's nothing to look up).
+fn held_off_by(settings: &Settings) -> Option<&'static str> {
+    if settings.ai_tag_images {
+        Some("Tag images")
+    } else if settings.ai_krea_prompts {
+        Some("Krea 2 prompts")
+    } else {
+        None
+    }
+}
+
+/// The Tools menu's Web research card: held off while Tag images or Krea 2
+/// prompts is on, what it searches, and what's still missing before it can.
 pub(super) fn tool_card(llm: &LlmState, settings: &Settings) -> Shown {
-    let blocked = settings.ai_tag_images;
+    let holder = held_off_by(settings);
+    let blocked = holder.is_some();
     let on = active(settings);
     let missing = if on { llm.research.missing() } else { None };
-    let (line, ink) = if blocked {
-        ("Off while Tag images is on".to_string(), Ink::Muted)
+    let (line, ink) = if let Some(tool) = holder {
+        (format!("Off while {tool} is on"), Ink::Muted)
     } else if missing.is_some() {
         ("Not set up yet".to_string(), Ink::Warn)
     } else {
         (format!("{} & citations", llm.research.provider.label()), Ink::Muted)
     };
-    let about = if blocked {
+    let about = if settings.ai_tag_images {
         "Off while Tag images is on: nothing a web page says gets near your tags.".to_string()
+    } else if blocked {
+        "Off while Krea 2 prompts is on: a prompt describes your picture or idea, so there's nothing \
+         to look up."
+            .to_string()
     } else {
         format!(
             "Before answering, the AI searches {} and answers from what it finds, citing \
@@ -396,6 +415,38 @@ mod tests {
         let c = copy_text("It is 330 m tall [1].\n", &report);
         assert_eq!(c, "It is 330 m tall [1].\n\nSources:\n[1] Eiffel Tower — https://example.com/eiffel\n");
         assert_eq!(copy_text("Hi", &Report::default()), "Hi");
+    }
+
+    /// Web research is held off by Tag images and by Krea 2 prompts, and
+    /// its card says by which.
+    #[test]
+    fn the_card_says_what_holds_it_off() {
+        // (Settings has a field of its own, so it can't be written out.)
+        #[allow(clippy::field_reassign_with_default)]
+        fn web_research_with(krea: bool, tags: bool) -> Settings {
+            let mut settings = Settings::default();
+            settings.ai_web_research = true;
+            settings.ai_krea_prompts = krea;
+            settings.ai_tag_images = tags;
+            settings
+        }
+        let llm = LlmState::default();
+        let on = web_research_with(false, false);
+        assert!(active(&on) && tool_card(&llm, &on).usable);
+
+        let krea = web_research_with(true, false);
+        let card = tool_card(&llm, &krea);
+        assert!(!active(&krea) && !card.on && !card.usable);
+        assert_eq!(card.line, "Off while Krea 2 prompts is on");
+        assert!(card.about.starts_with("Off while Krea 2 prompts is on:"), "{}", card.about);
+
+        let tags = web_research_with(false, true);
+        let card = tool_card(&llm, &tags);
+        assert!(!active(&tags) && !card.usable);
+        assert_eq!(card.line, "Off while Tag images is on");
+        assert!(card.about.contains("gets near your tags"));
+        // Both on: Tag images' reason (it's the one about safety).
+        assert_eq!(tool_card(&llm, &web_research_with(true, true)).line, "Off while Tag images is on");
     }
 
     #[test]
