@@ -60,7 +60,7 @@ pub struct CropFraction {
 const DEPTH_FOLDER: &str = "depth-anything-v2-base-onnx";
 /// Shown when the depth model hasn't been downloaded yet.
 const MODEL_MISSING_MSG: &str =
-    "Depth model not installed — Tag Manager Settings → Get Models → Depth (~370 MB).";
+    "Depth model not installed — Tag Manager Settings → Models → Depth Anything (~370 MB).";
 /// The plain mesh (where the Spatial Scene shader can't run): max screen-space
 /// shift (px) of the most-displaced depth layer. Kept small so the single-mesh
 /// warp reads as gentle depth rather than a stretchy rubber sheet (a mesh warps

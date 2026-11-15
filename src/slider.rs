@@ -39,7 +39,7 @@ const GAP: f32 = 12.0;
 pub const HEIGHT: f32 = 26.0;
 const RAIL_H: f32 = 6.0;
 /// Room at each end of the rail so the thumb never overhangs the hit area.
-const THUMB_PAD: f32 = 8.0;
+pub(crate) const THUMB_PAD: f32 = 8.0;
 /// The narrowest the track gets in a row without room for all of it.
 const MIN_TRACK: f32 = 60.0;
 /// A drag this close to the default's notch (a share of the track) lands on
@@ -193,6 +193,14 @@ fn palette() -> Palette {
         p.pill_edge = crate::theme::EDGE();
     }
     p
+}
+
+/// The value pill's fill, outline and text colours, for a number box that
+/// sits with the sliders (Text to Image's seed: not built on macOS).
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn pill_colors() -> (Color32, Color32, Color32) {
+    let p = palette();
+    (p.pill, p.pill_edge, p.pill_text)
 }
 
 fn base_palette() -> Palette {
@@ -555,6 +563,8 @@ pub(crate) mod rig {
     pub(crate) struct Rig<S> {
         pub ctx: egui::Context,
         pub state: S,
+        /// The screen's size, for a scene that needs another.
+        pub screen: Vec2,
         /// Shift held for the next frames.
         pub shift: bool,
         /// The last frame asked for another one straight away.
@@ -568,7 +578,8 @@ pub(crate) mod rig {
     impl<S> Rig<S> {
         pub fn new(state: S, scene: fn(&mut Ui, &mut S)) -> Self {
             let ctx = egui::Context::default();
-            let mut rig = Rig { ctx, state, shift: false, repaint: false, shapes: vec![], scene, time: 0.0 };
+            let screen = Vec2::new(640.0, 360.0);
+            let mut rig = Rig { ctx, state, screen, shift: false, repaint: false, shapes: vec![], scene, time: 0.0 };
             rig.frame(vec![]);
             rig
         }
@@ -590,7 +601,7 @@ pub(crate) mod rig {
         pub fn frame(&mut self, events: Vec<Event>) {
             self.time += 1.0 / 60.0;
             let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 360.0))),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.screen)),
                 time: Some(self.time),
                 modifiers: if self.shift { Modifiers::SHIFT } else { Modifiers::NONE },
                 events,

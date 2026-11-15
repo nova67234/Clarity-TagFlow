@@ -1666,41 +1666,17 @@ fn pill_field_in(
 /// A multi-line text box to match [`pill_field`]: the same sunk fill and
 /// accent ring, with rounded corners instead of round ends. Full width.
 pub(crate) fn well_box(ui: &mut egui::Ui, edit: egui::TextEdit<'_>) -> egui::Response {
-    well_box_in(ui, edit, None)
-}
-
-/// [`well_box`] for a pop-up that sizes itself to its content: the box grows
-/// with its text up to `max_h`, then scrolls inside (`id_salt` names the
-/// scroll position). Uncapped, a long text made the pop-up taller than the
-/// window.
-pub(crate) fn well_box_capped(ui: &mut egui::Ui, id_salt: &str, max_h: f32, edit: egui::TextEdit<'_>) -> egui::Response {
-    well_box_in(ui, edit, Some((id_salt, max_h)))
-}
-
-fn well_box_in(ui: &mut egui::Ui, edit: egui::TextEdit<'_>, cap: Option<(&str, f32)>) -> egui::Response {
     // As in pill_field: the well's slot first, filled in once the size and
     // focus are known.
     let bg = ui.painter().add(egui::Shape::Noop);
     let out = egui::Frame::NONE.inner_margin(egui::Margin::symmetric(14, 9)).show(ui, |ui| {
-        let edit = edit
-            .frame(egui::Frame::NONE)
-            .margin(egui::Margin::ZERO)
-            .font(egui::FontId::proportional(13.0))
-            .text_color(TEXT())
-            .desired_width(f32::INFINITY);
-        match cap {
-            None => ui.add(edit),
-            Some((id_salt, max_h)) => egui::ScrollArea::vertical()
-                .id_salt(id_salt)
-                .max_height(max_h)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    // Keep scrolling while a text selection is dragged past the edge.
-                    crate::drag_select_autoscroll(ui);
-                    ui.add(edit)
-                })
-                .inner,
-        }
+        ui.add(
+            edit.frame(egui::Frame::NONE)
+                .margin(egui::Margin::ZERO)
+                .font(egui::FontId::proportional(13.0))
+                .text_color(TEXT())
+                .desired_width(f32::INFINITY),
+        )
     });
     let resp = out.inner;
     let ring = if resp.has_focus() { crate::theme::selection_outline() } else { egui::Color32::TRANSPARENT };
@@ -1878,7 +1854,7 @@ pub(crate) fn pill_number(ui: &mut egui::Ui, width: f32, value: egui::DragValue<
 
 /// Find Issues' folder field and list: sunk below the cards (darker in dark
 /// themes, greyer in light ones).
-fn well_fill() -> egui::Color32 {
+pub(crate) fn well_fill() -> egui::Color32 {
     // Under Liquid Glass the Settings window's wells (text boxes, dropdowns,
     // lists) take the downloader's text-box colour instead.
     if liquid_main() {
@@ -1955,7 +1931,7 @@ fn card_fill() -> egui::Color32 {
 }
 
 /// Find Issues' card outlines and dividers.
-fn hairline() -> egui::Color32 {
+pub(crate) fn hairline() -> egui::Color32 {
     TEXT().gamma_multiply(0.08)
 }
 
@@ -2213,7 +2189,7 @@ fn dropdown_pill(
 
 /// The open list: a rounded panel under the pill's right end, its options
 /// `width` wide; a click outside closes it.
-fn dropdown_list(resp: &egui::Response, id: egui::Id, width: f32, add: impl FnOnce(&mut egui::Ui)) {
+pub(crate) fn dropdown_list(resp: &egui::Response, id: egui::Id, width: f32, add: impl FnOnce(&mut egui::Ui)) {
     egui::Popup::menu(resp)
         .id(id)
         .align(egui::RectAlign::BOTTOM_END)
@@ -2374,7 +2350,7 @@ fn paint_layout_glyph(p: &egui::Painter, rect: egui::Rect, kind: LayoutIcon, col
 }
 
 /// A chevron that turns from pointing down (`t` = 0, closed) to up (1, open).
-fn paint_chevron(p: &egui::Painter, c: egui::Pos2, t: f32, colour: egui::Color32) {
+pub(crate) fn paint_chevron(p: &egui::Painter, c: egui::Pos2, t: f32, colour: egui::Color32) {
     let dy = 2.2 * (1.0 - 2.0 * t);
     let stroke = egui::Stroke::new(1.6_f32, colour);
     let mid = egui::pos2(c.x, c.y + dy);
@@ -2587,43 +2563,6 @@ mod tests {
             assert!(s.line.left() >= s.title.right() + ORB, "{repeats}: {:?} runs into {:?}", s.line, s.title);
             assert!((s.line.height() - rows * one_row).abs() < 1.0, "{repeats}: {} high", s.line.height());
         }
-    }
-
-    /// A capped text box is the plain one until its text passes the cap,
-    /// then stays that tall and scrolls. (The Tag blacklist's pop-up grew
-    /// with every line, taller than the window.)
-    #[test]
-    fn a_capped_text_box_stops_growing() {
-        use crate::slider::rig::Rig;
-        struct Field {
-            text: String,
-            capped: bool,
-            height: f32,
-        }
-        const CAP: f32 = 150.0;
-        fn scene(ui: &mut egui::Ui, s: &mut Field) {
-            ui.set_width(300.0);
-            let edit = egui::TextEdit::multiline(&mut s.text).desired_rows(3);
-            if s.capped {
-                super::well_box_capped(ui, "capped", CAP, edit);
-            } else {
-                super::well_box(ui, edit);
-            }
-            s.height = ui.min_rect().height();
-        }
-        let mut rig = Rig::new(Field { text: String::new(), capped: false, height: 0.0 }, scene);
-        let mut height = |lines: usize, capped: bool| {
-            rig.state.text = (0..lines).map(|i| format!("tag_{i}\n")).collect();
-            rig.state.capped = capped;
-            rig.idle();
-            rig.state.height
-        };
-        assert_eq!(height(2, true), height(2, false), "the same box while the text is short");
-        assert!(height(40, false) > 2.0 * CAP, "the plain box grows with its text");
-        // The cap, and the box's padding around it.
-        let capped = height(40, true);
-        assert!((CAP..CAP + 20.0).contains(&capped), "{capped}");
-        assert_eq!(height(80, true), capped);
     }
 
     /// A dropdown row's name stops short of the note at its end. (A long

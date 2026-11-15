@@ -2960,6 +2960,9 @@ fn install_fallback_fonts(ctx: &egui::Context) {
     }
     fonts.families.insert(egui::FontFamily::Name("bold".into()), bold_list);
 
+    // The Tag Manager's own faces (Manrope), registered the same way.
+    crate::tag_manager::add_fonts(&mut fonts);
+
     // Cursive script font for the startup splash ("Clarity TagFlow" write-on).
     // The family is ALWAYS registered — laying out with an unknown family
     // panics — and just maps to the proportional list when no script font is

@@ -18,6 +18,8 @@ use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText};
 use crate::slider::PillSlider;
 use crate::theme::*;
 
+mod image_view;
+
 const GREEN: Color32 = Color32::from_rgb(46, 160, 67);
 const RED: Color32 = Color32::from_rgb(220, 70, 70);
 /// Drag-and-drop import accent (the blue the prompt box turns when a file with
@@ -1537,6 +1539,10 @@ pub struct GenerateState {
     remote_catalog: Option<Catalog>,
     /// The catalog generation last listed in the pickers.
     catalog_seen: u64,
+    /// Text to Image: the setting open over the settings bar (one at a time),
+    /// and whether the setup card under the header's button is.
+    open_setting: Option<image_view::Setting>,
+    show_setup: bool,
 }
 
 impl Default for GenerateState {
@@ -1611,6 +1617,8 @@ impl GenerateState {
             remote_host: None,
             remote_catalog: None,
             catalog_seen: 0,
+            open_setting: None,
+            show_setup: false,
         }
     }
 
@@ -3198,7 +3206,18 @@ fn window_frame() -> egui::Frame {
 
 /// True once ComfyUI's source is present (a rough "installed" check).
 fn is_installed() -> bool {
+    #[cfg(test)]
+    if let Some(installed) = INSTALLED_FOR_TEST.get() {
+        return installed;
+    }
     comfy_base().join("ComfyUI").join("main.py").exists()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What [`is_installed`] answers in a test that sets it, whatever the
+    /// machine running the tests has on disk.
+    static INSTALLED_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The installed ComfyUI version, read from its `comfyui_version.py`
@@ -3361,6 +3380,11 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// browser's selected file, used as the source for LTX image-to-video (None for
 /// the image families).
 pub fn show(ui: &mut egui::Ui, state: &mut GenerateState, current_image: Option<&Path>) {
+    // Text to Image has its own layout; what follows is the video Directors'.
+    if !state.family.is_video() {
+        image_view::show(ui, state);
+        return;
+    }
     // The whole view is one scrollable column. Normally everything fits exactly
     // (the prompt box is stretched so the Log row — and the log console while
     // open — bottoms out at the panel edge); the scroll area is the fallback
@@ -3385,32 +3409,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut GenerateState, current_image: Option<
 fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current_image: Option<&Path>) {
     let top_y = ui.cursor().min.y;
     sync_remote(state, ui.ctx());
-    // Drain background-runner messages.
-    if let Some(rx) = &state.rx {
-        let mut finished = false;
-        while let Ok(msg) = rx.try_recv() {
-            match msg {
-                RunnerMsg::Line(line) => state.log.push(line),
-                RunnerMsg::Status(s) => state.status = s,
-                RunnerMsg::Output(p) => {
-                    state.last_image = Some(p.clone());
-                    state.gen_images.push(p);
-                }
-                RunnerMsg::Done(ok) => {
-                    state.running = false;
-                    finished = true;
-                    state.status_err = !ok;
-                }
-                RunnerMsg::Nodes(s) => state.nodes_status = Some(s),
-            }
-        }
-        if finished {
-            state.rx = None;
-        }
-        if state.running {
-            ui.ctx().request_repaint();
-        }
-    }
+    drain_runner(state, ui.ctx());
 
     // --- Header (title + status + orb), mirroring Pixal3D. ---
     egui::Frame::new()
@@ -3539,35 +3538,11 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
         });
     }
 
-    // LoRA selection popup (Z-Image).
-    if state.show_lora_popup {
-        lora_popup(ui.ctx(), state);
-    }
-    // Embeddings (textual inversion) picker.
-    if state.show_embeddings_popup {
-        embeddings_popup(ui.ctx(), state);
-    }
-    // Negative-prompt editor.
-    if state.show_negative_popup {
-        negative_popup(ui.ctx(), state);
-    }
+    popups(ui.ctx(), state);
 
     ui.add_space(10.0);
 
-    // Is a file being dragged over the window right now? On Windows, winit
-    // (0.30) doesn't emit cursor-move events during an OS file drag, so the
-    // pointer position is unknown/stale — we can't reliably tell *where* over the
-    // window the file is. So highlight whenever a file is over the window and the
-    // pointer (if known at all) is over the box; the box is the drop target while
-    // a generator is open. (Uses last frame's box rect — the header row below is
-    // drawn before this frame's box exists.)
-    let dragging_files = ui.input(|i| !i.raw.hovered_files.is_empty());
-    if dragging_files {
-        ui.ctx().request_repaint();
-    }
-    let hover_pos = ui.input(|i| i.pointer.hover_pos());
-    let drag_over_prompt = dragging_files
-        && state.prompt_rect.is_none_or(|r| hover_pos.is_none_or(|p| r.contains(p)));
+    let drag_over_prompt = dragging_over_prompt(ui, state);
 
     // --- Prompt (stretched to the panel; long text scrolls inside). ---
     // Header row: "Prompt" on the left; on the right, the drag-and-drop import
@@ -3648,124 +3623,12 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                 ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 28.0), Layout::left_to_right(Align::Center), |ui| {
                     // "+" menu in the bottom-LEFT corner (flips to an × while
                     // open) — home of the LoRA picker and future tools.
-                    {
-                        let menu_id = ui.id().with(("add_menu", state.family.title()));
-                        let open = egui::Popup::is_id_open(ui.ctx(), menu_id);
-                        let (icon, tip) = if open {
-                            (egui::include_image!("../icons/close.svg"), "Close")
-                        } else {
-                            (egui::include_image!("../icons/add.svg"), "Add")
-                        };
-                        let add_resp = round_icon_button(ui, icon, 18.0, tip, true);
-                        egui::Popup::menu(&add_resp)
-                            .id(menu_id)
-                            .align(egui::RectAlign::TOP_START)
-                            .frame(crate::settings::dropdown_frame())
-                            .show(|ui| {
-                                ui.set_min_width(150.0);
-                                round_menu_rows(ui);
-                                // Every selected LoRA is applied (incl. "other model"
-                                // picks), so count them all.
-                                let n = state.loras.iter().filter(|l| l.selected).count();
-                                let label = if n > 0 { format!("LoRA ({n})") } else { "LoRA".to_string() };
-                                let licon = egui::Image::new(egui::include_image!("../icons/lora.svg"))
-                                    .fit_to_exact_size(egui::vec2(16.0, 16.0))
-                                    .tint(icon_tint(TEXT()));
-                                if ui.add(egui::Button::image_and_text(licon, RichText::new(label).size(12.0)).frame(false)).clicked() {
-                                    refresh_loras(state, ui.ctx());
-                                    state.show_lora_popup = true;
-                                    ui.close();
-                                }
-
-                                // Embeddings (textual inversion): selected ones are
-                                // injected into the workflow's pos/neg encoder.
-                                let en = state.embeddings.iter().filter(|e| e.selected).count();
-                                let elabel = if en > 0 { format!("Embeddings ({en})") } else { "Embeddings".to_string() };
-                                let eicon = egui::Image::new(egui::include_image!("../icons/extension.svg"))
-                                    .fit_to_exact_size(egui::vec2(16.0, 16.0))
-                                    .tint(icon_tint(TEXT()));
-                                if ui.add(egui::Button::image_and_text(eicon, RichText::new(elabel).size(12.0)).frame(false)).clicked() {
-                                    refresh_embeddings(state, ui.ctx());
-                                    state.show_embeddings_popup = true;
-                                    ui.close();
-                                }
-
-                                // Negative prompt: opens an editor popup; the text
-                                // is saved live and applied to the negative encoder.
-                                let nlabel = if state.negative.trim().is_empty() {
-                                    "Negative prompt".to_string()
-                                } else {
-                                    "Negative prompt (set)".to_string()
-                                };
-                                let nicon = egui::Image::new(egui::include_image!("../icons/edit.svg"))
-                                    .fit_to_exact_size(egui::vec2(16.0, 16.0))
-                                    .tint(icon_tint(TEXT()));
-                                if ui.add(egui::Button::image_and_text(nicon, RichText::new(nlabel).size(12.0)).frame(false)).clicked() {
-                                    state.show_negative_popup = true;
-                                    ui.close();
-                                }
-
-                                // Shown only when a dropped image's workflow is in
-                                // use — lets the user revert to the built-in pipeline.
-                                if state.imported_workflow.is_some() {
-                                    let cicon = egui::Image::new(egui::include_image!("../icons/close.svg"))
-                                        .fit_to_exact_size(egui::vec2(16.0, 16.0))
-                                        .tint(icon_tint(TEXT()));
-                                    if ui.add(egui::Button::image_and_text(cicon, RichText::new("Clear imported workflow").size(12.0)).frame(false)).clicked() {
-                                        state.imported_workflow = None;
-                                        state.nodes_status = None;
-                                        ui.close();
-                                    }
-                                }
-                            });
-                    }
+                    add_menu(ui, state);
 
                     // Send / stop pinned to the bottom-RIGHT corner, with the
                     // compact model selector to their left.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if state.running {
-                            let tip = if state.stop_between_steps { "Stop after the current step" } else { "Stop generating" };
-                            if round_icon_button(ui, egui::include_image!("../icons/stop.svg"), 18.0, tip, true).clicked() {
-                                state.cancel.store(true, Ordering::SeqCst);
-                                state.status = if state.stop_between_steps {
-                                    "Stopping after the current step…".into()
-                                } else {
-                                    "Cancelling…".into()
-                                };
-                            }
-                        } else if !state.prompt.trim().is_empty() {
-                            // The send button only appears once you start typing.
-                            // On a Link host: what it has ready.
-                            let remote_ready = state.remote_host.as_ref().map(|h| remote_ready(state, h));
-                            let inst = remote_ready.as_ref().map_or_else(is_installed, |r| r.is_ok());
-                            // Image-to-video needs a selected source *image*. After a
-                            // video run the browser selects the newest output (a
-                            // .webm), which ComfyUI can't use as the start frame.
-                            let src_is_video = current_image.is_some_and(crate::is_video);
-                            let needs_img =
-                                state.family.is_video() && state.i2v && (current_image.is_none() || src_is_video);
-                            let ready = inst && !needs_img;
-                            let not_ready = match &remote_ready {
-                                Some(Err(why)) => why.clone(),
-                                _ => "Run Setup Requirements first".to_string(),
-                            };
-                            let tip = if !inst {
-                                not_ready.as_str()
-                            } else if needs_img && src_is_video {
-                                "The selected file is a video — select an image to animate"
-                            } else if needs_img {
-                                "Select an image in the browser first"
-                            } else {
-                                "Generate"
-                            };
-                            if round_icon_button(ui, egui::include_image!("../icons/send.svg"), 18.0, tip, ready).clicked() && ready {
-                                start_generate(state, ui.ctx(), current_image);
-                            }
-                        } else {
-                            // Invisible stand-in so the model selector doesn't
-                            // drift into the corner while the send icon is hidden.
-                            ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
-                        }
+                        send_or_stop(ui, state, current_image);
                         ui.add_space(2.0);
                         model_selector(ui, state);
                     });
@@ -3774,49 +3637,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
         });
     let after_prompt_y = ui.cursor().min.y;
 
-    // Remember the box rect for next frame's drag-over hit-test, and publish it
-    // so the gallery's global drop handler knows a drop here is ours, not media.
-    let prompt_rect = prompt_resp.response.rect;
-    state.prompt_rect = Some(prompt_rect);
-    if let Ok(mut g) = PROMPT_DROP_RECT.lock() {
-        *g = Some((prompt_rect, ui.input(|i| i.time)));
-    }
-
-    // While a file is dragged over the box, tint it blue and show the attach
-    // icon centred — the visual cue that dropping will import its metadata.
-    if drag_over_prompt {
-        let p = ui.painter();
-        p.rect_filled(prompt_rect, CornerRadius::same(22), DROP_BLUE.gamma_multiply(0.18));
-        p.rect_stroke(
-            prompt_rect,
-            CornerRadius::same(22),
-            egui::Stroke::new(2.0_f32, DROP_BLUE),
-            egui::StrokeKind::Inside,
-        );
-        let side = 56.0_f32.min(prompt_rect.height() * 0.5);
-        let icon_rect = egui::Rect::from_center_size(prompt_rect.center(), egui::vec2(side, side));
-        egui::Image::new(egui::include_image!("../icons/attach_file.svg"))
-            .tint(DROP_BLUE)
-            .paint_at(ui, icon_rect);
-    }
-
-    // Handle a drop that landed on the box (only when idle). The first dropped
-    // file is imported: prompt + settings filled, and its workflow's custom
-    // nodes downloaded into ComfyUI.
-    if !state.running {
-        let dropped: Option<PathBuf> = ui.input(|i| {
-            i.raw.dropped_files.iter().find_map(|f| f.path.clone())
-        });
-        if let Some(path) = dropped {
-            // Same tolerance as the highlight: when the release position is
-            // unknown (typical for Windows DnD), accept the drop — this
-            // generator's box was the highlighted target.
-            let release_pos = ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
-            if release_pos.is_none_or(|p| prompt_rect.contains(p)) {
-                import_dropped_file(state, &path, ui.ctx());
-            }
-        }
-    }
+    prompt_drop(ui, state, prompt_resp.response.rect, drag_over_prompt);
 
     ui.add_space(8.0);
 
@@ -3982,11 +3803,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                 _ => "Copy the log",
             };
             if ui.add_enabled(!state.log.is_empty(), copy).on_hover_text(tip).clicked() {
-                // Use arboard directly so we get a success/failure result to flash on.
-                let ok = arboard::Clipboard::new()
-                    .and_then(|mut c| c.set_text(state.log.join("\n")))
-                    .is_ok();
-                state.copy_flash = Some((std::time::Instant::now(), ok));
+                copy_log(state);
             }
         });
     });
@@ -4036,6 +3853,359 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
         // Sizing settles one frame after a layout change — repaint to get there.
         state.below_h = below_h;
         ui.ctx().request_repaint();
+    }
+}
+
+/// Take in what the background runner has sent since the last frame.
+fn drain_runner(state: &mut GenerateState, ctx: &egui::Context) {
+    if let Some(rx) = &state.rx {
+        let mut finished = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                RunnerMsg::Line(line) => state.log.push(line),
+                RunnerMsg::Status(s) => state.status = s,
+                RunnerMsg::Output(p) => {
+                    state.last_image = Some(p.clone());
+                    state.gen_images.push(p);
+                }
+                RunnerMsg::Done(ok) => {
+                    state.running = false;
+                    finished = true;
+                    state.status_err = !ok;
+                }
+                RunnerMsg::Nodes(s) => state.nodes_status = Some(s),
+            }
+        }
+        if finished {
+            state.rx = None;
+        }
+        if state.running {
+            ctx.request_repaint();
+        }
+    }
+}
+
+/// The pop-ups the "+" menu opens, while they're open.
+fn popups(ctx: &egui::Context, state: &mut GenerateState) {
+    // LoRA selection popup (Z-Image).
+    if state.show_lora_popup {
+        lora_popup(ctx, state);
+    }
+    // Embeddings (textual inversion) picker.
+    if state.show_embeddings_popup {
+        embeddings_popup(ctx, state);
+    }
+    // Negative-prompt editor.
+    if state.show_negative_popup {
+        negative_popup(ctx, state);
+    }
+}
+
+/// Is a file being dragged over the window right now? On Windows, winit
+/// (0.30) doesn't emit cursor-move events during an OS file drag, so the
+/// pointer position is unknown/stale — we can't reliably tell *where* over the
+/// window the file is. So highlight whenever a file is over the window and the
+/// pointer (if known at all) is over the box; the box is the drop target while
+/// a generator is open. (Uses last frame's box rect: what's over the box is
+/// drawn before this frame's box exists.)
+fn dragging_over_prompt(ui: &egui::Ui, state: &GenerateState) -> bool {
+    let dragging_files = ui.input(|i| !i.raw.hovered_files.is_empty());
+    if dragging_files {
+        ui.ctx().request_repaint();
+    }
+    let hover_pos = ui.input(|i| i.pointer.hover_pos());
+    dragging_files && state.prompt_rect.is_none_or(|r| hover_pos.is_none_or(|p| r.contains(p)))
+}
+
+/// The prompt box's "+" (an × while its menu is open): the LoRA and
+/// embeddings pickers, the negative prompt, and letting go of an imported
+/// workflow.
+fn add_menu(ui: &mut egui::Ui, state: &mut GenerateState) {
+    let menu_id = ui.id().with(("add_menu", state.family.title()));
+    let open = egui::Popup::is_id_open(ui.ctx(), menu_id);
+    let (icon, tip) = if open {
+        (egui::include_image!("../icons/close.svg"), "Close")
+    } else {
+        (egui::include_image!("../icons/add.svg"), "Add")
+    };
+    let add_resp = round_icon_button(ui, icon, 18.0, tip, true);
+    egui::Popup::menu(&add_resp)
+        .id(menu_id)
+        .align(egui::RectAlign::TOP_START)
+        .frame(crate::settings::dropdown_frame())
+        .show(|ui| {
+            ui.set_min_width(150.0);
+            round_menu_rows(ui);
+            // Every selected LoRA is applied (incl. "other model"
+            // picks), so count them all.
+            let n = state.loras.iter().filter(|l| l.selected).count();
+            let label = if n > 0 { format!("LoRA ({n})") } else { "LoRA".to_string() };
+            let licon = egui::Image::new(egui::include_image!("../icons/lora.svg"))
+                .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                .tint(icon_tint(TEXT()));
+            if ui.add(egui::Button::image_and_text(licon, RichText::new(label).size(12.0)).frame(false)).clicked() {
+                refresh_loras(state, ui.ctx());
+                state.show_lora_popup = true;
+                ui.close();
+            }
+
+            // Embeddings (textual inversion): selected ones are
+            // injected into the workflow's pos/neg encoder.
+            let en = state.embeddings.iter().filter(|e| e.selected).count();
+            let elabel = if en > 0 { format!("Embeddings ({en})") } else { "Embeddings".to_string() };
+            let eicon = egui::Image::new(egui::include_image!("../icons/extension.svg"))
+                .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                .tint(icon_tint(TEXT()));
+            if ui.add(egui::Button::image_and_text(eicon, RichText::new(elabel).size(12.0)).frame(false)).clicked() {
+                refresh_embeddings(state, ui.ctx());
+                state.show_embeddings_popup = true;
+                ui.close();
+            }
+
+            // Negative prompt: opens an editor popup; the text
+            // is saved live and applied to the negative encoder.
+            let nlabel = if state.negative.trim().is_empty() {
+                "Negative prompt".to_string()
+            } else {
+                "Negative prompt (set)".to_string()
+            };
+            let nicon = egui::Image::new(egui::include_image!("../icons/edit.svg"))
+                .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                .tint(icon_tint(TEXT()));
+            if ui.add(egui::Button::image_and_text(nicon, RichText::new(nlabel).size(12.0)).frame(false)).clicked() {
+                state.show_negative_popup = true;
+                ui.close();
+            }
+
+            // Shown only when a dropped image's workflow is in
+            // use — lets the user revert to the built-in pipeline.
+            if state.imported_workflow.is_some() {
+                let cicon = egui::Image::new(egui::include_image!("../icons/close.svg"))
+                    .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                    .tint(icon_tint(TEXT()));
+                if ui.add(egui::Button::image_and_text(cicon, RichText::new("Clear imported workflow").size(12.0)).frame(false)).clicked() {
+                    state.imported_workflow = None;
+                    state.nodes_status = None;
+                    ui.close();
+                }
+            }
+        });
+}
+
+/// What a click on the send icon came to, other than a run.
+#[derive(PartialEq)]
+enum SendClick {
+    Nothing,
+    /// Generation isn't set up on this PC yet.
+    NotSetUp,
+}
+
+/// The prompt box's send icon — its stop icon while a job runs, and nothing
+/// (a blank of its size) while there's no prompt to send.
+fn send_or_stop(ui: &mut egui::Ui, state: &mut GenerateState, current_image: Option<&Path>) -> SendClick {
+    if state.running {
+        let tip = if state.stop_between_steps { "Stop after the current step" } else { "Stop generating" };
+        if round_icon_button(ui, egui::include_image!("../icons/stop.svg"), 18.0, tip, true).clicked() {
+            state.cancel.store(true, Ordering::SeqCst);
+            state.status = if state.stop_between_steps {
+                "Stopping after the current step…".into()
+            } else {
+                "Cancelling…".into()
+            };
+        }
+    } else if !state.prompt.trim().is_empty() {
+        // The send button only appears once you start typing.
+        // On a Link host: what it has ready.
+        let remote_ready = state.remote_host.as_ref().map(|h| remote_ready(state, h));
+        let inst = remote_ready.as_ref().map_or_else(is_installed, |r| r.is_ok());
+        // Image-to-video needs a selected source *image*. After a
+        // video run the browser selects the newest output (a
+        // .webm), which ComfyUI can't use as the start frame.
+        let src_is_video = current_image.is_some_and(crate::is_video);
+        let needs_img =
+            state.family.is_video() && state.i2v && (current_image.is_none() || src_is_video);
+        let ready = inst && !needs_img;
+        let not_ready = match &remote_ready {
+            Some(Err(why)) => why.clone(),
+            _ => "Run Setup Requirements first".to_string(),
+        };
+        let tip = if !inst {
+            not_ready.as_str()
+        } else if needs_img && src_is_video {
+            "The selected file is a video — select an image to animate"
+        } else if needs_img {
+            "Select an image in the browser first"
+        } else {
+            "Generate"
+        };
+        if round_icon_button(ui, egui::include_image!("../icons/send.svg"), 18.0, tip, ready).clicked() {
+            if ready {
+                start_generate(state, ui.ctx(), current_image);
+            } else if !inst && remote_ready.is_none() {
+                return SendClick::NotSetUp;
+            }
+        }
+    } else {
+        // Invisible stand-in so the model selector doesn't
+        // drift into the corner while the send icon is hidden.
+        ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
+    }
+    SendClick::Nothing
+}
+
+/// The prompt box at `prompt_rect` as a drop target: the rect is kept for the
+/// next frame's hit-test, the box is tinted while a file is over it, and a
+/// file dropped on it is imported.
+fn prompt_drop(ui: &mut egui::Ui, state: &mut GenerateState, prompt_rect: egui::Rect, drag_over_prompt: bool) {
+    // Remember the box rect for next frame's drag-over hit-test, and publish it
+    // so the gallery's global drop handler knows a drop here is ours, not media.
+    state.prompt_rect = Some(prompt_rect);
+    if let Ok(mut g) = PROMPT_DROP_RECT.lock() {
+        *g = Some((prompt_rect, ui.input(|i| i.time)));
+    }
+
+    // While a file is dragged over the box, tint it blue and show the attach
+    // icon centred — the visual cue that dropping will import its metadata.
+    if drag_over_prompt {
+        let p = ui.painter();
+        p.rect_filled(prompt_rect, CornerRadius::same(22), DROP_BLUE.gamma_multiply(0.18));
+        p.rect_stroke(
+            prompt_rect,
+            CornerRadius::same(22),
+            egui::Stroke::new(2.0_f32, DROP_BLUE),
+            egui::StrokeKind::Inside,
+        );
+        let side = 56.0_f32.min(prompt_rect.height() * 0.5);
+        let icon_rect = egui::Rect::from_center_size(prompt_rect.center(), egui::vec2(side, side));
+        egui::Image::new(egui::include_image!("../icons/attach_file.svg"))
+            .tint(DROP_BLUE)
+            .paint_at(ui, icon_rect);
+    }
+
+    // Handle a drop that landed on the box (only when idle). The first dropped
+    // file is imported: prompt + settings filled, and its workflow's custom
+    // nodes downloaded into ComfyUI.
+    if !state.running {
+        let dropped: Option<PathBuf> = ui.input(|i| {
+            i.raw.dropped_files.iter().find_map(|f| f.path.clone())
+        });
+        if let Some(path) = dropped {
+            // Same tolerance as the highlight: when the release position is
+            // unknown (typical for Windows DnD), accept the drop — this
+            // generator's box was the highlighted target.
+            let release_pos = ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
+            if release_pos.is_none_or(|p| prompt_rect.contains(p)) {
+                import_dropped_file(state, &path, ui.ctx());
+            }
+        }
+    }
+}
+
+/// Copy the log; the Copy icon flashes green or red on how that went.
+fn copy_log(state: &mut GenerateState) {
+    // Use arboard directly so we get a success/failure result to flash on.
+    let ok = arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(state.log.join("\n")))
+        .is_ok();
+    state.copy_flash = Some((std::time::Instant::now(), ok));
+}
+
+/// The model list: the family's built-in models, then (for the families that
+/// load one swappable file) the installed checkpoints found on disk and the
+/// switch that shows the other families' ones. `short` leaves out what the
+/// Text to Image bar says beside the list: the family's name goes from each
+/// built-in model's, and its size is the row's note.
+fn model_list(ui: &mut egui::Ui, state: &mut GenerateState, short: bool) {
+    // Built-in (downloadable) model variants. Selecting one clears any
+    // custom-checkpoint override.
+    for &m in GenModel::all_for(state.family) {
+        let selected = state.checkpoint.is_none() && state.model == m;
+        let missing_on_host = match (&state.remote_host, &state.remote_catalog) {
+            (Some(host), Some(cat)) if !cat.ready.contains(&m) => Some(format!("not set up on {host}")),
+            _ => None,
+        };
+        let (name, size) = if short {
+            image_view::short_label(m.label(), state.family.title())
+        } else {
+            (m.label().to_string(), None)
+        };
+        let note = missing_on_host.or(size);
+        if crate::settings::dropdown_option(ui, &name, None, note.as_deref(), selected).clicked() {
+            state.model = m;
+            state.checkpoint = None;
+            state.steps = m.default_steps();
+            state.cfg = m.default_cfg();
+            ui.close();
+        }
+    }
+
+    // Auto-detected installed checkpoints, filtered to this family (like
+    // the LoRA picker). Only families that load a single swappable
+    // checkpoint show this section.
+    if state.family.uses_checkpoint_picker() {
+        let family = state.family;
+        let show_other = state.show_other_ckpts;
+        let sel = state.checkpoint.clone();
+        // Partition into compatible (this family / unknown) vs off-family.
+        // Owned copies so the list isn't borrowed while we mutate `state`.
+        let mut compatible: Vec<(String, LoraBase)> = Vec::new();
+        let mut others: Vec<(String, LoraBase)> = Vec::new();
+        let base_files = family.builtin_ckpt_files();
+        for c in &state.checkpoints {
+            // The built-in base(s) are already listed above — don't duplicate.
+            if base_files.contains(&c.file.as_str()) {
+                continue;
+            }
+            if c.base.matches(family) || c.base == LoraBase::Unknown {
+                compatible.push((c.file.clone(), c.base));
+            } else {
+                others.push((c.file.clone(), c.base));
+            }
+        }
+
+        let mut pick: Option<String> = None;
+        if !compatible.is_empty() || (!others.is_empty() && show_other) {
+            ui.separator();
+            ui.label(RichText::new("Installed checkpoints").color(MUTED()).size(11.0));
+        }
+        for (file, _) in &compatible {
+            let selected = sel.as_deref() == Some(file.as_str());
+            if crate::settings::dropdown_option(ui, ckpt_display_name(file), None, None, selected).clicked() {
+                pick = Some(file.clone());
+            }
+        }
+        if show_other {
+            for (file, base) in &others {
+                let selected = sel.as_deref() == Some(file.as_str());
+                let resp =
+                    crate::settings::dropdown_option(ui, ckpt_display_name(file), None, Some(base.label()), selected);
+                if resp.clicked() {
+                    pick = Some(file.clone());
+                }
+            }
+        }
+        if let Some(file) = pick {
+            // A custom checkpoint runs through the family's default model
+            // node config; keep that model's default steps/cfg.
+            let m = family.default_model();
+            state.model = m;
+            state.steps = m.default_steps();
+            state.cfg = m.default_cfg();
+            state.checkpoint = Some(file);
+            ui.close();
+        }
+
+        if !others.is_empty() {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Show other-family checkpoints").color(TEXT()).size(12.0));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_space(4.0);
+                    crate::settings::switch(ui, &mut state.show_other_ckpts);
+                });
+            });
+        }
     }
 }
 
@@ -4096,91 +4266,7 @@ fn model_selector(ui: &mut egui::Ui, state: &mut GenerateState) {
             // stretched across the window.
             ui.set_width(260.0);
             ui.spacing_mut().item_spacing.y = 3.0;
-            // Built-in (downloadable) model variants. Selecting one clears any
-            // custom-checkpoint override.
-            for &m in GenModel::all_for(state.family) {
-                let selected = state.checkpoint.is_none() && state.model == m;
-                let missing_on_host = match (&state.remote_host, &state.remote_catalog) {
-                    (Some(host), Some(cat)) if !cat.ready.contains(&m) => Some(format!("not set up on {host}")),
-                    _ => None,
-                };
-                if crate::settings::dropdown_option(ui, m.label(), None, missing_on_host.as_deref(), selected).clicked() {
-                    state.model = m;
-                    state.checkpoint = None;
-                    state.steps = m.default_steps();
-                    state.cfg = m.default_cfg();
-                    ui.close();
-                }
-            }
-
-            // Auto-detected installed checkpoints, filtered to this family (like
-            // the LoRA picker). Only families that load a single swappable
-            // checkpoint show this section.
-            if state.family.uses_checkpoint_picker() {
-                let family = state.family;
-                let show_other = state.show_other_ckpts;
-                let sel = state.checkpoint.clone();
-                // Partition into compatible (this family / unknown) vs off-family.
-                // Owned copies so the list isn't borrowed while we mutate `state`.
-                let mut compatible: Vec<(String, LoraBase)> = Vec::new();
-                let mut others: Vec<(String, LoraBase)> = Vec::new();
-                let base_files = family.builtin_ckpt_files();
-                for c in &state.checkpoints {
-                    // The built-in base(s) are already listed above — don't duplicate.
-                    if base_files.contains(&c.file.as_str()) {
-                        continue;
-                    }
-                    if c.base.matches(family) || c.base == LoraBase::Unknown {
-                        compatible.push((c.file.clone(), c.base));
-                    } else {
-                        others.push((c.file.clone(), c.base));
-                    }
-                }
-
-                let mut pick: Option<String> = None;
-                if !compatible.is_empty() || (!others.is_empty() && show_other) {
-                    ui.separator();
-                    ui.label(RichText::new("Installed checkpoints").color(MUTED()).size(11.0));
-                }
-                for (file, _) in &compatible {
-                    let selected = sel.as_deref() == Some(file.as_str());
-                    if crate::settings::dropdown_option(ui, ckpt_display_name(file), None, None, selected).clicked() {
-                        pick = Some(file.clone());
-                    }
-                }
-                if show_other {
-                    for (file, base) in &others {
-                        let selected = sel.as_deref() == Some(file.as_str());
-                        let resp =
-                            crate::settings::dropdown_option(ui, ckpt_display_name(file), None, Some(base.label()), selected);
-                        if resp.clicked() {
-                            pick = Some(file.clone());
-                        }
-                    }
-                }
-                if let Some(file) = pick {
-                    // A custom checkpoint runs through the family's default model
-                    // node config; keep that model's default steps/cfg.
-                    let m = family.default_model();
-                    state.model = m;
-                    state.steps = m.default_steps();
-                    state.cfg = m.default_cfg();
-                    state.checkpoint = Some(file);
-                    ui.close();
-                }
-
-                if !others.is_empty() {
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Show other-family checkpoints").color(TEXT()).size(12.0));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.add_space(4.0);
-                            crate::settings::switch(ui, &mut state.show_other_ckpts);
-                        });
-                    });
-                }
-            }
+            model_list(ui, state, false);
         });
 }
 
@@ -4717,7 +4803,8 @@ fn run_setup(
             if unet_dest.exists() {
                 send("== UNet already present".into());
             } else if model.gated() && token.is_empty() {
-                send("ERROR: this dev model is gated — add an HF token above and retry".into());
+                // (The token's box is on the card under the header's setup button.)
+                send("ERROR: this dev model is gated — add an HF token under the setup button and retry".into());
                 ok = false;
             } else {
                 let auth = if model.gated() { token } else { "" };

@@ -26,6 +26,8 @@ use eframe::egui;
 use crate::slider::PillSlider;
 use crate::theme::{EDGE, FIELD, MUTED, PANEL, TEXT};
 
+mod buzz;
+
 const USER_AGENT: &str = "Clarity TagFlow (Civitai resource lookup)";
 const API_PING: &str = "https://civitai.com/api/v1/models?limit=1";
 
@@ -101,6 +103,8 @@ struct Fetched {
     /// download), and the file's suggested name.
     download_url: String,
     download_filename: Option<String>,
+    /// What its creator asks before the download, if anything (see `buzz`).
+    gate: Option<buzz::Gate>,
 }
 
 struct FetchedSection {
@@ -124,6 +128,9 @@ struct DownloadRequest {
     download_url: String,
     filename: Option<String>,
     resource_type: String,
+    /// What its creator asks before the download, while that still stands as
+    /// far as the card knows: words the failure, should Civitai refuse it.
+    gate: Option<buzz::Gate>,
 }
 
 /// Progress from a model-download worker thread.
@@ -159,6 +166,21 @@ struct UiResource {
     /// Civitai resource type ("Checkpoint" / "LORA" / "TextualInversion" / …),
     /// used to route the download into the right per-category folder.
     resource_type: String,
+    /// What its creator asks before the download, if anything (see `buzz`).
+    gate: Option<buzz::Gate>,
+}
+
+impl UiResource {
+    /// A download of this resource, as the card's button and its "Try again" ask for it.
+    fn download(&self) -> DownloadRequest {
+        DownloadRequest {
+            name: self.name.clone(),
+            download_url: self.download_url.clone(),
+            filename: self.download_filename.clone(),
+            resource_type: self.resource_type.clone(),
+            gate: self.gate.clone().filter(buzz::Gate::asks),
+        }
+    }
 }
 
 struct UiSection {
@@ -234,6 +256,8 @@ pub struct CivitaiState {
     folders_just_opened: bool,
     /// In-flight / finished model downloads (progress rows).
     downloads: Vec<Download>,
+    /// The Buzz of the account behind the API key (the counter under the header).
+    buzz: buzz::Account,
 }
 
 impl Default for CivitaiState {
@@ -258,6 +282,7 @@ impl Default for CivitaiState {
             settings_just_opened: false,
             folders_just_opened: false,
             downloads: Vec::new(),
+            buzz: buzz::Account::default(),
         }
     }
 }
@@ -375,6 +400,7 @@ pub fn show(
     }
 
     // Drain worker messages.
+    let mut arrived = false;
     if let Some(rx) = &state.rx {
         let mut done = None;
         let mut gone = false;
@@ -397,6 +423,7 @@ pub fn show(
                 state.result = None;
             } else {
                 state.result = Some(resolved);
+                arrived = true;
             }
             state.rx = None;
         } else if gone {
@@ -461,7 +488,9 @@ pub fn show(
             }
         });
     });
-    ui.add_space(8.0);
+    ui.add_space(4.0);
+    buzz_row(ui, state, arrived);
+    ui.add_space(6.0);
 
     // API-key / download settings popup, and the per-category folders popup.
     if state.show_settings {
@@ -576,6 +605,13 @@ fn resource_card(
     // the warning image's own tooltip) can re-show the reason on hover.
     let mut warn_rect: Option<egui::Rect> = None;
     let mut warn_msg = String::new();
+    // What its creator asks before the download, while that still stands
+    // between this account and the file: shown under the Download button (and
+    // under the warning a refused download leaves). Not once the file is here
+    // or on its way.
+    let have = installed || dl.is_some_and(|d| d.rx.is_some() || d.ok);
+    let asks = data.gate.as_ref().filter(|gate| gate.shows() && !have);
+    let mut cost_rect: Option<egui::Rect> = None;
     let inner = card_body(ui, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
@@ -602,7 +638,7 @@ fn resource_card(
             // failed → orange warning (instant hover error) · idle → download arrow.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(2.0);
-                match dl {
+                let mut slot = |ui: &mut egui::Ui| match dl {
                     Some(d) if d.rx.is_some() => {
                         let pct = if d.total > 0 {
                             (d.received as f64 / d.total as f64 * 100.0).round() as u32
@@ -665,6 +701,21 @@ fn resource_card(
                         }
                         dl_rect = Some(r.rect);
                     }
+                };
+                match asks {
+                    // The slot's icon with the price under it, as one column
+                    // (which widens to the price): both end at the card's
+                    // margin, so the icon stays where it is on a card with
+                    // nothing to pay.
+                    Some(gate) => {
+                        let column = egui::vec2(20.0, 20.0 + 3.0 + buzz::COST_H);
+                        ui.allocate_ui_with_layout(column, egui::Layout::top_down(egui::Align::Max), |ui| {
+                            ui.spacing_mut().item_spacing.y = 3.0;
+                            slot(ui);
+                            cost_rect = Some(buzz::cost(ui, gate));
+                        });
+                    }
+                    None => slot(ui),
                 }
                 // Remaining width → name + triggers, left-aligned and wrapped.
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -695,17 +746,19 @@ fn resource_card(
     if let Some(wr) = warn_rect {
         ui.interact(wr, egui::Id::new(("civitai_dl_err", data.name.as_str())), egui::Sense::hover())
             .on_hover_text(warn_msg);
+    }
+    // The price says more on hover (re-interacted for the same reason).
+    if let (Some(rect), Some(gate)) = (cost_rect, asks) {
+        ui.interact(rect, egui::Id::new(("civitai_cost", data.name.as_str())), egui::Sense::hover())
+            .on_hover_text(buzz::cost_tip(gate));
+    }
+    if warn_rect.is_some() {
         // Only failed cards offer a right-click "Try again" to re-run the download.
         egui::Popup::context_menu(&resp)
             .frame(egui::Frame::menu(&resp.ctx.global_style()).corner_radius(egui::CornerRadius::same(12)))
             .show(|ui| {
                 if ui.button("Try again").clicked() {
-                    *download_req = Some(DownloadRequest {
-                        name: data.name.clone(),
-                        download_url: data.download_url.clone(),
-                        filename: data.download_filename.clone(),
-                        resource_type: data.resource_type.clone(),
-                    });
+                    *download_req = Some(data.download());
                     ui.close();
                 }
             });
@@ -719,12 +772,7 @@ fn resource_card(
             (Some(p), Some(r)) if r.contains(p)
         );
         if on_download {
-            *download_req = Some(DownloadRequest {
-                name: data.name.clone(),
-                download_url: data.download_url.clone(),
-                filename: data.download_filename.clone(),
-                resource_type: data.resource_type.clone(),
-            });
+            *download_req = Some(data.download());
         } else {
             open_url(ui.ctx(), &data.url);
         }
@@ -839,7 +887,9 @@ fn api_key_popup(ctx: &egui::Context, state: &mut CivitaiState) {
                 ui.add_space(3.0);
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Stored encrypted on this device.").color(MUTED()).size(10.5),
+                        egui::RichText::new("For downloads and your Buzz. Stored encrypted here.")
+                            .color(MUTED())
+                            .size(10.5),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         crate::arrow_link(ui, "Get a key", "https://civitai.com/user/account", Some(10.5));
@@ -1083,7 +1133,7 @@ fn start_download(state: &mut CivitaiState, req: DownloadRequest, ctx: &egui::Co
     });
     let ctx = ctx.clone();
     std::thread::spawn(move || {
-        run_download(req.download_url, req.filename, key, std::path::PathBuf::from(dir), tx, ctx);
+        run_download(req.download_url, req.filename, key, req.gate, std::path::PathBuf::from(dir), tx, ctx);
     });
 }
 
@@ -1095,6 +1145,7 @@ fn run_download(
     mut url: String,
     filename_hint: Option<String>,
     key: String,
+    gate: Option<buzz::Gate>,
     dir: std::path::PathBuf,
     tx: Sender<DlMsg>,
     ctx: egui::Context,
@@ -1155,6 +1206,14 @@ fn run_download(
     }
     let status = resp.status().as_u16();
     if status != 200 {
+        // Civitai's refusal of something that has to be paid for first says
+        // so: the failure passes that on, with how much where the card knew.
+        if status == 403 {
+            let body = resp.body_mut().read_to_string().unwrap_or_default();
+            if let Some(why) = buzz::refusal(&body, gate.as_ref(), !key.is_empty()) {
+                return send_err(why);
+            }
+        }
         return send_err(match status {
             401 => "login required — add your Civitai API key in settings".into(),
             403 => "access denied — this model may be early access (needs purchase) or your API key lacks permission".into(),
@@ -1638,6 +1697,66 @@ fn save_civitai_key(key: &str) {
     let _ = crate::secret::write_private(&path, crate::secret::protect(trimmed));
 }
 
+/// The account's Buzz, in a row under the header — and what goes with it for
+/// the resources on show that ask for Buzz: their prices, and whether the
+/// account has them. `arrived` says the resources have only just been looked up.
+fn buzz_row(ui: &mut egui::Ui, state: &mut CivitaiState, arrived: bool) {
+    let look = state.buzz.tick(ui.ctx(), &state.api_key, state.show_settings);
+    let has_key = !state.api_key.trim().is_empty();
+    let asked = state.buzz.row(ui, has_key);
+    match asked {
+        Some(buzz::Ask::Key) => {
+            state.show_settings = true;
+            state.settings_just_opened = true;
+        }
+        Some(buzz::Ask::Again) => state.buzz.read(ui.ctx(), &state.api_key),
+        None => {}
+    }
+
+    // The resources that ask for Buzz are looked at when they arrive, when
+    // the app comes back to the front (from paying for one on Civitai, say)
+    // and with the balance, on a click — and from scratch with another key,
+    // which may be another account's.
+    let again = arrived || asked == Some(buzz::Ask::Again);
+    if let Some(look) = look.or(again.then_some(buzz::Look::Unpaid)) {
+        let mut asking = Vec::new();
+        for gate in state.result.iter_mut().flat_map(gates_mut) {
+            if look == buzz::Look::All {
+                gate.unlocked = None;
+            }
+            if gate.asks() {
+                // (Its card waits with the price while that's first read.)
+                if gate.price == buzz::Price::Unread {
+                    gate.price = buzz::Price::Reading;
+                }
+                asking.push(gate.clone());
+            }
+        }
+        state.buzz.look(ui.ctx(), &state.api_key, asking);
+    }
+    if let Some(found) = state.buzz.looked() {
+        for gate in state.result.iter_mut().flat_map(gates_mut) {
+            if let Some(now) = found.iter().find(|now| now.version == gate.version) {
+                gate.clone_from(now);
+            }
+        }
+    }
+    // No look under way, no price is being read: one that wasn't told isn't
+    // known (or, with the key gone, is as it was before any was asked for).
+    if !state.buzz.is_looking() {
+        for gate in state.result.iter_mut().flat_map(gates_mut) {
+            if gate.price == buzz::Price::Reading {
+                gate.price = if has_key { buzz::Price::Unknown } else { buzz::Price::Unread };
+            }
+        }
+    }
+}
+
+/// What the creators of the resources in `result` ask before a download.
+fn gates_mut(result: &mut UiResult) -> impl Iterator<Item = &mut buzz::Gate> {
+    result.sections.iter_mut().flat_map(|s| &mut s.items).filter_map(|item| item.gate.as_mut())
+}
+
 fn api_pill(ui: &mut egui::Ui, api: u8) {
     let (text, dot) = match api {
         API_ONLINE => ("Online", egui::Color32::from_rgb(46, 160, 67)),
@@ -1687,6 +1806,7 @@ fn resolve(ctx: &egui::Context, res: CivResult) -> UiResult {
                         download_url: f.download_url,
                         download_filename: f.download_filename,
                         resource_type: f.resource_type,
+                        gate: f.gate,
                     }
                 })
                 .collect(),
@@ -2072,6 +2192,7 @@ fn get_formatted_model_data(
         resource_type,
         download_url,
         download_filename,
+        gate: buzz::gate_of(version, chrono::Utc::now()),
     })
 }
 

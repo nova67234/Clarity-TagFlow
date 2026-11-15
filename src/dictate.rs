@@ -15,7 +15,7 @@ use std::sync::Arc;
 use eframe::egui;
 
 /// Model folder + file under the shared models root (`tools/`), also
-/// registered in the Get Models catalog so it can be fetched from there.
+/// registered in the Models catalog so it can be fetched from there.
 pub const FOLDER: &str = "whisper-base";
 pub const MODEL_FILE: &str = "ggml-base.bin";
 

@@ -35,7 +35,7 @@ Browse and tag thousands of images, auto-tag them with built-in AI models, read 
 
 ### 🌐 Integrations
 - **Gelbooru downloader** — tag search with blacklist support; API key encrypted at rest.
-- **Civitai panel** — resource info for the models behind your generated images.
+- **Civitai panel** — resource info for the models behind your generated images, with your Buzz and what a paid model costs.
 - **Backups** — archive your library and its tags in a couple of clicks.
 
 ---
@@ -83,5 +83,7 @@ Clarity TagFlow is a ground-up Rust rewrite of the Java app **terminus2** — sa
 Licensed under the [MIT License](LICENSE).
 
 Bold text in the AI chat uses **Ubuntu Medium** (© Canonical Ltd.), embedded under the [Ubuntu Font Licence 1.0](assets/fonts/UFL.txt), which ships with every download.
+
+The Tag Manager is set in **Manrope** (© The Manrope Project Authors), embedded under the [SIL Open Font License 1.1](assets/fonts/OFL.txt), which ships with every download too.
 
 *Same workflow. Native speed. More AI.* 🦀✨
