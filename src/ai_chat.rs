@@ -12,13 +12,14 @@
 //! (the sources under a reply, the notes viewer) are in
 //! src/ai_chat/web_research.rs.
 
+mod markdown;
 mod tools_menu;
 mod web_research;
 
 use eframe::egui;
 use egui::Margin;
 
-use crate::llm::{ChatRole, LlmState};
+use crate::llm::{ChatMsg, ChatRole, LlmState};
 use crate::theme::*;
 
 pub use web_research::NotesView;
@@ -426,12 +427,24 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
                     // Only the chat the reply streams into shows it live —
                     // another chat's last reply is finished text.
                     let live_chat = llm.streams_into(llm.chats[llm.active_chat].id);
+                    let chat_id = llm.chats[llm.active_chat].id;
                     for i in 0..n {
-                        let streaming = {
-                            let msg = &llm.chats[llm.active_chat].msgs[i];
-                            live_chat && i + 1 == n && msg.role == ChatRole::Model
-                        };
-                        message(ui, llm, i, streaming);
+                        let msg = &llm.chats[llm.active_chat].msgs[i];
+                        let streaming = live_chat && i + 1 == n && msg.role == ChatRole::Model;
+                        // A message out of sight isn't laid out again: its
+                        // room is kept. (Every one was, every frame, and a
+                        // long chat crawled while a reply came in.) Not the
+                        // last one — it's what changes — nor one being
+                        // edited or read out.
+                        let at = Some((chat_id, i));
+                        let settled = i + 1 < n && llm.editing != at && llm.speak_target != at;
+                        // (Its picture comes in a moment after it does.)
+                        let picture = msg.image.as_ref().and_then(|path| llm.msg_thumbs.get(path));
+                        let picture = picture.map(|thumb| thumb.as_ref().map(|t| t.size()));
+                        let key = message_key(msg, picture, col_w, ui.ctx().pixels_per_point());
+                        show_or_keep_room(ui, ("ai_msg", chat_id, i), key, col_w, settled, |ui| {
+                            message(ui, llm, i, streaming);
+                        });
                         ui.add_space(12.0);
                     }
                     // A retry or edit clicked inside the list is applied
@@ -786,6 +799,58 @@ fn conversation(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::set
     llm.input_rect = Some((area.response.rect, ui.ctx().input(|i| i.time)));
 }
 
+/// What a message's height hangs on, for [`show_or_keep_room`]: what it
+/// says and holds, its `picture` as far as that has loaded (not yet, not
+/// readable, or its size), and how wide (and at what zoom) it's set.
+fn message_key(msg: &ChatMsg, picture: Option<Option<[usize; 2]>>, width: f32, zoom: f32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (msg.role == ChatRole::User).hash(&mut hasher);
+    msg.text.hash(&mut hasher);
+    msg.thinking.hash(&mut hasher);
+    msg.image.hash(&mut hasher);
+    msg.doc.hash(&mut hasher);
+    msg.tag_image.hash(&mut hasher);
+    msg.tag_change.is_some().hash(&mut hasher);
+    msg.goals.len().hash(&mut hasher);
+    msg.character.hash(&mut hasher);
+    msg.research.is_some().hash(&mut hasher);
+    picture.hash(&mut hasher);
+    width.to_bits().hash(&mut hasher);
+    zoom.to_bits().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Draw `add` — or, where it's out of sight, only keep the room it took the
+/// last time it was drawn (`width` wide), without laying it out again. It's
+/// drawn whenever it would be in sight, when what its height hangs on (`key`)
+/// has changed since it was measured, and when it isn't `settled`. True when
+/// it was drawn.
+///
+/// What's drawn has ids of its own (by `id`), so they don't shift as the
+/// things before it go in and out of sight.
+fn show_or_keep_room(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    key: u64,
+    width: f32,
+    settled: bool,
+    add: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let id = egui::Id::new(id);
+    let measured = ui.data(|d| d.get_temp::<(u64, f32)>(id)).filter(|(at, _)| *at == key).map(|(_, height)| height);
+    if let Some(height) = measured.filter(|_| settled) {
+        let room = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, height));
+        if !ui.is_rect_visible(room) {
+            ui.allocate_space(room.size());
+            return false;
+        }
+    }
+    let height = ui.push_id(id, add).response.rect.height();
+    ui.data_mut(|d| d.insert_temp(id, (key, height)));
+    true
+}
+
 /// One conversation entry. User messages sit right in an accent-tinted
 /// bubble (corner radius 22) that hugs the text; the model's replies render
 /// with no bubble at all — just modern formatted markdown (real bold, bullet
@@ -1068,7 +1133,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         };
     }
     if streaming && !shown.trim().is_empty() {
-        shown.push('▌');
+        markdown::push_cursor(&mut shown);
     }
 
     // Reply text renders bare on the background (no bubble/card) — only the
@@ -1381,9 +1446,14 @@ fn chat_markdown(
             scroll.floating_allocated_width = 6.0;
             scroll.dormant_handle_opacity = 0.5;
         }
+        // (Prices that would be read as maths, maths written `\( … \)`.)
+        let text = markdown::prepare(text);
         egui_commonmark::CommonMarkViewer::new()
             .render_math_fn(Some(&render_math))
-            .show(ui, cache, text);
+            // A line break in a reply is one on screen, as in chat apps (a
+            // poem's lines, an address, a character's lines in role-play).
+            .keep_line_breaks(true)
+            .show(ui, cache, &text);
     });
 }
 
@@ -1769,63 +1839,23 @@ fn media_chip(ui: &mut egui::Ui, path: &std::path::Path, tint: egui::Color32, re
     });
 }
 
-/// Render chat math (`$...$` / `$$...$$`) via a minimal TeX → Unicode
-/// fallback — there's no real math engine, but local models mostly emit
-/// simple symbols (`$\pi$`, `$r^2$`), which used to show as raw TeX.
-/// Unmapped commands pass through as-is, which still beats raw `$…$`.
+/// Render chat maths (`$...$` / `$$...$$`) as plain Unicode text (see
+/// [`markdown::tex_to_unicode`]): there's no real maths engine, but what
+/// local models write mostly reads well that way.
 fn render_math(ui: &mut egui::Ui, tex: &str, inline: bool) {
-    let rt = egui::RichText::new(tex_to_unicode(tex))
-        .italics()
-        .color(chat_text())
-        .size(if inline { 14.5 } else { 15.5 });
+    let size = if inline { 14.5 } else { 15.5 };
+    // (What the fonts here haven't got is written another way.)
+    let font = egui::FontId::proportional(size);
+    let shown = markdown::tex_to_unicode(tex, &mut |c| ui.fonts_mut(|f| f.has_glyph(&font, c)));
+    let rt = egui::RichText::new(shown).italics().color(chat_text()).size(size);
     if inline {
         ui.label(rt);
     } else {
-        // Display math gets its own centred line, roughly like real LaTeX.
+        // Display maths gets its own centred line, roughly like real LaTeX.
         ui.vertical_centered(|ui| {
             ui.label(rt);
         });
     }
-}
-
-/// Map the TeX commands local models actually emit to Unicode. Entries whose
-/// name prefixes another (`\int`/`\in`, `\infty`/`\in`, `\leq`/`\le`) are
-/// ordered longest-first because replacement is sequential.
-fn tex_to_unicode(tex: &str) -> String {
-    const MAP: &[(&str, &str)] = &[
-        ("\\varepsilon", "ε"), ("\\epsilon", "ε"), ("\\varphi", "φ"), ("\\upsilon", "υ"),
-        ("\\alpha", "α"), ("\\beta", "β"), ("\\gamma", "γ"), ("\\delta", "δ"),
-        ("\\zeta", "ζ"), ("\\eta", "η"), ("\\theta", "θ"), ("\\iota", "ι"),
-        ("\\kappa", "κ"), ("\\lambda", "λ"), ("\\mu", "μ"), ("\\nu", "ν"),
-        ("\\xi", "ξ"), ("\\rho", "ρ"), ("\\sigma", "σ"), ("\\tau", "τ"),
-        ("\\phi", "φ"), ("\\chi", "χ"), ("\\psi", "ψ"), ("\\omega", "ω"),
-        ("\\Gamma", "Γ"), ("\\Delta", "Δ"), ("\\Theta", "Θ"), ("\\Lambda", "Λ"),
-        ("\\Xi", "Ξ"), ("\\Pi", "Π"), ("\\Sigma", "Σ"), ("\\Phi", "Φ"),
-        ("\\Psi", "Ψ"), ("\\Omega", "Ω"),
-        ("\\times", "×"), ("\\cdot", "·"), ("\\div", "÷"), ("\\pm", "±"), ("\\mp", "∓"),
-        ("\\leq", "≤"), ("\\geq", "≥"), ("\\neq", "≠"), ("\\approx", "≈"),
-        ("\\infty", "∞"), ("\\int", "∫"), ("\\notin", "∉"),
-        ("\\sqrt", "√"), ("\\sum", "∑"), ("\\prod", "∏"), ("\\partial", "∂"),
-        ("\\rightarrow", "→"), ("\\leftarrow", "←"), ("\\Rightarrow", "⇒"),
-        ("\\Leftarrow", "⇐"), ("\\to", "→"),
-        ("\\subset", "⊂"), ("\\cup", "∪"), ("\\cap", "∩"),
-        ("\\forall", "∀"), ("\\exists", "∃"),
-        ("\\degree", "°"), ("\\circ", "∘"), ("\\ldots", "…"), ("\\dots", "…"),
-        ("\\left", ""), ("\\right", ""),
-        // Short forms LAST — they prefix longer commands above (\le → \left,
-        // \leftarrow; \in → \int, \infty), which must be consumed first.
-        ("\\le", "≤"), ("\\ge", "≥"), ("\\ne", "≠"), ("\\in", "∈"),
-        ("\\pi", "π"),
-        ("^2", "²"), ("^3", "³"),
-    ];
-    let mut s = tex.to_string();
-    for (from, to) in MAP {
-        s = s.replace(from, to);
-    }
-    // Drop TeX grouping braces — for the simple math this handles, they only
-    // add noise (`{area:.2f}`-style text lives in code spans, not math).
-    s.retain(|c| c != '{' && c != '}');
-    s.trim().to_string()
 }
 
 /// Tint for icons in the conversation (messages) area: the Appearance tab's
@@ -2762,5 +2792,422 @@ mod tests {
             assert!(used.width() <= 300.5, "the row grew to {}", used.width());
             assert!(shown.right() <= used.left() + 300.5 - reserve, "{shown:?} with {reserve} kept free");
         }
+    }
+
+    // --- What a reply's markdown makes of what models write. ---
+
+    struct Reply {
+        text: String,
+        cache: egui_commonmark::CommonMarkCache,
+    }
+
+    /// `text` as a reply, in a 420-wide column.
+    fn reply(text: &str) -> crate::slider::rig::Rig<Reply> {
+        fn scene(ui: &mut egui::Ui, s: &mut Reply) {
+            ui.set_width(420.0);
+            super::chat_markdown(ui, &mut s.cache, &s.text, false);
+        }
+        let mut rig = crate::slider::rig::Rig::new(Reply { text: text.to_string(), cache: Default::default() }, scene);
+        rig.screen = egui::vec2(640.0, 900.0);
+        rig.idle();
+        rig
+    }
+
+    /// Each run of text the last frame painted: what it says, where, and how
+    /// its first part is set.
+    fn painted<S>(rig: &crate::slider::rig::Rig<S>) -> Vec<(String, egui::Rect, egui::TextFormat)> {
+        fn find(shape: &egui::Shape, found: &mut Vec<(String, egui::Rect, egui::TextFormat)>) {
+            match shape {
+                egui::Shape::Text(t) if !t.galley.text().trim().is_empty() => {
+                    let format = t.galley.job.sections.first().map(|s| s.format.clone()).unwrap_or_default();
+                    found.push((t.galley.text().to_string(), t.visual_bounding_rect(), format));
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, found)),
+                _ => {}
+            }
+        }
+        let mut found = vec![];
+        rig.shapes.iter().for_each(|c| find(&c.shape, &mut found));
+        found
+    }
+
+    /// The one run of text that says `text`.
+    fn run<S>(rig: &crate::slider::rig::Rig<S>, text: &str) -> (egui::Rect, egui::TextFormat) {
+        let found: Vec<_> = painted(rig).into_iter().filter(|(said, _, _)| said == text).collect();
+        assert_eq!(found.len(), 1, "{text:?} is painted {} times in {:?}", found.len(), words(rig));
+        (found[0].1, found[0].2.clone())
+    }
+
+    /// Everything painted, end to end.
+    fn words<S>(rig: &crate::slider::rig::Rig<S>) -> String {
+        painted(rig).into_iter().map(|(said, _, _)| said).collect()
+    }
+
+    /// Prices keep their dollar signs, and maths reads as maths however it's
+    /// marked. ("$5-$10" was shown "5-10"; `\( x^2 \)` as "( x^2 )";
+    /// `\frac{a}{b}` as "\fracab".)
+    #[test]
+    fn maths_in_a_reply_reads_as_maths() {
+        let rig = reply("It costs $5-$10 per month.");
+        assert_eq!(words(&rig), "It costs $5-$10 per month.");
+        let rig = reply(r"Inline \( x^2 \), then $\frac{a}{b}$ and $90^\circ$.");
+        for maths in ["x²", "a/b", "90°"] {
+            assert!(run(&rig, maths).1.italics, "{maths} is set as maths");
+        }
+        assert!(!words(&rig).contains(['\\', '(', '$']), "{}", words(&rig));
+        let rig = reply("So:\n\n\\[ E = mc^2 \\]");
+        let (formula, _) = run(&rig, "E = mc²");
+        assert!((formula.center().x - 210.0).abs() < 2.0, "{formula:?} is centred in the column");
+        // What the fonts here haven't got is written another way (no box).
+        let rig = reply(r"$y_i$");
+        let has = rig.ctx.fonts_mut(|f| f.has_glyph(&egui::FontId::proportional(14.5), 'ᵢ'));
+        assert_eq!(words(&rig), if has { "yᵢ" } else { "y_i" });
+    }
+
+    /// The HTML tags models write in their markdown do what they say, where
+    /// they were shown as text: `<br>` (in a table cell too), `<sub>`,
+    /// `<sup>`, `<u>`… A tag with no other half is still text.
+    #[test]
+    fn html_tags_in_a_reply_do_what_they_say() {
+        let rig = reply("Water is H<sub>2</sub>O, and E = mc<sup>3</sup>.");
+        assert_eq!(words(&rig), "Water is H2O, and E = mc3.");
+        let (body, (lowered, low), (raised, high)) = (run(&rig, "Water is H").0, run(&rig, "2"), run(&rig, "3"));
+        assert!(low.font_id.size < 12.0 && high.font_id.size < 12.0, "small: {} {}", low.font_id.size, high.font_id.size);
+        assert!(raised.top() < lowered.top(), "{raised:?} is over {lowered:?}");
+        assert!(lowered.bottom() <= body.bottom() + 1.0 && raised.top() >= body.top() - 3.0);
+
+        let rig = reply("one<br>two<br/>three<BR>four");
+        let tops: Vec<f32> = ["one", "two", "three", "four"].iter().map(|line| run(&rig, line).0.top()).collect();
+        assert!(tops.windows(2).all(|pair| pair[1] > pair[0] + 10.0), "{tops:?}");
+
+        let rig = reply("| Plan | Notes |\n|---|---|\n| Basic | one<br>two |\n| Pro | three |");
+        let (one, two, three) = (run(&rig, "one").0, run(&rig, "two").0, run(&rig, "three").0);
+        assert!(two.top() > one.bottom() - 2.0 && three.top() > two.bottom(), "{one:?} {two:?} {three:?}");
+        // (To a few pixels: letters start a little in from where they're put.)
+        assert!((one.left() - two.left()).abs() < 2.5 && (one.left() - three.left()).abs() < 2.5, "{one:?} {two:?} {three:?}");
+        assert!(!words(&rig).contains('<'), "{}", words(&rig));
+
+        let rig = reply("An <i>italic</i>, <u>under</u>, <s>gone</s>, <kbd>Ctrl</kbd>, <b>bold</b>.");
+        assert_eq!(words(&rig), "An italic, under, gone, Ctrl, bold.");
+        assert!(run(&rig, "italic").1.italics);
+        assert!(run(&rig, "under").1.underline != egui::Stroke::NONE);
+        assert!(run(&rig, "gone").1.strikethrough != egui::Stroke::NONE);
+        assert_eq!(run(&rig, "Ctrl").1.font_id.family, egui::FontFamily::Monospace);
+        let between: Vec<_> = painted(&rig).into_iter().filter(|(said, _, _)| said == ", ").collect();
+        assert_eq!(between.len(), 4);
+        for (_, _, format) in between {
+            assert!(!format.italics && format.underline == egui::Stroke::NONE && format.strikethrough == egui::Stroke::NONE);
+            assert_eq!(format.font_id.family, egui::FontFamily::Proportional, "each is off again after it");
+        }
+
+        // A tag on its own — in a sentence about HTML, or never closed in
+        // its paragraph — is text, and styles nothing after it.
+        let rig = reply("The <b> tag is bold, <i>this never closes.\n\nA new paragraph.");
+        assert_eq!(words(&rig), "The <b> tag is bold, <i>this never closes.A new paragraph.");
+        assert!(!run(&rig, "A new paragraph.").1.italics);
+        // One this doesn't know is as written.
+        let rig = reply("Replace <your-name> here, <span>as is</span>.");
+        assert_eq!(words(&rig), "Replace <your-name> here, <span>as is</span>.");
+    }
+
+    /// A line break in a reply is one on screen (a poem, an address) — in a
+    /// list item starting under the item's text.
+    #[test]
+    fn line_breaks_in_a_reply_are_kept() {
+        let rig = reply("Roses are red,\nViolets are blue,\nSugar is sweet.");
+        let lines: Vec<egui::Rect> =
+            ["Roses are red,", "Violets are blue,", "Sugar is sweet."].iter().map(|line| run(&rig, line).0).collect();
+        for pair in lines.windows(2) {
+            assert!(pair[1].top() > pair[0].bottom() - 2.0, "{pair:?}");
+            assert!((pair[1].left() - pair[0].left()).abs() < 2.5, "{pair:?}");
+        }
+        let rig = reply("- first line\n  second line\n- next\n\n> quoted\n> again");
+        let (first, second, next) = (run(&rig, "first line").0, run(&rig, "second line").0, run(&rig, "next").0);
+        assert!(second.top() > first.bottom() - 2.0 && next.top() > second.bottom() - 2.0);
+        assert!((second.left() - first.left()).abs() < 2.5, "{second:?} starts under {first:?}");
+        assert!(run(&rig, "again").0.top() > run(&rig, "quoted").0.bottom() - 2.0);
+        // A paragraph's words still wrap where the column ends.
+        let long = "A paragraph of ordinary text, with no line breaks of its own. ".repeat(6);
+        let (wrapped, _) = run(&reply(&long), long.trim_end());
+        assert!(wrapped.height() > 30.0 && wrapped.right() < 640.0, "{wrapped:?}");
+    }
+
+    /// What a list item holds besides its first line is under that line: a
+    /// step's code block (it sat to the right of the step's text), its
+    /// second paragraph (it ran straight on from the first), and what comes
+    /// after either.
+    #[test]
+    fn a_list_items_blocks_are_under_its_text() {
+        let rig = reply("1. Install it:\n   ```sh\n   pip install x\n   ```\n   and then more\n2. Run it.");
+        let (step, code, more, next) = (
+            run(&rig, "Install it:").0,
+            run(&rig, "pip install x").0,
+            run(&rig, "and then more").0,
+            run(&rig, "Run it.").0,
+        );
+        assert!(code.top() > step.bottom() && more.top() > code.bottom() && next.top() > more.bottom(), "{step:?} {code:?} {more:?}");
+        assert!(code.left() < step.left() + 8.0 && (more.left() - step.left()).abs() < 2.5, "{step:?} {code:?} {more:?}");
+
+        let rig = reply("- one\n\n  second paragraph\n\n  ```\n  code\n  ```\n\n  third paragraph\n\n- two");
+        let tops: Vec<egui::Rect> =
+            ["one", "second paragraph", "code", "third paragraph", "two"].iter().map(|said| run(&rig, said).0).collect();
+        for pair in tops.windows(2) {
+            assert!(pair[1].top() > pair[0].bottom() - 2.0, "{pair:?}");
+        }
+        assert!((tops[1].left() - tops[0].left()).abs() < 2.5 && (tops[3].left() - tops[0].left()).abs() < 2.5, "{tops:?}");
+
+        // After a list inside it, too.
+        let rig = reply("- a\n\n  - b\n\n  after b\n- c");
+        let (b, after, c) = (run(&rig, "b").0, run(&rig, "after b").0, run(&rig, "c").0);
+        assert!(after.top() > b.bottom() && c.top() > after.bottom(), "{b:?} {after:?} {c:?}");
+
+        // An item that is only its text, a task or a code block is as it was.
+        let rig = reply("- plain `code` [link](https://example.com) end\n- [ ] task\n- ```\n  only\n  ```");
+        let (plain, end) = (run(&rig, "plain ").0, run(&rig, " end").0);
+        assert!((plain.center().y - end.center().y).abs() < 4.0, "{plain:?} {end:?}");
+        assert!(run(&rig, "task").0.top() > plain.bottom() - 2.0 && run(&rig, "only").0.top() > run(&rig, "task").0.bottom() - 2.0);
+        let gap = run(&rig, "only").0.top() - run(&rig, "task").0.bottom();
+        assert!(gap < 14.0, "no empty line over the code: {gap}");
+    }
+
+    /// Only web links open. (What opens a clicked link hands anything else —
+    /// a `file:` link, a path — to the system.) The rest are their text.
+    #[test]
+    fn only_web_links_in_a_reply_open() {
+        let mut rig = reply(
+            "[web](https://example.com/a)\n\n[file](file:///etc/passwd)\n\n[path](C:\\Windows\\notepad.exe)\n\n\
+             [bare](www.example.com/b)\n\n[page](notes.html)\n\n[mail](mailto:a@example.com)\n\n[script](javascript:alert(1))\n\n\
+             <https://example.com/c>",
+        );
+        for link in ["web", "file", "path", "bare", "page", "mail", "script", "https://example.com/c"] {
+            let at = run(&rig, link).0.center();
+            rig.click(at);
+            rig.idle();
+        }
+        assert_eq!(
+            rig.opened,
+            ["https://example.com/a", "https://www.example.com/b", "mailto:a@example.com", "https://example.com/c"]
+        );
+        // What opens looks like a link; what doesn't, like the words round it.
+        let link = run(&rig, "web").1.color;
+        assert_eq!(run(&rig, "mail").1.color, link);
+        for text in ["file", "path", "page", "script"] {
+            assert_ne!(run(&rig, text).1.color, link, "{text}");
+        }
+    }
+
+    /// A picture that can't be shown says what it is, where it was a lone ⚠:
+    /// one on the web is a link to it (nothing is fetched).
+    #[test]
+    fn a_picture_in_a_reply_says_what_it_is() {
+        let mut rig = reply("Here: ![a cat](https://example.com/cat.png)\n\n![](https://example.com/x.png)\n\n![chart](file:///nowhere/chart.png)");
+        // (The file is looked for off this thread.)
+        for _ in 0..500 {
+            if words(&rig).ends_with("chart") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            rig.frame(vec![]);
+        }
+        assert_eq!(words(&rig), "Here: a cathttps://example.com/x.pngchart");
+        for text in ["a cat", "https://example.com/x.png", "chart"] {
+            let at = run(&rig, text).0.center();
+            rig.click(at);
+            rig.idle();
+        }
+        assert_eq!(rig.opened, ["https://example.com/cat.png", "https://example.com/x.png"]);
+    }
+
+    /// The colour of the code that says `word`, in the block painted.
+    fn code_color(rig: &crate::slider::rig::Rig<Reply>, word: &str) -> egui::Color32 {
+        fn find(shape: &egui::Shape, word: &str, found: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    if let Some(at) = t.galley.text().find(word) {
+                        let section = t.galley.job.sections.iter().find(|s| s.byte_range.contains(&at));
+                        found.extend(section.map(|s| s.format.color));
+                    }
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, word, found)),
+                _ => {}
+            }
+        }
+        let mut found = vec![];
+        rig.shapes.iter().for_each(|c| find(&c.shape, word, &mut found));
+        assert_eq!(found.len(), 1, "{word:?} in the code");
+        found[0]
+    }
+
+    /// Code is coloured in the languages replies are written in, however the
+    /// block names them. (Only C, Python, Rust and TOML were, in lower case.)
+    #[test]
+    fn code_in_a_reply_is_coloured() {
+        let rig = reply("```JavaScript\n// a note\nconst total = \"a // b\"; /* aside */ let next = 5;\n```");
+        let (keyword, name, text, comment) =
+            (code_color(&rig, "const"), code_color(&rig, "total"), code_color(&rig, "a // b"), code_color(&rig, "a note"));
+        assert_eq!(code_color(&rig, "let"), keyword);
+        assert_eq!(code_color(&rig, "next"), name);
+        assert_eq!(code_color(&rig, "aside"), comment);
+        let all = [keyword, name, text, comment];
+        for (i, a) in all.iter().enumerate() {
+            assert!(all[i + 1..].iter().all(|b| a != b), "{all:?}");
+        }
+        // The same colours whichever highlighter has the language.
+        let rig = reply("```Python\n# a note\ndef total():\n    return \"text\"\n```");
+        assert_eq!(
+            (code_color(&rig, "def"), code_color(&rig, "total"), code_color(&rig, "text"), code_color(&rig, "a note")),
+            (keyword, name, text, comment)
+        );
+        for (block, words, plain) in [
+            ("```sql\nselect name FROM users -- all of them\n```", vec!["select", "FROM"], "users"),
+            ("```bash\nif [ -f x ]; then echo $# found; fi # done\n```", vec!["if", "then", "echo", "fi"], "found"),
+            ("```json\n{\"on\": true, \"n\": null}\n```", vec!["true", "null"], "n"),
+            ("```ts title=\"a.ts\"\ninterface A { readonly x: number }\n```", vec!["interface", "readonly", "number"], "x"),
+            ("```go\nfunc main() { defer f() }\n```", vec!["func", "defer"], "main"),
+            ("```c#\npublic class A { }\n```", vec!["public", "class"], "A"),
+        ] {
+            let rig = reply(block);
+            for word in words {
+                assert_eq!(code_color(&rig, word), keyword, "{word} in {block}");
+            }
+            assert_ne!(code_color(&rig, plain), keyword, "{plain} in {block}");
+        }
+        // A comment mark inside other things isn't one.
+        let rig = reply("```yaml\nurl: http://example.com/x # the site\ncount: $#\n```");
+        assert_ne!(code_color(&rig, "example"), comment);
+        assert_eq!(code_color(&rig, "the site"), comment);
+        let rig = reply("```sql\nselect 'it''s -- not a comment' -- but this is\n```");
+        assert_eq!(code_color(&rig, "not a comment"), text);
+        assert_eq!(code_color(&rig, "but this is"), comment);
+        // A language neither knows is plain: one colour.
+        let rig = reply("```brainfuck\nconst x = \"a\" // b\n```");
+        assert_eq!(code_color(&rig, "const"), code_color(&rig, "// b"));
+    }
+
+    /// A message out of sight isn't laid out again: its room is kept. One
+    /// that would be in sight always is, and one whose key has changed, and
+    /// one that isn't settled (the last).
+    #[test]
+    fn messages_out_of_sight_keep_their_room() {
+        use crate::slider::rig::Rig;
+        struct Chat {
+            keys: Vec<u64>,
+            cache: egui_commonmark::CommonMarkCache,
+            drawn: Vec<usize>,
+            height: f32,
+        }
+        fn scene(ui: &mut egui::Ui, s: &mut Chat) {
+            s.drawn.clear();
+            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                ui.set_width(400.0);
+                let n = s.keys.len();
+                for i in 0..n {
+                    let (key, cache, drawn) = (s.keys[i], &mut s.cache, &mut s.drawn);
+                    super::show_or_keep_room(ui, ("test_msg", i), key, 400.0, i + 1 < n, |ui| {
+                        drawn.push(i);
+                        let text = format!("Message {i}\n\n- a point\n- another\n\n`code` and **bold** words.");
+                        super::chat_markdown(ui, cache, &text, false);
+                    });
+                    ui.add_space(12.0);
+                }
+                s.height = ui.min_rect().height();
+            });
+        }
+        let chat = Chat { keys: vec![7; 40], cache: Default::default(), drawn: vec![], height: 0.0 };
+        let mut rig = Rig::new(chat, scene);
+        assert_eq!(rig.state.drawn, (0..40).collect::<Vec<_>>(), "all of them, the first time");
+        let height = rig.state.height;
+        rig.frame(vec![]);
+        // What's in sight (the top few), and the last.
+        let top = rig.state.drawn.clone();
+        assert!(top.len() < 8 && top[0] == 0 && top.last() == Some(&39), "{top:?}");
+        assert!(top[..top.len() - 1].windows(2).all(|w| w[1] == w[0] + 1), "{top:?}");
+        assert!((rig.state.height - height).abs() < 0.5, "{} → {}", height, rig.state.height);
+        assert_eq!(rig.texts("Message 0").len(), 1);
+
+        // Scrolled on: what's in sight there — drawn, and where it should be.
+        let wheel = |rig: &mut Rig<Chat>, dy: f32| {
+            let at = egui::pos2(200.0, 150.0);
+            rig.frame(vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, dy),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            rig.idle();
+        };
+        for _ in 0..6 {
+            wheel(&mut rig, -150.0);
+        }
+        // (Until the scrolling has come to rest.)
+        for _ in 0..40 {
+            let before = rig.state.drawn.clone();
+            let at = rig.texts(&format!("Message {}", before[1]));
+            rig.idle();
+            if rig.state.drawn == before && rig.texts(&format!("Message {}", before[1])) == at {
+                break;
+            }
+        }
+        let middle = rig.state.drawn.clone();
+        assert!(middle[0] > top[top.len() - 2] && middle.len() < 8, "{middle:?}");
+        assert!((rig.state.height - height).abs() < 0.5);
+        // (The first of them may start over the top.)
+        for i in &middle[1..middle.len() - 1] {
+            let shown = rig.texts(&format!("Message {i}"));
+            assert_eq!(shown.len(), 1, "message {i}");
+        }
+        // Each is where it would be with all of them drawn.
+        let at = rig.texts(&format!("Message {}", middle[1]))[0];
+        rig.state.keys = vec![8; 40];
+        rig.frame(vec![]);
+        assert_eq!(rig.state.drawn.len(), 40, "its key changed: every one is measured again");
+        assert_eq!(rig.texts(&format!("Message {}", middle[1]))[0], at);
+        rig.frame(vec![]);
+        assert_eq!(rig.state.drawn, middle);
+
+        // One whose key changes out of sight is drawn once more, then left.
+        rig.state.keys[0] = 9;
+        rig.frame(vec![]);
+        assert_eq!(rig.state.drawn[0], 0);
+        rig.frame(vec![]);
+        assert_eq!(rig.state.drawn, middle);
+    }
+
+    /// A message's key is what its height hangs on.
+    #[test]
+    fn a_messages_key_follows_what_it_says() {
+        use crate::llm::{ChatMsg, ChatRole};
+        let msg = |text: &str| ChatMsg {
+            role: ChatRole::Model,
+            text: text.to_string(),
+            thinking: None,
+            image: None,
+            doc: None,
+            tag_image: None,
+            tag_change: None,
+            goals: vec![],
+            character: None,
+            remember: false,
+            picture_memory: false,
+            shared_with: vec![],
+            research: None,
+        };
+        let key = |m: &ChatMsg| super::message_key(m, None, 600.0, 1.0);
+        assert_eq!(key(&msg("a reply")), key(&msg("a reply")));
+        assert_ne!(key(&msg("a reply")), key(&msg("a reply, longer")));
+        let mut thought = msg("a reply");
+        thought.thinking = Some("hm".into());
+        assert_ne!(key(&thought), key(&msg("a reply")));
+        let mut user = msg("a reply");
+        user.role = ChatRole::User;
+        assert_ne!(key(&user), key(&msg("a reply")));
+        assert_ne!(super::message_key(&msg("a reply"), None, 500.0, 1.0), key(&msg("a reply")));
+        assert_ne!(super::message_key(&msg("a reply"), None, 600.0, 1.25), key(&msg("a reply")));
+        // Its picture loading changes its height.
+        assert_ne!(super::message_key(&msg("a reply"), Some(Some([512, 300])), 600.0, 1.0), key(&msg("a reply")));
+        assert_ne!(super::message_key(&msg("a reply"), Some(None), 600.0, 1.0), key(&msg("a reply")));
     }
 }

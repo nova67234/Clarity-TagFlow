@@ -33,6 +33,10 @@ pub struct CommonMarkOptions<'f> {
     pub mutable: bool,
     pub math_fn: Option<&'f crate::RenderMathFn>,
     pub html_fn: Option<&'f crate::RenderHtmlFn>,
+    /// PATCH(Clarity TagFlow): a line break in the text is one in what's
+    /// shown (as chat apps have it), where markdown would run the two lines
+    /// together.
+    pub keep_line_breaks: bool,
 }
 
 impl std::fmt::Debug for CommonMarkOptions<'_> {
@@ -73,6 +77,7 @@ impl Default for CommonMarkOptions<'_> {
             use_explicit_uri_scheme: false,
             default_implicit_uri_scheme: "file://".to_owned(),
             alerts: AlertBundle::gfm(),
+            keep_line_breaks: false,
             mutable: false,
             math_fn: None,
             html_fn: None,
@@ -115,6 +120,11 @@ pub struct Style {
     pub strikethrough: bool,
     pub quote: bool,
     pub code: bool,
+    /// PATCH(Clarity TagFlow): what the inline HTML tags models write turn
+    /// on — `<u>`, `<sup>`, `<sub>`.
+    pub underline: bool,
+    pub raised: bool,
+    pub lowered: bool,
 }
 
 impl Style {
@@ -189,6 +199,19 @@ impl Style {
 
         if self.strikethrough {
             text = text.strikethrough();
+        }
+
+        // PATCH(Clarity TagFlow): `<u>`; `<sup>` (small, at the top of the
+        // line) and `<sub>` (small, dropped a little under its foot: a line
+        // shorter than the letters are sits that much lower on the row).
+        if self.underline {
+            text = text.underline();
+        }
+        if self.raised {
+            text = text.small().raised();
+        } else if self.lowered {
+            let height = ui.text_style_height(&egui::TextStyle::Small);
+            text = text.small().line_height(Some(height - 3.0));
         }
 
         if self.code {
@@ -294,9 +317,34 @@ impl Link {
             if ui_link.clicked() || ui_link.middle_clicked() {
                 cache.link_hooks_mut().insert(destination, true);
             }
+        } else if let Some(url) = web_url(&destination) {
+            ui.hyperlink_to(layout_job, url);
         } else {
-            ui.hyperlink_to(layout_job, destination);
+            // PATCH(Clarity TagFlow): only web links open. What opens a
+            // clicked link hands anything else — a `file:` link, a bare
+            // path — to the system to open, and a reply's links are the
+            // model's (or a web page's it read). Its text is shown as text.
+            for section in &mut layout_job.sections {
+                section.format.color = ui.visuals().text_color();
+            }
+            ui.label(layout_job)
+                .on_hover_text(format!("Not a web link, so it isn't opened:\n{destination}"));
         }
+    }
+}
+
+/// PATCH(Clarity TagFlow): `destination` as the web address a click opens —
+/// an http(s) or mailto link as it is, a bare "www.…" as https — or `None`
+/// for anything else.
+pub fn web_url(destination: &str) -> Option<String> {
+    let destination = destination.trim();
+    let lower = destination.to_ascii_lowercase();
+    if ["http://", "https://", "mailto:"].iter().any(|scheme| lower.starts_with(scheme)) {
+        Some(destination.to_string())
+    } else if lower.starts_with("www.") && !destination.contains(char::is_whitespace) {
+        Some(format!("https://{destination}"))
+    } else {
+        None
     }
 }
 
@@ -322,7 +370,30 @@ impl Image {
         }
     }
 
-    pub fn end(self, ui: &mut Ui, options: &CommonMarkOptions) {
+    pub fn end(self, ui: &mut Ui, cache: &mut CommonMarkCache, options: &CommonMarkOptions) {
+        // PATCH(Clarity TagFlow): a picture that can't be shown here says
+        // what it is, where it drew a lone ⚠. One on the web (nothing is
+        // fetched from there) is a link to it under its description; any
+        // other that doesn't load is its description.
+        let on_the_web = ["http://", "https://"].iter().any(|s| self.uri.to_ascii_lowercase().starts_with(s));
+        let loads = !on_the_web
+            && ui
+                .ctx()
+                .try_load_image(&self.uri, egui::SizeHint::default())
+                .is_ok();
+        if !loads {
+            let Self { uri, alt_text } = self;
+            if on_the_web {
+                let text = if alt_text.is_empty() { vec![RichText::new(&uri)] } else { alt_text };
+                Link { destination: uri, text }.end(ui, cache);
+            } else if !alt_text.is_empty() {
+                for alt in alt_text {
+                    ui.label(alt.italics());
+                }
+            }
+            return;
+        }
+
         let response = ui.add(
             egui::Image::from_uri(&self.uri)
                 .fit_to_original_size(1.0)
@@ -449,6 +520,13 @@ impl CodeBlock {
 }
 
 fn simple_highlighting(ui: &Ui, text: &str, extension: &str) -> egui::text::LayoutJob {
+    // PATCH(Clarity TagFlow): the language by its name however it's written
+    // ("Python", "js title=x"), and the ones egui's highlighter doesn't know
+    // (JavaScript, JSON, shell, SQL…) coloured by `highlight`.
+    let extension = &crate::highlight::language_name(extension);
+    if let Some(job) = crate::highlight::highlight(ui, text, extension) {
+        return job;
+    }
     egui_extras::syntax_highlighting::highlight(
         ui.ctx(),
         ui.style(),

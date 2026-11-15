@@ -125,6 +125,13 @@ impl<'f> CommonMarkViewer<'f> {
         self
     }
 
+    /// PATCH(Clarity TagFlow): keep the text's own line breaks (a soft break
+    /// is a new line, as in chat apps) where markdown would join the lines.
+    pub fn keep_line_breaks(mut self, keep: bool) -> Self {
+        self.options.keep_line_breaks = keep;
+        self
+    }
+
     /// Show alt text when hovering over images. By default this is enabled.
     pub fn show_alt_text_on_hover(mut self, show: bool) -> Self {
         self.options.show_alt_text_on_hover = show;

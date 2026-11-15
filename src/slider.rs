@@ -571,6 +571,8 @@ pub(crate) mod rig {
         pub repaint: bool,
         /// What the last frame painted.
         pub shapes: Vec<egui::epaint::ClippedShape>,
+        /// The links the frames so far asked the system to open.
+        pub opened: Vec<String>,
         scene: fn(&mut Ui, &mut S),
         time: f64,
     }
@@ -579,7 +581,17 @@ pub(crate) mod rig {
         pub fn new(state: S, scene: fn(&mut Ui, &mut S)) -> Self {
             let ctx = egui::Context::default();
             let screen = Vec2::new(640.0, 360.0);
-            let mut rig = Rig { ctx, state, screen, shift: false, repaint: false, shapes: vec![], scene, time: 0.0 };
+            let mut rig = Rig {
+                ctx,
+                state,
+                screen,
+                shift: false,
+                repaint: false,
+                shapes: vec![],
+                opened: vec![],
+                scene,
+                time: 0.0,
+            };
             rig.frame(vec![]);
             rig
         }
@@ -611,6 +623,11 @@ pub(crate) mod rig {
             let out = self.ctx.run_ui(input, |ui| scene(ui, state));
             self.repaint = out.viewport_output.get(&egui::ViewportId::ROOT).is_some_and(|v| v.repaint_delay.is_zero());
             self.shapes = out.shapes;
+            for command in out.platform_output.commands {
+                if let egui::OutputCommand::OpenUrl(open) = command {
+                    self.opened.push(open.url);
+                }
+            }
         }
 
         /// Settle: a few frames with nothing new, then a pause long enough

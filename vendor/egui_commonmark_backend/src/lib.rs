@@ -6,6 +6,9 @@
 pub mod alerts;
 #[doc(hidden)]
 pub mod elements;
+
+// PATCH(Clarity TagFlow): colouring for more code-block languages.
+pub mod highlight;
 #[doc(hidden)]
 pub mod misc;
 #[doc(hidden)]

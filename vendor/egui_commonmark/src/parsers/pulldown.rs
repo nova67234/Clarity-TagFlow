@@ -79,10 +79,20 @@ pub struct CommonMarkViewerInternal {
     /// Only populated if the html_fn option has been set
     html_block: String,
     is_list_item: bool,
+    /// PATCH(Clarity TagFlow): whether the list item being drawn, if one
+    /// is, has anything in it yet — see `keep_item_blocks_apart`.
+    item_begun: Option<bool>,
+    /// PATCH(Clarity TagFlow): a list inside a list item has just ended, and
+    /// nothing of the item has been drawn since.
+    after_inner_list: bool,
     def_list: DefinitionList,
     is_table: bool,
     is_blockquote: bool,
     checkbox_events: Vec<CheckboxClickEvent>,
+    /// PATCH(Clarity TagFlow): where in the text the inline HTML tags are
+    /// that open or close a style and have their other half in the same
+    /// block (see `paired_html`).
+    paired_html: Vec<usize>,
 }
 
 pub(crate) struct CheckboxClickEvent {
@@ -100,12 +110,15 @@ impl CommonMarkViewerInternal {
             image: None,
             line: Newline::default(),
             is_list_item: false,
+            item_begun: None,
+            after_inner_list: false,
             def_list: Default::default(),
             code_block: None,
             html_block: String::new(),
             is_table: false,
             is_blockquote: false,
             checkbox_events: Vec::new(),
+            paired_html: Vec::new(),
         }
     }
 }
@@ -137,6 +150,7 @@ impl CommonMarkViewerInternal {
             let height = ui.text_style_height(&TextStyle::Body);
             ui.set_row_height(height);
 
+            self.paired_html = paired_html(text, options);
             let mut events = pulldown_cmark::Parser::new_ext(
                 text,
                 parser_options_math(options.math_fn.is_some()),
@@ -211,6 +225,7 @@ impl CommonMarkViewerInternal {
             return;
         };
 
+        self.paired_html = paired_html(text, options);
         let events =
             pulldown_cmark::Parser::new_ext(text, parser_options_math(options.math_fn.is_some()))
                 .into_offset_iter()
@@ -380,6 +395,7 @@ impl CommonMarkViewerInternal {
 
             // Required to ensure that the content of the list item is aligned with
             // the * or - when wrapping
+            self.item_begun = Some(false);
             ui.horizontal_wrapped(|ui| {
                 while let Some((_, (e, src_span))) = events_iter.next() {
                     self.process_event(
@@ -393,6 +409,7 @@ impl CommonMarkViewerInternal {
                     );
                 }
             });
+            self.item_begun = None;
         }
     }
 
@@ -467,42 +484,18 @@ impl CommonMarkViewerInternal {
                 let frame = egui::Frame::group(ui.style()).show(ui, |ui| {
                     let Table { header, rows } = parse_table(events);
 
+                    // PATCH(Clarity TagFlow): a cell is drawn by `table_cell`
+                    // (one with `<br>`s in it has a line for each part).
                     egui::Grid::new(id).striped(true).show(ui, |ui| {
                         for col in header {
-                            ui.horizontal(|ui| {
-                                for (e, src_span) in col {
-                                    let tmp_start = std::mem::replace(
-                                        &mut self.line.should_start_newline,
-                                        false,
-                                    );
-                                    let tmp_end =
-                                        std::mem::replace(&mut self.line.should_end_newline, false);
-                                    self.event(ui, e, src_span, cache, options, max_width);
-                                    self.line.should_start_newline = tmp_start;
-                                    self.line.should_end_newline = tmp_end;
-                                }
-                            });
+                            self.table_cell(ui, col, cache, options, max_width);
                         }
 
                         ui.end_row();
 
                         for row in rows {
                             for col in row {
-                                ui.horizontal(|ui| {
-                                    for (e, src_span) in col {
-                                        let tmp_start = std::mem::replace(
-                                            &mut self.line.should_start_newline,
-                                            false,
-                                        );
-                                        let tmp_end = std::mem::replace(
-                                            &mut self.line.should_end_newline,
-                                            false,
-                                        );
-                                        self.event(ui, e, src_span, cache, options, max_width);
-                                        self.line.should_start_newline = tmp_start;
-                                        self.line.should_end_newline = tmp_end;
-                                    }
-                                });
+                                self.table_cell(ui, col, cache, options, max_width);
                             }
 
                             ui.end_row();
@@ -549,6 +542,7 @@ impl CommonMarkViewerInternal {
         options: &CommonMarkOptions,
         max_width: f32,
     ) {
+        self.keep_item_blocks_apart(ui, &event);
         match event {
             pulldown_cmark::Event::Start(tag) => self.start_tag(ui, tag, options),
             pulldown_cmark::Event::End(tag) => self.end_tag(ui, tag, cache, options, max_width),
@@ -561,12 +555,21 @@ impl CommonMarkViewerInternal {
                 self.text_style.code = false;
             }
             pulldown_cmark::Event::InlineHtml(text) => {
-                self.event_text(text, ui);
+                // PATCH(Clarity TagFlow): the few tags models write in
+                // their markdown do what they say — `<br>`, `<sub>`,
+                // `<sup>`, `<b>`… — where they were shown as text. Any
+                // other tag still is.
+                if !self.html_tag(ui, &text, src_span.start) {
+                    self.event_text(text, ui);
+                }
             }
 
             pulldown_cmark::Event::Html(text) => {
                 if options.html_fn.is_some() {
                     self.html_block.push_str(&text);
+                } else if is_line_break(&text) {
+                    // PATCH(Clarity TagFlow): a `<br>` on a line of its own.
+                    newline(ui);
                 } else {
                     self.event_text(text, ui);
                 }
@@ -575,7 +578,12 @@ impl CommonMarkViewerInternal {
                 footnote_start(ui, &footnote);
             }
             pulldown_cmark::Event::SoftBreak => {
-                soft_break(ui);
+                // PATCH(Clarity TagFlow): see `keep_line_breaks`.
+                if options.keep_line_breaks && !self.is_table {
+                    newline(ui);
+                } else {
+                    soft_break(ui);
+                }
             }
             pulldown_cmark::Event::HardBreak => newline(ui),
             pulldown_cmark::Event::Rule => {
@@ -608,6 +616,126 @@ impl CommonMarkViewerInternal {
                 }
             }
         }
+    }
+
+    /// PATCH(Clarity TagFlow): one cell of a table, its parts side by side.
+    /// `<br>` — how models break a line inside a cell, where markdown has no
+    /// way to — starts a new line of the cell.
+    fn table_cell(
+        &mut self,
+        ui: &mut Ui,
+        cell: Vec<(pulldown_cmark::Event, Range<usize>)>,
+        cache: &mut CommonMarkCache,
+        options: &CommonMarkOptions,
+        max_width: f32,
+    ) {
+        // (A cell after the row's first starts with the end of the one
+        // before it, which is drawn as the space between the two — so its
+        // later lines start with that space too, to stand under its first.)
+        let spaced = matches!(cell.first(), Some((pulldown_cmark::Event::End(pulldown_cmark::TagEnd::TableCell), _)));
+        let mut lines = vec![Vec::new()];
+        for (e, src_span) in cell {
+            if matches!(&e, pulldown_cmark::Event::InlineHtml(t) if is_line_break(t)) {
+                lines.push(Vec::new());
+            } else if let Some(line) = lines.last_mut() {
+                line.push((e, src_span));
+            }
+        }
+        let mut line_of_cell = |ui: &mut Ui, line: Vec<(pulldown_cmark::Event, Range<usize>)>, spaced: bool| {
+            ui.horizontal(|ui| {
+                if spaced {
+                    ui.label("  ");
+                }
+                for (e, src_span) in line {
+                    let tmp_start = std::mem::replace(&mut self.line.should_start_newline, false);
+                    let tmp_end = std::mem::replace(&mut self.line.should_end_newline, false);
+                    self.event(ui, e, src_span, cache, options, max_width);
+                    self.line.should_start_newline = tmp_start;
+                    self.line.should_end_newline = tmp_end;
+                }
+            });
+        };
+        if lines.len() == 1 {
+            line_of_cell(ui, lines.remove(0), false);
+        } else {
+            ui.vertical(|ui| {
+                for (i, line) in lines.into_iter().enumerate() {
+                    line_of_cell(ui, line, spaced && i > 0);
+                }
+            });
+        }
+    }
+
+    /// PATCH(Clarity TagFlow): inside a list item, a paragraph or a code
+    /// block that isn't the first thing in it starts on a line of its own,
+    /// and so does what follows a list in it. (An item is drawn as one
+    /// wrapped line, where they ran on: a step's code block sat to the right
+    /// of its text, and its second paragraph straight after the first
+    /// without so much as a space. What follows a code block wraps by
+    /// itself: the block is as wide as the line.)
+    fn keep_item_blocks_apart(&mut self, ui: &mut Ui, event: &pulldown_cmark::Event) {
+        use pulldown_cmark::{Event, Tag, TagEnd};
+        // (A code block's lines come as text, and aren't the item's.)
+        if self.code_block.is_some() && !matches!(event, Event::End(TagEnd::CodeBlock)) {
+            return;
+        }
+        let block = matches!(event, Event::Start(Tag::Paragraph | Tag::CodeBlock(_)));
+        let inline = matches!(
+            event,
+            Event::Text(_)
+                | Event::Code(_)
+                | Event::InlineMath(_)
+                | Event::InlineHtml(_)
+                | Event::FootnoteReference(_)
+                | Event::TaskListMarker(_)
+                | Event::Start(Tag::Link { .. } | Tag::Image { .. })
+        );
+        if self.after_inner_list {
+            if block || inline {
+                newline(ui);
+                self.after_inner_list = false;
+            } else if matches!(event, Event::Start(Tag::Item) | Event::End(TagEnd::List(_))) {
+                self.after_inner_list = false;
+            }
+        }
+        if let Some(begun) = &mut self.item_begun
+            && (block || inline)
+        {
+            if block && *begun {
+                newline(ui);
+            }
+            *begun = true;
+        }
+    }
+
+    /// PATCH(Clarity TagFlow): do what the inline HTML tag `text` (at `at` in
+    /// the source) says, if it's one of the few this knows: a line break, or
+    /// a style switched on or off — a style only where the tag has its other
+    /// half in the same block, so a lone "<b>" in a sentence about HTML is
+    /// still text (and doesn't embolden the rest of the reply). False when
+    /// it's to be shown as text.
+    fn html_tag(&mut self, ui: &mut Ui, text: &str, at: usize) -> bool {
+        let Some((name, closing)) = html_tag_name(text) else { return false };
+        if name == "br" {
+            newline(ui);
+            return true;
+        }
+        if !self.paired_html.contains(&at) {
+            return false;
+        }
+        let on = !closing;
+        let style = &mut self.text_style;
+        match html_style(&name) {
+            Some(HtmlStyle::Strong) => style.strong = on,
+            Some(HtmlStyle::Emphasis) => style.emphasis = on,
+            Some(HtmlStyle::Underline) => style.underline = on,
+            Some(HtmlStyle::Strikethrough) => style.strikethrough = on,
+            Some(HtmlStyle::Raised) => style.raised = on,
+            Some(HtmlStyle::Lowered) => style.lowered = on,
+            Some(HtmlStyle::Code) => style.code = on,
+            None => return false,
+        }
+        true
     }
 
     fn event_text(&mut self, text: CowStr, ui: &mut Ui) {
@@ -840,6 +968,8 @@ impl CommonMarkViewerInternal {
                 }
 
                 self.list.end_level(ui, self.line.can_insert_end());
+                // PATCH(Clarity TagFlow): see `keep_item_blocks_apart`.
+                self.after_inner_list = self.list.is_inside_a_list();
 
                 if !self.list.is_inside_a_list() {
                     // Reset all the state and make it ready for the next list that occurs
@@ -875,7 +1005,7 @@ impl CommonMarkViewerInternal {
             }
             pulldown_cmark::TagEnd::Image => {
                 if let Some(image) = self.image.take() {
-                    image.end(ui, options);
+                    image.end(ui, cache, options);
                 }
             }
             pulldown_cmark::TagEnd::HtmlBlock => {
@@ -902,7 +1032,18 @@ impl CommonMarkViewerInternal {
         max_width: f32,
     ) {
         if let Some(block) = self.code_block.take() {
-            block.end(ui, cache, options, max_width);
+            if self.item_begun.is_some() {
+                // PATCH(Clarity TagFlow): in a list item (one wrapped line)
+                // a little room over and under it, as it has between
+                // paragraphs.
+                ui.vertical(|ui| {
+                    ui.add_space(3.0);
+                    block.end(ui, cache, options, max_width);
+                    ui.add_space(3.0);
+                });
+            } else {
+                block.end(ui, cache, options, max_width);
+            }
             self.line.try_insert_end(ui);
         }
     }
@@ -970,4 +1111,79 @@ fn word_pieces(text: &str) -> Vec<&str> {
         pieces.push(&text[start..]);
     }
     pieces
+}
+
+/// PATCH(Clarity TagFlow): the styles inline HTML tags switch.
+#[derive(Clone, Copy, PartialEq)]
+enum HtmlStyle {
+    Strong,
+    Emphasis,
+    Underline,
+    Strikethrough,
+    Raised,
+    Lowered,
+    Code,
+}
+
+fn html_style(name: &str) -> Option<HtmlStyle> {
+    Some(match name {
+        "b" | "strong" => HtmlStyle::Strong,
+        "i" | "em" => HtmlStyle::Emphasis,
+        "u" | "ins" => HtmlStyle::Underline,
+        "s" | "del" | "strike" => HtmlStyle::Strikethrough,
+        "sup" => HtmlStyle::Raised,
+        "sub" => HtmlStyle::Lowered,
+        "code" | "kbd" | "samp" | "tt" => HtmlStyle::Code,
+        _ => return None,
+    })
+}
+
+/// PATCH(Clarity TagFlow): the name of a bare HTML tag — `<b>`, `</b>`,
+/// `<br/>` — in lower case, and whether it's a closing one. `None` for a tag
+/// with anything more in it (attributes), or for what isn't one tag.
+fn html_tag_name(text: &str) -> Option<(String, bool)> {
+    let inner = text.trim().strip_prefix('<')?.strip_suffix('>')?;
+    let closing = inner.starts_with('/');
+    let name = inner.trim_start_matches('/').trim_end_matches('/').trim();
+    let plain = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric());
+    plain.then(|| (name.to_ascii_lowercase(), closing))
+}
+
+/// PATCH(Clarity TagFlow): `text` is a `<br>` (however it's written).
+fn is_line_break(text: &str) -> bool {
+    html_tag_name(text).is_some_and(|(name, _)| name == "br")
+}
+
+/// PATCH(Clarity TagFlow): where in `text` the inline HTML style tags are
+/// that have their other half — `<sub>` its `</sub>` — later in the same
+/// block. (Read ahead of drawing, and only when there's a tag to find.)
+fn paired_html(text: &str, options: &CommonMarkOptions) -> Vec<usize> {
+    use pulldown_cmark::{Event, Tag, TagEnd};
+    let mut paired = Vec::new();
+    if !text.contains("</") {
+        return paired;
+    }
+    // The tags open in this block: what each switches, and where it is.
+    let mut open: Vec<(HtmlStyle, usize)> = Vec::new();
+    let events = pulldown_cmark::Parser::new_ext(text, parser_options_math(options.math_fn.is_some()));
+    for (event, span) in events.into_offset_iter() {
+        match event {
+            Event::Start(Tag::Paragraph | Tag::Heading { .. } | Tag::Item | Tag::TableCell | Tag::BlockQuote(_))
+            | Event::End(TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item | TagEnd::TableCell | TagEnd::BlockQuote(_)) => {
+                open.clear()
+            }
+            Event::InlineHtml(tag) => {
+                let Some((name, closing)) = html_tag_name(&tag) else { continue };
+                let Some(style) = html_style(&name) else { continue };
+                if !closing {
+                    open.push((style, span.start));
+                } else if let Some(i) = open.iter().rposition(|(s, _)| *s == style) {
+                    paired.extend([open[i].1, span.start]);
+                    open.truncate(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    paired
 }
