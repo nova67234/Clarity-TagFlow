@@ -856,9 +856,19 @@ fn sniff_checkpoint_base(path: &Path) -> LoraBase {
 /// so `CheckpointLoaderSimple` can actually load them wherever they landed.
 const CKPT_DIRS: [&str; 3] = ["checkpoints", "diffusion_models", "unet"];
 
+#[cfg(test)]
+thread_local! {
+    /// What [`scan_checkpoints`] finds, in a test.
+    static CHECKPOINTS_FOR_TEST: std::cell::RefCell<Option<Vec<(String, PathBuf)>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Full `.safetensors` / `.ckpt` checkpoints across all [`CKPT_DIRS`], as
 /// (filename, full path), de-duplicated by filename (first folder wins) and sorted.
 fn scan_checkpoints() -> Vec<(String, PathBuf)> {
+    #[cfg(test)]
+    if let Some(found) = CHECKPOINTS_FOR_TEST.with_borrow(|found| found.clone()) {
+        return found;
+    }
     let models = comfy_base().join("ComfyUI").join("models");
     let mut seen = std::collections::HashSet::new();
     let mut v: Vec<(String, PathBuf)> = Vec::new();
@@ -1092,12 +1102,19 @@ static SHA_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap
 /// `path`'s SHA-256, from [`SHA_CACHE`] when the file hasn't changed since.
 /// `None` when it can't be read right now (locked, still being copied).
 fn cached_sha256(path: &std::path::Path) -> Option<String> {
+    cached_sha256_with(path, |_| {})
+}
+
+/// [`cached_sha256`], telling `read` how far through the file it is (0 to 1)
+/// as it reads it. (Not at all when the hash was kept.)
+fn cached_sha256_with(path: &std::path::Path, mut read: impl FnMut(f32)) -> Option<String> {
     let m = std::fs::metadata(path).ok()?;
     let key: FileKey = (path.to_path_buf(), m.len(), m.modified().ok());
     if let Some(sha) = SHA_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return Some(sha.clone());
     }
-    let sha = crate::scan::sha256_file(path)?;
+    let len = m.len().max(1) as f32;
+    let sha = crate::scan::sha256_file_with(path, |done| read(done as f32 / len))?;
     SHA_CACHE.lock().unwrap_or_else(|e| e.into_inner()).insert(key, sha.clone());
     Some(sha)
 }
@@ -1466,6 +1483,23 @@ pub struct GenerateState {
     /// sniffed + filtered per family — offered alongside the built-in download
     /// options in the model picker.
     checkpoints: Vec<CkptEntry>,
+    /// Text to Image's Model list is open. (Its own flag, not egui's one
+    /// open pop-up: a tile's right-click menu opens over it.)
+    model_list_open: bool,
+    /// Text to Image's LoRAs or Embeddings list is open (and was last frame,
+    /// for its opening and closing), and whose details fill it.
+    extras_open: Option<image_view::extras::Extra>,
+    extras_was_open: Option<image_view::extras::Extra>,
+    extras_info: Option<String>,
+    /// Favorites: models, LoRAs and embeddings (see `image_view::models`),
+    /// read in when a list opens.
+    faves: Option<Vec<String>>,
+    /// The Model list's tile pictures, by model (see `image_view::models`).
+    model_thumbs: std::collections::HashMap<String, image_view::models::Thumb>,
+    /// The model the running generation uses, by its tile's key: its first
+    /// image becomes the tile's picture when it has none. (None for video,
+    /// and for an imported workflow, which picks its own.)
+    run_thumb_key: Option<String>,
     /// The selected installed checkpoint filename, or `None` to use the built-in
     /// model's default checkpoint. Only meaningful for families that use a single
     /// swappable checkpoint (SDXL).
@@ -1590,6 +1624,13 @@ impl GenerateState {
             lora_delete_confirm: None,
             show_other_loras: false,
             checkpoints: Vec::new(),
+            model_list_open: false,
+            extras_open: None,
+            extras_was_open: None,
+            extras_info: None,
+            faves: None,
+            model_thumbs: Default::default(),
+            run_thumb_key: None,
             checkpoint: None,
             show_other_ckpts: false,
             ckpt_menu_was_open: false,
@@ -2072,23 +2113,15 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()), a.a())
 }
 
-/// Render one LoRA as a Civitai-style card: preview on the left, a top-right ℹ
-/// action slot (same place + 20px size as the Civitai panel's Download arrow),
-/// the name, and a weight slider when selected. The whole card is clickable —
-/// selection is shown by an accent border (no checkbox). `off_family` flags
-/// LoRAs trained for a different model than the current tab, marking them with a
-/// coloured base-family dot.
-fn lora_row(
-    ui: &mut egui::Ui,
-    l: &mut LoraEntry,
-    loras_dir: &Path,
-    tdir: &Path,
-    off_family: bool,
-) -> bool {
-    // A host's LoRA: its details come from the host (once they've arrived).
-    if l.info_open && l.info.is_none() && picker_host().is_some() {
-        l.info = remote_lora_info_cached(&l.file, ui.ctx());
-    }
+/// The longest side a LoRA's or embedding's preview is kept at: the Text to
+/// Image lists show them as wide as the column, at up to twice that in pixels.
+const PREVIEW_EDGE: u32 = 768;
+
+/// Pick up a LoRA's preview from the thumbnails folder once it's there: its
+/// animation (decoded on a worker; the still shows until it lands) and its
+/// still — a few decodes a frame across all LoRAs, so a first open never
+/// stalls.
+fn pick_up_lora_preview(ui: &egui::Ui, l: &mut LoraEntry, tdir: &Path) {
     // Pick up an animated GIF thumbnail (video-only Civitai previews). The
     // multi-frame decode runs on a worker thread; until it lands (or if it
     // fails) the still poster below shows as usual.
@@ -2115,7 +2148,7 @@ fn lora_row(
         let img = tdir.join(format!("{stem}.img"));
         if img.exists() {
             if take_thumb_decode_budget(ui.ctx()) {
-                match std::fs::read(&img).ok().and_then(|b| crate::civitai::decode_thumb(&b, 200)) {
+                match std::fs::read(&img).ok().and_then(|b| crate::civitai::decode_thumb(&b, PREVIEW_EDGE)) {
                     Some(ci) => {
                         l.thumb = Some(ui.ctx().load_texture(
                             format!("lora_thumb_{stem}"),
@@ -2130,6 +2163,43 @@ fn lora_row(
             l.thumb_missing = true;
         }
     }
+}
+
+/// The frame of an animated preview to show now (and a repaint when the next
+/// is due).
+fn anim_frame(ui: &egui::Ui, frames: &AnimFrames) -> egui::TextureHandle {
+    let total: f32 = frames.iter().map(|(_, d)| d).sum();
+    let mut t = (ui.input(|i| i.time) as f32) % total.max(0.02);
+    let mut cur = &frames[0];
+    for f in frames.iter() {
+        if t < f.1 {
+            cur = f;
+            break;
+        }
+        t -= f.1;
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_secs_f32((cur.1 - t).max(0.01)));
+    cur.0.clone()
+}
+
+/// Render one LoRA as a Civitai-style card: preview on the left, a top-right ℹ
+/// action slot (same place + 20px size as the Civitai panel's Download arrow),
+/// the name, and a weight slider when selected. The whole card is clickable —
+/// selection is shown by an accent border (no checkbox). `off_family` flags
+/// LoRAs trained for a different model than the current tab, marking them with a
+/// coloured base-family dot.
+fn lora_row(
+    ui: &mut egui::Ui,
+    l: &mut LoraEntry,
+    loras_dir: &Path,
+    tdir: &Path,
+    off_family: bool,
+) -> bool {
+    // A host's LoRA: its details come from the host (once they've arrived).
+    if l.info_open && l.info.is_none() && picker_host().is_some() {
+        l.info = remote_lora_info_cached(&l.file, ui.ctx());
+    }
+    pick_up_lora_preview(ui, l, tdir);
 
     let mut info_clicked = false;
     let mut copy_clicked = false;
@@ -2142,19 +2212,9 @@ fn lora_row(
             // in a clean App Store-style list. An animated GIF preview (video-
             // only Civitai models) plays in place of the still.
             if let Some(frames) = l.anim.clone() {
-                let total: f32 = frames.iter().map(|(_, d)| d).sum();
-                let mut t = (ui.input(|i| i.time) as f32) % total.max(0.02);
-                let mut cur = &frames[0];
-                for f in frames.iter() {
-                    if t < f.1 {
-                        cur = f;
-                        break;
-                    }
-                    t -= f.1;
-                }
-                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f32((cur.1 - t).max(0.01)));
+                let frame = anim_frame(ui, &frames);
                 ui.add(
-                    egui::Image::new(&cur.0)
+                    egui::Image::new(&frame)
                         .max_height(80.0)
                         .max_width(130.0)
                         .corner_radius(8),
@@ -2333,33 +2393,38 @@ fn lora_row(
             .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
             .pick_file()
     {
-        // The thumb cache stores the raw image bytes ({stem}.img) and decodes
-        // them on load — so the picked file's bytes are stored as-is, after a
-        // decode check so a broken image can't wedge the card in "missing".
-        let stem = l.file.trim_end_matches(".safetensors");
-        if let Ok(bytes) = std::fs::read(&src)
-            && crate::civitai::decode_thumb(&bytes, 200).is_some()
-        {
-            let _ = std::fs::create_dir_all(tdir);
-            let _ = std::fs::write(tdir.join(format!("{stem}.img")), &bytes);
-            let _ = std::fs::remove_file(tdir.join(format!("{stem}.none")));
-            // A picked GIF also becomes the animated preview; any other format
-            // replaces (and stops) a previously auto-generated animation.
-            let is_gif = src.extension().is_some_and(|x| x.eq_ignore_ascii_case("gif"));
-            let gif = tdir.join(format!("{stem}.gif"));
-            if is_gif {
-                let _ = std::fs::write(&gif, &bytes);
-            } else {
-                let _ = std::fs::remove_file(&gif);
-            }
-            ANIM_CACHE.lock().unwrap().remove(stem); // decode the new file fresh
-            l.anim = None;
-            l.anim_missing = false;
-            l.thumb = None; // reload from the new bytes next frame
-            l.thumb_missing = false;
-        }
+        set_lora_thumbnail(l, tdir, &src);
     }
     want_delete
+}
+
+/// Make the picture at `src` a LoRA's preview (a GIF also its animation).
+fn set_lora_thumbnail(l: &mut LoraEntry, tdir: &Path, src: &Path) {
+    // The thumb cache stores the raw image bytes ({stem}.img) and decodes
+    // them on load — so the picked file's bytes are stored as-is, after a
+    // decode check so a broken image can't wedge the card in "missing".
+    let stem = l.file.trim_end_matches(".safetensors");
+    if let Ok(bytes) = std::fs::read(src)
+        && crate::civitai::decode_thumb(&bytes, 16).is_some()
+    {
+        let _ = std::fs::create_dir_all(tdir);
+        let _ = std::fs::write(tdir.join(format!("{stem}.img")), &bytes);
+        let _ = std::fs::remove_file(tdir.join(format!("{stem}.none")));
+        // A picked GIF also becomes the animated preview; any other format
+        // replaces (and stops) a previously auto-generated animation.
+        let is_gif = src.extension().is_some_and(|x| x.eq_ignore_ascii_case("gif"));
+        let gif = tdir.join(format!("{stem}.gif"));
+        if is_gif {
+            let _ = std::fs::write(&gif, &bytes);
+        } else {
+            let _ = std::fs::remove_file(&gif);
+        }
+        ANIM_CACHE.lock().unwrap().remove(stem); // decode the new file fresh
+        l.anim = None;
+        l.anim_missing = false;
+        l.thumb = None; // reload from the new bytes next frame
+        l.thumb_missing = false;
+    }
 }
 
 /// The tallest the negative prompt's text box gets before it scrolls inside
@@ -2667,10 +2732,12 @@ fn lora_popup(ctx: &egui::Context, state: &mut GenerateState) {
                 }
             });
         });
+}
 
-    // Delete confirmation (right-click → Delete LoRA…): a compact centred
-    // modal naming the file — deleting a couple-hundred-MB download by
-    // accident would sting.
+/// Delete confirmation for a LoRA (right-click → Delete LoRA…): a compact
+/// centred modal naming the file — deleting a couple-hundred-MB download by
+/// accident would sting.
+fn lora_delete_dialog(ctx: &egui::Context, state: &mut GenerateState) {
     if let Some(file) = state.lora_delete_confirm.clone() {
         egui::Window::new("Delete LoRA")
             .id(egui::Id::new("lora_delete_confirm"))
@@ -2934,9 +3001,11 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
                 }
             });
         });
+}
 
-    // Delete confirmation (right-click → Delete Embedding…): the same compact
-    // centred modal as the LoRA picker's.
+/// Delete confirmation for an embedding (right-click → Delete Embedding…):
+/// the same compact centred modal as the LoRA one.
+fn embedding_delete_dialog(ctx: &egui::Context, state: &mut GenerateState) {
     if let Some(file) = state.embedding_delete_confirm.clone() {
         egui::Window::new("Delete Embedding")
             .id(egui::Id::new("embedding_delete_confirm"))
@@ -3001,9 +3070,9 @@ fn embeddings_popup(ctx: &egui::Context, state: &mut GenerateState) {
 /// name column when selected. A click anywhere else (de)selects it. Right-click
 /// offers Set Thumbnail / Delete (delete is confirmed by the caller; returns
 /// true when requested).
-fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, tdir: &Path, off_family: bool) -> bool {
-    let name = embed_stem(&e.file).to_string();
-
+/// Pick up an embedding's preview from the thumbnails folder once it's there
+/// (a few decodes a frame across all of them).
+fn pick_up_embedding_preview(ui: &egui::Ui, e: &mut EmbeddingEntry, tdir: &Path) {
     // Pick up a freshly downloaded thumbnail from the cache — at most a few
     // decodes per frame across all rows, so the first open never stalls.
     if e.thumb.is_none() && !e.thumb_missing {
@@ -3011,7 +3080,7 @@ fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, tdir: &Path, off_fam
         let img = tdir.join(format!("{stem}.img"));
         if img.exists() {
             if take_thumb_decode_budget(ui.ctx()) {
-                match std::fs::read(&img).ok().and_then(|b| crate::civitai::decode_thumb(&b, 200)) {
+                match std::fs::read(&img).ok().and_then(|b| crate::civitai::decode_thumb(&b, PREVIEW_EDGE)) {
                     Some(ci) => {
                         e.thumb = Some(ui.ctx().load_texture(format!("embed_thumb_{stem}"), ci, Default::default()));
                     }
@@ -3022,6 +3091,13 @@ fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, tdir: &Path, off_fam
             e.thumb_missing = true;
         }
     }
+
+}
+
+fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, tdir: &Path, off_family: bool) -> bool {
+    let name = embed_stem(&e.file).to_string();
+
+    pick_up_embedding_preview(ui, e, tdir);
 
     let base = e.base;
     let selected = e.selected;
@@ -3155,21 +3231,26 @@ fn embedding_row(ui: &mut egui::Ui, e: &mut EmbeddingEntry, tdir: &Path, off_fam
             .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
             .pick_file()
     {
-        // The thumb cache stores the raw image bytes ({stem}.img) and decodes
-        // them on load — so the picked file's bytes are stored as-is, after a
-        // decode check so a broken image can't wedge the card in "missing".
-        let stem = embed_stem(&e.file);
-        if let Ok(bytes) = std::fs::read(&src)
-            && crate::civitai::decode_thumb(&bytes, 200).is_some()
-        {
-            let _ = std::fs::create_dir_all(tdir);
-            let _ = std::fs::write(tdir.join(format!("{stem}.img")), &bytes);
-            let _ = std::fs::remove_file(tdir.join(format!("{stem}.none")));
-            e.thumb = None; // reload from the new bytes next frame
-            e.thumb_missing = false;
-        }
+        set_embedding_thumbnail(e, tdir, &src);
     }
     want_delete
+}
+
+/// Make the picture at `src` an embedding's preview.
+fn set_embedding_thumbnail(e: &mut EmbeddingEntry, tdir: &Path, src: &Path) {
+    // The thumb cache stores the raw image bytes ({stem}.img) and decodes
+    // them on load — so the picked file's bytes are stored as-is, after a
+    // decode check so a broken image can't wedge the card in "missing".
+    let stem = embed_stem(&e.file);
+    if let Ok(bytes) = std::fs::read(src)
+        && crate::civitai::decode_thumb(&bytes, 16).is_some()
+    {
+        let _ = std::fs::create_dir_all(tdir);
+        let _ = std::fs::write(tdir.join(format!("{stem}.img")), &bytes);
+        let _ = std::fs::remove_file(tdir.join(format!("{stem}.none")));
+        e.thumb = None; // reload from the new bytes next frame
+        e.thumb_missing = false;
+    }
 }
 
 /// Draw a small rounded "Positive"/"Negative" pill (active = filled with `accent`,
@@ -3623,7 +3704,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                 ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 28.0), Layout::left_to_right(Align::Center), |ui| {
                     // "+" menu in the bottom-LEFT corner (flips to an × while
                     // open) — home of the LoRA picker and future tools.
-                    add_menu(ui, state);
+                    add_menu(ui, state, true);
 
                     // Send / stop pinned to the bottom-RIGHT corner, with the
                     // compact model selector to their left.
@@ -3865,6 +3946,11 @@ fn drain_runner(state: &mut GenerateState, ctx: &egui::Context) {
                 RunnerMsg::Line(line) => state.log.push(line),
                 RunnerMsg::Status(s) => state.status = s,
                 RunnerMsg::Output(p) => {
+                    if let Some(key) = &state.run_thumb_key
+                        && !crate::is_video(&p)
+                    {
+                        image_view::models::keep_first_image(key, &p);
+                    }
                     state.last_image = Some(p.clone());
                     state.gen_images.push(p);
                 }
@@ -3899,6 +3985,10 @@ fn popups(ctx: &egui::Context, state: &mut GenerateState) {
     if state.show_negative_popup {
         negative_popup(ctx, state);
     }
+    // (A delete asked for in either picker — the pop-ups or the text box's
+    // lists.)
+    lora_delete_dialog(ctx, state);
+    embedding_delete_dialog(ctx, state);
 }
 
 /// Is a file being dragged over the window right now? On Windows, winit
@@ -3918,9 +4008,9 @@ fn dragging_over_prompt(ui: &egui::Ui, state: &GenerateState) -> bool {
 }
 
 /// The prompt box's "+" (an × while its menu is open): the LoRA and
-/// embeddings pickers, the negative prompt, and letting go of an imported
-/// workflow.
-fn add_menu(ui: &mut egui::Ui, state: &mut GenerateState) {
+/// embeddings pickers (`pickers`: Text to Image has its own, beside it), the
+/// negative prompt, and letting go of an imported workflow.
+fn add_menu(ui: &mut egui::Ui, state: &mut GenerateState, pickers: bool) {
     let menu_id = ui.id().with(("add_menu", state.family.title()));
     let open = egui::Popup::is_id_open(ui.ctx(), menu_id);
     let (icon, tip) = if open {
@@ -3936,30 +4026,32 @@ fn add_menu(ui: &mut egui::Ui, state: &mut GenerateState) {
         .show(|ui| {
             ui.set_min_width(150.0);
             round_menu_rows(ui);
-            // Every selected LoRA is applied (incl. "other model"
-            // picks), so count them all.
-            let n = state.loras.iter().filter(|l| l.selected).count();
-            let label = if n > 0 { format!("LoRA ({n})") } else { "LoRA".to_string() };
-            let licon = egui::Image::new(egui::include_image!("../icons/lora.svg"))
-                .fit_to_exact_size(egui::vec2(16.0, 16.0))
-                .tint(icon_tint(TEXT()));
-            if ui.add(egui::Button::image_and_text(licon, RichText::new(label).size(12.0)).frame(false)).clicked() {
-                refresh_loras(state, ui.ctx());
-                state.show_lora_popup = true;
-                ui.close();
-            }
+            if pickers {
+                // Every selected LoRA is applied (incl. "other model"
+                // picks), so count them all.
+                let n = state.loras.iter().filter(|l| l.selected).count();
+                let label = if n > 0 { format!("LoRA ({n})") } else { "LoRA".to_string() };
+                let licon = egui::Image::new(egui::include_image!("../icons/lora.svg"))
+                    .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                    .tint(icon_tint(TEXT()));
+                if ui.add(egui::Button::image_and_text(licon, RichText::new(label).size(12.0)).frame(false)).clicked() {
+                    refresh_loras(state, ui.ctx());
+                    state.show_lora_popup = true;
+                    ui.close();
+                }
 
-            // Embeddings (textual inversion): selected ones are
-            // injected into the workflow's pos/neg encoder.
-            let en = state.embeddings.iter().filter(|e| e.selected).count();
-            let elabel = if en > 0 { format!("Embeddings ({en})") } else { "Embeddings".to_string() };
-            let eicon = egui::Image::new(egui::include_image!("../icons/extension.svg"))
-                .fit_to_exact_size(egui::vec2(16.0, 16.0))
-                .tint(icon_tint(TEXT()));
-            if ui.add(egui::Button::image_and_text(eicon, RichText::new(elabel).size(12.0)).frame(false)).clicked() {
-                refresh_embeddings(state, ui.ctx());
-                state.show_embeddings_popup = true;
-                ui.close();
+                // Embeddings (textual inversion): selected ones are
+                // injected into the workflow's pos/neg encoder.
+                let en = state.embeddings.iter().filter(|e| e.selected).count();
+                let elabel = if en > 0 { format!("Embeddings ({en})") } else { "Embeddings".to_string() };
+                let eicon = egui::Image::new(egui::include_image!("../icons/extension.svg"))
+                    .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                    .tint(icon_tint(TEXT()));
+                if ui.add(egui::Button::image_and_text(eicon, RichText::new(elabel).size(12.0)).frame(false)).clicked() {
+                    refresh_embeddings(state, ui.ctx());
+                    state.show_embeddings_popup = true;
+                    ui.close();
+                }
             }
 
             // Negative prompt: opens an editor popup; the text
@@ -4115,7 +4207,7 @@ fn copy_log(state: &mut GenerateState) {
 /// switch that shows the other families' ones. `short` leaves out what the
 /// Text to Image bar says beside the list: the family's name goes from each
 /// built-in model's, and its size is the row's note.
-fn model_list(ui: &mut egui::Ui, state: &mut GenerateState, short: bool) {
+fn model_list(ui: &mut egui::Ui, state: &mut GenerateState) {
     // Built-in (downloadable) model variants. Selecting one clears any
     // custom-checkpoint override.
     for &m in GenModel::all_for(state.family) {
@@ -4124,13 +4216,7 @@ fn model_list(ui: &mut egui::Ui, state: &mut GenerateState, short: bool) {
             (Some(host), Some(cat)) if !cat.ready.contains(&m) => Some(format!("not set up on {host}")),
             _ => None,
         };
-        let (name, size) = if short {
-            image_view::short_label(m.label(), state.family.title())
-        } else {
-            (m.label().to_string(), None)
-        };
-        let note = missing_on_host.or(size);
-        if crate::settings::dropdown_option(ui, &name, None, note.as_deref(), selected).clicked() {
+        if crate::settings::dropdown_option(ui, m.label(), None, missing_on_host.as_deref(), selected).clicked() {
             state.model = m;
             state.checkpoint = None;
             state.steps = m.default_steps();
@@ -4266,7 +4352,7 @@ fn model_selector(ui: &mut egui::Ui, state: &mut GenerateState) {
             // stretched across the window.
             ui.set_width(260.0);
             ui.spacing_mut().item_spacing.y = 3.0;
-            model_list(ui, state, false);
+            model_list(ui, state);
         });
 }
 
@@ -4935,6 +5021,7 @@ fn start_generate(state: &mut GenerateState, ctx: &egui::Context, cur_image: Opt
     state.status = "Generating…".into();
     state.status_err = false;
     state.nodes_status = None;
+    state.run_thumb_key = image_view::models::run_key(state);
     state.cancel.store(false, Ordering::SeqCst);
     state.stop_between_steps = false;
     let cancel = state.cancel.clone();

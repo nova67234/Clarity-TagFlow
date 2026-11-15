@@ -366,13 +366,13 @@ fn the_family_list_switches_tabs() {
 /// The model list picks a built-in model, with its own steps and guidance.
 #[test]
 fn the_model_list_picks_a_model() {
-    let mut rig = view(GenFamily::Flux, 640.0, true);
+    let mut rig = view(GenFamily::Flux, 1100.0, true);
     text(&rig, "Model");
     // The bar has room for the name; its note is in the list.
     text(&rig, "schnell · GGUF Q4");
     assert!(!shown(&rig, "schnell · GGUF Q4 · 8GB+, fast, free"), "a note cut short is left out");
     click_text(&mut rig, "Model");
-    // (The chosen one is in the bar and in the list.)
+    // (The chosen one is in the bar and on its tile.)
     assert_eq!(rig.texts("schnell · GGUF Q4").len(), 2);
     text(&rig, "8GB+, fast, free");
     for (name, note) in
@@ -388,6 +388,7 @@ fn the_model_list_picks_a_model() {
     // (This one's note fits.)
     text(&rig, "dev · GGUF Q8 · 12GB+, gated");
     assert!(!shown(&rig, "schnell · GGUF Q8"), "the list closed");
+    assert!(!rig.state.state.model_list_open);
     // The bar's segments follow.
     text(&rig, "20");
     text(&rig, "3.5");
@@ -550,13 +551,14 @@ fn the_plus_menu_has_the_extras() {
     rig.state.state.negative = "blurry".into();
     rig.click(plus_at(&rig));
     rig.idle();
-    for entry in ["LoRA", "Embeddings", "Negative prompt (set)"] {
-        text(&rig, entry);
-    }
+    text(&rig, "Negative prompt (set)");
+    // (The LoRAs and embeddings have their own pill, beside it.)
+    assert!(!shown(&rig, "LoRA"));
+    assert_eq!(rig.texts("Embeddings").len(), 1, "the pill's, not the menu's");
     assert!(!shown(&rig, "Clear imported workflow"));
     rig.key(egui::Key::Escape);
     rig.idle();
-    assert!(!shown(&rig, "Embeddings"));
+    assert!(!shown(&rig, "Negative prompt (set)"));
 
     // With an imported workflow the menu lets go of it, and the box says
     // which graph Generate runs.
@@ -609,10 +611,13 @@ fn the_imports_note_keeps_between_the_buttons() {
     assert_fills(&rig, "with a long note");
     let note = text(&rig, long);
     let room = prompt_box(&rig);
+    // Over the row of buttons, inside the box.
     assert!(
-        note.left() >= room.left() + 12.0 + 28.0 && note.right() <= room.right() - 12.0 - 28.0,
-        "the note {note:?} runs under a button of {room:?}"
+        note.left() >= room.left() + 12.0 && note.right() <= room.right() - 12.0,
+        "the note {note:?} runs out of {room:?}"
     );
+    assert!(note.bottom() <= room.bottom() - 12.0 - FOOTER_H, "the note {note:?} runs into the buttons");
+    assert!(note.bottom() > room.bottom() - 12.0 - FOOTER_H - 30.0, "just over them");
 }
 
 /// "Log" opens the console under it; Copy only works with something logged.
@@ -651,4 +656,897 @@ fn the_directors_keep_their_layout() {
     text(&rig, "Prompt");
     text(&rig, "Setup Requirements");
     text(&rig, "Frames");
+}
+
+// --- The model list's tiles. ---
+
+/// The names' blue on the tiles.
+const NAME_BLUE: Color32 = Color32::from_rgb(110, 170, 255);
+
+/// A new, empty folder for the tiles' pictures in this test.
+fn thumbs_in(test: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("clarity_model_thumbs_{test}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    models::THUMBS_DIR_FOR_TEST.set(Some(dir.clone()));
+    dir
+}
+
+/// A `w` × `h` picture at `path`.
+fn picture_file(path: &Path, w: u32, h: u32) {
+    image::RgbImage::from_pixel(w, h, image::Rgb([200, 120, 40])).save_with_format(path, image::ImageFormat::Png).unwrap();
+}
+
+/// Where `text` is painted in the tiles' blue (once).
+fn on_tile(rig: &Rig<View>, text: &str) -> egui::Rect {
+    fn find(shape: &egui::Shape, text: &str, found: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Text(t) if t.galley.text() == text && t.galley.job.sections[0].format.color == NAME_BLUE => {
+                found.push(t.visual_bounding_rect())
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, text, found)),
+            _ => {}
+        }
+    }
+    let mut found = vec![];
+    rig.shapes.iter().for_each(|c| find(&c.shape, text, &mut found));
+    assert_eq!(found.len(), 1, "{text:?} is on {} tiles", found.len());
+    found[0]
+}
+
+/// The ring round the chosen tile, if the name at `name` has one.
+fn ringed(rig: &Rig<View>, name: egui::Rect) -> bool {
+    fn find(shape: &egui::Shape, name: egui::Rect, found: &mut bool) {
+        match shape {
+            egui::Shape::Rect(r)
+                if r.stroke.width == 3.0
+                    && r.stroke.color == crate::theme::selection_outline()
+                    && r.rect.contains_rect(name) =>
+            {
+                *found = true
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, name, found)),
+            _ => {}
+        }
+    }
+    let mut found = false;
+    rig.shapes.iter().for_each(|c| find(&c.shape, name, &mut found));
+    found
+}
+
+fn right_click(rig: &mut Rig<View>, pos: egui::Pos2) {
+    for pressed in [true, false] {
+        rig.frame(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+    }
+    rig.idle();
+}
+
+/// The list is tiles down a column: each model's name in blue at its foot,
+/// what it's for in its corner, and the chosen one ringed.
+#[test]
+fn the_model_list_is_tiles() {
+    thumbs_in("tiles");
+    let mut rig = view(GenFamily::Flux, 1100.0, true);
+    click_text(&mut rig, "Model");
+    let names = ["schnell · GGUF Q4", "schnell · GGUF Q8", "dev · GGUF Q4", "dev · GGUF Q8"];
+    let at: Vec<egui::Rect> = names.iter().map(|name| on_tile(&rig, name)).collect();
+    for pair in at.windows(2) {
+        assert_eq!(pair[0].left(), pair[1].left(), "a column");
+        // A tile's height and the gap.
+        assert!((pair[1].top() - pair[0].top() - ((WIDTH - 24.0) * 0.56).round() - 12.0).abs() < 1.0, "{at:?}");
+    }
+    // Under its name, its note, in white.
+    let note = text(&rig, "12GB+, free");
+    assert!(note.top() >= at[1].bottom() - 1.0 && note.left() == at[1].left(), "{note:?} {:?}", at[1]);
+    assert_eq!(ink(&rig, "12GB+, free"), Color32::from_white_alpha(200));
+    // "Flux" in each tile's top left corner (and in the bar).
+    let badges = rig.texts("Flux");
+    assert_eq!(badges.len(), 5);
+    for name in &at {
+        assert!(
+            badges.iter().any(|b| b.top() < name.top()
+                && b.left() < LEFT + 60.0
+                && name.top() - b.top() < (WIDTH - 24.0) * 0.56),
+            "no badge over {name:?}"
+        );
+    }
+    assert!(ringed(&rig, at[0]));
+    for name in &at[1..] {
+        assert!(!ringed(&rig, *name));
+    }
+}
+
+/// The list goes as far down as the window, and scrolls past it.
+#[test]
+fn the_model_list_keeps_to_the_window() {
+    thumbs_in("window");
+    let mut rig = view(GenFamily::Flux, 640.0, true);
+    click_text(&mut rig, "Model");
+    let first = on_tile(&rig, "schnell · GGUF Q4");
+    on_tile(&rig, "schnell · GGUF Q8");
+    assert!(!shown(&rig, "dev · GGUF Q8"), "the last one is below");
+    for _ in 0..10 {
+        let at = first.center();
+        rig.frame(vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -120.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+    }
+    rig.idle();
+    let last = on_tile(&rig, "dev · GGUF Q8");
+    assert!(last.bottom() <= rig.screen.y, "{last:?}");
+    assert!(rig.state.state.model_list_open);
+}
+
+/// It closes on a click outside it, on Escape, and on its picker.
+#[test]
+fn the_model_list_closes_as_a_list_does() {
+    thumbs_in("closes");
+    let mut rig = view(GenFamily::Flux, 1100.0, true);
+    let open = |rig: &mut Rig<View>| {
+        click_text(rig, "Model");
+        assert!(rig.state.state.model_list_open);
+        on_tile(rig, "dev · GGUF Q4");
+    };
+    open(&mut rig);
+    // The gap between two tiles isn't outside. (Just over the second
+    // tile's badge.)
+    let mut badges = rig.texts("Flux");
+    badges.sort_by(|a, b| a.top().total_cmp(&b.top()));
+    rig.click(egui::pos2(LEFT + 100.0, badges[2].top() - 16.0));
+    rig.idle();
+    assert!(rig.state.state.model_list_open, "a click between tiles is in the list");
+    // Outside: the header.
+    rig.click(egui::pos2(LEFT + 120.0, TOP + 20.0));
+    rig.idle();
+    assert!(!rig.state.state.model_list_open);
+    assert!(!shown(&rig, "dev · GGUF Q4"));
+    open(&mut rig);
+    rig.key(egui::Key::Escape);
+    rig.idle();
+    assert!(!rig.state.state.model_list_open);
+    open(&mut rig);
+    click_text(&mut rig, "Model");
+    assert!(!rig.state.state.model_list_open);
+    assert!(rig.state.state.model == GenModel::SchnellQ4, "nothing was picked");
+}
+
+/// A tile shows its picture: Civitai's or one the user set, else the first
+/// image made with it; a tile with none (or a broken one) is blank.
+#[test]
+fn a_tile_shows_its_picture() {
+    let dir = thumbs_in("pictures");
+    picture_file(&dir.join("builtin-SchnellQ8.img"), 64, 32);
+    picture_file(&dir.join("builtin-DevQ4.gen.jpg"), 32, 64);
+    std::fs::write(dir.join("builtin-DevQ8.img"), b"not a picture").unwrap();
+    let mut rig = view(GenFamily::Flux, 1100.0, true);
+    click_text(&mut rig, "Model");
+    for _ in 0..4 {
+        rig.idle();
+    }
+    let size = |rig: &Rig<View>, key: &str| {
+        rig.state.state.model_thumbs.get(key).and_then(|t| t.tex.as_ref()).map(|t| t.size())
+    };
+    assert_eq!(size(&rig, "builtin-SchnellQ8"), Some([64, 32]));
+    assert_eq!(size(&rig, "builtin-DevQ4"), Some([32, 64]));
+    assert_eq!(size(&rig, "builtin-SchnellQ4"), None);
+    assert_eq!(size(&rig, "builtin-DevQ8"), None);
+    // A picture of its own goes over the first image made with it.
+    picture_file(&dir.join("builtin-DevQ4.img"), 48, 48);
+    rig.idle();
+    rig.idle();
+    assert_eq!(size(&rig, "builtin-DevQ4"), Some([48, 48]));
+    // Each picture is drawn on its tile.
+    let ids: Vec<egui::TextureId> =
+        rig.state.state.model_thumbs.values().filter_map(|t| t.tex.as_ref().map(|t| t.id())).collect();
+    let drawn = rig
+        .shapes
+        .iter()
+        .filter(|c| matches!(&c.shape, egui::Shape::Rect(r) if r.brush.as_ref().is_some_and(|b| ids.contains(&b.fill_texture_id))))
+        .count();
+    assert_eq!((ids.len(), drawn), (2, 2));
+}
+
+/// A tile's right-click menu sets its picture, or takes it away — and the
+/// list stays open for it.
+#[test]
+fn a_tiles_menu_takes_its_picture_away() {
+    let dir = thumbs_in("menu");
+    picture_file(&dir.join("builtin-SchnellQ4.img"), 40, 30);
+    picture_file(&dir.join("builtin-SchnellQ4.gen.jpg"), 40, 30);
+    let mut rig = view(GenFamily::Flux, 1100.0, true);
+    click_text(&mut rig, "Model");
+    rig.idle();
+    // (By the tile's right edge: the menu opens out past the list's.)
+    let tile = egui::pos2(LEFT + WIDTH - 24.0, on_tile(&rig, "schnell · GGUF Q4").center().y - 60.0);
+    right_click(&mut rig, tile);
+    text(&rig, "Set Thumbnail…");
+    assert!(text(&rig, "Remove Thumbnail").right() > LEFT + WIDTH, "the menu is out past the list");
+    click_text(&mut rig, "Remove Thumbnail");
+    assert!(rig.state.state.model_list_open, "the list stays open");
+    on_tile(&rig, "schnell · GGUF Q4");
+    assert!(!dir.join("builtin-SchnellQ4.img").exists() && !dir.join("builtin-SchnellQ4.gen.jpg").exists());
+    assert!(dir.join("builtin-SchnellQ4.none").exists(), "Civitai's mustn't come back");
+    assert!(rig.state.state.model_thumbs["builtin-SchnellQ4"].tex.is_none());
+    // A tile with no picture has nothing to take away.
+    rig.key(egui::Key::Escape);
+    rig.idle();
+    if !rig.state.state.model_list_open {
+        click_text(&mut rig, "Model");
+    }
+    let tile = on_tile(&rig, "schnell · GGUF Q8").center() - egui::vec2(0.0, 60.0);
+    right_click(&mut rig, tile);
+    text(&rig, "Set Thumbnail…");
+    assert!(!shown(&rig, "Remove Thumbnail"));
+    assert!(!dir.join("builtin-SchnellQ8.none").exists());
+}
+
+/// The first image made with a model becomes its tile's picture, and stays.
+#[test]
+fn the_first_image_made_with_a_model_becomes_its_picture() {
+    let dir = thumbs_in("first");
+    let (made, later) = (dir.join("made.png"), dir.join("later.png"));
+    picture_file(&made, 300, 200);
+    picture_file(&later, 100, 100);
+    let mut rig = view(GenFamily::Flux, 640.0, true);
+    let (tx, rx) = std::sync::mpsc::channel();
+    rig.state.state.rx = Some(rx);
+    rig.state.state.running = true;
+    let run = |rig: &mut Rig<View>, key: &str, images: &[&PathBuf]| {
+        rig.state.state.run_thumb_key = Some(key.into());
+        for image in images {
+            tx.send(RunnerMsg::Output((*image).clone())).unwrap();
+        }
+        rig.frame(vec![]);
+    };
+    let kept = |key: &str| image::open(dir.join(format!("{key}.gen.jpg"))).ok().map(|i| (i.width(), i.height()));
+    run(&mut rig, "builtin-DevQ4", &[&made, &later]);
+    assert_eq!(kept("builtin-DevQ4"), Some((300, 200)));
+    run(&mut rig, "builtin-DevQ4", &[&later]);
+    assert_eq!(kept("builtin-DevQ4"), Some((300, 200)), "a later image doesn't replace it");
+    // Not for a model whose picture was taken away, nor from a video.
+    std::fs::write(dir.join("builtin-DevQ8.none"), b"").unwrap();
+    run(&mut rig, "builtin-DevQ8", &[&made]);
+    assert_eq!(kept("builtin-DevQ8"), None);
+    run(&mut rig, "builtin-SchnellQ8", &[&dir.join("clip.webm")]);
+    assert!(!dir.join("builtin-SchnellQ8.gen.jpg").exists());
+    // Nor when no model's run is going.
+    rig.state.state.run_thumb_key = None;
+    tx.send(RunnerMsg::Output(made.clone())).unwrap();
+    rig.frame(vec![]);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().ends_with(".gen.jpg")).count(), 1);
+    // The first image large is kept small.
+    let big = dir.join("big.png");
+    picture_file(&big, 2000, 1000);
+    run(&mut rig, "builtin-SchnellQ4", &[&big]);
+    assert_eq!(kept("builtin-SchnellQ4"), Some((768, 384)));
+}
+
+/// A generation's first image is for the model picked — not a video's, and
+/// not an imported workflow's.
+#[test]
+fn a_run_is_for_the_model_picked() {
+    let mut state = GenerateState::new(GenFamily::Flux);
+    assert_eq!(models::run_key(&state).as_deref(), Some("builtin-SchnellQ4"));
+    state.model = GenModel::DevQ8;
+    assert_eq!(models::run_key(&state).as_deref(), Some("builtin-DevQ8"));
+    let mut state = GenerateState::new(GenFamily::Sdxl);
+    state.checkpoint = Some("juggernautXL_v9.safetensors".into());
+    assert_eq!(models::run_key(&state).as_deref(), Some("ckpt-juggernautXL_v9"));
+    state.imported_workflow = Some("{}".into());
+    assert_eq!(models::run_key(&state), None);
+    assert_eq!(models::run_key(&GenerateState::new(GenFamily::Ltx)), None);
+}
+
+/// SDXL's installed checkpoints: under a caption, marked with what they're
+/// for (when it's known), other families' behind the switch; a click picks one.
+#[test]
+fn installed_checkpoints_are_tiles_too() {
+    thumbs_in("checkpoints");
+    let found = ["sd_xl_base_1.0", "juggernautXL_v9", "my_merge", "fluxFusion_v2"]
+        .map(|f| (format!("{f}.safetensors"), PathBuf::from(format!("/nowhere/{f}.safetensors"))));
+    CHECKPOINTS_FOR_TEST.set(Some(found.to_vec()));
+    let mut rig = view(GenFamily::Sdxl, 1400.0, true);
+    rig.state.state.checkpoints = vec![
+        CkptEntry { file: "sd_xl_base_1.0.safetensors".into(), base: LoraBase::Sdxl },
+        CkptEntry { file: "juggernautXL_v9.safetensors".into(), base: LoraBase::Sdxl },
+        CkptEntry { file: "my_merge.safetensors".into(), base: LoraBase::Unknown },
+        CkptEntry { file: "fluxFusion_v2.safetensors".into(), base: LoraBase::Flux },
+    ];
+    click_text(&mut rig, "Model");
+    let caption = text(&rig, "Installed checkpoints");
+    let base = on_tile(&rig, "Base 1.0");
+    let jug = on_tile(&rig, "juggernautXL_v9");
+    let merge = on_tile(&rig, "my_merge");
+    assert!(base.top() < caption.top() && caption.top() < jug.top() && jug.top() < merge.top());
+    assert!(!shown(&rig, "sd_xl_base_1.0"), "the built-in one is listed once");
+    // (In the bar, on the built-in tile and on Juggernaut's; not on the merge.)
+    assert_eq!(rig.texts("SDXL").len(), 3);
+    assert!(!shown(&rig, "Unknown"), "what isn't known isn't marked");
+    assert!(!shown(&rig, "fluxFusion_v2") && !shown(&rig, "Flux"));
+    text(&rig, "Show other-family checkpoints");
+    let switch = text(&rig, "Show other-family checkpoints").right_center() + egui::vec2(WIDTH - 260.0, 0.0);
+    rig.click(egui::pos2(LEFT + WIDTH - 40.0, switch.y));
+    rig.idle();
+    assert!(rig.state.state.show_other_ckpts);
+    on_tile(&rig, "fluxFusion_v2");
+    text(&rig, "Flux");
+    click_text(&mut rig, "juggernautXL_v9");
+    let state = &rig.state.state;
+    assert_eq!(state.checkpoint.as_deref(), Some("juggernautXL_v9.safetensors"));
+    assert!(state.model == GenModel::SdxlBase && !state.model_list_open);
+    text(&rig, "juggernautXL_v9");
+    CHECKPOINTS_FOR_TEST.set(None);
+}
+
+/// Opening the list looks up Civitai's previews for this family's files on
+/// this PC that have no picture yet — not for another PC's.
+#[test]
+fn opening_the_list_looks_up_the_missing_previews() {
+    let dir = thumbs_in("lookup");
+    std::fs::write(dir.join("ckpt-juggernautXL_v9.img"), b"x").unwrap();
+    std::fs::write(dir.join("ckpt-nothere.none"), b"").unwrap();
+    let found = ["sd_xl_base_1.0", "juggernautXL_v9", "dreamshaper", "nothere", "fluxFusion_v2"]
+        .map(|f| (format!("{f}.safetensors"), PathBuf::from(format!("/nowhere/{f}.safetensors"))));
+    CHECKPOINTS_FOR_TEST.set(Some(found.to_vec()));
+    let mut rig = view(GenFamily::Sdxl, 1100.0, true);
+    rig.state.state.checkpoints = ["sd_xl_base_1.0", "juggernautXL_v9", "dreamshaper", "nothere"]
+        .map(|f| CkptEntry { file: format!("{f}.safetensors"), base: LoraBase::Sdxl })
+        .into_iter()
+        .chain([CkptEntry { file: "fluxFusion_v2.safetensors".into(), base: LoraBase::Flux }])
+        .collect();
+    models::FETCH_FOR_TEST.set(None);
+    click_text(&mut rig, "Model");
+    let wanted = |keys: &[&str]| Some(keys.iter().map(|k| k.to_string()).collect::<Vec<_>>());
+    assert_eq!(models::FETCH_FOR_TEST.take(), wanted(&["builtin-SdxlBase", "ckpt-dreamshaper"]));
+    rig.idle();
+    assert_eq!(models::FETCH_FOR_TEST.take(), None, "once an opening");
+    // Shown, another family's is looked up too.
+    rig.state.state.show_other_ckpts = true;
+    rig.key(egui::Key::Escape);
+    rig.idle();
+    click_text(&mut rig, "Model");
+    assert_eq!(models::FETCH_FOR_TEST.take(), wanted(&["builtin-SdxlBase", "ckpt-dreamshaper", "ckpt-fluxFusion_v2"]));
+    // Another PC's models are on that PC.
+    let mut state = GenerateState::new(GenFamily::Sdxl);
+    state.remote_host = Some("Studio".into());
+    models::opened(&state, &rig.ctx);
+    assert_eq!(models::FETCH_FOR_TEST.take(), None);
+    state.remote_host = None;
+    models::opened(&state, &rig.ctx);
+    assert_eq!(models::FETCH_FOR_TEST.take(), wanted(&["builtin-SdxlBase"]));
+    CHECKPOINTS_FOR_TEST.set(None);
+}
+
+/// A tile's picture is cropped to fill it, not stretched: its middle
+/// across, nearer its top than its bottom.
+#[test]
+fn a_picture_fills_its_tile() {
+    let tile = egui::vec2(200.0, 100.0);
+    let uv = models::cover_uv(egui::vec2(400.0, 100.0), tile);
+    assert_eq!((uv.min.x, uv.max.x, uv.min.y, uv.max.y), (0.25, 0.75, 0.0, 1.0));
+    let uv = models::cover_uv(egui::vec2(100.0, 200.0), tile);
+    assert_eq!((uv.min.x, uv.max.x), (0.0, 1.0));
+    assert!((uv.height() - 0.25).abs() < 1e-6 && (uv.min.y - 0.225).abs() < 1e-6, "{uv:?}");
+    let uv = models::cover_uv(egui::vec2(200.0, 100.0), tile);
+    assert_eq!(uv, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)));
+}
+
+/// The list opens with the chosen model in sight (from the top when it's
+/// in sight there), not where it was left.
+#[test]
+fn the_model_list_opens_at_the_chosen_model() {
+    thumbs_in("opens_at");
+    let mut rig = view(GenFamily::Flux, 640.0, true);
+    let wheel = |rig: &mut Rig<View>, at: egui::Pos2, dy: f32| {
+        for _ in 0..10 {
+            rig.frame(vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, dy),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+        }
+        rig.idle();
+    };
+    click_text(&mut rig, "Model");
+    let at = on_tile(&rig, "schnell · GGUF Q4").center();
+    wheel(&mut rig, at, -120.0);
+    assert!(!shown(&rig, "8GB+, fast, free"), "scrolled past the first");
+    rig.key(egui::Key::Escape);
+    rig.idle();
+    click_text(&mut rig, "Model");
+    on_tile(&rig, "schnell · GGUF Q4");
+    // The last one chosen, it opens there.
+    rig.state.state.model = GenModel::DevQ8;
+    rig.key(egui::Key::Escape);
+    rig.idle();
+    click_text(&mut rig, "Model");
+    let last = on_tile(&rig, "dev · GGUF Q8");
+    assert!(last.bottom() <= rig.screen.y);
+    assert!(!shown(&rig, "8GB+, fast, free"));
+    // Scrolled on from there, it stays where it's put while it's open.
+    wheel(&mut rig, at, 120.0);
+    text(&rig, "8GB+, fast, free");
+}
+
+// --- The tiles' loading rings. ---
+
+/// The ring's shapes on screen: its faint tracks, and its blue arcs.
+fn rings(rig: &Rig<View>) -> (usize, usize) {
+    fn find(shape: &egui::Shape, found: &mut (usize, usize)) {
+        match shape {
+            egui::Shape::Circle(c) if c.stroke.width == 3.0 && c.stroke.color == Color32::from_white_alpha(40) => {
+                found.0 += 1
+            }
+            egui::Shape::Path(p) if p.stroke.width == 3.0 && p.stroke.color == egui::epaint::ColorMode::Solid(NAME_BLUE) => {
+                found.1 += 1
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, found)),
+            _ => {}
+        }
+    }
+    let mut found = (0, 0);
+    rig.shapes.iter().for_each(|c| find(&c.shape, &mut found));
+    found
+}
+
+/// A tile whose picture is on its way has a ring: a faint track while its
+/// turn's to come, filling with the per cent while its file is read, turning
+/// while the preview downloads. A tile with a picture has none.
+#[test]
+fn a_tile_rings_while_its_picture_is_on_its_way() {
+    let dir = thumbs_in("rings");
+    picture_file(&dir.join("builtin-SchnellQ4.img"), 40, 30);
+    models::set_fetching_for_test(&["builtin-SchnellQ4", "builtin-DevQ4"], Some(("builtin-SchnellQ8", Some(0.42))));
+    let mut rig = view(GenFamily::Flux, 1100.0, true);
+    click_text(&mut rig, "Model");
+    rig.idle();
+    // (Two tracks: the one being read, and the one whose turn's to come.)
+    assert_eq!(rings(&rig), (2, 1));
+    let percent = text(&rig, "42%");
+    let name = on_tile(&rig, "schnell · GGUF Q8");
+    assert!(percent.bottom() < name.top() && name.top() - percent.bottom() < 160.0, "{percent:?} {name:?}");
+    assert!((percent.center().x - (LEFT + WIDTH / 2.0)).abs() < 2.0, "in the middle");
+    assert_eq!(models::loading("builtin-DevQ4"), Some(models::Loading::Waiting));
+
+    models::set_fetching_for_test(&["builtin-SchnellQ4", "builtin-DevQ4"], Some(("builtin-SchnellQ8", None)));
+    rig.frame(vec![]);
+    assert!(!shown(&rig, "42%"));
+    assert_eq!(rings(&rig), (2, 1), "it turns");
+
+    models::set_fetching_for_test(&[], None);
+    rig.frame(vec![]);
+    assert_eq!(rings(&rig), (0, 0));
+}
+
+/// The look-up reads each file (saying how far), then downloads its
+/// preview: kept when Civitai has one, marked when it hasn't.
+#[test]
+fn the_look_up_reads_each_file_then_downloads_its_preview() {
+    let dir = thumbs_in("look_up");
+    let files = dir.join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    let file = |name: &str, bytes: &[u8]| {
+        let path = files.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+    // (Big enough to be read in many blocks.)
+    let big = file("big.safetensors", &vec![7u8; 3 * 1024 * 1024]);
+    let none = file("none.safetensors", b"b");
+    let fails = file("fails.safetensors", b"c");
+    let sha = |p: &Path| crate::scan::sha256_file(p).unwrap();
+    let (big_sha, none_sha) = (sha(&big), sha(&none));
+    let todo = vec![
+        ("ckpt-big".to_string(), big.clone()),
+        ("ckpt-none".to_string(), none.clone()),
+        ("ckpt-fails".to_string(), fails.clone()),
+    ];
+    let asked = std::cell::RefCell::new(vec![]);
+    let lookup = |s: &str| {
+        let key = if s == big_sha { "ckpt-big" } else if s == none_sha { "ckpt-none" } else { "ckpt-fails" };
+        // While it downloads, its ring turns and the rest wait their turn.
+        assert_eq!(models::loading(key), Some(models::Loading::Downloading));
+        asked.borrow_mut().push((key, models::loading("ckpt-fails")));
+        match key {
+            "ckpt-big" => Ok(Some(b"PICTURE".to_vec())),
+            "ckpt-none" => Ok(None),
+            _ => Err(crate::civitai::PreviewFail::Item),
+        }
+    };
+    let read = std::cell::RefCell::new(vec![]);
+    let repaint = || {
+        if let Some(models::Loading::Reading(part)) = models::loading("ckpt-big") {
+            read.borrow_mut().push(part);
+        }
+    };
+    models::work(todo, &dir, &lookup, &repaint);
+    assert_eq!(
+        *asked.borrow(),
+        [
+            ("ckpt-big", Some(models::Loading::Waiting)),
+            ("ckpt-none", Some(models::Loading::Waiting)),
+            ("ckpt-fails", Some(models::Loading::Downloading)),
+        ]
+    );
+    let read = read.borrow();
+    assert!(read.len() > 10 && read.windows(2).all(|w| w[0] < w[1]) && *read.last().unwrap() >= 0.99, "{read:?}");
+    assert_eq!(std::fs::read(dir.join("ckpt-big.img")).unwrap(), b"PICTURE");
+    assert!(dir.join("ckpt-none.none").exists());
+    assert!(!dir.join("ckpt-fails.img").exists() && !dir.join("ckpt-fails.none").exists(), "tried again next time");
+    for key in ["ckpt-big", "ckpt-none", "ckpt-fails"] {
+        assert_eq!(models::loading(key), None, "no ring is left turning");
+    }
+}
+
+/// Offline, the look-up stops (and leaves no rings); so it does when the
+/// list closes.
+#[test]
+fn the_look_up_stops_offline_or_when_the_list_closes() {
+    let dir = thumbs_in("look_up_stops");
+    let a = dir.join("a.safetensors");
+    let b = dir.join("b.safetensors");
+    std::fs::write(&a, b"a").unwrap();
+    std::fs::write(&b, b"b").unwrap();
+    let todo = || vec![("ckpt-a".to_string(), a.clone()), ("ckpt-b".to_string(), b.clone())];
+    let asked = std::cell::Cell::new(0);
+    let offline = |_: &str| {
+        asked.set(asked.get() + 1);
+        Err(crate::civitai::PreviewFail::Offline)
+    };
+    models::work(todo(), &dir, &offline, &|| {});
+    assert_eq!(asked.get(), 1);
+    assert_eq!((models::loading("ckpt-a"), models::loading("ckpt-b")), (None, None));
+    assert!(!dir.join("ckpt-a.none").exists(), "offline isn't \"none\"");
+
+    models::CANCEL_FOR_TEST.set(true);
+    let found = |_: &str| {
+        asked.set(asked.get() + 1);
+        Ok(None)
+    };
+    models::work(todo(), &dir, &found, &|| {});
+    assert_eq!(asked.get(), 1, "closed, nothing more is looked up");
+    assert_eq!(models::loading("ckpt-b"), None);
+    models::CANCEL_FOR_TEST.set(false);
+}
+
+// --- The text box's LoRAs | Embeddings pill and its lists. ---
+
+use super::extras::Extra;
+
+/// A LoRA made for `base`, with a `w` × `h` preview (none at 0 × 0).
+fn lora(rig: &Rig<View>, file: &str, base: LoraBase, (w, h): (usize, usize)) -> LoraEntry {
+    LoraEntry {
+        file: file.into(),
+        selected: false,
+        strength: DEFAULT_STRENGTH,
+        base,
+        sniffed: true,
+        info_open: false,
+        info: None,
+        thumb: preview(rig, file, w, h),
+        // (Not looked for in this PC's folder.)
+        thumb_missing: true,
+        anim: None,
+        anim_missing: true,
+    }
+}
+
+fn embedding(rig: &Rig<View>, file: &str, base: LoraBase, (w, h): (usize, usize)) -> EmbeddingEntry {
+    EmbeddingEntry {
+        file: file.into(),
+        base,
+        sniffed: true,
+        selected: false,
+        negative: false,
+        strength: DEFAULT_STRENGTH,
+        thumb: preview(rig, file, w, h),
+        thumb_missing: true,
+    }
+}
+
+fn preview(rig: &Rig<View>, name: &str, w: usize, h: usize) -> Option<egui::TextureHandle> {
+    (w > 0).then(|| {
+        let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &vec![90; w * h * 4]);
+        rig.ctx.load_texture(format!("test_preview_{name}"), image, Default::default())
+    })
+}
+
+/// Flux's text box with these LoRAs (and no embeddings).
+fn with_loras(test: &str, loras: &[(&str, LoraBase, (usize, usize))]) -> Rig<View> {
+    thumbs_in(test);
+    let mut rig = view(GenFamily::Flux, 1000.0, true);
+    rig.state.state.loras = loras.iter().map(|(file, base, size)| lora(&rig, file, *base, *size)).collect();
+    rig.state.state.embeddings.clear();
+    rig.idle();
+    rig
+}
+
+/// The pill's half for `kind`: its caption.
+fn pill_half(rig: &Rig<View>, kind: &str) -> egui::Rect {
+    let found: Vec<egui::Rect> = rig.texts(kind).into_iter().filter(|r| r.top() > prompt_box(rig).top()).collect();
+    assert_eq!(found.len(), 1, "{kind:?} in the pill");
+    found[0]
+}
+
+fn open_list(rig: &mut Rig<View>, kind: &str) {
+    let at = pill_half(rig, kind).center();
+    rig.click(at);
+    rig.idle();
+}
+
+/// The ⓘ buttons' centres, top to bottom.
+fn infos(rig: &Rig<View>) -> Vec<egui::Pos2> {
+    fn find(shape: &egui::Shape, found: &mut Vec<egui::Pos2>) {
+        match shape {
+            egui::Shape::Circle(c) if c.radius == 14.0 && c.fill.a() >= 150 && c.fill.r() == 0 => found.push(c.center),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, found)),
+            _ => {}
+        }
+    }
+    let mut found = vec![];
+    rig.shapes.iter().for_each(|c| find(&c.shape, &mut found));
+    found.sort_by(|a, b| a.y.total_cmp(&b.y));
+    found
+}
+
+/// Between the "+" and send: LoRAs | Embeddings, each saying how many are on.
+#[test]
+fn the_text_box_has_a_loras_and_embeddings_pill() {
+    let mut rig = with_loras("pill", &[("a.safetensors", LoraBase::Flux, (0, 0))]);
+    let (loras, embeddings) = (pill_half(&rig, "LoRAs"), pill_half(&rig, "Embeddings"));
+    assert!(plus_at(&rig).x < loras.left() && loras.right() < embeddings.left() && embeddings.right() < send_at(&rig).x);
+    assert!((loras.center().y - plus_at(&rig).y).abs() < 14.0, "on the buttons' row");
+    assert_eq!(rig.texts("None").len(), 2);
+    rig.state.state.loras[0].selected = true;
+    rig.idle();
+    text(&rig, "1 on");
+    assert_eq!(rig.texts("None").len(), 1);
+    // Each opens its own list, and a second click shuts it.
+    open_list(&mut rig, "LoRAs");
+    assert_eq!(rig.state.state.extras_open, Some(Extra::Loras));
+    open_list(&mut rig, "Embeddings");
+    assert_eq!(rig.state.state.extras_open, Some(Extra::Embeddings));
+    open_list(&mut rig, "Embeddings");
+    assert_eq!(rig.state.state.extras_open, None);
+}
+
+/// The LoRAs are tiles like the models', each its picture's own shape (kept
+/// between half and one and a quarter its width), its name in blue at its
+/// foot, its family top left and its ⓘ top right.
+#[test]
+fn the_loras_are_tiles_their_pictures_shape() {
+    let mut rig = with_loras(
+        "lora_tiles",
+        &[
+            ("tall.safetensors", LoraBase::Flux, (100, 400)),
+            ("wide.safetensors", LoraBase::Flux, (300, 100)),
+            ("none.safetensors", LoraBase::Unknown, (0, 0)),
+        ],
+    );
+    open_list(&mut rig, "LoRAs");
+    let width = WIDTH - 24.0;
+    let tops: Vec<f32> = infos(&rig).iter().map(|c| c.y - 8.0 - 14.0).collect();
+    assert_eq!(tops.len(), 3, "an ⓘ a tile");
+    let names: Vec<egui::Rect> = ["tall", "wide", "none"].iter().map(|n| on_tile(&rig, n)).collect();
+    // Tall: cut to 1.25 its width; wide: half; no picture: the models' shape.
+    for (i, aspect) in [1.25, 0.5, 0.56].into_iter().enumerate() {
+        let height = (width * aspect).round();
+        let next_top = tops.get(i + 1).copied().unwrap_or(f32::INFINITY);
+        // (A name's ink ends a little over its line's foot.)
+        assert!((names[i].bottom() + 12.0 - (tops[i] + height)).abs() < 5.0, "tile {i}: {names:?} {tops:?}");
+        assert!(tops[i] + height + 12.0 <= next_top + 0.5, "the gap after tile {i}");
+    }
+    for info in infos(&rig) {
+        assert!((info.x - (LEFT + WIDTH - 12.0 - 8.0 - 14.0)).abs() < 2.0, "top right");
+    }
+    // What it's made for, where it's known, top left. (Not the Family bar's.)
+    let badges: Vec<egui::Rect> = rig.texts("Flux").into_iter().filter(|b| b.left() > LEFT + 24.0).collect();
+    assert_eq!(badges.len(), 2, "{badges:?}");
+    for (badge, top) in badges.iter().zip(&tops) {
+        assert!(badge.left() < LEFT + 12.0 + 20.0 && (badge.top() - top) < 20.0, "{badge:?} on the tile at {top}");
+    }
+}
+
+/// A click turns a LoRA on: ringed, its weight along its foot and its name
+/// just over that. A click on the weight is the weight's.
+#[test]
+fn a_click_turns_a_lora_on_with_its_weight_at_its_foot() {
+    let mut rig = with_loras("lora_on", &[("grain.safetensors", LoraBase::Flux, (200, 200))]);
+    open_list(&mut rig, "LoRAs");
+    let off = on_tile(&rig, "grain");
+    assert!(!ringed(&rig, off));
+    assert!(!shown(&rig, "1.00"));
+    rig.click(off.center() - egui::vec2(0.0, 80.0));
+    rig.idle();
+    assert!(rig.state.state.loras[0].selected);
+    let name = on_tile(&rig, "grain");
+    let weight = text(&rig, "1.00");
+    assert!(ringed(&rig, name));
+    assert!(weight.top() > name.bottom() && weight.left() < name.right(), "{weight:?} under {name:?}");
+    assert!(name.bottom() < off.bottom() - 20.0, "the name went up over it");
+    text(&rig, "1 on");
+    // (The weight's own click, not the tile's.)
+    rig.click(weight.center());
+    rig.idle();
+    assert!(rig.state.state.loras[0].selected);
+    rig.click(name.center() - egui::vec2(0.0, 80.0));
+    rig.idle();
+    assert!(!rig.state.state.loras[0].selected);
+}
+
+/// ⓘ fills the list with the LoRA's details; back goes back to the tiles —
+/// the list stays open — and a click outside it closes it.
+#[test]
+fn info_fills_the_list_with_its_details() {
+    let mut rig = with_loras(
+        "lora_info",
+        &[("grain.safetensors", LoraBase::Flux, (200, 300)), ("neon.safetensors", LoraBase::Flux, (0, 0))],
+    );
+    rig.state.state.loras[0].info = Some(LoraInfo {
+        triggers: vec!["film grain".into(), "35mm".into()],
+        facts: vec![("Steps".into(), "2400".into())],
+    });
+    open_list(&mut rig, "LoRAs");
+    let info = infos(&rig)[0];
+    rig.click(info);
+    rig.idle();
+    assert_eq!(rig.state.state.extras_info.as_deref(), Some("grain.safetensors"));
+    for words in ["Use this LoRA", "Trigger words", "film grain, 35mm", "Steps:", "2400", "Made for:", "File:"] {
+        text(&rig, words);
+    }
+    assert!(!shown(&rig, "neon"), "the details fill the list");
+    assert!(!shown(&rig, "Weight"), "off, no weight");
+    // On, from here: its weight shows.
+    let use_it = text(&rig, "Use this LoRA");
+    rig.click(egui::pos2(LEFT + WIDTH - 12.0 - 20.0, use_it.center().y));
+    rig.idle();
+    assert!(rig.state.state.loras[0].selected);
+    text(&rig, "Weight");
+    // Back: the tiles again, and the list's still open.
+    let title = text(&rig, "grain");
+    rig.click(egui::pos2(title.left() - 6.0 - 18.0, title.center().y));
+    rig.idle();
+    assert_eq!(rig.state.state.extras_info, None);
+    assert_eq!(rig.state.state.extras_open, Some(Extra::Loras));
+    on_tile(&rig, "neon");
+    // Outside: the header.
+    rig.click(egui::pos2(LEFT + 120.0, TOP + 20.0));
+    rig.idle();
+    assert_eq!(rig.state.state.extras_open, None);
+}
+
+/// Favorites (right-click, or the details' heart) come first, under their
+/// own caption; they're kept for next time.
+#[test]
+fn favorite_loras_come_first() {
+    let mut rig = with_loras(
+        "lora_faves",
+        &[("a.safetensors", LoraBase::Flux, (0, 0)), ("b.safetensors", LoraBase::Flux, (0, 0))],
+    );
+    open_list(&mut rig, "LoRAs");
+    assert!(!shown(&rig, "Favorites"));
+    assert!(on_tile(&rig, "a").top() < on_tile(&rig, "b").top());
+    let b = on_tile(&rig, "b").center() - egui::vec2(0.0, 60.0);
+    right_click(&mut rig, b);
+    click_text(&mut rig, "Favorite");
+    let (faves, all) = (text(&rig, "Favorites"), text(&rig, "All LoRAs"));
+    assert!(faves.top() < on_tile(&rig, "b").top() && on_tile(&rig, "b").top() < all.top());
+    assert!(all.top() < on_tile(&rig, "a").top());
+    let kept = std::fs::read_to_string(models::THUMBS_DIR_FOR_TEST.with_borrow(|d| d.clone()).unwrap().join("favorites.txt"));
+    assert_eq!(kept.unwrap().trim(), "lora:b.safetensors");
+    // From its details: no longer.
+    let info = infos(&rig)[0];
+    rig.click(info);
+    rig.idle();
+    let title = text(&rig, "b");
+    rig.click(egui::pos2(LEFT + WIDTH - 12.0 - 18.0, title.center().y));
+    rig.idle();
+    assert!(!models::is_fave(&rig.state.state, "lora:b.safetensors"));
+    let title = text(&rig, "b");
+    rig.click(egui::pos2(title.left() - 6.0 - 18.0, title.center().y));
+    rig.idle();
+    assert!(!shown(&rig, "Favorites"));
+}
+
+/// Another family's LoRAs wait behind the switch at the list's foot.
+#[test]
+fn other_families_loras_are_behind_the_switch() {
+    let mut rig = with_loras(
+        "lora_others",
+        &[("ours.safetensors", LoraBase::Flux, (0, 0)), ("xl.safetensors", LoraBase::Sdxl, (0, 0))],
+    );
+    open_list(&mut rig, "LoRAs");
+    on_tile(&rig, "ours");
+    assert!(!shown(&rig, "xl"));
+    let switch = text(&rig, "Show other-family LoRAs (1)");
+    rig.click(egui::pos2(LEFT + WIDTH - 12.0 - 20.0, switch.center().y));
+    rig.idle();
+    assert!(rig.state.state.show_other_loras);
+    assert!(text(&rig, "For other models").top() < on_tile(&rig, "xl").top());
+    text(&rig, "SDXL");
+}
+
+/// An embedding goes in the prompt it's put in: on, its chips say which.
+#[test]
+fn an_embedding_goes_in_the_prompt_chosen() {
+    let mut rig = with_loras("embeddings", &[]);
+    rig.state.state.embeddings = vec![embedding(&rig, "film_look.safetensors", LoraBase::Unknown, (0, 0))];
+    open_list(&mut rig, "Embeddings");
+    let name = on_tile(&rig, "film_look");
+    assert!(!shown(&rig, "Negative"));
+    rig.click(name.center() - egui::vec2(0.0, 60.0));
+    rig.idle();
+    assert!(rig.state.state.embeddings[0].selected);
+    let (positive, negative) = (text(&rig, "Positive"), text(&rig, "Negative"));
+    assert!(positive.left() > on_tile(&rig, "film_look").right() && positive.right() < negative.left());
+    rig.click(negative.center());
+    rig.idle();
+    assert!(rig.state.state.embeddings[0].negative && rig.state.state.embeddings[0].selected);
+    // Its details say how to use it by name.
+    let info = infos(&rig)[0];
+    rig.click(info);
+    rig.idle();
+    text(&rig, "Use it by name");
+    text(&rig, "embedding:film_look");
+    text(&rig, "Goes in");
+}
+
+/// With nothing installed, the list says where the files go.
+#[test]
+fn an_empty_list_says_where_the_files_go() {
+    let mut rig = with_loras("empty", &[]);
+    open_list(&mut rig, "LoRAs");
+    text(&rig, "No LoRAs yet: put .safetensors files in models/loras.");
+    rig.state.state.loras = vec![lora(&rig, "xl.safetensors", LoraBase::Sdxl, (0, 0))];
+    rig.idle();
+    text(&rig, "No Flux LoRAs here.");
+    text(&rig, "Show other-family LoRAs (1)");
+}
+
+/// A favorite model comes first, under "Favorites", the rest under
+/// "Built-in"; another tab sees it (they're read when a list opens).
+#[test]
+fn a_favorite_model_comes_first() {
+    thumbs_in("model_faves");
+    let mut rig = view(GenFamily::Flux, 1100.0, true);
+    click_text(&mut rig, "Model");
+    let q8 = on_tile(&rig, "dev · GGUF Q8").center() - egui::vec2(0.0, 60.0);
+    right_click(&mut rig, q8);
+    click_text(&mut rig, "Favorite");
+    let faves = text(&rig, "Favorites");
+    let built_in = text(&rig, "Built-in");
+    assert!(faves.top() < on_tile(&rig, "dev · GGUF Q8").top());
+    assert!(on_tile(&rig, "dev · GGUF Q8").top() < built_in.top() && built_in.top() < on_tile(&rig, "schnell · GGUF Q4").top());
+    let mut other = GenerateState::new(GenFamily::Flux);
+    models::load_faves(&mut other);
+    assert!(models::is_fave(&other, "model:builtin-DevQ8"));
+    // Opened again, the favorites are in sight (the chosen model is too).
+    rig.key(egui::Key::Escape);
+    rig.idle();
+    click_text(&mut rig, "Model");
+    text(&rig, "Favorites");
+    on_tile(&rig, "schnell · GGUF Q4");
+    // Taken back: the list as it was.
+    let q8 = on_tile(&rig, "dev · GGUF Q8").center() - egui::vec2(0.0, 60.0);
+    right_click(&mut rig, q8);
+    click_text(&mut rig, "Remove Favorite");
+    assert!(!shown(&rig, "Favorites") && !shown(&rig, "Built-in"));
 }

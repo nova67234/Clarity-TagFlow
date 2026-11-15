@@ -39,9 +39,11 @@ const LOG_ROW_H: f32 = 24.0;
 const CONSOLE_GAP: f32 = 8.0;
 const CONSOLE_H: f32 = 140.0;
 /// The prompt box is never shorter: three lines over its buttons.
-const PROMPT_MIN_H: f32 = 132.0;
+const PROMPT_MIN_H: f32 = 148.0;
 /// The prompt box's row of buttons.
-const FOOTER_H: f32 = 28.0;
+const FOOTER_H: f32 = extras::PILL_H;
+/// What an import says, over the row of buttons.
+const NOTE_H: f32 = 16.0;
 
 /// What a bar holds sits this far in from its edge: 40 tall.
 const INSET: f32 = 6.0;
@@ -330,8 +332,6 @@ fn wide_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response 
 /// The family picker's width in the model bar, and its list's.
 const FAMILY_W: f32 = 124.0;
 const FAMILY_LIST_W: f32 = 172.0;
-/// The model list's width (as the list was in the prompt box).
-const MODEL_LIST_W: f32 = 260.0;
 
 /// The model bar: one sunk pill holding the family and, in the rest of it,
 /// the model. Their lists hang from the bar, each at its own end.
@@ -355,7 +355,8 @@ fn model_bar(ui: &mut egui::Ui, state: &mut GenerateState) {
     };
 
     let id = egui::Id::new(("t2i_family", state.family.title()));
-    let resp = picker(ui, family, id, "Family", state.family.title(), None);
+    let open = egui::Popup::is_id_open(ui.ctx(), id);
+    let resp = picker(ui, family, id, "Family", state.family.title(), None, open);
     egui::Popup::menu(&from_bar(resp))
         .id(id)
         .align(egui::RectAlign::BOTTOM_START)
@@ -378,16 +379,28 @@ fn model_bar(ui: &mut egui::Ui, state: &mut GenerateState) {
         });
 
     let id = egui::Id::new(("t2i_model", state.family.title()));
+    let (name, note) = model_text(state);
+    let resp = picker(ui, model, id, "Model", &name, note.as_deref(), state.model_list_open);
+    if resp.clicked() {
+        state.model_list_open = !state.model_list_open;
+    }
     // The installed checkpoints are looked for once each time the list
     // opens, so a new download is there without a restart.
-    let open = egui::Popup::is_id_open(ui.ctx(), id);
-    if state.family.uses_checkpoint_picker() && open && !state.ckpt_menu_was_open {
-        refresh_checkpoints(state);
+    // (Civitai's previews are looked up while it's open.)
+    let open = state.model_list_open;
+    let opening = open && !state.ckpt_menu_was_open;
+    if opening {
+        if state.family.uses_checkpoint_picker() {
+            refresh_checkpoints(state);
+        }
+        models::opened(state, ui.ctx());
+    } else if !open && state.ckpt_menu_was_open {
+        models::closed();
     }
     state.ckpt_menu_was_open = open;
-    let (name, note) = model_text(state);
-    let resp = picker(ui, model, id, "Model", &name, note.as_deref());
-    crate::settings::dropdown_list(&from_bar(resp), id, MODEL_LIST_W, |ui| model_list(ui, state, true));
+    if open {
+        models::list(&from_bar(resp), id, state, opening);
+    }
 }
 
 /// The chosen model as the bar shows it: its name and, for a built-in one,
@@ -428,11 +441,11 @@ fn picker(
     caption: &str,
     value: &str,
     note: Option<&str>,
+    open: bool,
 ) -> egui::Response {
     let mut resp =
         ui.interact(rect, id.with("picker"), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, format!("{caption}: {value}")));
-    let open = egui::Popup::is_id_open(ui.ctx(), id);
     let turn = ui.ctx().animate_bool(id.with("chevron"), open);
     if ui.is_rect_visible(rect) {
         let hot = resp.hovered() || resp.has_focus() || open;
@@ -478,24 +491,33 @@ fn picker(
 
 /// The prompt box, `height` tall: the prompt (long text scrolls inside)
 /// over its row of buttons — the "+" menu in the bottom-left corner, send
-/// (stop, while a job runs) in the bottom-right one, and between them what
-/// an import says. A file dropped on the box is imported.
+/// (stop, while a job runs) in the bottom-right one, and between them the
+/// LoRAs | Embeddings pill; what an import says sits over the row. A file
+/// dropped on the box is imported.
 fn prompt_box(ui: &mut egui::Ui, state: &mut GenerateState, height: f32) {
     const RADIUS: f32 = 22.0;
     let drag_over = dragging_over_prompt(ui, state);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
     ui.painter().rect(rect, RADIUS, well(), egui::Stroke::new(1.0_f32, hairline()), egui::StrokeKind::Inside);
 
-    // The buttons' row first: the text has what's over it.
+    // The buttons' row first: the text has what's over it (and what an
+    // import says, over the row, when it says something).
     let footer = egui::Rect::from_min_max(
         egui::pos2(rect.left() + 12.0, rect.bottom() - 12.0 - FOOTER_H),
         egui::pos2(rect.right() - 12.0, rect.bottom() - 12.0),
     );
+    let note = import_note(state, drag_over);
+    let note_rect = note.as_ref().map(|_| {
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 18.0, footer.top() - 6.0 - NOTE_H),
+            egui::pos2(rect.right() - 18.0, footer.top() - 6.0),
+        )
+    });
     // (The text runs to the box's edge less the scroll bar's room, so the
     // bar rides the edge rather than the words.)
     let text = egui::Rect::from_min_max(
         egui::pos2(rect.left() + 18.0, rect.top() + 14.0),
-        egui::pos2(rect.right() - 8.0, footer.top() - 8.0),
+        egui::pos2(rect.right() - 8.0, note_rect.map_or(footer.top() - 8.0, |r| r.top() - 4.0)),
     );
     let mut text_ui = ui.new_child(egui::UiBuilder::new().max_rect(text).layout(Layout::top_down(Align::Min)));
     egui::ScrollArea::vertical()
@@ -528,24 +550,24 @@ fn prompt_box(ui: &mut egui::Ui, state: &mut GenerateState, height: f32) {
             crate::spellcheck::attach(ui, &out, &mut state.prompt, &mut state.spell);
         });
 
-    let mut row = at(ui, footer);
-    row.spacing_mut().item_spacing.x = 8.0;
-    add_menu(&mut row, state);
-    row.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        if send_or_stop(ui, state, None) == SendClick::NotSetUp {
-            // Its hover says to run Setup Requirements first: a click shows
-            // where that is.
-            state.show_setup = true;
+    // The "+" and send in the corners, the LoRAs | Embeddings pill between.
+    let button = egui::vec2(28.0, 28.0);
+    let plus = egui::Rect::from_center_size(egui::pos2(footer.left() + 14.0, footer.center().y), button);
+    let send = egui::Rect::from_center_size(egui::pos2(footer.right() - 14.0, footer.center().y), button);
+    add_menu(&mut at(ui, plus), state, false);
+    if send_or_stop(&mut at(ui, send), state, None) == SendClick::NotSetUp {
+        // Its hover says to run Setup Requirements first: a click shows
+        // where that is.
+        state.show_setup = true;
+    }
+    let pill = egui::Rect::from_min_max(egui::pos2(plus.right() + 10.0, footer.top()), egui::pos2(send.left() - 10.0, footer.bottom()));
+    extras::pill(ui, pill, rect, state);
+    if let (Some((note, color, why)), Some(note_rect)) = (note, note_rect) {
+        let label = at(ui, note_rect).add(egui::Label::new(RichText::new(note).font(medium(11.5)).color(color)).truncate());
+        if let Some(why) = why {
+            label.on_hover_text(why);
         }
-        if let Some((note, color, why)) = import_note(state, drag_over) {
-            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                let label = ui.add(egui::Label::new(RichText::new(note).font(medium(11.5)).color(color)).truncate());
-                if let Some(why) = why {
-                    label.on_hover_text(why);
-                }
-            });
-        }
-    });
+    }
 
     prompt_drop(ui, state, rect, drag_over);
 }
@@ -931,6 +953,9 @@ fn console(ui: &mut egui::Ui, state: &GenerateState) {
             }
         });
 }
+
+pub(super) mod extras;
+pub(super) mod models;
 
 #[cfg(test)]
 mod tests;
