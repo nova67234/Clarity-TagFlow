@@ -988,6 +988,9 @@ pub struct ChatMsg {
     pub tag_change: Option<crate::ai_tagging::TagChange>,
     /// Role play: goals this reply set, achieved or failed (its note).
     pub goals: Vec<crate::roleplay::GoalEvent>,
+    /// Role play: what this reply changed about the character — traits
+    /// gained or dropped, parts of its persona rewritten (its note).
+    pub growth: Vec<crate::roleplay::GrowthEvent>,
     /// Role play with thoughts in character: the character whose reply this
     /// is — its thoughts are shown as that character's ("Mira's thoughts").
     pub character: Option<String>,
@@ -1801,6 +1804,22 @@ impl LlmState {
                                         }
                                     }
                                 }
+                                // The same for how it has grown: traits
+                                // gained or dropped, its persona brought up
+                                // to date.
+                                if self.roleplay.own_growth && !d.growth.is_empty() && !self.roleplay.load_failed {
+                                    let events = self.roleplay.apply_growth(&d.growth, crate::memory::now());
+                                    if !events.is_empty() {
+                                        self.roleplay.save();
+                                        if let Some(m) = self
+                                            .gen_chat
+                                            .and_then(|id| self.chats.iter_mut().find(|c| c.id == id))
+                                            .and_then(|c| c.msgs.last_mut())
+                                        {
+                                            m.growth = events;
+                                        }
+                                    }
+                                }
                             }
                         }
                         // Tag images: a finished reply may end in tag edits —
@@ -2031,6 +2050,7 @@ impl LlmState {
             tag_image,
             tag_change: None,
             goals: Vec::new(),
+            growth: Vec::new(),
             character: None,
             remember,
             picture_memory,
@@ -2471,6 +2491,7 @@ impl LlmState {
                         tag_image: None,
                         tag_change: None,
                         goals: Vec::new(),
+                        growth: Vec::new(),
                         character,
                         // A reply written from web pages or with PDFs in
                         // view stays out of the memory and the album: a page
@@ -4546,6 +4567,7 @@ mod roleplay_goal_tests {
             tag_image: None,
             tag_change: None,
             goals: Vec::new(),
+            growth: Vec::new(),
             character: None,
             remember: false,
             picture_memory: false,
@@ -4607,6 +4629,61 @@ mod roleplay_goal_tests {
         assert_eq!(back.goals, llm.roleplay.goals);
         assert_eq!(back.goals[0].outcome, "We climbed it at sunset.");
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// A finished reply's growth lines change the character — a trait
+    /// gained, one dropped, a part of its persona taken out: hidden from the
+    /// text, noted under it, kept on disk, the persona as it was kept for
+    /// undoing. With own growth off, or in a reply that acts on nothing, the
+    /// lines are only hidden.
+    #[test]
+    fn a_role_play_reply_changes_the_character() {
+        use crate::roleplay::{GrowthEvent, GrowthKind, Trait};
+        let file = crate::roleplay::test_store_path();
+        let _ = std::fs::remove_file(&file);
+        const PERSONA: &str = "Mira is a shy sailor. She has never left the harbour.";
+        let said = "I did it, Andrew!\nTRAIT: braver than she knew\nTRAIT_GONE: [T1]\nPERSONA_GONE: [P2]";
+        let reply = |grows: bool, inert: bool| {
+            let (mut llm, tx) = role_play(Vec::new());
+            llm.roleplay.persona = PERSONA.into();
+            llm.roleplay.traits = vec![Trait { text: "shy".into(), by_ai: false, added: 1 }];
+            llm.roleplay.own_growth = grows;
+            llm.gen_docs = inert;
+            tx.send(Msg::Token(said.into())).unwrap();
+            tx.send(Msg::Done(Ok(()))).unwrap();
+            llm.poll(&egui::Context::default());
+            llm
+        };
+
+        let llm = reply(true, false);
+        let m = llm.chats[llm.active_chat].msgs.last().unwrap();
+        assert_eq!(m.text, "I did it, Andrew!");
+        assert_eq!(
+            m.growth,
+            vec![
+                GrowthEvent { kind: GrowthKind::TraitDropped, text: "shy".into() },
+                GrowthEvent { kind: GrowthKind::TraitGained, text: "braver than she knew".into() },
+                GrowthEvent { kind: GrowthKind::PersonaRemoved, text: "She has never left the harbour.".into() },
+            ]
+        );
+        assert_eq!(llm.roleplay.persona, "Mira is a shy sailor.");
+        let back = RoleplayState::load();
+        assert_eq!(back.persona, "Mira is a shy sailor.");
+        assert_eq!(back.traits.len(), 1);
+        assert!(back.traits[0].text == "braver than she knew" && back.traits[0].by_ai);
+        assert_eq!(back.persona_history.len(), 1);
+        assert_eq!(back.persona_history[0].text, PERSONA);
+        let _ = std::fs::remove_file(&file);
+
+        for (grows, inert) in [(false, false), (true, true)] {
+            let llm = reply(grows, inert);
+            let m = llm.chats[llm.active_chat].msgs.last().unwrap();
+            assert_eq!(m.text, "I did it, Andrew!", "the lines are hidden all the same");
+            assert!(m.growth.is_empty());
+            assert_eq!(llm.roleplay.persona, PERSONA);
+            assert!(llm.roleplay.traits.len() == 1 && llm.roleplay.traits[0].text == "shy");
+            assert!(llm.roleplay.persona_history.is_empty() && !file.exists(), "nothing was saved");
+        }
     }
 
     /// Written with PDFs in view, a role-play reply acts on nothing — and
@@ -4746,6 +4823,7 @@ mod web_research_tests {
             tag_image: None,
             tag_change: None,
             goals: Vec::new(),
+            growth: Vec::new(),
             character: None,
             remember: role == ChatRole::User,
             picture_memory: false,
@@ -5014,6 +5092,7 @@ mod reply_end_tests {
             tag_image: None,
             tag_change: None,
             goals: Vec::new(),
+            growth: Vec::new(),
             character: None,
             remember: false,
             picture_memory: false,
@@ -6633,6 +6712,7 @@ mod pdf_tests {
             tag_image: None,
             tag_change: None,
             goals: Vec::new(),
+            growth: Vec::new(),
             character: None,
             remember: true,
             picture_memory: false,

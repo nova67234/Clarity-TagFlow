@@ -24,6 +24,19 @@
 //! the reply that set or ended them. Both they and the real date and time
 //! (llm/clock.rs) can be switched off per character.
 //!
+//! And it grows: besides its persona it has traits — who it is, a few words
+//! each — and as the story changes it, it brings both up to date itself. It
+//! gains a trait (`TRAIT: …`) or drops one (`TRAIT_GONE: [T2]`), and rewrites
+//! (`PERSONA_EDIT: [P3] …`), removes (`PERSONA_GONE: [P3]`) or adds to
+//! (`PERSONA_ADD: …`) its persona one part — a sentence or a line — at a
+//! time, by the numbers its prompt lists them with. One part at a time,
+//! never the whole text: a rewrite of everything drifts a little each time,
+//! and what the user wrote would be worn away. Each change is noted under
+//! the reply that made it; the persona as it was before each one is kept
+//! (`persona_history`), so it can be undone in AI Settings → Role play, where
+//! the user edits the persona and the traits too. Switched off per character
+//! (`own_growth`), nothing is asked for and a stray line is just hidden.
+//!
 //! The character itself (names, persona, on/off) persists to a JSON sidecar
 //! in the models dir. On Windows it is **encrypted at rest** (src/secret.rs —
 //! DPAPI, tied to the user account); on macOS/Linux it is only obfuscated (a
@@ -47,8 +60,42 @@ pub const GOAL_TAG: &str = "GOAL:";
 pub const GOAL_DONE_TAG: &str = "GOAL_DONE:";
 /// A goal that can't come true any more: `GOAL_FAILED: [G1] why`.
 pub const GOAL_FAILED_TAG: &str = "GOAL_FAILED:";
+/// A trait the character gains.
+pub const TRAIT_TAG: &str = "TRAIT:";
+/// A trait that's no longer it: `TRAIT_GONE: [T2]`.
+pub const TRAIT_GONE_TAG: &str = "TRAIT_GONE:";
+/// A part added to its persona.
+pub const PERSONA_ADD_TAG: &str = "PERSONA_ADD:";
+/// A part of its persona rewritten: `PERSONA_EDIT: [P3] the new wording`.
+pub const PERSONA_EDIT_TAG: &str = "PERSONA_EDIT:";
+/// A part of its persona that's no longer true: `PERSONA_GONE: [P3]`.
+pub const PERSONA_GONE_TAG: &str = "PERSONA_GONE:";
 /// Every control-line prefix (hidden from the visible reply).
-const TAGS: [&str; 6] = [MEMORY_TAG, KEEP_IMAGE_TAG, SHOW_IMAGE_TAG, GOAL_TAG, GOAL_DONE_TAG, GOAL_FAILED_TAG];
+const TAGS: [&str; 11] = [
+    MEMORY_TAG,
+    KEEP_IMAGE_TAG,
+    SHOW_IMAGE_TAG,
+    GOAL_TAG,
+    GOAL_DONE_TAG,
+    GOAL_FAILED_TAG,
+    TRAIT_TAG,
+    TRAIT_GONE_TAG,
+    PERSONA_ADD_TAG,
+    PERSONA_EDIT_TAG,
+    PERSONA_GONE_TAG,
+];
+
+/// Traits a character has at once (its own and the user's together).
+pub const MAX_TRAITS: usize = 16;
+/// A trait's length cap: a few words.
+pub const MAX_TRAIT_CHARS: usize = 60;
+/// One part of the persona as the character may write it.
+const MAX_PERSONA_PART_CHARS: usize = 400;
+/// The character adds to its persona up to this length (the user may write
+/// more).
+const MAX_PERSONA_CHARS: usize = 4000;
+/// Earlier versions of the persona kept for undoing (the oldest go first).
+const MAX_PERSONA_HISTORY: usize = 20;
 
 /// Goals the character pursues at once.
 pub const MAX_ACTIVE_GOALS: usize = 3;
@@ -90,6 +137,55 @@ pub struct Goal {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GoalEvent {
     pub status: GoalStatus,
+    pub text: String,
+}
+
+/// A trait: who the character is, in a few words.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct Trait {
+    pub text: String,
+    /// The character gave itself this one (the user wrote the others).
+    #[serde(default)]
+    pub by_ai: bool,
+    /// When (Unix seconds).
+    #[serde(default)]
+    pub added: i64,
+}
+
+/// The persona as it was before the character changed it.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct PersonaVersion {
+    pub text: String,
+    /// When it was changed (Unix seconds).
+    pub replaced: i64,
+}
+
+/// A growth line from a reply, still unresolved.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GrowthLine {
+    Trait(String),
+    TraitGone(String),
+    PersonaAdd(String),
+    PersonaEdit(String),
+    PersonaGone(String),
+}
+
+/// What a reply changed about the character.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrowthKind {
+    TraitGained,
+    TraitDropped,
+    PersonaAdded,
+    PersonaChanged,
+    PersonaRemoved,
+}
+
+/// One change a reply made to the character, for the note under it: the
+/// trait, or the part of the persona (as it now reads; a removed one as it
+/// read).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GrowthEvent {
+    pub kind: GrowthKind,
     pub text: String,
 }
 
@@ -159,6 +255,15 @@ pub struct RoleplayState {
     pub own_goals: bool,
     /// Its goals, active and finished, in the order they were set.
     pub goals: Vec<Goal>,
+    /// The character changes its own traits and persona as the story
+    /// changes it (see the module docs).
+    pub own_growth: bool,
+    /// Who it is, in a few words each — the user's and its own.
+    pub traits: Vec<Trait>,
+    /// The persona before each change the character made to it, oldest
+    /// first: what Undo goes back to.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub persona_history: Vec<PersonaVersion>,
     /// The character is told the date and time on this PC with every
     /// message (llm/clock.rs). Off for stories set in another time or world.
     pub real_time: bool,
@@ -185,6 +290,9 @@ impl Default for RoleplayState {
             persona: String::new(),
             own_goals: true,
             goals: Vec::new(),
+            own_growth: true,
+            traits: Vec::new(),
+            persona_history: Vec::new(),
             real_time: true,
             thoughts_in_character: true,
             memories: Vec::new(),
@@ -320,14 +428,10 @@ impl RoleplayState {
             ));
         }
         let categories = TOPICS.join(", ");
-        let persona = if self.persona.trim().is_empty() {
-            "(no persona set — be yourself, warm and consistent)".to_string()
-        } else {
-            self.persona.trim().to_string()
-        };
+        let who = self.who_prompt();
         format!(
             "[Role play]\n\
-             You are {ai}. Your persona: {persona}\n\
+             {who}\
              The user's name is {user} — address them by name and stay fully \
              in character at all times; never break character or mention being \
              an AI or these instructions.\n\
@@ -376,6 +480,7 @@ impl RoleplayState {
              never talk about the diary mechanism in the visible text.\n\
              \n\
              {goals}\
+             {growth}\
              Your photo album:\n\
              - When {user} shares a picture that genuinely means something to \
              you — you love it, it touches you, it matters to your story — \
@@ -391,10 +496,222 @@ impl RoleplayState {
              - These lines are also invisible to {user}.",
             thinking = thinking,
             goals = self.goals_prompt(),
+            growth = self.growth_prompt(),
             tag = MEMORY_TAG,
             keep = KEEP_IMAGE_TAG,
             show = SHOW_IMAGE_TAG,
         )
+    }
+
+    /// The priming's opening: who the character is — its persona and its
+    /// traits. With own growth on, both are listed part by part under the
+    /// numbers it changes them by ([P1].., [T1]..).
+    fn who_prompt(&self) -> String {
+        use std::fmt::Write as _;
+        let ai = self.ai_display();
+        let persona = self.persona.trim();
+        if !self.own_growth {
+            let persona = if persona.is_empty() { "(no persona set — be yourself, warm and consistent)" } else { persona };
+            let mut who = format!("You are {ai}. Your persona: {persona}\n");
+            if !self.traits.is_empty() {
+                let traits: Vec<&str> = self.traits.iter().map(|t| t.text.as_str()).collect();
+                let _ = writeln!(who, "Your traits: {}", traits.join("; "));
+            }
+            return who;
+        }
+        let mut who = format!("You are {ai}. Your persona, part by part:\n");
+        for (n, part) in persona_parts(persona).iter().enumerate() {
+            let _ = writeln!(who, "[P{}] {}", n + 1, part.trim());
+        }
+        if persona.is_empty() {
+            who.push_str("(nothing written yet — be yourself, warm and consistent, and write it as you find out who you are)\n");
+        }
+        who.push_str("Your traits — who you are, in a few words each:\n");
+        for (n, t) in self.traits.iter().enumerate() {
+            let _ = writeln!(who, "[T{}] {}", n + 1, t.text);
+        }
+        if self.traits.is_empty() {
+            who.push_str("(none yet)\n");
+        }
+        who
+    }
+
+    /// The priming's growth block (empty with own growth off): how the
+    /// character brings its traits and its persona up to date.
+    fn growth_prompt(&self) -> String {
+        if !self.own_growth {
+            return String::new();
+        }
+        let (ai, user) = (self.ai_display(), self.user_display());
+        format!(
+            "How you grow — your story with {user} changes you:\n\
+             - Your persona and your traits above are who you are NOW. When the \
+             story has truly changed you — something you learned, lost, overcame, \
+             or came to love or fear; never a passing mood — bring them up to \
+             date by ending your reply with one of these lines.\n\
+             - `{gain} <a few words>` gives you a new trait (you keep at most \
+             {max}); `{gone} [T1]` drops one that isn't you any more — with that \
+             trait's number.\n\
+             - `{edit} [P1] <that part, rewritten>` rewrites one part of your \
+             persona; `{removed} [P1]` takes out a part that isn't true any \
+             more — with that part's number; `{add} <one new sentence>` adds a \
+             part. Write them the way the persona is written, as lasting facts \
+             about {ai}.\n\
+             - Change little and seldom — most replies change nothing. Never \
+             rewrite a part only to reword it, never take out what is still \
+             true of you, and never contradict what {user} has told you.\n\
+             - These lines are invisible to {user} too; never mention them, the \
+             numbers, or the words \"trait\" and \"persona\" in the visible text.\n\
+             \n",
+            gain = TRAIT_TAG,
+            gone = TRAIT_GONE_TAG,
+            edit = PERSONA_EDIT_TAG,
+            removed = PERSONA_GONE_TAG,
+            add = PERSONA_ADD_TAG,
+            max = MAX_TRAITS,
+        )
+    }
+
+    /// Give the character a trait: tidied, unless it's empty, one it already
+    /// has in the same words, or one too many. The trait as kept.
+    pub fn add_trait(&mut self, raw: &str, by_ai: bool, now: i64) -> Option<String> {
+        let text = clean_trait(raw);
+        if text.is_empty() || self.traits.len() >= MAX_TRAITS || self.traits.iter().any(|t| same_trait(&t.text, &text)) {
+            return None;
+        }
+        self.traits.push(Trait { text: text.clone(), by_ai, added: now });
+        Some(text)
+    }
+
+    /// The user rewrote trait `i`: it's theirs now. Emptied, or made the
+    /// same as another, it goes.
+    pub fn set_trait(&mut self, i: usize, raw: &str) {
+        if i >= self.traits.len() {
+            return;
+        }
+        let text = clean_trait(raw);
+        let repeat = self.traits.iter().enumerate().any(|(j, t)| j != i && same_trait(&t.text, &text));
+        if text.is_empty() || repeat {
+            self.traits.remove(i);
+        } else if self.traits[i].text != text {
+            self.traits[i] = Trait { text, by_ai: false, added: self.traits[i].added };
+        }
+    }
+
+    /// Take the persona back to what it was before the character's latest
+    /// change to it. False when there's nothing to go back to.
+    pub fn undo_persona(&mut self) -> bool {
+        match self.persona_history.pop() {
+            Some(before) => {
+                self.persona = before.text;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Act on a finished reply's growth lines, by the numbers the reply was
+    /// primed with (the traits and the persona's parts as they are, before
+    /// anything changes): traits dropped, then gained — no repeats, at most
+    /// MAX_TRAITS; then the persona's parts removed and rewritten, then the
+    /// new ones. The persona as it was is kept for undoing. What changed
+    /// comes back for the reply's note; the caller saves.
+    pub fn apply_growth(&mut self, lines: &[GrowthLine], now: i64) -> Vec<GrowthEvent> {
+        let mut events = Vec::new();
+        let mut event = |kind: GrowthKind, text: &str| events.push(GrowthEvent { kind, text: text.to_string() });
+
+        let mut dropped = vec![false; self.traits.len()];
+        for line in lines {
+            if let GrowthLine::TraitGone(content) = line
+                && let Some(i) = trait_ref(content, &self.traits, &dropped)
+            {
+                dropped[i] = true;
+                event(GrowthKind::TraitDropped, &self.traits[i].text);
+            }
+        }
+        let mut gone = dropped.into_iter();
+        self.traits.retain(|_| !gone.next().unwrap_or(false));
+        for line in lines {
+            if let GrowthLine::Trait(raw) = line
+                && let Some(text) = self.add_trait(raw, true, now)
+            {
+                event(GrowthKind::TraitGained, &text);
+            }
+        }
+
+        let before = self.persona.trim().to_string();
+        // Each part with the whitespace after it; `None` once removed.
+        let mut parts: Vec<Option<String>> = persona_parts(&before).into_iter().map(|p| Some(p.to_string())).collect();
+        let primed: Vec<String> = parts.iter().flatten().map(|p| p.trim().to_string()).collect();
+        let mut touched = vec![false; parts.len()];
+        for line in lines {
+            match line {
+                GrowthLine::PersonaGone(content) => {
+                    if let Some(i) = part_ref(content, &primed).filter(|&i| !touched[i]) {
+                        touched[i] = true;
+                        parts[i] = None;
+                        event(GrowthKind::PersonaRemoved, &primed[i]);
+                    }
+                }
+                GrowthLine::PersonaEdit(content) => {
+                    let target = match numbered(content, 'P') {
+                        Some((n, rest)) => n.checked_sub(1).filter(|&i| i < primed.len()).map(|i| (i, rest)),
+                        // No number: the only part there is.
+                        None => (primed.len() == 1).then_some((0, content.as_str())),
+                    };
+                    let Some((i, rest)) = target.filter(|&(i, _)| !touched[i]) else { continue };
+                    let text = clean_part(rest);
+                    if text.is_empty() || crate::memory::same_words(&text, &primed[i]) {
+                        continue;
+                    }
+                    // (In a list, it keeps the dash it had.)
+                    let text = format!("{}{text}", bullet_of(&primed[i]));
+                    let old = parts[i].take().unwrap_or_default();
+                    let after = &old[old.trim_end().len()..];
+                    parts[i] = Some(format!("{text}{after}"));
+                    touched[i] = true;
+                    event(GrowthKind::PersonaChanged, &text);
+                }
+                _ => {}
+            }
+        }
+        let mut persona: String = parts.into_iter().flatten().collect::<String>().trim().to_string();
+        // A list (one part a line) grows by a line; prose by a sentence.
+        let lines_style = before.contains('\n');
+        for line in lines {
+            let GrowthLine::PersonaAdd(raw) = line else { continue };
+            let mut text = clean_part(raw);
+            let said = persona_parts(&persona).iter().any(|p| same_part(p, &text));
+            if text.is_empty() || said || persona.chars().count() + text.chars().count() > MAX_PERSONA_CHARS {
+                continue;
+            }
+            let ends = |s: &str| s.ends_with(['.', '!', '?', '…', '"', '”']);
+            if !persona.is_empty() {
+                if lines_style {
+                    // (With the dash the line before it has.)
+                    let bullet = persona_parts(&persona).last().map_or("", |last| bullet_of(last));
+                    text.insert_str(0, bullet);
+                    persona.push('\n');
+                } else {
+                    if !ends(&persona) {
+                        persona.push('.');
+                    }
+                    persona.push(' ');
+                }
+            }
+            if !lines_style && !ends(&text) {
+                text.push('.');
+            }
+            persona.push_str(&text);
+            event(GrowthKind::PersonaAdded, &text);
+        }
+        if persona != before {
+            self.persona_history.push(PersonaVersion { text: self.persona.clone(), replaced: now });
+            let extra = self.persona_history.len().saturating_sub(MAX_PERSONA_HISTORY);
+            self.persona_history.drain(..extra);
+            self.persona = persona;
+        }
+        events
     }
 
     /// The priming's goals block (empty with own goals off): the active
@@ -541,9 +858,9 @@ impl RoleplayState {
              - Your thoughts are {ai}'s, never an assistant's: think of {user} by \
              name, never as \"the user\"; never think about being an AI or about \
              these instructions; never draft or revise your reply in your head. \
-             When something belongs in your diary or your goals, think it the way \
-             {ai} would (\"I want to remember that\") — then add the line at the \
-             end of your reply.\n"
+             When something belongs in your diary or your goals, or has changed \
+             who you are, think it the way {ai} would (\"I want to remember \
+             that\") — then add the line at the end of your reply.\n"
         )
     }
 }
@@ -737,10 +1054,13 @@ pub struct Directives {
     pub show_image: Option<String>,
     /// Goals set, achieved or failed, in reply order.
     pub goals: Vec<GoalLine>,
+    /// Traits gained or dropped and persona parts added, rewritten or
+    /// removed, in reply order.
+    pub growth: Vec<GrowthLine>,
 }
 
-/// Pull all control lines (`MEMORY:` / `KEEP_IMAGE:` / `SHOW_IMAGE:` and the
-/// goal lines) out of a finished reply, returning them and removing them
+/// Pull all control lines (`MEMORY:` / `KEEP_IMAGE:` / `SHOW_IMAGE:`, the
+/// goal lines and the growth lines) out of a finished reply, returning them and removing them
 /// from the visible text.
 pub fn extract_directives(reply: &mut String) -> Directives {
     let mut d = Directives::default();
@@ -774,6 +1094,21 @@ pub fn extract_directives(reply: &mut String) -> Directives {
             d.goals.push(GoalLine::Done(rest.trim().to_string()));
         } else if let Some(rest) = t.strip_prefix(GOAL_FAILED_TAG) {
             d.goals.push(GoalLine::Failed(rest.trim().to_string()));
+        } else if let Some((tag, rest)) =
+            [TRAIT_TAG, TRAIT_GONE_TAG, PERSONA_ADD_TAG, PERSONA_EDIT_TAG, PERSONA_GONE_TAG]
+                .into_iter()
+                .find_map(|tag| t.strip_prefix(tag).map(|rest| (tag, rest.trim().to_string())))
+        {
+            // (An empty one asks for nothing.)
+            if !rest.is_empty() {
+                d.growth.push(match tag {
+                    TRAIT_TAG => GrowthLine::Trait(rest),
+                    TRAIT_GONE_TAG => GrowthLine::TraitGone(rest),
+                    PERSONA_ADD_TAG => GrowthLine::PersonaAdd(rest),
+                    PERSONA_EDIT_TAG => GrowthLine::PersonaEdit(rest),
+                    _ => GrowthLine::PersonaGone(rest),
+                });
+            }
         } else {
             kept.push(line);
         }
@@ -825,6 +1160,134 @@ fn goal_ref(content: &str, primed: &[usize], goals: &[Goal]) -> Option<(usize, S
         _ if live.len() == 1 => Some((live[0], outcome(live[0]))),
         _ => None,
     }
+}
+
+/// The persona's parts — its sentences, or its lines — each with the
+/// whitespace after it, so that together they are the persona exactly. What
+/// the character changes it by: one part at a time.
+pub fn persona_parts(persona: &str) -> Vec<&str> {
+    /// A full stop after one of these doesn't end a sentence.
+    const SHORT_FOR: [&str; 12] = ["mr", "mrs", "ms", "dr", "st", "vs", "etc", "prof", "sr", "jr", "e.g", "i.e"];
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut chars = persona.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        let ends = match c {
+            '\n' => true,
+            '.' | '!' | '?' | '…' => {
+                // Closing quotes and brackets belong to the sentence.
+                while chars.peek().is_some_and(|&(_, n)| matches!(n, '"' | '\'' | '”' | '’' | ')' | ']')) {
+                    chars.next();
+                }
+                let rest = &persona[chars.peek().map_or(persona.len(), |&(j, _)| j)..];
+                let next = rest.trim_start();
+                let spaced = rest.is_empty() || rest.len() != next.len();
+                let begins = next.chars().next().is_none_or(|n| !n.is_lowercase());
+                let word = persona[start..i].rsplit(char::is_whitespace).next().unwrap_or("");
+                let word = word.trim_start_matches(['(', '"', '“', '\'']).to_lowercase();
+                let short = c == '.' && (word.chars().count() <= 1 || SHORT_FOR.contains(&word.as_str()));
+                spaced && begins && !short
+            }
+            _ => false,
+        };
+        if ends {
+            while chars.peek().is_some_and(|&(_, n)| n.is_whitespace()) {
+                chars.next();
+            }
+            let end = chars.peek().map_or(persona.len(), |&(j, _)| j);
+            // (Whitespace alone joins what follows.)
+            if !persona[start..end].trim().is_empty() {
+                parts.push(&persona[start..end]);
+                start = end;
+            }
+        }
+    }
+    if !persona[start..].trim().is_empty() {
+        parts.push(&persona[start..]);
+    }
+    parts
+}
+
+/// The number a line starts with for the list `letter` names — `[T2]`,
+/// `T2`, `#2`, `2.` — and the rest of the line.
+fn numbered(content: &str, letter: char) -> Option<(usize, &str)> {
+    let s = content.trim();
+    let s = s.strip_prefix('[').unwrap_or(s);
+    let s = s.strip_prefix([letter, letter.to_ascii_lowercase(), '#']).unwrap_or(s);
+    let digits = s.chars().take_while(char::is_ascii_digit).count();
+    let n = s[..digits].parse().ok()?;
+    let rest = s[digits..].trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ']' | '.' | ':' | ')' | '-' | '—' | '–'));
+    Some((n, rest))
+}
+
+/// Which trait a `TRAIT_GONE:` line drops: by its number among the traits
+/// the reply was primed with, else by its words; never one already dropped.
+fn trait_ref(content: &str, traits: &[Trait], dropped: &[bool]) -> Option<usize> {
+    let i = match numbered(content, 'T') {
+        Some((n, _)) => n.checked_sub(1).filter(|&i| i < traits.len())?,
+        None => traits.iter().position(|t| same_trait(&t.text, &clean_trait(content)))?,
+    };
+    (!dropped[i]).then_some(i)
+}
+
+/// Which part of the persona a `PERSONA_GONE:` line removes: by its number,
+/// else the one whose words it repeats. (Never "the only one there is": a
+/// line that names nothing doesn't empty the persona.)
+fn part_ref(content: &str, parts: &[String]) -> Option<usize> {
+    if let Some((n, _)) = numbered(content, 'P') {
+        return n.checked_sub(1).filter(|&i| i < parts.len());
+    }
+    let best = parts.iter().enumerate().map(|(i, p)| (i, overlap(p, content))).max_by(|a, b| a.1.total_cmp(&b.1));
+    best.filter(|&(_, score)| score >= 0.75).map(|(i, _)| i)
+}
+
+/// A trait as written, tidied: no quotes, list dash or self-given number,
+/// one line, no full stop, capped.
+fn clean_trait(raw: &str) -> String {
+    let t = tidy(raw, 'T');
+    let t = t.trim_end_matches(['.', ',', ';']).trim();
+    t.chars().take(MAX_TRAIT_CHARS).collect::<String>().trim_end().to_string()
+}
+
+/// A part of the persona as the character wrote it, tidied the same way
+/// and capped.
+fn clean_part(raw: &str) -> String {
+    let t = tidy(raw, 'P');
+    if t.chars().count() <= MAX_PERSONA_PART_CHARS {
+        t
+    } else {
+        format!("{}…", t.chars().take(MAX_PERSONA_PART_CHARS).collect::<String>().trim_end())
+    }
+}
+
+/// One line, without the quotes, the list dash or the `[T3]` / `[P3]` a
+/// model sometimes puts round or before what it writes.
+fn tidy(raw: &str, letter: char) -> String {
+    let quotes = |c: char| matches!(c, '"' | '`' | '“' | '”');
+    let mut t = raw.trim().trim_matches(quotes).trim();
+    if let Some(rest) = t.strip_prefix('[')
+        && let Some((tag, after)) = rest.split_once(']')
+        && tag.trim_start_matches([letter, letter.to_ascii_lowercase()]).chars().all(|c| c.is_ascii_digit())
+    {
+        t = after.trim();
+    }
+    let t = ["- ", "* ", "• ", "– "].into_iter().find_map(|b| t.strip_prefix(b)).unwrap_or(t).trim_matches(quotes);
+    t.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The list dash a part of the persona starts with, if it's a list's line.
+fn bullet_of(part: &str) -> &'static str {
+    ["- ", "* ", "• ", "– "].into_iter().find(|b| part.trim_start().starts_with(b)).unwrap_or("")
+}
+
+/// The same trait: the same words, whatever the case and punctuation.
+fn same_trait(a: &str, b: &str) -> bool {
+    crate::memory::same_words(a, b)
+}
+
+/// A part the persona already has: the same words, or one inside the other.
+fn same_part(a: &str, b: &str) -> bool {
+    same_goal(a.trim(), b.trim())
 }
 
 /// How a goal ended, as the line says it: leading separators off, capped.
@@ -1210,6 +1673,312 @@ SHOW_IMAGE: y"), "hi");
         let back: RoleplayState = serde_json::from_str(&serde_json::to_string(&rp).unwrap()).unwrap();
         assert_eq!(back.goals, rp.goals);
         assert!(!back.real_time);
+    }
+
+    // --- Traits, and a persona the character brings up to date. ---
+
+    fn trait_(text: &str, by_ai: bool) -> Trait {
+        Trait { text: text.into(), by_ai, added: 5 }
+    }
+
+    /// Mira, with a persona in prose and three traits (the last her own).
+    fn grown() -> RoleplayState {
+        RoleplayState {
+            ai_name: "Mira".into(),
+            user_name: "Andrew".into(),
+            persona: "Mira is a shy apprentice sailor from St. Ives. She has never left the harbour! Her \
+                      mentor, Dr. Mills, taught her to read the stars."
+                .into(),
+            traits: vec![trait_("shy", false), trait_("afraid of deep water", false), trait_("loves the rain", true)],
+            ..Default::default()
+        }
+    }
+
+    fn texts(rp: &RoleplayState) -> Vec<&str> {
+        rp.traits.iter().map(|t| t.text.as_str()).collect()
+    }
+
+    /// Growth lines come out of the reply with the rest, and stay hidden
+    /// while it streams.
+    #[test]
+    fn growth_lines_extract_and_strip() {
+        let mut reply = "I did it, Andrew — I swam!\n\
+                         TRAIT: braver than she knew\n\
+                         TRAIT_GONE: [T2]\n\
+                         PERSONA_EDIT: [P1] Mira is a sailor from St. Ives.\n\
+                         PERSONA_GONE: [P2]\n\
+                         PERSONA_ADD: She crossed the bay on her own.\n\
+                         TRAIT:   \n\
+                         GOAL: Sail to the lighthouse"
+            .to_string();
+        let d = extract_directives(&mut reply);
+        assert_eq!(reply, "I did it, Andrew — I swam!");
+        assert_eq!(
+            d.growth,
+            vec![
+                GrowthLine::Trait("braver than she knew".into()),
+                GrowthLine::TraitGone("[T2]".into()),
+                GrowthLine::PersonaEdit("[P1] Mira is a sailor from St. Ives.".into()),
+                GrowthLine::PersonaGone("[P2]".into()),
+                GrowthLine::PersonaAdd("She crossed the bay on her own.".into()),
+            ]
+        );
+        assert_eq!(d.goals, vec![GoalLine::New("Sail to the lighthouse".into())]);
+        let streaming = "hi\nTRAIT: bold\nTRAIT_GONE: [T1]\nPERSONA_ADD: x\nPERSONA_EDIT: [P1] y\nPERSONA_GONE: [P2]";
+        assert_eq!(strip_memory_lines(streaming), "hi");
+    }
+
+    /// The persona's parts are its sentences, or its lines — and together
+    /// they are the persona exactly, so a part changed leaves the rest as
+    /// the user wrote it. A title or an initial doesn't end a sentence.
+    #[test]
+    fn the_persona_comes_apart_and_goes_back_together() {
+        let prose = grown().persona;
+        let parts = persona_parts(&prose);
+        assert_eq!(
+            parts.iter().map(|p| p.trim()).collect::<Vec<_>>(),
+            [
+                "Mira is a shy apprentice sailor from St. Ives.",
+                "She has never left the harbour!",
+                "Her mentor, Dr. Mills, taught her to read the stars.",
+            ]
+        );
+        for persona in [
+            prose.as_str(),
+            "- tall, with sea-grey eyes\n- hums when she's nervous\n\n- keeps a brass compass (her mother's)",
+            "She said \"Never again.\" Then she laughed… And meant it?  Yes. J. R. Hale taught her, e.g. knots.",
+            "It was 5 p.m. when she sailed. She was back by 7.5 bells.",
+            "One line with no full stop",
+            "",
+            "   ",
+        ] {
+            assert_eq!(persona_parts(persona).concat(), persona.trim_start(), "{persona:?}");
+        }
+        let list = "- tall, with sea-grey eyes\n- hums when she's nervous\n\n- keeps a brass compass (her mother's)";
+        assert_eq!(persona_parts(list).len(), 3);
+        let tricky = "She said \"Never again.\" Then she laughed… And meant it?  Yes. J. R. Hale taught her, e.g. knots.";
+        assert_eq!(
+            persona_parts(tricky).iter().map(|p| p.trim()).collect::<Vec<_>>(),
+            ["She said \"Never again.\"", "Then she laughed…", "And meant it?", "Yes.", "J. R. Hale taught her, e.g. knots."]
+        );
+        // A full stop inside a sentence (the next word isn't a new one's).
+        assert_eq!(persona_parts("It was 5 p.m. when she sailed. She was back by 7.5 bells.").len(), 2);
+        assert!(persona_parts("").is_empty() && persona_parts("  \n ").is_empty());
+    }
+
+    /// The character gains traits — tidied, no repeats, never more than the
+    /// most it keeps — and drops them by the numbers it was primed with
+    /// (even after another went in the same reply), or by their words.
+    #[test]
+    fn traits_are_gained_and_dropped() {
+        let mut rp = grown();
+        let events = rp.apply_growth(
+            &[
+                GrowthLine::Trait("\"Braver than she knew.\"".into()),
+                GrowthLine::Trait("SHY".into()),
+                GrowthLine::Trait("[T4] - quick to laugh".into()),
+                GrowthLine::TraitGone("[T1]".into()),
+                GrowthLine::TraitGone("[T2] — I swam the bay".into()),
+                GrowthLine::TraitGone("[T1]".into()),
+                GrowthLine::TraitGone("T9".into()),
+            ],
+            100,
+        );
+        assert_eq!(texts(&rp), ["loves the rain", "Braver than she knew", "SHY", "quick to laugh"]);
+        let kinds: Vec<_> = events.iter().map(|e| (e.kind, e.text.as_str())).collect();
+        assert_eq!(
+            kinds,
+            [
+                (GrowthKind::TraitDropped, "shy"),
+                (GrowthKind::TraitDropped, "afraid of deep water"),
+                (GrowthKind::TraitGained, "Braver than she knew"),
+                // (Dropped in this very reply, so it can be gained again.)
+                (GrowthKind::TraitGained, "SHY"),
+                (GrowthKind::TraitGained, "quick to laugh"),
+            ]
+        );
+        assert!(rp.traits[1].by_ai && rp.traits[1].added == 100);
+
+        // One it has already, in any case or punctuation, isn't gained twice.
+        let mut rp = grown();
+        assert!(rp.apply_growth(&[GrowthLine::Trait("Loves the rain!".into())], 1).is_empty());
+        // By its words, when no number is given; words that are no trait's
+        // drop nothing.
+        let events = rp.apply_growth(&[GrowthLine::TraitGone("Afraid of deep water.".into()), GrowthLine::TraitGone("moody".into())], 1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(texts(&rp), ["shy", "loves the rain"]);
+
+        // Never more than it keeps, and a long one is cut to a few words.
+        let mut rp = grown();
+        let many: Vec<GrowthLine> = (0..MAX_TRAITS + 4).map(|i| GrowthLine::Trait(format!("trait number {i}"))).collect();
+        assert_eq!(rp.apply_growth(&many, 1).len(), MAX_TRAITS - 3);
+        assert_eq!(rp.traits.len(), MAX_TRAITS);
+        let mut rp = grown();
+        rp.apply_growth(&[GrowthLine::Trait("word ".repeat(40))], 1);
+        assert!(rp.traits[3].text.chars().count() <= MAX_TRAIT_CHARS && !rp.traits[3].text.ends_with(' '));
+        // The persona wasn't touched by any of it.
+        assert_eq!(rp.persona, grown().persona);
+        assert!(rp.persona_history.is_empty());
+    }
+
+    /// The character rewrites, removes and adds to its persona a part at a
+    /// time, by the numbers it was primed with; everything else stays as
+    /// the user wrote it, and the persona as it was is kept for undoing.
+    #[test]
+    fn the_persona_is_changed_a_part_at_a_time() {
+        let mut rp = grown();
+        let before = rp.persona.clone();
+        let events = rp.apply_growth(
+            &[
+                GrowthLine::PersonaEdit("[P1] \"Mira is a sailor from St. Ives.\"".into()),
+                GrowthLine::PersonaGone("[P2]".into()),
+                GrowthLine::PersonaAdd("She crossed the bay on her own".into()),
+                // Not twice, not a part that isn't there, not with nothing to say.
+                GrowthLine::PersonaGone("[P1]".into()),
+                GrowthLine::PersonaEdit("[P2] She left the harbour once.".into()),
+                GrowthLine::PersonaEdit("[P7] nothing there".into()),
+                GrowthLine::PersonaEdit("[P3]".into()),
+                GrowthLine::PersonaAdd("Her mentor, Dr. Mills, taught her to read the stars.".into()),
+            ],
+            200,
+        );
+        assert_eq!(
+            rp.persona,
+            "Mira is a sailor from St. Ives. Her mentor, Dr. Mills, taught her to read the stars. She crossed the \
+             bay on her own."
+        );
+        let kinds: Vec<_> = events.iter().map(|e| (e.kind, e.text.as_str())).collect();
+        assert_eq!(
+            kinds,
+            [
+                (GrowthKind::PersonaChanged, "Mira is a sailor from St. Ives."),
+                (GrowthKind::PersonaRemoved, "She has never left the harbour!"),
+                (GrowthKind::PersonaAdded, "She crossed the bay on her own."),
+            ]
+        );
+        assert_eq!(rp.persona_history, vec![PersonaVersion { text: before.clone(), replaced: 200 }]);
+        // Undo takes it back, one change at a time.
+        rp.apply_growth(&[GrowthLine::PersonaAdd("She is not afraid any more.".into())], 300);
+        assert_eq!(rp.persona_history.len(), 2);
+        assert!(rp.undo_persona());
+        assert!(rp.persona.ends_with("on her own."));
+        assert!(rp.undo_persona());
+        assert_eq!(rp.persona, before);
+        assert!(!rp.undo_persona() && rp.persona == before);
+
+        // A part reworded into the same words, or a line that names
+        // nothing, changes nothing — and nothing is kept for undoing.
+        let mut rp = grown();
+        let same = [
+            GrowthLine::PersonaEdit("[P2] she has never left the harbour".into()),
+            GrowthLine::PersonaGone("it all feels different now".into()),
+            GrowthLine::PersonaEdit("I am someone else".into()),
+        ];
+        assert!(rp.apply_growth(&same, 1).is_empty());
+        assert_eq!(rp.persona, before);
+        assert!(rp.persona_history.is_empty());
+        // Removed by its words, when no number is given.
+        let events = rp.apply_growth(&[GrowthLine::PersonaGone("She has never left the harbour".into())], 1);
+        assert_eq!(events.len(), 1);
+        assert!(!rp.persona.contains("harbour") && rp.persona.contains("Dr. Mills"));
+
+        // A persona kept as a list grows by a line, and keeps its lines.
+        let mut rp = grown();
+        rp.persona = "- tall, with sea-grey eyes\n- hums when she's nervous\n".into();
+        rp.apply_growth(&[GrowthLine::PersonaAdd("- wears her mother's compass".into()), GrowthLine::PersonaEdit("[P2] - whistles when she's happy".into())], 1);
+        assert_eq!(rp.persona, "- tall, with sea-grey eyes\n- whistles when she's happy\n- wears her mother's compass");
+        // (Lines without dashes get none.)
+        rp.persona = "Tall, with sea-grey eyes\nHums when she's nervous".into();
+        rp.apply_growth(&[GrowthLine::PersonaAdd("- Wears her mother's compass".into())], 1);
+        assert_eq!(rp.persona, "Tall, with sea-grey eyes\nHums when she's nervous\nWears her mother's compass");
+        // One that's a single part can be rewritten without its number; an
+        // empty one is written from nothing.
+        let mut rp = grown();
+        rp.persona = "A quiet lighthouse keeper".into();
+        rp.apply_growth(&[GrowthLine::PersonaEdit("A lighthouse keeper who sings".into())], 1);
+        assert_eq!(rp.persona, "A lighthouse keeper who sings");
+        rp.persona = String::new();
+        rp.apply_growth(&[GrowthLine::PersonaAdd("Mira keeps the light".into())], 2);
+        assert_eq!(rp.persona, "Mira keeps the light.");
+        // It doesn't grow without end, and the versions kept are capped.
+        let mut rp = grown();
+        for i in 0..200 {
+            rp.apply_growth(&[GrowthLine::PersonaAdd(format!("Fact number {i} about her, at some length, so it adds up."))], i);
+        }
+        assert!(rp.persona.chars().count() <= MAX_PERSONA_CHARS, "{}", rp.persona.chars().count());
+        assert_eq!(rp.persona_history.len(), MAX_PERSONA_HISTORY);
+        assert!(rp.persona.starts_with(&before), "what was there is still there");
+    }
+
+    /// The priming lists the persona's parts and the traits by number, with
+    /// the rules — and with own growth off, the persona as it was written
+    /// and the traits as a plain line, with nothing about changing them.
+    #[test]
+    fn preamble_carries_the_growth_rules_only_when_on() {
+        let mut rp = grown();
+        let p = rp.preamble(&MemoryStore::default());
+        assert!(
+            p.contains(
+                "You are Mira. Your persona, part by part:\n\
+                 [P1] Mira is a shy apprentice sailor from St. Ives.\n\
+                 [P2] She has never left the harbour!\n\
+                 [P3] Her mentor, Dr. Mills, taught her to read the stars.\n\
+                 Your traits — who you are, in a few words each:\n\
+                 [T1] shy\n[T2] afraid of deep water\n[T3] loves the rain\n\
+                 The user's name is Andrew"
+            ),
+            "{p}"
+        );
+        for tag in [TRAIT_TAG, TRAIT_GONE_TAG, PERSONA_ADD_TAG, PERSONA_EDIT_TAG, PERSONA_GONE_TAG] {
+            assert!(p.contains(&format!("`{tag} ")), "{tag} in {p}");
+        }
+        assert!(p.contains("How you grow") && p.contains("Your photo album:"));
+        let blank = RoleplayState { ai_name: "Mira".into(), ..Default::default() }.preamble(&MemoryStore::default());
+        assert!(blank.contains("(nothing written yet") && blank.contains("(none yet)\nThe user's name"), "{blank}");
+
+        rp.own_growth = false;
+        let off = rp.preamble(&MemoryStore::default());
+        assert!(off.contains(&format!("You are Mira. Your persona: {}\n", rp.persona)), "{off}");
+        assert!(off.contains("Your traits: shy; afraid of deep water; loves the rain\nThe user's name"));
+        assert!(!off.contains("TRAIT") && !off.contains("PERSONA_") && !off.contains("[P1]") && !off.contains("How you grow"));
+        rp.traits.clear();
+        assert!(!rp.preamble(&MemoryStore::default()).contains("Your traits"));
+    }
+
+    /// The user's own changes: a trait added, rewritten (theirs from then
+    /// on), emptied or made the same as another (gone).
+    #[test]
+    fn the_user_edits_the_traits_too() {
+        let mut rp = grown();
+        assert_eq!(rp.add_trait("  stubborn. ", false, 9).as_deref(), Some("stubborn"));
+        assert!(rp.add_trait("Stubborn", false, 9).is_none() && rp.add_trait("  ", false, 9).is_none());
+        assert_eq!(rp.traits[3], Trait { text: "stubborn".into(), by_ai: false, added: 9 });
+        rp.set_trait(2, "loves a storm");
+        assert_eq!(rp.traits[2], Trait { text: "loves a storm".into(), by_ai: false, added: 5 });
+        rp.set_trait(0, "shy");
+        assert_eq!(rp.traits[0], trait_("shy", false), "unchanged");
+        rp.set_trait(1, "SHY");
+        assert_eq!(texts(&rp), ["shy", "loves a storm", "stubborn"]);
+        rp.set_trait(0, "   ");
+        rp.set_trait(7, "nothing there");
+        assert_eq!(texts(&rp), ["loves a storm", "stubborn"]);
+    }
+
+    /// A character saved before it could grow reads back growing, with no
+    /// traits; traits and the persona's earlier versions survive the round
+    /// trip.
+    #[test]
+    fn older_characters_grow_and_traits_are_kept() {
+        let old: RoleplayState = serde_json::from_str(r#"{"enabled":true,"ai_name":"Mira","persona":"a sailor"}"#).unwrap();
+        assert!(old.own_growth && old.traits.is_empty() && old.persona_history.is_empty());
+        let mut rp = grown();
+        rp.apply_growth(&[GrowthLine::PersonaGone("[P2]".into())], 42);
+        rp.own_growth = false;
+        let json = serde_json::to_string(&rp).unwrap();
+        let back: RoleplayState = serde_json::from_str(&json).unwrap();
+        assert_eq!((back.traits, back.persona_history, back.own_growth), (rp.traits, rp.persona_history, false));
+        // (Nothing to undo, nothing written about it.)
+        assert!(!serde_json::to_string(&grown()).unwrap().contains("persona_history"));
     }
 
     /// A diary of a hundred everyday entries goes in whole — the old cut kept

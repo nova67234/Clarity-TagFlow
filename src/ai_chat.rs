@@ -813,6 +813,7 @@ fn message_key(msg: &ChatMsg, picture: Option<Option<[usize; 2]>>, width: f32, z
     msg.tag_image.hash(&mut hasher);
     msg.tag_change.is_some().hash(&mut hasher);
     msg.goals.len().hash(&mut hasher);
+    msg.growth.len().hash(&mut hasher);
     msg.character.hash(&mut hasher);
     msg.research.is_some().hash(&mut hasher);
     msg.krea_prompt.hash(&mut hasher);
@@ -861,7 +862,7 @@ const TO_IMAGE: &str = "Use in Text to Image";
 /// lists, headings, code blocks) straight on the background, like current
 /// assistant UIs. A streaming reply shows a ▌ cursor.
 fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool) {
-    let (role, text, stored_thinking, image, doc, tag_image, tag_change, goals, krea_prompt) = {
+    let (role, text, stored_thinking, image, doc, tag_image, tag_change, goals, growth, krea_prompt) = {
         let m = &llm.chats[llm.active_chat].msgs[index];
         (
             m.role,
@@ -872,6 +873,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
             m.tag_image.clone(),
             m.tag_change.clone(),
             m.goals.clone(),
+            m.growth.clone(),
             m.krea_prompt,
         )
     };
@@ -1178,6 +1180,11 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         ui.add_space(4.0);
         goal_note(ui, &goals);
     }
+    // ...and what it changed about the character itself.
+    if !growth.is_empty() {
+        ui.add_space(4.0);
+        growth_note(ui, &growth);
+    }
 
     // Action row under every finished reply: copy / regenerate / listen
     // (copy and listen only when there's text to copy or read).
@@ -1271,19 +1278,44 @@ fn goal_note(ui: &mut egui::Ui, events: &[crate::roleplay::GoalEvent]) {
             }
             GoalStatus::Failed => (egui::include_image!("../icons/x.svg"), MUTED(), "Goal failed"),
         };
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            ui.add(egui::Image::new(icon).fit_to_exact_size(egui::vec2(13.0, 13.0)).tint(tint));
-            let w = ui.available_width().min(560.0);
-            ui.scope(|ui| {
-                ui.set_max_width(w);
-                ui.add(
-                    egui::Label::new(egui::RichText::new(format!("{what}: {}", e.text)).color(MUTED()).size(11.5))
-                        .wrap(),
-                );
-            });
-        });
+        quiet_note(ui, icon, tint, &format!("{what}: {}", e.text));
     }
+}
+
+/// Role play: one quiet line per change a reply made to the character — a
+/// trait gained or dropped, a part of its persona added, rewritten or
+/// removed (src/roleplay.rs). The persona's can be undone in AI Settings →
+/// Role play, where the traits are too.
+fn growth_note(ui: &mut egui::Ui, events: &[crate::roleplay::GrowthEvent]) {
+    for e in events {
+        let (icon, tint, what) = growth_line(e.kind);
+        quiet_note(ui, icon, tint, &format!("{what}: {}", e.text));
+    }
+}
+
+/// A growth note's icon, its tint and what it says happened.
+fn growth_line(kind: crate::roleplay::GrowthKind) -> (egui::ImageSource<'static>, egui::Color32, &'static str) {
+    use crate::roleplay::GrowthKind;
+    match kind {
+        GrowthKind::TraitGained => (egui::include_image!("../icons/sparkle.svg"), ACCENT1(), "New trait"),
+        GrowthKind::TraitDropped => (egui::include_image!("../icons/x.svg"), MUTED(), "Trait dropped"),
+        GrowthKind::PersonaAdded => (egui::include_image!("../icons/edit.svg"), ACCENT1(), "Added to its persona"),
+        GrowthKind::PersonaChanged => (egui::include_image!("../icons/edit.svg"), ACCENT1(), "Persona rewritten"),
+        GrowthKind::PersonaRemoved => (egui::include_image!("../icons/x.svg"), MUTED(), "Taken out of its persona"),
+    }
+}
+
+/// One small muted line under a reply, after its icon.
+fn quiet_note(ui: &mut egui::Ui, icon: egui::ImageSource<'_>, tint: egui::Color32, text: &str) {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.add(egui::Image::new(icon).fit_to_exact_size(egui::vec2(13.0, 13.0)).tint(tint));
+        let w = ui.available_width().min(560.0);
+        ui.scope(|ui| {
+            ui.set_max_width(w);
+            ui.add(egui::Label::new(egui::RichText::new(text).color(MUTED()).size(11.5)).wrap());
+        });
+    });
 }
 
 /// Tag images: the note under a reply that changed tags — which image, the
@@ -3236,6 +3268,7 @@ mod tests {
             tag_image: None,
             tag_change: None,
             goals: vec![],
+            growth: vec![],
             character: None,
             remember: false,
             picture_memory: false,
@@ -3265,6 +3298,59 @@ mod tests {
         assert_eq!(rig.state.to_image.as_deref(), Some(PROMPT));
     }
 
+    /// Role play: what a reply changed about the character is noted under
+    /// it, a quiet line each, like its goals.
+    #[test]
+    fn a_reply_that_changed_the_character_says_so() {
+        use crate::llm::{ChatMsg, ChatRole, LlmState};
+        use crate::roleplay::{GoalEvent, GoalStatus, GrowthEvent, GrowthKind};
+        fn scene(ui: &mut egui::Ui, llm: &mut LlmState) {
+            ui.set_width(600.0);
+            super::message(ui, llm, 0, false);
+        }
+        let change = |kind, text: &str| GrowthEvent { kind, text: text.to_string() };
+        let mut llm = LlmState::default();
+        llm.chats[0].msgs.push(ChatMsg {
+            role: ChatRole::Model,
+            text: "I did it, Andrew!".to_string(),
+            thinking: None,
+            image: None,
+            doc: None,
+            tag_image: None,
+            tag_change: None,
+            goals: vec![GoalEvent { status: GoalStatus::Achieved, text: "Swim the bay".into() }],
+            growth: vec![
+                change(GrowthKind::TraitGained, "braver than she knew"),
+                change(GrowthKind::TraitDropped, "shy"),
+                change(GrowthKind::PersonaAdded, "She crossed the bay on her own."),
+                change(GrowthKind::PersonaChanged, "Mira is a sailor."),
+                change(GrowthKind::PersonaRemoved, "She has never left the harbour."),
+            ],
+            character: None,
+            remember: false,
+            picture_memory: false,
+            shared_with: vec![],
+            research: None,
+            krea_prompt: false,
+        });
+        let mut rig = crate::slider::rig::Rig::new(llm, scene);
+        rig.idle();
+        let lines = [
+            "I did it, Andrew!",
+            "Goal achieved: Swim the bay",
+            "New trait: braver than she knew",
+            "Trait dropped: shy",
+            "Added to its persona: She crossed the bay on her own.",
+            "Persona rewritten: Mira is a sailor.",
+            "Taken out of its persona: She has never left the harbour.",
+        ];
+        let tops: Vec<f32> = lines.iter().map(|line| run(&rig, line).0.top()).collect();
+        assert!(tops.windows(2).all(|pair| pair[1] > pair[0] + 8.0), "one under the other: {tops:?}");
+        // Small and quiet, so the story stays in front.
+        let (reply, note) = (run(&rig, lines[0]).1, run(&rig, lines[2]).1);
+        assert!(note.font_id.size < reply.font_id.size && note.color != reply.color);
+    }
+
     /// A message's key is what its height hangs on.
     #[test]
     fn a_messages_key_follows_what_it_says() {
@@ -3278,6 +3364,7 @@ mod tests {
             tag_image: None,
             tag_change: None,
             goals: vec![],
+            growth: vec![],
             character: None,
             remember: false,
             picture_memory: false,

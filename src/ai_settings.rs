@@ -729,6 +729,23 @@ fn roleplay_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) 
                     .hint_text("Who is the AI? Looks, personality, the world you're in…"),
             )
             .lost_focus();
+            changed |= persona_undo(ui, rp);
+            row_sep(ui);
+            field_label(ui, "Traits");
+            changed |= traits_editor(ui, rp);
+            row_sep(ui);
+            row(
+                ui,
+                "Grows on its own",
+                Some(
+                    "As the story changes the character, it gains and drops traits and brings its \
+                     persona up to date itself — a part at a time. A note under the reply says when, \
+                     and a change to the persona can be undone here.",
+                ),
+                |ui| {
+                    changed |= switch(ui, &mut rp.own_growth).changed();
+                },
+            );
         });
         if changed {
             rp.save();
@@ -805,6 +822,226 @@ fn roleplay_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) 
             },
         );
     });
+}
+
+/// Under the persona, once the character has changed it: when it last did,
+/// and Undo — back to the persona as it was before that change (shown on
+/// hover), one change at a time. True when undone.
+fn persona_undo(ui: &mut egui::Ui, rp: &mut crate::roleplay::RoleplayState) -> bool {
+    let Some(before) = rp.persona_history.last() else { return false };
+    let mut undone = false;
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let when = crate::memory::format_date(before.replaced);
+        let was = if before.text.trim().is_empty() { "(empty)" } else { before.text.trim() };
+        ui.label(egui::RichText::new(format!("{} changed this on {when}.", rp.ai_display())).color(MUTED()).size(11.5));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            undone = ui
+                .button(egui::RichText::new("Undo").size(12.5))
+                .on_hover_text(format!("Back to how it read before:\n\n{was}"))
+                .clicked();
+        });
+    });
+    undone && rp.undo_persona()
+}
+
+/// What the traits editor is doing between frames: the trait being edited
+/// (`NEW_TRAIT` for one being added) and the text typed so far.
+#[derive(Clone)]
+struct TraitDraft {
+    at: usize,
+    text: String,
+    /// The box has been given the keyboard.
+    focused: bool,
+}
+
+const NEW_TRAIT: usize = usize::MAX;
+
+/// Role play → Character → Traits: one pill a trait — the character's own
+/// with a violet dot, like the Tag Manager's AI tags. Click one to rewrite
+/// it (emptied, it goes), its × to remove it, the last pill to add one. True
+/// when the traits changed.
+fn traits_editor(ui: &mut egui::Ui, rp: &mut crate::roleplay::RoleplayState) -> bool {
+    use crate::roleplay::MAX_TRAITS;
+    let id = ui.id().with("rp_traits");
+    let mut draft: Option<TraitDraft> = ui.data(|d| d.get_temp(id));
+    // (A trait the character dropped meanwhile isn't there to edit.)
+    if draft.as_ref().is_some_and(|d| d.at != NEW_TRAIT && d.at >= rp.traits.len()) {
+        draft = None;
+    }
+    let who = rp.ai_display().to_string();
+    let mut changed = false;
+    // What the pills ask for, carried out once they're all drawn.
+    let (mut edit, mut remove, mut commit) = (None, None, None);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+        for (i, t) in rp.traits.iter().enumerate() {
+            match &mut draft {
+                Some(d) if d.at == i => commit = trait_field(ui, d).or(commit),
+                _ => match trait_pill(ui, t, &who) {
+                    Some(TraitAsk::Edit) => edit = Some(i),
+                    Some(TraitAsk::Remove) => remove = Some(i),
+                    None => {}
+                },
+            }
+        }
+        // The last pill adds one — or is the box it's being typed in.
+        if let Some(d) = draft.as_mut().filter(|d| d.at == NEW_TRAIT) {
+            commit = trait_field(ui, d).or(commit);
+        } else if rp.traits.len() < MAX_TRAITS && add_pill(ui, rp.traits.is_empty()).clicked() {
+            edit = Some(NEW_TRAIT);
+        }
+    });
+    if rp.traits.is_empty() && draft.is_none() && edit.is_none() {
+        ui.add_space(2.0);
+        let hint = if rp.own_growth {
+            "Who the character is, a few words each — add some, or let it find its own as the story goes."
+        } else {
+            "Who the character is, a few words each."
+        };
+        ui.label(egui::RichText::new(hint).color(MUTED()).size(11.5));
+    }
+    if let Some(done) = commit {
+        if let (Some(d), TraitDone::Keep) = (&draft, done) {
+            if d.at == NEW_TRAIT {
+                changed |= rp.add_trait(&d.text, false, crate::memory::now()).is_some();
+            } else {
+                let before = rp.traits.clone();
+                rp.set_trait(d.at, &d.text);
+                changed |= rp.traits != before;
+            }
+        }
+        draft = None;
+    }
+    if let Some(i) = remove {
+        rp.traits.remove(i);
+        changed = true;
+        // (The one being edited keeps its place.)
+        draft = draft.and_then(|d| match d.at {
+            at if at == i => None,
+            at if at != NEW_TRAIT && at > i => Some(TraitDraft { at: at - 1, ..d }),
+            _ => Some(d),
+        });
+    }
+    if let Some(at) = edit {
+        let text = rp.traits.get(at).map(|t| t.text.clone()).unwrap_or_default();
+        draft = Some(TraitDraft { at, text, focused: false });
+    }
+    ui.data_mut(|d| match draft {
+        Some(draft) => {
+            d.insert_temp(id, draft);
+        }
+        None => d.remove::<TraitDraft>(id),
+    });
+    changed
+}
+
+/// What a click on a trait's pill asks for.
+enum TraitAsk {
+    Edit,
+    Remove,
+}
+
+/// How editing a trait ended.
+#[derive(Clone, Copy)]
+enum TraitDone {
+    /// Enter, Tab or a click elsewhere: what's typed is the trait.
+    Keep,
+    /// Escape: as it was.
+    Cancel,
+}
+
+/// The height of a trait's pill (a text box's, so nothing moves when one
+/// turns into the other).
+const TRAIT_H: f32 = 32.0;
+/// The narrowest a trait's text box gets.
+const TRAIT_FIELD_MIN: f32 = 140.0;
+
+/// One trait as a pill: its words (cut short where the row is narrower), and
+/// a × at its end.
+fn trait_pill(ui: &mut egui::Ui, t: &crate::roleplay::Trait, who: &str) -> Option<TraitAsk> {
+    let (pad, dot, close) = (12.0, if t.by_ai { 12.0 } else { 0.0 }, 22.0);
+    let room = (ui.available_width().max(160.0) - pad - dot - close - 4.0).max(40.0);
+    let mut job = egui::text::LayoutJob::simple_singleline(t.text.clone(), egui::FontId::proportional(12.5), TEXT());
+    job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+    let galley = ui.painter().layout_job(job);
+    let size = egui::vec2(pad + dot + galley.size().x + close + 4.0, TRAIT_H);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let x_rect = egui::Rect::from_center_size(egui::pos2(rect.right() - 4.0 - close / 2.0, rect.center().y), egui::vec2(close, close));
+    let x = ui.interact(x_rect, resp.id.with("remove"), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &t.text));
+    x.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Remove the trait {}", t.text)));
+    let since = crate::memory::format_date(t.added);
+    let whose = if t.by_ai { format!("{who}'s own, since {since}.") } else { "Yours.".to_string() };
+    let resp = resp.on_hover_text(format!("{whose} Click to rewrite it.")).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let x = x.on_hover_text("Remove this trait").on_hover_cursor(egui::CursorIcon::PointingHand);
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let hot = resp.hovered() && !x.hovered();
+        let fill = if hot { crate::settings::well_fill().lerp_to_gamma(TEXT(), 0.06) } else { crate::settings::well_fill() };
+        p.rect(rect, TRAIT_H / 2.0, fill, egui::Stroke::new(1.0_f32, EDGE()), egui::StrokeKind::Inside);
+        if t.by_ai {
+            p.circle_filled(egui::pos2(rect.left() + pad + 3.0, rect.center().y), 3.0, crate::tag_manager::AI_NEW_VIOLET);
+        }
+        let at = egui::pos2(rect.left() + pad + dot, rect.center().y - galley.size().y / 2.0);
+        p.galley(at, galley, TEXT());
+        if x.hovered() {
+            p.circle_filled(x_rect.center(), close / 2.0, TEXT().gamma_multiply(0.08));
+        }
+        let tint = crate::theme::icon_tint(if x.hovered() { TEXT() } else { MUTED() });
+        let icon = egui::Rect::from_center_size(x_rect.center(), egui::vec2(11.0, 11.0));
+        egui::Image::new(egui::include_image!("../icons/close.svg")).tint(tint).paint_at(ui, icon);
+    }
+    if x.clicked() {
+        Some(TraitAsk::Remove)
+    } else if resp.clicked() {
+        Some(TraitAsk::Edit)
+    } else {
+        None
+    }
+}
+
+/// The pill that adds a trait: a dashed-looking, quieter one at the end of
+/// the row ("Add a trait" while there are none, a plus after).
+fn add_pill(ui: &mut egui::Ui, first: bool) -> egui::Response {
+    let label = if first { "+  Add a trait" } else { "+  Add" };
+    let galley = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(12.5), MUTED());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 28.0, TRAIT_H), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Add a trait"));
+    let resp = resp.on_hover_text("Add a trait: who the character is, in a few words").on_hover_cursor(egui::CursorIcon::PointingHand);
+    if ui.is_rect_visible(rect) {
+        let ink = if resp.hovered() { TEXT() } else { MUTED() };
+        let edge = if resp.hovered() { MUTED() } else { EDGE() };
+        ui.painter().rect_stroke(rect, TRAIT_H / 2.0, egui::Stroke::new(1.0_f32, edge), egui::StrokeKind::Inside);
+        ui.painter().galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, ink);
+    }
+    resp
+}
+
+/// The text box a trait is typed in (in place of its pill). How it ended,
+/// once it has: on Enter, Tab or a click elsewhere what's typed is kept; on
+/// Escape it's as it was.
+fn trait_field(ui: &mut egui::Ui, draft: &mut TraitDraft) -> Option<TraitDone> {
+    let typed = ui.painter().layout_no_wrap(draft.text.clone(), egui::FontId::proportional(13.0), TEXT()).size().x;
+    let width = (typed + 44.0).clamp(TRAIT_FIELD_MIN, ui.available_width().max(TRAIT_FIELD_MIN));
+    // (In a ui of its own: a pill field leaves a row's cursor inside its
+    // own right end, so the next pill sat on it.)
+    let edit =
+        egui::TextEdit::singleline(&mut draft.text).hint_text("A few words").char_limit(crate::roleplay::MAX_TRAIT_CHARS);
+    let resp = ui
+        .allocate_ui_with_layout(egui::vec2(width, TRAIT_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            crate::settings::pill_field(ui, width, edit)
+        })
+        .inner;
+    if !draft.focused {
+        resp.request_focus();
+        draft.focused = true;
+        return None;
+    }
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        return Some(TraitDone::Cancel);
+    }
+    resp.lost_focus().then_some(TraitDone::Keep)
 }
 
 /// Role play → Goals: the switch for the character's own goals, and the
@@ -1105,5 +1342,160 @@ fn research_tab(ui: &mut egui::Ui, llm: &mut LlmState) {
 
     if llm.research != before {
         llm.research.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::roleplay::{GrowthLine, RoleplayState, Trait};
+    use crate::slider::rig::Rig;
+
+    /// The character under edit, and how often the editors said it changed
+    /// (when it's saved).
+    struct Editing {
+        rp: RoleplayState,
+        saves: usize,
+    }
+
+    fn scene(ui: &mut egui::Ui, s: &mut Editing) {
+        ui.set_width(520.0);
+        if persona_undo(ui, &mut s.rp) {
+            s.saves += 1;
+        }
+        if traits_editor(ui, &mut s.rp) {
+            s.saves += 1;
+        }
+    }
+
+    fn editing(traits: &[(&str, bool)]) -> Rig<Editing> {
+        let traits = traits.iter().map(|&(text, by_ai)| Trait { text: text.into(), by_ai, added: 1 }).collect();
+        let rp = RoleplayState { ai_name: "Mira".into(), traits, ..Default::default() };
+        let mut rig = Rig::new(Editing { rp, saves: 0 }, scene);
+        rig.idle();
+        rig
+    }
+
+    fn traits(rig: &Rig<Editing>) -> Vec<(&str, bool)> {
+        rig.state.rp.traits.iter().map(|t| (t.text.as_str(), t.by_ai)).collect()
+    }
+
+    /// Where a trait's pill has its words, and its × after them.
+    fn pill(rig: &Rig<Editing>, text: &str) -> (egui::Pos2, egui::Pos2) {
+        let words = rig.texts(text);
+        assert_eq!(words.len(), 1, "{text:?} has a pill");
+        (words[0].center(), egui::pos2(words[0].right() + 11.0, words[0].center().y))
+    }
+
+    fn select_all(rig: &mut Rig<Editing>) {
+        rig.frame(vec![egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }]);
+    }
+
+    /// The traits are pills: a click on one rewrites it (it's the user's
+    /// from then on), its × removes it, the last pill adds one.
+    #[test]
+    fn traits_are_edited_as_pills() {
+        let mut rig = editing(&[("shy", false), ("loves the rain", true)]);
+        assert_eq!(rig.texts("+  Add").len(), 1);
+
+        // Rewritten: the pill turns into a box holding its words.
+        let (words, _) = pill(&rig, "loves the rain");
+        rig.click(words);
+        rig.idle();
+        assert_eq!(rig.state.saves, 0, "nothing changes until it's typed");
+        select_all(&mut rig);
+        rig.type_text("loves a storm");
+        assert_eq!(traits(&rig), [("shy", false), ("loves the rain", true)], "not while it's being typed");
+        rig.key(egui::Key::Enter);
+        rig.idle();
+        assert_eq!(traits(&rig), [("shy", false), ("loves a storm", false)]);
+        assert_eq!(rig.state.saves, 1);
+        assert_eq!(rig.texts("loves a storm").len(), 1, "a pill again");
+
+        // Escape leaves it as it was.
+        let (words, _) = pill(&rig, "shy");
+        rig.click(words);
+        rig.idle();
+        select_all(&mut rig);
+        rig.type_text("bold");
+        // (The box has its room: the next pill starts after it — past the
+        // box's end, the gap and the pill's own edge.)
+        let (typed, next) = (rig.texts("bold")[0], rig.texts("loves a storm")[0]);
+        assert!(next.left() >= typed.left() - 14.0 + TRAIT_FIELD_MIN + 6.0 + 12.0 - 1.0, "{typed:?} then {next:?}");
+        rig.key(egui::Key::Escape);
+        rig.idle();
+        assert_eq!(traits(&rig), [("shy", false), ("loves a storm", false)]);
+        assert_eq!(rig.state.saves, 1);
+
+        // Added with the last pill; one it already has isn't added twice.
+        for (typed, saves) in [("quick to laugh", 2), ("SHY", 2)] {
+            let add = rig.texts("+  Add")[0].center();
+            rig.click(add);
+            rig.idle();
+            rig.type_text(typed);
+            rig.key(egui::Key::Enter);
+            rig.idle();
+            assert_eq!(rig.state.saves, saves, "{typed}");
+        }
+        assert_eq!(traits(&rig), [("shy", false), ("loves a storm", false), ("quick to laugh", false)]);
+
+        // Removed by its ×; emptied, a trait goes too.
+        let (_, x) = pill(&rig, "loves a storm");
+        rig.click(x);
+        rig.idle();
+        assert_eq!(traits(&rig), [("shy", false), ("quick to laugh", false)]);
+        let (words, _) = pill(&rig, "shy");
+        rig.click(words);
+        rig.idle();
+        select_all(&mut rig);
+        rig.key(egui::Key::Backspace);
+        rig.key(egui::Key::Enter);
+        rig.idle();
+        assert_eq!(traits(&rig), [("quick to laugh", false)]);
+        assert_eq!(rig.state.saves, 4);
+    }
+
+    /// With none, the first pill says what it's for; at the most a
+    /// character keeps, there's no pill to add another.
+    #[test]
+    fn the_add_pill_comes_and_goes() {
+        let rig = editing(&[]);
+        assert_eq!(rig.texts("+  Add a trait").len(), 1);
+        let full: Vec<String> = (0..crate::roleplay::MAX_TRAITS).map(|i| format!("trait {i}")).collect();
+        let full: Vec<(&str, bool)> = full.iter().map(|t| (t.as_str(), false)).collect();
+        let rig = editing(&full);
+        assert!(rig.texts("+  Add").is_empty() && rig.texts("+  Add a trait").is_empty());
+        assert_eq!(rig.texts("trait 15").len(), 1);
+    }
+
+    /// Once the character has changed its persona, the line under it says
+    /// when — and Undo takes it back, a change at a time.
+    #[test]
+    fn a_change_to_the_persona_can_be_undone() {
+        let mut rig = editing(&[]);
+        assert!(rig.texts("Undo").is_empty(), "nothing to undo yet");
+        rig.state.rp.persona = "Mira is a shy sailor. She has never left the harbour.".into();
+        rig.state.rp.apply_growth(&[GrowthLine::PersonaGone("[P2]".into())], 1_795_000_000);
+        rig.state.rp.apply_growth(&[GrowthLine::PersonaAdd("She swam the bay.".into())], 1_795_000_100);
+        rig.idle();
+        let said = format!("Mira changed this on {}.", crate::memory::format_date(1_795_000_100));
+        assert_eq!(rig.texts(&said).len(), 1);
+
+        let undo = rig.texts("Undo")[0].center();
+        rig.click(undo);
+        rig.idle();
+        assert_eq!(rig.state.rp.persona, "Mira is a shy sailor.");
+        assert_eq!(rig.state.saves, 1);
+        let undo = rig.texts("Undo")[0].center();
+        rig.click(undo);
+        rig.idle();
+        assert_eq!(rig.state.rp.persona, "Mira is a shy sailor. She has never left the harbour.");
+        assert!(rig.texts("Undo").is_empty() && rig.state.saves == 2);
     }
 }
