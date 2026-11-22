@@ -36,6 +36,19 @@ const CONTEXT_TOKENS: usize = 16_384;
 /// scheme as the text-to-image view's cancel flag.
 static GEN_CANCEL: AtomicBool = AtomicBool::new(false);
 
+/// The work assistant is about to load the chat model, and the image model
+/// may be holding the graphics card (Settings: "Take turns on the graphics
+/// card"): the worker stops an idle ComfyUI before it loads, so the chat
+/// model doesn't end up half on the CPU — where its thinking takes minutes.
+static IMAGE_MODEL_STEPS_ASIDE: AtomicBool = AtomicBool::new(false);
+
+/// See [`IMAGE_MODEL_STEPS_ASIDE`]: set before a message that will load the
+/// model, cleared if the message couldn't be sent after all.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn image_model_steps_aside(first: bool) {
+    IMAGE_MODEL_STEPS_ASIDE.store(first, Ordering::SeqCst);
+}
+
 /// Set by the worker when a reply stopped before the model ended it — at
 /// Max reply length or the context's edge — so its last line may be cut
 /// short (Tag images then leaves the reply's tag edits unapplied).
@@ -229,6 +242,16 @@ pub struct GenParams {
     /// How long the thinking models may reason before answering (the
     /// slider at the bottom of the chat's tools menu).
     pub thinking: ThinkLevel,
+}
+
+impl GenParams {
+    /// These, thinking no longer than `most`.
+    fn thinking_at_most(mut self, most: ThinkLevel) -> Self {
+        if self.thinking.budget() > most.budget() {
+            self.thinking = most;
+        }
+        self
+    }
 }
 
 impl Default for GenParams {
@@ -1030,6 +1053,7 @@ pub enum ChatRole {
 #[cfg(test)]
 struct AskedInTest {
     msgs: Vec<CmdMsg>,
+    params: GenParams,
     pinned: usize,
     detailed: bool,
     reply: std::sync::mpsc::Sender<Msg>,
@@ -1052,6 +1076,10 @@ pub struct AssistantChat {
     pub looking: bool,
     /// What its replies asked for, for main.rs to carry out.
     pub actions: Vec<crate::assistant::Action>,
+    /// Its last reply had an image to generate and no model to generate it
+    /// with: it asked which (`assistant::MODEL_QUESTION`), and the user's
+    /// next message is the answer.
+    pub model_question: bool,
 }
 
 /// One message in an AI Chat conversation.
@@ -1598,16 +1626,32 @@ impl LlmState {
     /// minute and a half (see `unload_when_done`). The next activation
     /// reloads the model on its first ask.
     pub fn unload(&mut self) {
-        // Voice and mic stop with the chat: their Stop controls are in it,
-        // and nothing polls them while it's hidden — a clip still being
-        // synthesized would play when the chat is next shown, and dictation
-        // would record on and drop its transcript into the draft later.
+        self.quiet();
+        self.begin_unload();
+    }
+
+    /// AI Chat was switched off. Its model goes with it ([`Self::unload`])
+    /// — unless the work assistant is on (`assistant`), which answers with
+    /// the same model: that stays loaded, so its next message doesn't wait
+    /// for a load.
+    pub fn chat_off(&mut self, assistant: bool) {
+        if assistant {
+            self.quiet();
+        } else {
+            self.unload();
+        }
+    }
+
+    /// Voice and mic stop with the chat: their Stop controls are in it,
+    /// and nothing polls them while it's hidden — a clip still being
+    /// synthesized would play when the chat is next shown, and dictation
+    /// would record on and drop its transcript into the draft later.
+    fn quiet(&mut self) {
         self.voice.stop();
         if let Some(mut c) = self.tts.take() {
             let _ = c.kill();
         }
         self.dictate.cancel();
-        self.begin_unload();
     }
 
     /// AI Chat re-activated before a pending unload fired — keep the worker.
@@ -2379,6 +2423,7 @@ impl LlmState {
         &mut self,
         ctx: &egui::Context,
         msgs: Vec<CmdMsg>,
+        params: GenParams,
         pinned: usize,
         detailed: bool,
         reply: std::sync::mpsc::Sender<Msg>,
@@ -2387,10 +2432,10 @@ impl LlmState {
         // answer.)
         #[cfg(test)]
         if let Some(asked) = &mut self.asked_in_test {
-            asked.push(AskedInTest { msgs, pinned, detailed, reply });
+            asked.push(AskedInTest { msgs, params, pinned, detailed, reply });
             return Ok(());
         }
-        submit(ctx, self.model, self.image_detail, Cmd::Ask { msgs, params: self.params, pinned, detailed, reply, remote: None })
+        submit(ctx, self.model, self.image_detail, Cmd::Ask { msgs, params, pinned, detailed, reply, remote: None })
     }
 
     /// The work assistant's conversation, if it has one yet.
@@ -2409,6 +2454,18 @@ impl LlmState {
     /// (`run_err` says why): another reply is still coming, or no model is
     /// set up.
     pub fn assistant_send(&mut self, text: &str, scene: crate::assistant::Scene, ctx: &egui::Context) -> bool {
+        self.assistant_ask(text, scene, false, ctx)
+    }
+
+    /// [`Self::assistant_send`] for a message that asks it to look, in so
+    /// many words (the card's own "What do you think of this image?"): the
+    /// selected image goes with it at once, without the reply that would
+    /// only ask to be shown it.
+    pub fn assistant_send_shown(&mut self, text: &str, scene: crate::assistant::Scene, ctx: &egui::Context) -> bool {
+        self.assistant_ask(text, scene, true, ctx)
+    }
+
+    fn assistant_ask(&mut self, text: &str, scene: crate::assistant::Scene, shown: bool, ctx: &egui::Context) -> bool {
         let text = text.trim();
         if self.running || text.is_empty() {
             return false;
@@ -2437,11 +2494,15 @@ impl LlmState {
                 self.chats.len() - 1
             }
         };
+        let image = scene.selected.clone().filter(|image| shown && image.exists());
+        // (Whatever it says, it answers "Which model should I use?", if
+        // that was asked: it isn't asked twice.)
+        self.assistant.model_question = false;
         self.chats[index].msgs.push(ChatMsg {
             role: ChatRole::User,
             text: text.to_string(),
             thinking: None,
-            image: None,
+            image: image.clone(),
             doc: None,
             tag_image: None,
             tag_change: None,
@@ -2456,7 +2517,7 @@ impl LlmState {
             krea_prompt: false,
         });
         self.assistant.scene = scene;
-        self.assistant.looking = false;
+        self.assistant.looking = image.is_some();
         self.assistant_reply(ctx);
         true
     }
@@ -2514,7 +2575,21 @@ impl LlmState {
             self.assistant.actions.push(crate::assistant::Action::Open(place));
         }
         if let Some(prompt) = d.generate {
-            self.assistant.actions.push(crate::assistant::Action::Generate(prompt));
+            let scene = &self.assistant.scene;
+            if scene.model.is_none() && !scene.models.is_empty() {
+                // Several models and nothing to choose by: asked, once. The
+                // prompt is written again for the model picked (tags or
+                // sentences).
+                self.assistant.model_question = true;
+                let said = reply.text.trim_end();
+                reply.text = if said.is_empty() {
+                    crate::assistant::MODEL_QUESTION.to_string()
+                } else {
+                    format!("{said}\n\n{}", crate::assistant::MODEL_QUESTION)
+                };
+            } else {
+                self.assistant.actions.push(crate::assistant::Action::Generate(prompt));
+            }
         }
         if let Some((like, why)) = d.verdict
             && let Some(image) = shown
@@ -2723,9 +2798,10 @@ impl LlmState {
 
         GEN_CANCEL.store(false, Ordering::SeqCst);
         GEN_CUT_OFF.store(false, Ordering::SeqCst);
-        // (The assistant reads an image with its close-ups when it's shown
-        // it, as Krea 2 prompts does: it may be asked to recreate it.)
-        let detailed = wants_close_ups(self.krea_prompts || assistant, self.detailed_vision, &msgs);
+        // (The assistant reads an image whole — a tenth of what its
+        // close-ups take to read, which is minutes on a model that isn't all
+        // on the graphics card — unless Detailed vision is on.)
+        let detailed = wants_close_ups(self.krea_prompts && !assistant, self.detailed_vision, &msgs);
         let (tx, rx) = std::sync::mpsc::channel();
         // A Link host answers when this PC is linked to one sharing its
         // chat; otherwise the resident worker (a different model selected
@@ -2784,17 +2860,20 @@ impl LlmState {
             };
             web::spawn(job, tx)
         } else {
+            // The assistant answers at once or not at all: it thinks
+            // briefly, whatever the chat's thinking is set to (the thought is
+            // hidden in its card, and most of the wait).
+            let params = if assistant { self.params.thinking_at_most(ThinkLevel::Low) } else { self.params };
             match remote {
                 Some((peer, host)) => {
                     let ctx = ctx.clone();
-                    let params = self.params;
                     std::thread::Builder::new()
                         .name("ai-remote-ask".into())
                         .spawn(move || remote_ask(&peer, &host, msgs, params, pinned, detailed, None, &tx, &ctx))
                         .map(|_| ())
                         .map_err(|e| e.to_string())
                 }
-                None => self.ask_local(ctx, msgs, pinned, detailed, tx),
+                None => self.ask_local(ctx, msgs, params, pinned, detailed, tx),
             }
         };
         match asked {
@@ -3276,6 +3355,13 @@ mod worker {
                 None => base(m),
             }
         };
+        // The image model is idle and may have the graphics card: it steps
+        // aside first (see `IMAGE_MODEL_STEPS_ASIDE`).
+        #[cfg(not(target_os = "macos"))]
+        if super::IMAGE_MODEL_STEPS_ASIDE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            load_send(Msg::Status("Freeing the graphics card…".into()));
+            crate::generate::stop_server_if_ours();
+        }
         let loaded = match load(&load_send, model, detail) {
             Ok(l) => l,
             Err(e) => {
@@ -5510,6 +5596,8 @@ mod assistant_tests {
     fn bare() -> LlmState {
         let mut llm = LlmState::default();
         llm.asked_in_test = Some(Vec::new());
+        // (Whatever this machine has in its model folder.)
+        llm.installed = false;
         llm
     }
 
@@ -5596,7 +5684,7 @@ mod assistant_tests {
         let newest = second.msgs.last().unwrap();
         assert_eq!(newest.image.as_deref(), Some(image.as_path()));
         assert!(newest.text.contains("The selected image, fox.png, is attached: you can see it now."), "{}", newest.text);
-        assert!(second.detailed, "read with its close-ups");
+        assert!(!second.detailed, "read whole: its close-ups are for when Detailed vision is on");
         assert_eq!(second.msgs.len(), 3, "brief, its yes, and the message — not the reply that asked");
 
         // It answers, and ends with what it wants done.
@@ -5654,6 +5742,137 @@ mod assistant_tests {
             assert!(talk(&llm).last().unwrap().text.starts_with("There's no image selected"));
             assert!(talk(&llm)[0].image.is_none() && llm.assistant.actions.is_empty());
         }
+    }
+
+    /// Asked in so many words to look (the card's own asks), the assistant
+    /// has the image from the start: no reply that only asks to be shown it.
+    /// With nothing selected — or a file that's gone — the message goes as
+    /// any other.
+    #[test]
+    fn asked_to_look_it_is_shown_the_image_at_once() {
+        if !BUILT_WITH_LLM {
+            return;
+        }
+        let (dir, image) = picture("shown");
+        let ctx = egui::Context::default();
+        let mut llm = app();
+        assert!(llm.assistant_send_shown("What do you think of this image?", in_gallery(Some(&image)), &ctx));
+        assert!(llm.assistant.looking);
+        let first = &asked(&llm)[0];
+        let newest = first.msgs.last().unwrap();
+        assert_eq!(newest.image.as_deref(), Some(image.as_path()));
+        assert!(newest.text.contains("is attached: you can see it now"), "{}", newest.text);
+        answer(&mut llm, "Calm.\nLIKE: the light");
+        assert!(!llm.running && asked(&llm).len() == 1 && !llm.assistant.looking);
+        assert_eq!(llm.take_assistant_actions(), [Action::Verdict { image: image.clone(), like: true }]);
+
+        for selected in [None, Some(dir.join("gone.png"))] {
+            assert!(llm.assistant_send_shown("And this one?", in_gallery(selected.as_deref()), &ctx));
+            assert!(!llm.assistant.looking && asked(&llm).last().unwrap().msgs.last().unwrap().image.is_none());
+            answer(&mut llm, "Which?");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Switching AI Chat off frees its model — but not while the work
+    /// assistant is on: that answers with it. Detailed vision still gives
+    /// the assistant an image's close-ups.
+    #[test]
+    fn the_model_stays_for_the_assistant() {
+        if !BUILT_WITH_LLM {
+            return;
+        }
+        let ctx = egui::Context::default();
+        let mut llm = app();
+        // (A reply in flight: the unload waits for it, so it shows.)
+        assert!(llm.assistant_send("hello", in_gallery(None), &ctx));
+        llm.chat_off(true);
+        assert!(!llm.unload_when_done, "the assistant keeps the model");
+        llm.chat_off(false);
+        assert!(llm.unload_when_done, "nothing else needs it");
+        answer(&mut llm, "Hi.");
+
+        let (dir, image) = picture("detailed");
+        for detailed in [false, true] {
+            llm.detailed_vision = detailed;
+            assert!(llm.assistant_send_shown("What's in it?", in_gallery(Some(&image)), &ctx));
+            assert_eq!(asked(&llm).last().unwrap().detailed, detailed);
+            answer(&mut llm, "A fox.");
+        }
+        // (Krea 2 prompts' close-ups are the chat's.)
+        llm.detailed_vision = false;
+        llm.krea_prompts = true;
+        assert!(llm.assistant_send_shown("And now?", in_gallery(Some(&image)), &ctx));
+        assert!(!asked(&llm).last().unwrap().detailed);
+        answer(&mut llm, "Still a fox.");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The assistant thinks briefly, whatever the chat's thinking is set to
+    /// — never longer than the chat would; the chat's own replies think as
+    /// set.
+    #[test]
+    fn the_assistant_thinks_briefly() {
+        if !BUILT_WITH_LLM {
+            return;
+        }
+        let ctx = egui::Context::default();
+        let mut llm = app();
+        for (set, thinks) in [
+            (ThinkLevel::Max, ThinkLevel::Low),
+            (ThinkLevel::Medium, ThinkLevel::Low),
+            (ThinkLevel::Low, ThinkLevel::Low),
+            (ThinkLevel::Off, ThinkLevel::Off),
+        ] {
+            llm.params.thinking = set;
+            llm.params.temperature = 0.4;
+            assert!(llm.assistant_send("hello", in_gallery(None), &ctx));
+            let params = asked(&llm).last().unwrap().params;
+            assert!(params.thinking == thinks && params.temperature == 0.4 && params.max_tokens == llm.params.max_tokens, "{set:?}");
+            answer(&mut llm, "Hi.");
+        }
+        llm.params.thinking = ThinkLevel::High;
+        llm.draft = "a question of the chat's own".into();
+        llm.send_draft(&ctx);
+        assert!(asked(&llm).last().unwrap().params.thinking == ThinkLevel::High);
+    }
+
+    /// An image to generate, several models, and nothing to choose one by:
+    /// the reply asks which in place of generating, and the next message —
+    /// whatever it says — is the answer. With a model chosen, it generates.
+    #[test]
+    fn it_asks_which_model_when_it_cant_tell() {
+        if !BUILT_WITH_LLM {
+            return;
+        }
+        use crate::assistant::{MODEL_QUESTION, ModelChoice, Why};
+        let ctx = egui::Context::default();
+        let mut llm = app();
+        let unsure = || Scene { models: vec!["SDXL", "Krea 2"], ..in_gallery(None) };
+        assert!(llm.assistant_send("make me a fox", unsure(), &ctx));
+        assert!(asked(&llm)[0].msgs.last().unwrap().text.contains("Text to Image models: SDXL, Krea 2. I haven't picked one"));
+        answer(&mut llm, "A fox in fresh snow, coming up.\nGENERATE: a red fox in fresh snow");
+        assert!(llm.take_assistant_actions().is_empty() && llm.assistant.model_question);
+        assert_eq!(talk(&llm).last().unwrap().text, format!("A fox in fresh snow, coming up.\n\n{MODEL_QUESTION}"));
+
+        // The answer: the question is no longer open.
+        let krea = ModelChoice { key: "krea2", title: "Krea 2", tags: false, why: Why::Answered };
+        assert!(llm.assistant_send("Krea 2", Scene { model: Some(krea), ..in_gallery(None) }, &ctx));
+        assert!(!llm.assistant.model_question);
+        assert!(asked(&llm)[1].msgs.last().unwrap().text.contains("I've just picked Krea 2"));
+        answer(&mut llm, "GENERATE: a red fox in fresh snow");
+        assert_eq!(llm.take_assistant_actions(), [Action::Generate("a red fox in fresh snow".into())]);
+        assert!(!llm.assistant.model_question && talk(&llm).last().unwrap().text.is_empty());
+
+        // Only a prompt, and nothing to choose by: only the question. A
+        // reply that generates nothing asks nothing.
+        assert!(llm.assistant_send("another", unsure(), &ctx));
+        answer(&mut llm, "GENERATE: a second fox");
+        assert_eq!(talk(&llm).last().unwrap().text, MODEL_QUESTION);
+        assert!(llm.assistant.model_question && llm.take_assistant_actions().is_empty());
+        assert!(llm.assistant_send("never mind — hello", unsure(), &ctx));
+        answer(&mut llm, "Hello!");
+        assert!(!llm.assistant.model_question && talk(&llm).last().unwrap().text == "Hello!");
     }
 
     /// Places, and an opinion: carried out when the reply ended by itself —

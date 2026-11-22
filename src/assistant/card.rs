@@ -68,21 +68,69 @@ impl Default for AssistantUi {
 pub enum Ask {
     /// Send this to the assistant.
     Send(String),
+    /// Send this with the selected image shown: it asks the assistant to
+    /// look, in so many words (the card's own asks).
+    Show(String),
     /// Stop the reply that's coming.
     Stop,
 }
 
+/// What a reply still coming is doing, while its words aren't there to
+/// read: the line the pill and the card show, and — while it thinks — the
+/// end of its thought, so the wait is seen to be going somewhere.
+#[derive(Debug, Default, PartialEq)]
+struct Doing {
+    what: String,
+    thought: Option<String>,
+}
+
+/// The most of a thought's last line the card shows.
+const THOUGHT_CHARS: usize = 96;
+
+/// What the reply that's coming is doing (None: none is). The worker's own
+/// line until the first words — loading the model, reading the message —
+/// then by what has come: a thought (hidden, but for its last line), words
+/// to read, or the prompt of an image, which is the app's to read.
+fn doing(llm: &LlmState) -> Option<Doing> {
+    if !llm.assistant_busy() {
+        return None;
+    }
+    let raw = llm.assistant_chat().and_then(|c| c.msgs.last()).filter(|m| m.role == ChatRole::Model).map_or("", |m| m.text.as_str());
+    let (thought, said) = crate::llm::split_channels(raw);
+    // (Counted from when the reply was asked for, then from its first
+    // word: `gen_started`.)
+    let secs = llm.gen_started.map(|t| t.elapsed().as_secs()).filter(|&s| s >= 2);
+    let timed = |what: &str| match secs {
+        Some(secs) => format!("{what} {secs} s"),
+        None => what.to_string(),
+    };
+    let dressing = |c: char| c.is_whitespace() || matches!(c, '`' | '*' | '_');
+    Some(if said.lines().any(|line| line.trim_start_matches(dressing).starts_with(crate::assistant::GENERATE_TAG)) {
+        Doing { what: timed("Writing the prompt…"), thought: None }
+    } else if !said.trim().is_empty() {
+        Doing { what: "Writing…".to_string(), thought: None }
+    } else if !thought.trim().is_empty() {
+        let line = thought.lines().rev().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default();
+        let skip = line.chars().count().saturating_sub(THOUGHT_CHARS);
+        let tail: String = line.chars().skip(skip).collect();
+        Doing { what: timed("Thinking…"), thought: Some(if skip > 0 { format!("…{}", tail.trim_start()) } else { tail }) }
+    } else {
+        // Before the first word: what the worker says it's doing (loading
+        // the model, reading the image…) — until it says, that the image is
+        // on its way to it, or just that it's thinking.
+        let status = llm.status.trim();
+        let what = match (status.is_empty() || status == "Starting…", llm.assistant.looking) {
+            (true, true) => "Looking at the image…",
+            (true, false) => "Thinking…",
+            (false, _) => status,
+        };
+        Doing { what: timed(what), thought: None }
+    })
+}
+
 /// What the pill says: what the assistant is doing, or just that it's there.
 fn pill_text(llm: &LlmState) -> String {
-    if !llm.assistant_busy() {
-        "Assistant".to_string()
-    } else if llm.assistant.looking {
-        "Looking at the image…".to_string()
-    } else if llm.status.trim().is_empty() {
-        "Thinking…".to_string()
-    } else {
-        llm.status.clone()
-    }
+    doing(llm).map_or_else(|| "Assistant".to_string(), |doing| doing.what)
 }
 
 /// The pill in the top bar: the orb — alive while a reply is coming — and a
@@ -306,17 +354,23 @@ fn card(
                         ask = first_asks(ui, can_generate).or(ask.take());
                     }
                     let last = msgs.len().saturating_sub(1);
+                    let coming = doing(llm);
                     for (i, m) in msgs.iter().enumerate() {
                         if m.user {
                             user_message(ui, llm, m);
                         } else {
-                            reply(ui, &mut state.markdown, m, busy && i == last, &llm.status, llm.assistant.looking);
+                            reply(ui, &mut state.markdown, m, coming.as_ref().filter(|_| i == last));
                         }
+                    }
+                    // "Which model should I use?": the ones to pick from,
+                    // under the question — a click answers it.
+                    if llm.assistant.model_question && !busy && msgs.last().is_some_and(|m| !m.user) {
+                        ask = model_asks(ui, &llm.assistant.scene.models).or(ask.take());
                     }
                     // Being shown the image: the reply that asked is gone,
                     // the one that answers hasn't begun.
-                    if busy && msgs.last().is_some_and(|m| m.user) {
-                        waiting(ui, if llm.assistant.looking { "Looking at the image…" } else { &llm.status });
+                    if let Some(coming) = coming.as_ref().filter(|_| msgs.last().is_some_and(|m| m.user)) {
+                        waiting(ui, coming);
                     }
                 });
                 if let Some(why) = &llm.run_err {
@@ -354,7 +408,23 @@ fn first_asks(ui: &mut egui::Ui, can_generate: bool) -> Option<Ask> {
         let asks: &[&str] = if can_generate { &[LOOK_FIRST, RECREATE_FIRST, OPEN_FIRST] } else { &[LOOK_FIRST] };
         for text in asks {
             if crate::scan::pill(ui, text, crate::scan::Pill::Outline, None, true).clicked() {
-                ask = Some(Ask::Send(text.to_string()));
+                // (The two about the image ask it to look.)
+                ask = Some(if *text == OPEN_FIRST { Ask::Send(text.to_string()) } else { Ask::Show(text.to_string()) });
+            }
+        }
+    });
+    ask
+}
+
+/// The models the assistant asks the user to pick from, to answer with a
+/// click (typing a name answers the same).
+fn model_asks(ui: &mut egui::Ui, models: &[&'static str]) -> Option<Ask> {
+    let mut ask = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+        for model in models {
+            if crate::scan::pill(ui, model, crate::scan::Pill::Outline, None, true).clicked() {
+                ask = Some(Ask::Send(model.to_string()));
             }
         }
     });
@@ -388,12 +458,13 @@ fn user_message(ui: &mut egui::Ui, llm: &mut LlmState, m: &Shown) {
 
 /// The assistant's reply: its words, then what it did. While it's coming
 /// and has said nothing yet, what it's busy with.
-fn reply(ui: &mut egui::Ui, cache: &mut egui_commonmark::CommonMarkCache, m: &Shown, coming: bool, status: &str, looking: bool) {
+fn reply(ui: &mut egui::Ui, cache: &mut egui_commonmark::CommonMarkCache, m: &Shown, coming: Option<&Doing>) {
     if m.text.trim().is_empty() && m.did.is_empty() {
-        if coming {
-            waiting(ui, if looking { "Looking at the image…" } else { status });
-        } else {
-            ui.label(egui::RichText::new("No answer.").color(MUTED()).italics().size(12.5));
+        match coming {
+            Some(coming) => waiting(ui, coming),
+            None => {
+                ui.label(egui::RichText::new("No answer.").color(MUTED()).italics().size(12.5));
+            }
         }
         return;
     }
@@ -410,14 +481,26 @@ fn reply(ui: &mut egui::Ui, cache: &mut egui_commonmark::CommonMarkCache, m: &Sh
     for did in &m.did {
         did_line(ui, did);
     }
+    // Its words are there, and more is coming that isn't for reading: the
+    // prompt of the image it's about to make.
+    if let Some(coming) = coming.filter(|c| c.what.starts_with("Writing the prompt")) {
+        waiting(ui, coming);
+    }
 }
 
-/// A spinner and what's being waited for.
-fn waiting(ui: &mut egui::Ui, what: &str) {
-    ui.horizontal(|ui| {
-        ui.add(egui::Spinner::new().size(13.0).color(MUTED()));
-        let what = if what.trim().is_empty() { "Thinking…" } else { what };
-        ui.label(egui::RichText::new(what).color(MUTED()).size(12.5));
+/// A spinner and what's being waited for — with the end of the thought
+/// under it, while there is one.
+fn waiting(ui: &mut egui::Ui, doing: &Doing) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().size(13.0).color(MUTED()));
+            ui.label(egui::RichText::new(&doing.what).color(MUTED()).size(12.5));
+        });
+        if let Some(thought) = &doing.thought {
+            let ink = MUTED().gamma_multiply(0.7);
+            ui.add(egui::Label::new(egui::RichText::new(thought).color(ink).italics().size(11.5)).truncate().selectable(false));
+        }
     });
     ui.ctx().request_repaint();
 }
@@ -559,7 +642,13 @@ mod tests {
         }
         let recreate = one(&rig, RECREATE_FIRST).center();
         rig.click(recreate);
-        assert_eq!(rig.state.asks, [Ask::Send(RECREATE_FIRST.to_string())]);
+        // (About the image: it goes with the image shown.)
+        assert_eq!(rig.state.asks, [Ask::Show(RECREATE_FIRST.to_string())]);
+        let (look, open) = (one(&rig, LOOK_FIRST).center(), one(&rig, OPEN_FIRST).center());
+        rig.click(look);
+        rig.click(open);
+        assert_eq!(rig.state.asks[1..], [Ask::Show(LOOK_FIRST.to_string()), Ask::Send(OPEN_FIRST.to_string())]);
+        rig.state.asks.truncate(1);
 
         // Where nothing can be generated, nothing about it is offered.
         rig.state.can_generate = false;
@@ -595,6 +684,108 @@ mod tests {
         assert_eq!(rig.state.asks.len(), 2);
     }
 
+    /// While a reply is coming and has nothing to read yet, the pill and
+    /// the card say what it's doing: the worker's line until the first
+    /// words, then that it's thinking — for how long, with the end of the
+    /// thought under it — or writing an image's prompt.
+    #[test]
+    fn a_coming_reply_says_what_it_is_doing() {
+        let mut rig = over(vec![msg(ChatRole::User, "Recreate it at night", &[]), msg(ChatRole::Model, "", &[])]);
+        assert_eq!(doing(&rig.state.llm), None);
+        rig.state.llm.running = true;
+        rig.state.llm.gen_assistant = true;
+        let coming = |rig: &mut Rig<Over>, raw: &str| {
+            rig.state.llm.chats[1].msgs[1].text = raw.to_string();
+            doing(&rig.state.llm).unwrap()
+        };
+        let plain = |what: &str| Doing { what: what.to_string(), thought: None };
+        // Nothing has come: the worker's line (none yet: thinking — or,
+        // shown the image, looking at it).
+        assert_eq!(coming(&mut rig, ""), plain("Thinking…"));
+        rig.state.llm.status = "Starting…".into();
+        assert_eq!(coming(&mut rig, ""), plain("Thinking…"));
+        rig.state.llm.assistant.looking = true;
+        assert_eq!(coming(&mut rig, ""), plain("Looking at the image…"));
+        rig.state.llm.status = "Reading the image…".into();
+        assert_eq!(coming(&mut rig, ""), plain("Reading the image…"), "what the worker says, once it does");
+        rig.state.llm.assistant.looking = false;
+        rig.state.llm.status = "Loading the model (first time takes a minute)…".into();
+        assert_eq!(coming(&mut rig, ""), plain("Loading the model (first time takes a minute)…"));
+        rig.state.llm.gen_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(40));
+        assert_eq!(coming(&mut rig, "").what, "Loading the model (first time takes a minute)… 40 s");
+        rig.state.llm.gen_started = None;
+
+        // A thought: its last line — the end of it, when it's long.
+        let thinking = coming(&mut rig, "<|channel>thought\nThe user wants night.\nA streetlamp outside, then.\n\n");
+        assert_eq!(thinking, Doing { what: "Thinking…".into(), thought: Some("A streetlamp outside, then.".into()) });
+        let long = format!("<think>{}the very end", "word ".repeat(40));
+        let tail = coming(&mut rig, &long).thought.unwrap();
+        assert!(tail.starts_with('…') && tail.ends_with("word the very end") && tail.chars().count() <= THOUGHT_CHARS + 1, "{tail}");
+        // Timed from its first word, once that's worth saying.
+        rig.state.llm.gen_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
+        assert_eq!(coming(&mut rig, "<|channel>thought\nHm.").what, "Thinking… 12 s");
+        rig.state.llm.gen_started = Some(std::time::Instant::now());
+        assert_eq!(coming(&mut rig, "<|channel>thought\nHm.").what, "Thinking…");
+
+        // Words, and the prompt after them (however it's dressed).
+        assert_eq!(coming(&mut rig, "<|channel>thought\nHm.<channel|>On it."), plain("Writing…"));
+        assert_eq!(coming(&mut rig, "<|channel>thought\nHm.<channel|>On it.\n`GENERATE: a cat"), plain("Writing the prompt…"));
+        assert_eq!(coming(&mut rig, "On it. Not GENERATE: yet"), plain("Writing…"));
+
+        // In the card: the line, and the thought under it; neither once
+        // the reply has ended.
+        rig.state.llm.gen_started = None;
+        rig.state.llm.chats[1].msgs[1].text = "<|channel>thought\nA streetlamp outside, then.".into();
+        rig.idle();
+        let pill = one(&rig, "Thinking…").center();
+        rig.click(pill);
+        rig.idle();
+        let lines = rig.texts("Thinking…");
+        assert_eq!(lines.len(), 2, "in the pill and in the card");
+        let thought = one(&rig, "A streetlamp outside, then.");
+        assert!(lines.iter().any(|line| thought.top() > line.bottom() - 2.0 && thought.top() < line.bottom() + 8.0), "{lines:?} {thought:?}");
+        // Words to read need no line under them: the pill's is enough.
+        rig.state.llm.chats[1].msgs[1].text = "<|channel>thought\nHm.<channel|>On it.".into();
+        rig.idle();
+        one(&rig, "On it.");
+        assert_eq!(rig.texts("Writing…").len(), 1);
+        rig.state.llm.running = false;
+        rig.state.llm.chats[1].msgs[1].text = "Done.".into();
+        rig.idle();
+        assert!(rig.texts("Thinking…").is_empty() && rig.texts("A streetlamp outside, then.").is_empty());
+    }
+
+    /// "Which model should I use?": the models to pick from are under the
+    /// question, and a click answers with that model's name. Not while a
+    /// reply is coming, and not once it's answered.
+    #[test]
+    fn the_models_to_pick_from_are_under_the_question() {
+        let mut rig = over(vec![
+            msg(ChatRole::User, "make me a fox", &[]),
+            msg(ChatRole::Model, "A fox in fresh snow.\n\nWhich model should I use?", &[]),
+        ]);
+        rig.state.llm.assistant.scene.models = vec!["SDXL", "Krea 2", "Z-Image"];
+        rig.state.llm.assistant.model_question = true;
+        let pill = pill_at(&rig);
+        rig.click(pill);
+        rig.idle();
+        let question = one(&rig, "Which model should I use?");
+        let (sdxl, krea, z) = (one(&rig, "SDXL"), one(&rig, "Krea 2"), one(&rig, "Z-Image"));
+        assert!(sdxl.top() > question.bottom() && sdxl.right() < krea.left() && krea.right() < z.left());
+        rig.click(krea.center());
+        assert_eq!(rig.state.asks, [Ask::Send("Krea 2".to_string())]);
+
+        rig.state.llm.running = true;
+        rig.state.llm.gen_assistant = true;
+        rig.idle();
+        assert!(rig.texts("SDXL").is_empty(), "a reply is coming");
+        rig.state.llm.running = false;
+        rig.state.llm.assistant.model_question = false;
+        rig.idle();
+        assert!(rig.texts("SDXL").is_empty() && rig.texts("Z-Image").is_empty(), "answered");
+        one(&rig, "Which model should I use?");
+    }
+
     /// The conversation: the user's messages on the right, the replies on
     /// the left with what they did under them. A reply still coming shows
     /// without its thought or its control lines, the pill says what it's
@@ -609,10 +800,10 @@ mod tests {
         ]);
         rig.state.llm.running = true;
         rig.state.llm.gen_assistant = true;
-        rig.state.llm.status = "Writing…".into();
+        rig.state.llm.status = "Thinking…".into();
         rig.idle();
-        assert_eq!(one(&rig, "Writing…").center().y, rig.texts("Writing…")[0].center().y);
-        let pill = one(&rig, "Writing…").center();
+        // (Its words are there, and the image's prompt is coming.)
+        let pill = one(&rig, "Writing the prompt…").center();
         rig.click(pill);
         rig.idle();
         let (asked, said, did) = (one(&rig, "What do you think of it?"), one(&rig, "Calm and warm."), one(&rig, "Liked it — the warm light"));
@@ -622,6 +813,9 @@ mod tests {
         assert!(coming.top() > one(&rig, "Recreate it at night").bottom());
         assert!(rig.texts("Night, a lamp.").is_empty(), "its thought stays its own");
         assert!(rig.texts("GENERATE: a cat at ni").is_empty(), "and its control lines the app's");
+        let writing = rig.texts("Writing the prompt…");
+        assert_eq!(writing.len(), 2, "in the pill, and under what it said");
+        assert!(writing.iter().any(|r| r.top() > coming.bottom() - 2.0));
         // Stop, where Send was.
         let hint = one(&rig, "Ask the assistant");
         let button = egui::pos2(hint.left() - 14.0 + (CARD_W - 28.0 - 40.0) + 8.0 + 16.0, hint.center().y);

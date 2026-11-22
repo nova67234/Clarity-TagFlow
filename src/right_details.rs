@@ -120,11 +120,56 @@ impl RightPanelState {
             .any(|state| state.busy())
     }
 
-    /// Text to Image, for the work assistant to generate in: the image
-    /// model's view that's showing, or — from anywhere else — Krea 2's,
-    /// which it opens (the assistant writes a prompt in natural language).
+    /// The Text to Image models, in the order their list has them, as the
+    /// work assistant chooses among them (`assistant::choose_model`): which
+    /// are downloaded, which one's view is showing (`panels`: the right panel
+    /// is on screen), and how often the user has generated with each
+    /// (`uses`, the settings' hidden count).
     #[cfg(not(target_os = "macos"))]
-    pub fn open_text_to_image(&mut self) -> &mut crate::generate::GenerateState {
+    pub fn image_models(&self, panels: bool, uses: &std::collections::BTreeMap<String, u32>) -> Vec<crate::assistant::ImageModel> {
+        [RightView::Sdxl, RightView::Anima, RightView::Krea2, RightView::Generate, RightView::ZImage]
+            .into_iter()
+            .filter_map(|view| {
+                let mut model = self.generation(view)?.assistant_model();
+                model.open = panels && self.view == view;
+                model.uses = uses.get(model.key).copied().unwrap_or(0);
+                Some(model)
+            })
+            .collect()
+    }
+
+    /// The runs started in each generation view since this was last asked,
+    /// by the model's key — main.rs adds them to the settings' count.
+    #[cfg(not(target_os = "macos"))]
+    pub fn take_runs(&mut self) -> Vec<(&'static str, u32)> {
+        [
+            &mut self.generate,
+            &mut self.zimage,
+            &mut self.ltx,
+            &mut self.wan,
+            &mut self.minimax,
+            &mut self.sdxl,
+            &mut self.anima,
+            &mut self.krea2,
+        ]
+        .into_iter()
+        .map(|state| state.take_runs())
+        .filter(|(_, runs)| *runs > 0)
+        .collect()
+    }
+
+    /// Text to Image, for the work assistant to generate in: the view of
+    /// the model it chose (`key`, as [`Self::image_models`] has it), which
+    /// it opens. With none chosen: the image model's view that's showing,
+    /// or — from anywhere else — Krea 2's.
+    #[cfg(not(target_os = "macos"))]
+    pub fn open_text_to_image(&mut self, key: Option<&str>) -> &mut crate::generate::GenerateState {
+        let chosen = [RightView::Sdxl, RightView::Anima, RightView::Krea2, RightView::Generate, RightView::ZImage]
+            .into_iter()
+            .find(|view| key.is_some() && self.generation(*view).map(|state| state.assistant_model().key) == key);
+        if let Some(view) = chosen {
+            self.view = view;
+        }
         if !matches!(self.view, RightView::Sdxl | RightView::Anima | RightView::Krea2 | RightView::Generate | RightView::ZImage) {
             self.view = RightView::Krea2;
         }

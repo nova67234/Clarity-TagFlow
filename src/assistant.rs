@@ -122,6 +122,139 @@ pub struct Scene {
     pub generating: bool,
     /// Text to Image can be driven here (not on macOS).
     pub can_generate: bool,
+    /// The Text to Image model a GENERATE prompt of this reply runs on
+    /// ([`choose_model`]). None with `models` to pick from: the user is
+    /// asked which, once, in place of generating.
+    pub model: Option<ModelChoice>,
+    /// With no model chosen: the ones the user can pick, by name.
+    pub models: Vec<&'static str>,
+}
+
+/// A Text to Image model, as the app describes it when a message is sent.
+// (Nothing generates in the macOS build.)
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageModel {
+    /// Its key in the settings ("krea2").
+    pub key: &'static str,
+    /// Its name ("Krea 2").
+    pub title: &'static str,
+    /// Its prompts are comma-separated tags (SDXL, Anima), not sentences.
+    pub tags: bool,
+    /// It is downloaded: it can generate.
+    pub ready: bool,
+    /// Its view is the one showing in the right panel.
+    pub open: bool,
+    /// How many runs the user has started with it (the hidden count:
+    /// `Settings::gen_uses`).
+    pub uses: u32,
+}
+
+/// Why a model is the one to generate with — the note says it to the AI.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Why {
+    /// The message names it.
+    Named,
+    /// The message answers "Which model should I use?" with it.
+    Answered,
+    /// Its view is open.
+    Open,
+    /// The user generates with it most.
+    MostUsed,
+    /// The user picked it when asked.
+    Picked,
+    /// It's the only one downloaded (or nothing is: its view says what to
+    /// set up).
+    Only,
+}
+
+/// The model a reply's GENERATE prompt runs on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelChoice {
+    pub key: &'static str,
+    pub title: &'static str,
+    pub tags: bool,
+    pub why: Why,
+}
+
+/// What the assistant asks, once, when it has nothing to choose a model by
+/// (the card puts the models under it, to click).
+pub const MODEL_QUESTION: &str = "Which model should I use?";
+
+/// The ways a message names a model, lower-case, as whole words.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn names_of(key: &str) -> &'static [&'static str] {
+    match key {
+        "sdxl" => &["sdxl", "sd xl", "stable diffusion xl"],
+        "anima" => &["anima"],
+        "krea2" => &["krea 2", "krea2", "krea"],
+        "flux" => &["flux"],
+        "zimage" => &["z image", "zimage"],
+        _ => &[],
+    }
+}
+
+/// The models `text` names ("in SDXL", "use z-image") — whole words, any
+/// case, with or without the dash.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub fn named_models<'a>(text: &str, models: &'a [ImageModel]) -> Vec<&'a ImageModel> {
+    let words: String = text.chars().map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { ' ' }).collect();
+    let words = format!(" {} ", words.split_whitespace().collect::<Vec<_>>().join(" "));
+    models.iter().filter(|m| names_of(m.key).iter().any(|name| words.contains(&format!(" {name} ")))).collect()
+}
+
+/// The model the assistant generates with for a message, and — when the
+/// message answers its one question (`answering`) — the model to keep as
+/// the user's pick. In this order: the one the message names; the one whose
+/// view is open; the one the user generates with most; the one they picked
+/// when asked; the only one downloaded. None: there are several and nothing
+/// to choose by, so the user is asked ([`offered`]).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub fn choose_model(
+    models: &[ImageModel],
+    text: &str,
+    picked: Option<&str>,
+    answering: bool,
+) -> (Option<ModelChoice>, Option<&'static str>) {
+    let choice = |m: &ImageModel, why| Some(ModelChoice { key: m.key, title: m.title, tags: m.tags, why });
+    let named = named_models(text, models);
+    let named = if named.len() == 1 { Some(named[0]) } else { None };
+    let ready: Vec<&ImageModel> = models.iter().filter(|m| m.ready).collect();
+    // Asked once: an answer that names none leaves the choice to the app
+    // (Krea 2, which takes the plain sentences the AI writes best).
+    let keep = if answering && picked.is_none() {
+        named.or_else(|| ready.iter().copied().find(|m| m.key == "krea2")).or_else(|| ready.first().copied()).map(|m| m.key)
+    } else {
+        None
+    };
+    let picked = picked.or(keep);
+    if let Some(m) = named {
+        return (choice(m, if keep.is_some() { Why::Answered } else { Why::Named }), keep);
+    }
+    if let Some(m) = models.iter().find(|m| m.open) {
+        return (choice(m, Why::Open), keep);
+    }
+    let most = ready.iter().map(|m| m.uses).max().filter(|&uses| uses > 0);
+    let mut used_most = ready.iter().copied().filter(|m| Some(m.uses) == most);
+    if let Some(m) = used_most.clone().find(|m| Some(m.key) == picked).or_else(|| used_most.next()) {
+        return (choice(m, Why::MostUsed), keep);
+    }
+    if let Some(m) = models.iter().find(|m| Some(m.key) == picked) {
+        return (choice(m, Why::Picked), keep);
+    }
+    match ready.as_slice() {
+        [only] => (choice(only, Why::Only), keep),
+        // Nothing downloaded: Krea 2's view says what to set up.
+        [] => (models.iter().find(|m| m.key == "krea2").or(models.first()).and_then(|m| choice(m, Why::Only)), keep),
+        _ => (None, keep),
+    }
+}
+
+/// The models the user is asked to pick from: the downloaded ones.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub fn offered(models: &[ImageModel]) -> Vec<&'static str> {
+    models.iter().filter(|m| m.ready).map(|m| m.title).collect()
 }
 
 impl Scene {
@@ -144,7 +277,36 @@ impl Scene {
             (None, None) => "No image is selected.".to_string(),
         };
         let busy = if self.generating { " An image is being generated right now." } else { "" };
-        format!("[App note — I am in {place}. {selected}{busy}]")
+        format!("[App note — I am in {place}. {selected}{busy}{}]", self.model_note())
+    }
+
+    /// Which Text to Image model a GENERATE prompt runs on, and why — or
+    /// that the user hasn't picked one.
+    fn model_note(&self) -> String {
+        if !self.can_generate {
+            return String::new();
+        }
+        let Some(model) = &self.model else {
+            if self.models.is_empty() {
+                return String::new();
+            }
+            return format!(
+                " Text to Image models: {}. I haven't picked one yet, so the app asks me which before your GENERATE prompt runs.",
+                self.models.join(", ")
+            );
+        };
+        let title = model.title;
+        let which = match model.why {
+            Why::Named => format!("For this one I asked for the Text to Image model {title}."),
+            Why::Answered => format!(
+                "I've just picked {title} as my Text to Image model: write the GENERATE line now for the image I asked for."
+            ),
+            Why::Open => format!("Text to Image is open on {title}."),
+            Why::MostUsed => format!("My usual Text to Image model is {title}."),
+            Why::Picked | Why::Only => format!("My Text to Image model is {title}."),
+        };
+        let tags = if model.tags { " It takes comma-separated tags, not sentences." } else { "" };
+        format!(" {which}{tags}")
     }
 }
 
@@ -201,9 +363,9 @@ pub fn brief(can_generate: bool) -> String {
              I ask you to make, generate or recreate an image, and at most once a reply. Write the prompt as one \
              paragraph of plain natural language, 60 to 200 words: the main subject first, then concrete details \
              (colors, materials, clothing, expression, pose), the setting, the lighting, and the medium or camera. \
-             Quote any text that should appear in the image. No tag lists, no negatives, no line breaks. (It \
-             runs on the Text to Image model I have open, or on Krea 2 when none is. Only if the note says \
-             Text to Image is on SDXL or Anima, write comma-separated tags instead of sentences.)\n"
+             Quote any text that should appear in the image. No tag lists, no negatives, no line breaks. (The \
+             note says which Text to Image model it runs on. Only if the note says that model takes tags, \
+             write comma-separated tags instead of sentences.)\n"
         )
     } else {
         String::new()
@@ -382,7 +544,7 @@ pub fn open(place: Place, settings: &mut crate::settings::Settings, right: &mut 
         Place::Civitai => right.view = RightView::Civitai,
         #[cfg(not(target_os = "macos"))]
         Place::TextToImage => {
-            right.open_text_to_image();
+            right.open_text_to_image(None);
         }
         #[cfg(not(target_os = "macos"))]
         Place::TextToVideo => right.open_text_to_video(),
@@ -400,8 +562,8 @@ pub fn did_open(place: Place) -> String {
 
 // (Nothing generates in the macOS build.)
 #[cfg_attr(target_os = "macos", allow(dead_code))]
-pub fn did_generate() -> String {
-    "Started generating in Text to Image".to_string()
+pub fn did_generate(model: &str) -> String {
+    format!("Started generating in {model}")
 }
 
 pub fn did_verdict(like: bool, why: &str) -> String {
@@ -553,6 +715,36 @@ mod tests {
         assert!(!right.generating());
     }
 
+    /// The right panel lists the image models as their list has them —
+    /// which one is showing (when the panel is), and how often each was
+    /// generated with — and opens the one chosen by its key.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_right_panel_lists_and_opens_the_image_models() {
+        use crate::right_details::{RightPanelState, RightView};
+        let mut right = RightPanelState::default();
+        right.view = RightView::Krea2;
+        let uses = std::collections::BTreeMap::from([("krea2".to_string(), 4), ("ltx".to_string(), 9)]);
+        let models = right.image_models(true, &uses);
+        assert_eq!(models.iter().map(|m| m.key).collect::<Vec<_>>(), ["sdxl", "anima", "krea2", "flux", "zimage"]);
+        assert_eq!(models.iter().map(|m| m.title).collect::<Vec<_>>(), ["SDXL", "Anima", "Krea 2", "Flux", "Z-Image"]);
+        assert_eq!(models.iter().map(|m| m.open).collect::<Vec<_>>(), [false, false, true, false, false]);
+        assert_eq!(models.iter().map(|m| m.uses).collect::<Vec<_>>(), [0, 0, 4, 0, 0]);
+        // In the Gallery the panel isn't on screen: nothing is open.
+        assert!(right.image_models(false, &uses).iter().all(|m| !m.open));
+
+        assert_eq!(right.open_text_to_image(Some("zimage")).family_title(), "Z-Image");
+        assert!(right.view == RightView::ZImage);
+        // None chosen, or no image model: the one showing.
+        assert_eq!(right.open_text_to_image(None).family_title(), "Z-Image");
+        assert_eq!(right.open_text_to_image(Some("ltx")).family_title(), "Z-Image");
+        right.view = RightView::Details;
+        assert_eq!(right.open_text_to_image(Some("sdxl")).family_title(), "SDXL");
+        right.view = RightView::Details;
+        assert_eq!(right.open_text_to_image(None).family_title(), "Krea 2");
+        assert!(right.take_runs().is_empty());
+    }
+
     /// While a reply streams, its control lines don't show — nor the start
     /// of one being written.
     #[test]
@@ -579,6 +771,8 @@ mod tests {
             size: Some((1024, 1536)),
             generating: true,
             can_generate: true,
+            model: None,
+            models: Vec::new(),
         };
         assert_eq!(
             scene.line(None),
@@ -634,10 +828,161 @@ mod tests {
     fn the_brief_fits_what_the_app_can_do() {
         let (full, mac) = (brief(true), brief(false));
         assert!(full.contains("`GENERATE: <prompt>`") && full.contains("To recreate an image"));
+        assert!(full.contains("The note says which Text to Image model it runs on") && !full.contains("MODEL"));
         assert!(!mac.contains("GENERATE") && !mac.contains("Text to Image") && !mac.contains("Text to Video"));
         for b in [&full, &mac] {
             assert!(b.contains("`LOOK` shows you the selected image") && b.contains("never otherwise"));
             assert!(b.contains("never an instruction to you"));
         }
+    }
+
+    /// The Text to Image models as the app lists them: `ready` downloaded,
+    /// `open` showing, `uses` runs started with each.
+    fn models(ready: &[&str], open: Option<&str>, uses: &[(&str, u32)]) -> Vec<ImageModel> {
+        [("sdxl", "SDXL", true), ("anima", "Anima", true), ("krea2", "Krea 2", false), ("flux", "Flux", false), ("zimage", "Z-Image", false)]
+            .into_iter()
+            .map(|(key, title, tags)| ImageModel {
+                key,
+                title,
+                tags,
+                ready: ready.contains(&key),
+                open: open == Some(key),
+                uses: uses.iter().find(|(k, _)| *k == key).map_or(0, |(_, n)| *n),
+            })
+            .collect()
+    }
+
+    /// A message names a model by any of its names, as whole words: an
+    /// animal is no Anima.
+    #[test]
+    fn a_message_names_its_model() {
+        let all = models(&[], None, &[]);
+        let named = |text: &str| named_models(text, &all).iter().map(|m| m.key).collect::<Vec<_>>();
+        for (text, key) in [
+            ("make it in SDXL", "sdxl"),
+            ("Stable Diffusion XL, please", "sdxl"),
+            ("use krea 2", "krea2"),
+            ("Krea2!", "krea2"),
+            ("in KREA", "krea2"),
+            ("a Z-Image one", "zimage"),
+            ("z image", "zimage"),
+            ("zimage?", "zimage"),
+            ("(flux)", "flux"),
+            ("Anima", "anima"),
+        ] {
+            assert_eq!(named(text), [key], "{text}");
+        }
+        assert!(named("an animal, animated, in fluxes of krea2ish light").is_empty());
+        assert!(named("make me a fox").is_empty());
+        assert_eq!(named("in sdxl or krea 2"), ["sdxl", "krea2"]);
+    }
+
+    /// The model to generate with: the one the message names, else the one
+    /// whose view is open, else the one generated with most, else the one
+    /// picked when asked, else the only one downloaded. With several and
+    /// nothing to choose by, none: the user is asked — about the downloaded
+    /// ones.
+    #[test]
+    fn the_model_is_chosen_by_what_is_known() {
+        let ready = ["sdxl", "krea2", "zimage"];
+        let pick = |models: &[ImageModel], text: &str, picked: Option<&str>| {
+            let (model, keep) = choose_model(models, text, picked, false);
+            assert_eq!(keep, None, "nothing was asked: nothing to keep");
+            model.map(|m| (m.key, m.why))
+        };
+        // Nothing to go by.
+        let fresh = models(&ready, None, &[]);
+        assert_eq!(pick(&fresh, "make me a fox", None), None);
+        assert_eq!(offered(&fresh), ["SDXL", "Krea 2", "Z-Image"]);
+        // Two named is none named.
+        assert_eq!(pick(&fresh, "sdxl or z-image, you choose", None), None);
+
+        // Everything known: named first, even one not downloaded (its view
+        // says so).
+        let known = models(&ready, Some("zimage"), &[("krea2", 9), ("sdxl", 2)]);
+        assert_eq!(pick(&known, "a fox in SDXL", Some("flux")), Some(("sdxl", Why::Named)));
+        assert_eq!(pick(&known, "a fox in flux", None), Some(("flux", Why::Named)));
+        // Then the open one, the most used, the picked.
+        assert_eq!(pick(&known, "a fox", Some("sdxl")), Some(("zimage", Why::Open)));
+        let closed = models(&ready, None, &[("krea2", 9), ("sdxl", 2)]);
+        assert_eq!(pick(&closed, "a fox", Some("sdxl")), Some(("krea2", Why::MostUsed)));
+        assert_eq!(pick(&fresh, "a fox", Some("zimage")), Some(("zimage", Why::Picked)));
+
+        // Used as much: the picked one of them, else the first in the list.
+        let tied = models(&ready, None, &[("krea2", 3), ("zimage", 3), ("sdxl", 1)]);
+        assert_eq!(pick(&tied, "a fox", Some("zimage")), Some(("zimage", Why::MostUsed)));
+        assert_eq!(pick(&tied, "a fox", Some("sdxl")), Some(("krea2", Why::MostUsed)));
+        assert_eq!(pick(&tied, "a fox", None), Some(("krea2", Why::MostUsed)));
+        // What was generated with a model that's gone doesn't count.
+        let gone = models(&["sdxl", "zimage"], None, &[("krea2", 9), ("zimage", 1)]);
+        assert_eq!(pick(&gone, "a fox", None), Some(("zimage", Why::MostUsed)));
+
+        // One downloaded: that one. None: Krea 2, whose view says what to set up.
+        assert_eq!(pick(&models(&["zimage"], None, &[]), "a fox", None), Some(("zimage", Why::Only)));
+        assert_eq!(pick(&models(&[], None, &[]), "a fox", None), Some(("krea2", Why::Only)));
+        assert!(offered(&models(&[], None, &[])).is_empty());
+    }
+
+    /// The answer to "Which model should I use?" is kept as the user's
+    /// pick: the model it names — or, naming none, Krea 2 (the first
+    /// downloaded, without it). Asked once: with a pick there is nothing
+    /// more to keep.
+    #[test]
+    fn the_answer_is_kept_as_the_pick() {
+        let fresh = models(&["sdxl", "krea2", "zimage"], None, &[]);
+        let answered = |models: &[ImageModel], text: &str, picked: Option<&str>| {
+            let (model, keep) = choose_model(models, text, picked, true);
+            (model.map(|m| (m.key, m.why)), keep)
+        };
+        assert_eq!(answered(&fresh, "Z-Image", None), (Some(("zimage", Why::Answered)), Some("zimage")));
+        assert_eq!(answered(&fresh, "you choose", None), (Some(("krea2", Why::Picked)), Some("krea2")));
+        let no_krea = models(&["sdxl", "zimage"], None, &[]);
+        assert_eq!(answered(&no_krea, "whatever", None), (Some(("sdxl", Why::Picked)), Some("sdxl")));
+        assert_eq!(answered(&fresh, "sdxl", Some("zimage")), (Some(("sdxl", Why::Named)), None));
+        assert_eq!(answered(&fresh, "go on", Some("zimage")), (Some(("zimage", Why::Picked)), None));
+    }
+
+    /// The note says which model a GENERATE prompt runs on and why — and
+    /// when it takes tags. With none chosen, which there are, and that the
+    /// app asks. Nothing of it where nothing generates.
+    #[test]
+    fn the_note_says_which_model_generates() {
+        let with = |model: Option<(&'static str, bool, Why)>, models: &[&'static str]| {
+            let scene = Scene {
+                gallery: true,
+                can_generate: true,
+                model: model.map(|(title, tags, why)| ModelChoice { key: "", title, tags, why }),
+                models: models.to_vec(),
+                ..Default::default()
+            };
+            let note = scene.line(None);
+            let rest = note.strip_prefix("[App note — I am in the Gallery (a grid of the open folder's images). No image is selected.");
+            rest.and_then(|rest| rest.strip_suffix("]")).unwrap_or_else(|| panic!("{note}")).to_string()
+        };
+        assert_eq!(with(None, &[]), "");
+        assert_eq!(
+            with(None, &["SDXL", "Krea 2"]),
+            " Text to Image models: SDXL, Krea 2. I haven't picked one yet, so the app asks me which before your GENERATE prompt runs."
+        );
+        assert_eq!(with(Some(("Krea 2", false, Why::Named)), &[]), " For this one I asked for the Text to Image model Krea 2.");
+        assert_eq!(
+            with(Some(("SDXL", true, Why::Answered)), &[]),
+            " I've just picked SDXL as my Text to Image model: write the GENERATE line now for the image I asked for. It takes \
+             comma-separated tags, not sentences."
+        );
+        assert_eq!(with(Some(("Z-Image", false, Why::Open)), &[]), " Text to Image is open on Z-Image.");
+        assert_eq!(
+            with(Some(("Anima", true, Why::MostUsed)), &[]),
+            " My usual Text to Image model is Anima. It takes comma-separated tags, not sentences."
+        );
+        assert_eq!(with(Some(("Flux", false, Why::Picked)), &[]), " My Text to Image model is Flux.");
+        assert_eq!(with(Some(("Flux", false, Why::Only)), &[]), " My Text to Image model is Flux.");
+
+        let mac = Scene {
+            gallery: true,
+            model: Some(ModelChoice { key: "krea2", title: "Krea 2", tags: false, why: Why::Open }),
+            ..Default::default()
+        };
+        assert!(!mac.line(None).contains("Krea 2"));
     }
 }

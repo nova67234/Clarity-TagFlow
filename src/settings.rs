@@ -95,10 +95,19 @@ pub struct Settings {
     /// top bar, over the app, that can look, open places and generate when
     /// asked (Settings → AI Model).
     pub ai_assistant: bool,
-    /// While the assistant has an image generated, the chat model steps
-    /// aside so the image model has the graphics card (it loads again with
-    /// the next message). Off for a card with room for both.
+    /// The chat model and the image model take turns on the graphics card:
+    /// the chat model steps aside while the assistant has an image generated
+    /// (it loads again with the next message), and an idle ComfyUI stops
+    /// before the chat model loads. Off for a card with room for both.
     pub ai_assistant_swap: bool,
+    /// The Text to Image model the user picked when the assistant asked
+    /// which to use — asked once, when it had nothing else to choose by
+    /// (`assistant::choose_model`). Its key, as in `gen_uses`.
+    pub ai_assistant_model: Option<String>,
+    /// How many runs the user has started with each generation model, by
+    /// its key ("krea2", "sdxl"…). Nothing shows it: the assistant takes the
+    /// most used image model for the user's usual one.
+    pub gen_uses: std::collections::BTreeMap<String, u32>,
     /// Remember across chats (AI Settings → Memory): the AI keeps long-term
     /// memories (src/memory.rs) and looks them up when they're useful.
     pub ai_memory_enabled: bool,
@@ -315,6 +324,8 @@ impl Default for Settings {
             ai_krea_prompts: false,
             ai_assistant: false,
             ai_assistant_swap: true,
+            ai_assistant_model: None,
+            gen_uses: std::collections::BTreeMap::new(),
             ai_memory_enabled: false,
             ai_tag_images: false,
             ai_web_research: false,
@@ -1026,7 +1037,7 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                         if settings.ai_chat {
                             llm.cancel_unload();
                         } else {
-                            llm.unload();
+                            llm.chat_off(settings.ai_assistant);
                         }
                     }
                 },
@@ -1080,11 +1091,11 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                 row_sep(ui);
                 row(
                     ui,
-                    "Free the graphics card to generate",
+                    "Take turns on the graphics card",
                     Some(
-                        "When the assistant starts a generation, the chat model steps aside so the image \
-                         model has the graphics card, and loads again with your next message. Switch off \
-                         if your card has room for both.",
+                        "The chat model steps aside when the assistant starts a generation, and the image \
+                         model when you next write to the assistant — each loads again when it's needed. \
+                         Switch off if your card has room for both.",
                     ),
                     |ui| {
                         switch(ui, &mut settings.ai_assistant_swap);

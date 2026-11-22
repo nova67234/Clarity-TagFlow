@@ -1570,5 +1570,39 @@ fn the_assistant_generates_only_when_the_view_could() {
     assert_eq!(why, "Krea 2 is busy with another run.");
     assert_eq!(state.prompt, "what the user typed");
     assert_eq!(state.family_title(), "Krea 2");
+
+    // Set up, but this model was never downloaded: it downloads nothing
+    // on its own.
+    state.running = false;
+    DOWNLOADED_FOR_TEST.set(Some(false));
+    let why = state.assistant_generate("a fox in the snow", &ctx, None).unwrap_err();
+    assert_eq!(why, "Krea 2 isn't downloaded yet — run Setup Requirements in its view first.");
+    assert!(!state.busy() && state.prompt == "what the user typed");
     INSTALLED_FOR_TEST.set(None);
+    DOWNLOADED_FOR_TEST.set(None);
+}
+
+/// A model as the work assistant chooses among them: ready once Text to
+/// Image is set up and the model downloaded; SDXL and Anima take tags. The
+/// runs started with it are counted, and handed over once.
+#[test]
+fn a_model_is_described_for_the_assistant() {
+    let mut state = GenerateState::new(GenFamily::Sdxl);
+    for (installed, downloaded) in [(false, false), (true, false), (false, true), (true, true)] {
+        INSTALLED_FOR_TEST.set(Some(installed));
+        DOWNLOADED_FOR_TEST.set(Some(downloaded));
+        let model = state.assistant_model();
+        assert_eq!((model.key, model.title, model.tags), ("sdxl", "SDXL", true));
+        assert_eq!(model.ready, installed && downloaded, "{installed} {downloaded}");
+        assert!(!model.open && model.uses == 0);
+    }
+    INSTALLED_FOR_TEST.set(None);
+    DOWNLOADED_FOR_TEST.set(None);
+    let tags = |family| GenerateState::new(family).assistant_model().tags;
+    assert!(tags(GenFamily::Anima) && !tags(GenFamily::Krea2) && !tags(GenFamily::Flux) && !tags(GenFamily::ZImage));
+
+    assert_eq!(state.take_runs(), ("sdxl", 0));
+    state.runs_started = 3;
+    assert_eq!(state.take_runs(), ("sdxl", 3));
+    assert_eq!(state.take_runs(), ("sdxl", 0));
 }

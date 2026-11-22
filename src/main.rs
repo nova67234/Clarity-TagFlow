@@ -1056,15 +1056,70 @@ impl ViewerApp {
             None => here.push_str(" · no image selected"),
         }
         match assistant::card::show(ctx, &mut self.assistant, &mut self.llm, &here, scene.can_generate) {
-            Some(assistant::card::Ask::Send(text)) => {
-                let scene = self.assistant_scene(true);
-                self.llm.assistant_send(&text, scene, ctx);
+            Some(ask @ (assistant::card::Ask::Send(_) | assistant::card::Ask::Show(_))) => {
+                let (text, shown) = match ask {
+                    assistant::card::Ask::Show(text) => (text, true),
+                    assistant::card::Ask::Send(text) => (text, false),
+                    assistant::card::Ask::Stop => unreachable!("matched above"),
+                };
+                let mut scene = self.assistant_scene(true);
+                let pick = self.choose_model(&mut scene, &text);
+                // The chat model is about to load, and an idle image model
+                // may have the graphics card: it steps aside first.
+                #[cfg(not(target_os = "macos"))]
+                let turns = self.settings.ai_assistant_swap
+                    && link::remote_chat().is_none()
+                    && !llm::worker_loaded()
+                    && !self.right_state.generating();
+                #[cfg(not(target_os = "macos"))]
+                llm::image_model_steps_aside(turns);
+                let sent = if shown {
+                    self.llm.assistant_send_shown(&text, scene, ctx)
+                } else {
+                    self.llm.assistant_send(&text, scene, ctx)
+                };
+                if sent {
+                    if let Some(key) = pick {
+                        self.settings.ai_assistant_model = Some(key.to_string());
+                    }
+                } else {
+                    #[cfg(not(target_os = "macos"))]
+                    llm::image_model_steps_aside(false);
+                }
             }
             Some(assistant::card::Ask::Stop) => self.llm.stop_generation(),
             None => {}
         }
         for action in self.llm.take_assistant_actions() {
             self.carry_out(action, ctx);
+        }
+    }
+
+    /// The Text to Image model the assistant generates with, should the
+    /// reply to `text` ask for an image, into `scene` — or, with several
+    /// and nothing to choose by, the ones to ask the user about. Returns
+    /// the model to keep as the user's pick, when `text` answers that
+    /// question.
+    fn choose_model(&self, scene: &mut assistant::Scene, text: &str) -> Option<&'static str> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let models = self.right_state.image_models(!scene.gallery, &self.settings.gen_uses);
+            let (model, pick) = assistant::choose_model(
+                &models,
+                text,
+                self.settings.ai_assistant_model.as_deref(),
+                self.llm.assistant.model_question,
+            );
+            if model.is_none() {
+                scene.models = assistant::offered(&models);
+            }
+            scene.model = model;
+            pick
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = (scene, text);
+            None
         }
     }
 
@@ -1085,6 +1140,8 @@ impl ViewerApp {
             size,
             generating,
             can_generate: cfg!(not(target_os = "macos")),
+            model: None,
+            models: Vec::new(),
         }
     }
 
@@ -1105,9 +1162,12 @@ impl ViewerApp {
                     // (Text to Image is in the right panel.)
                     self.settings.layout = settings::Layout::Panels;
                     let current = self.selected.and_then(|i| self.images.get(i)).cloned();
-                    match self.right_state.open_text_to_image().assistant_generate(&prompt, ctx, current.as_deref()) {
+                    let key = self.llm.assistant.scene.model.as_ref().map(|model| model.key);
+                    let view = self.right_state.open_text_to_image(key);
+                    let model = view.family_title();
+                    match view.assistant_generate(&prompt, ctx, current.as_deref()) {
                         Ok(()) => {
-                            self.llm.assistant_did(assistant::did_generate());
+                            self.llm.assistant_did(assistant::did_generate(model));
                             // The image model gets the graphics card: the
                             // chat model steps aside (not one on a Link host,
                             // which isn't on this card).
@@ -2421,6 +2481,12 @@ impl eframe::App for ViewerApp {
         // Settings are closed).
         if !self.settings.ai_chat && (assistant_on || self.llm.needs_poll()) {
             self.llm.poll(ui.ctx());
+        }
+        // What the user generates with, counted (nothing shows it: the
+        // assistant takes the most used image model for their usual one).
+        #[cfg(not(target_os = "macos"))]
+        for (model, runs) in self.right_state.take_runs() {
+            *self.settings.gen_uses.entry(model.to_string()).or_default() += runs;
         }
         if assistant_on {
             self.work_assistant(ui.ctx());

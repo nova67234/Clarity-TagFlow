@@ -1632,6 +1632,10 @@ pub struct GenerateState {
     /// between steps (a download or pip run in flight can't be aborted) — so
     /// Stop says so instead of a "Cancelling…" that looks stuck.
     stop_between_steps: bool,
+    /// Runs started since main.rs last counted them into the settings
+    /// (`Settings::gen_uses` — the hidden count the work assistant chooses
+    /// the user's usual model by).
+    runs_started: u32,
     /// Z-Image: measured height (last frame) of everything between the prompt box
     /// and the end of the Log row. The prompt stretches by this much short of the
     /// panel bottom, so the Log row + copy icon sit exactly on the bottom edge.
@@ -1703,6 +1707,11 @@ impl GenerateState {
             None if !is_installed() => {
                 return Err("Text to Image isn't set up yet — open it and run its setup first.".to_string());
             }
+            // (A run would only end saying so: the assistant downloads nothing
+            // on its own.)
+            None if !self.downloaded() => {
+                return Err(format!("{} isn't downloaded yet — run Setup Requirements in its view first.", self.family.title()));
+            }
             None => {}
         }
         self.prompt = prompt.to_string();
@@ -1718,6 +1727,40 @@ impl GenerateState {
     /// The model family this view is for, by name ("Krea 2").
     pub fn family_title(&self) -> &'static str {
         self.family.title()
+    }
+
+    /// The files the view's model needs are on disk.
+    fn downloaded(&self) -> bool {
+        #[cfg(test)]
+        if let Some(downloaded) = DOWNLOADED_FOR_TEST.get() {
+            return downloaded;
+        }
+        missing_files(self.model, self.checkpoint.as_deref()).is_empty()
+    }
+
+    /// The view's model as the work assistant chooses among them: its key
+    /// in the settings, its name, whether its prompts are tags rather than
+    /// sentences, and whether it can generate now. (`open` and `uses` are
+    /// for right_details.rs to fill in.)
+    pub fn assistant_model(&self) -> crate::assistant::ImageModel {
+        let ready = match &self.remote_host {
+            Some(host) => remote_ready(self, host).is_ok(),
+            None => is_installed() && self.downloaded(),
+        };
+        crate::assistant::ImageModel {
+            key: self.family.out_dir(),
+            title: self.family.title(),
+            tags: matches!(self.family, GenFamily::Sdxl | GenFamily::Anima),
+            ready,
+            open: false,
+            uses: 0,
+        }
+    }
+
+    /// The runs started here since this was last asked, for the count of
+    /// what the user generates with.
+    pub fn take_runs(&mut self) -> (&'static str, u32) {
+        (self.family.out_dir(), std::mem::take(&mut self.runs_started))
     }
 
     /// Build the state for a given model family (Flux or Z-Image).
@@ -1781,6 +1824,7 @@ impl GenerateState {
             neg_spell: crate::spellcheck::SpellcheckState::default(),
             cancel: Arc::new(AtomicBool::new(false)),
             stop_between_steps: false,
+            runs_started: 0,
             below_h: 210.0,
             frames,
             fps: DEFAULT_FPS,
@@ -3435,6 +3479,8 @@ thread_local! {
     /// What [`is_installed`] answers in a test that sets it, whatever the
     /// machine running the tests has on disk.
     static INSTALLED_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test says whether a view's model is on disk, in place of looking.
+    static DOWNLOADED_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// A ComfyUI version ("0.29.4") older than `major.minor`. One that can't be
@@ -5205,6 +5251,7 @@ fn start_generate(state: &mut GenerateState, ctx: &egui::Context, cur_image: Opt
     state.run_thumb_key = image_view::models::run_key(state);
     state.cancel.store(false, Ordering::SeqCst);
     state.stop_between_steps = false;
+    state.runs_started += 1;
     let cancel = state.cancel.clone();
 
     let seed = if state.randomize_seed {

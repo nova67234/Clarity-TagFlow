@@ -90,7 +90,7 @@ pub fn show(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut crate::setting
             }
             if ui.button("Turn off AI Chat").on_hover_text("Back to the browser").clicked() {
                 settings.ai_chat = false;
-                llm.unload();
+                llm.chat_off(settings.ai_assistant);
             }
         });
         return;
