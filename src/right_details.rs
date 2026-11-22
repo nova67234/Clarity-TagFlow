@@ -44,6 +44,9 @@ pub enum RightView {
     /// The Wan 2.2 text/image-to-video generation view (same ComfyUI backend).
     #[cfg(not(target_os = "macos"))]
     Wan,
+    /// The MiniMax H3 text/image-to-video generation view (same ComfyUI backend).
+    #[cfg(not(target_os = "macos"))]
+    MiniMax,
     /// The SDXL Base 1.0 text-to-image generation view (same ComfyUI backend).
     #[cfg(not(target_os = "macos"))]
     Sdxl,
@@ -67,6 +70,7 @@ fn family_view(family: crate::generate::GenFamily) -> RightView {
         crate::generate::GenFamily::ZImage => RightView::ZImage,
         crate::generate::GenFamily::Ltx => RightView::Ltx,
         crate::generate::GenFamily::Wan => RightView::Wan,
+        crate::generate::GenFamily::MiniMax => RightView::MiniMax,
     }
 }
 
@@ -187,6 +191,9 @@ pub struct RightPanelState {
     /// State for the Wan 2.2 generation view (same backend, video output).
     #[cfg(not(target_os = "macos"))]
     pub wan: crate::generate::GenerateState,
+    /// State for the MiniMax H3 generation view (same backend, video output).
+    #[cfg(not(target_os = "macos"))]
+    pub minimax: crate::generate::GenerateState,
     /// State for the SDXL Base 1.0 generation view (same backend, image output).
     #[cfg(not(target_os = "macos"))]
     pub sdxl: crate::generate::GenerateState,
@@ -251,6 +258,8 @@ impl Default for RightPanelState {
             ltx: crate::generate::GenerateState::new(crate::generate::GenFamily::Ltx),
             #[cfg(not(target_os = "macos"))]
             wan: crate::generate::GenerateState::new(crate::generate::GenFamily::Wan),
+            #[cfg(not(target_os = "macos"))]
+            minimax: crate::generate::GenerateState::new(crate::generate::GenFamily::MiniMax),
             #[cfg(not(target_os = "macos"))]
             sdxl: crate::generate::GenerateState::new(crate::generate::GenFamily::Sdxl),
             #[cfg(not(target_os = "macos"))]
@@ -641,12 +650,12 @@ pub fn show(
                                     ui.close();
                                 }
                             }
-                            // One "Text to Video" entry for the two video Directors
-                            // (LTX / Wan). It opens LTX first; the view's header
+                            // One "Text to Video" entry for the video Directors
+                            // (LTX / Wan / MiniMax). It opens LTX first; the view's header
                             // dropdown switches between them.
                             #[cfg(not(target_os = "macos"))]
                             {
-                                let t2v_active = matches!(state.view, RightView::Ltx | RightView::Wan);
+                                let t2v_active = matches!(state.view, RightView::Ltx | RightView::Wan | RightView::MiniMax);
                                 if crate::settings::dropdown_option(ui, "Text to Video", None, None, t2v_active).clicked() {
                                     if !t2v_active {
                                         state.view = RightView::Ltx;
@@ -685,6 +694,11 @@ pub fn show(
                     let show_wan = state.view == RightView::Wan;
                     #[cfg(target_os = "macos")]
                     let show_wan = false;
+
+                    #[cfg(not(target_os = "macos"))]
+                    let show_minimax = state.view == RightView::MiniMax;
+                    #[cfg(target_os = "macos")]
+                    let show_minimax = false;
 
                     #[cfg(not(target_os = "macos"))]
                     let show_sdxl = state.view == RightView::Sdxl;
@@ -733,6 +747,14 @@ pub fn show(
                         {
                             crate::generate::show(ui, &mut state.wan, current_image);
                             if let Some(f) = state.wan.family_switch.take() {
+                                state.view = family_view(f);
+                            }
+                        }
+                    } else if show_minimax {
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            crate::generate::show(ui, &mut state.minimax, current_image);
+                            if let Some(f) = state.minimax.family_switch.take() {
                                 state.view = family_view(f);
                             }
                         }

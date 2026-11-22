@@ -164,6 +164,7 @@ fn family_color(family: GenFamily) -> Color32 {
         GenFamily::Krea2 => LoraBase::Krea2,
         GenFamily::Ltx => LoraBase::Ltx,
         GenFamily::Wan => LoraBase::Wan,
+        GenFamily::MiniMax => LoraBase::MiniMax,
     }
     .dot_color()
 }

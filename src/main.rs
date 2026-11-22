@@ -1115,6 +1115,7 @@ impl ViewerApp {
                     right_details::RightView::Sdxl => (4u8, self.right_state.sdxl.gen_images().to_vec()),
                     right_details::RightView::Anima => (5u8, self.right_state.anima.gen_images().to_vec()),
                     right_details::RightView::Krea2 => (6u8, self.right_state.krea2.gen_images().to_vec()),
+                    right_details::RightView::MiniMax => (7u8, self.right_state.minimax.gen_images().to_vec()),
                     _ => (0u8, self.right_state.generate.gen_images().to_vec()),
                 };
                 // The LTX and Wan Directors are image-to-video, so they keep the
@@ -1124,7 +1125,7 @@ impl ViewerApp {
                 // other (text-to-image) views just show their generated results.
                 let combine = matches!(
                     self.right_state.view,
-                    right_details::RightView::Ltx | right_details::RightView::Wan
+                    right_details::RightView::Ltx | right_details::RightView::Wan | right_details::RightView::MiniMax
                 );
                 let sig = (tab, gen_list.len());
                 // Outputs moved or deleted from the browser stay gone (the
@@ -1910,7 +1911,7 @@ impl ViewerApp {
             {
                 matches!(
                     self.right_state.view,
-                    right_details::RightView::Ltx | right_details::RightView::Wan
+                    right_details::RightView::Ltx | right_details::RightView::Wan | right_details::RightView::MiniMax
                 )
             }
             #[cfg(target_os = "macos")]
@@ -1959,7 +1960,7 @@ impl ViewerApp {
                 #[cfg(not(target_os = "macos"))]
                 if matches!(
                     self.right_state.view,
-                    right_details::RightView::Ltx | right_details::RightView::Wan
+                    right_details::RightView::Ltx | right_details::RightView::Wan | right_details::RightView::MiniMax
                 ) && !is_video(&path)
                 {
                     self.video_player = None;
@@ -2299,6 +2300,7 @@ impl eframe::App for ViewerApp {
                     | right_details::RightView::ZImage
                     | right_details::RightView::Ltx
                     | right_details::RightView::Wan
+                    | right_details::RightView::MiniMax
                     | right_details::RightView::Sdxl
                     | right_details::RightView::Anima
                     | right_details::RightView::Krea2

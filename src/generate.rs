@@ -74,6 +74,27 @@ const LTX2_GEMMA: &str =
 const LTX2_UPSCALER: &str =
     "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors?download=true";
 
+/// MiniMax H3 (Hailuo 3, open weights; repackaged by Comfy-Org, ungated): a
+/// 33B video model that writes its own stereo sound — voices, effects, music —
+/// in the same pass. One model does text- and image-to-video
+/// (`MiniMaxH3ImageToVideo` takes an optional first frame). The files are the
+/// ones ComfyUI's own template uses: the pruned int8 transformer, the
+/// Qwen3-VL 32B text encoder (nvfp4), the video and audio VAEs, and the
+/// 8-step Lightning LoRA behind the Turbo variant. All native nodes — needs
+/// ComfyUI 0.30+. ~43 GB together.
+const H3_REPO: &str = "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main";
+const H3_UNET: &str = "minimax_h3_fl2va_pruned_int8_convrot.safetensors";
+const H3_TE: &str = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors";
+const H3_VAE: &str = "minimax_h3_video_vae_int8_convrot.safetensors";
+const H3_AUDIO_VAE: &str = "minimax_h3_audio_vae_fp32.safetensors";
+const H3_TURBO_LORA: &str = "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors";
+/// The first ComfyUI with MiniMax H3's nodes.
+const H3_MIN_COMFY: (u32, u32) = (0, 30);
+/// H3 always runs at 24 frames a second (its sound is made to that clock).
+const H3_FPS: i32 = 24;
+/// The largest picture the open weights were trained for: 1344×768.
+const H3_MAX_PIXELS: i64 = 1344 * 768;
+
 /// Wan 2.2 TI2V 5B (Alibaba, repackaged by Comfy-Org, ungated). A single model
 /// that does BOTH text- and image-to-video — `Wan22ImageToVideoLatent` takes an
 /// optional start image — so it slots straight into the t2v/i2v toggle. Ships its
@@ -136,6 +157,8 @@ pub enum GenFamily {
     Ltx,
     /// Wan 2.2: text/image-to-video generation (single 5B TI2V model; .webm out).
     Wan,
+    /// MiniMax H3: text/image-to-video with its own sound (.mp4 out).
+    MiniMax,
     /// SDXL: Stable Diffusion XL text-to-image (single checkpoint, native nodes).
     Sdxl,
     /// Anima: 2B anime text-to-image (Cosmos-2 DiT; UNet + Qwen3 encoder + VAE).
@@ -152,6 +175,7 @@ impl GenFamily {
             GenFamily::ZImage => "Z-Image",
             GenFamily::Ltx => "LTX Director",
             GenFamily::Wan => "Wan Director",
+            GenFamily::MiniMax => "MiniMax Director",
             GenFamily::Sdxl => "SDXL",
             GenFamily::Anima => "Anima",
             GenFamily::Krea2 => "Krea 2",
@@ -164,6 +188,7 @@ impl GenFamily {
             GenFamily::ZImage => "zimage",
             GenFamily::Ltx => "ltx",
             GenFamily::Wan => "wan",
+            GenFamily::MiniMax => "minimax",
             GenFamily::Sdxl => "sdxl",
             GenFamily::Anima => "anima",
             GenFamily::Krea2 => "krea2",
@@ -175,6 +200,7 @@ impl GenFamily {
             GenFamily::ZImage => GenModel::ZImageFast,
             GenFamily::Ltx => GenModel::LtxDistilled,
             GenFamily::Wan => GenModel::WanTi2v5bFast,
+            GenFamily::MiniMax => GenModel::MiniMaxH3,
             GenFamily::Sdxl => GenModel::SdxlBase,
             GenFamily::Anima => GenModel::AnimaBase,
             GenFamily::Krea2 => GenModel::Krea2Turbo,
@@ -183,26 +209,40 @@ impl GenFamily {
     /// This family produces video (an .mp4) rather than a still image — drives
     /// the video-only UI controls and the run loop's output handling.
     fn is_video(self) -> bool {
-        matches!(self, GenFamily::Ltx | GenFamily::Wan)
+        matches!(self, GenFamily::Ltx | GenFamily::Wan | GenFamily::MiniMax)
+    }
+    /// The video families, in the order the header's dropdown lists them.
+    const VIDEO: [GenFamily; 3] = [GenFamily::Ltx, GenFamily::Wan, GenFamily::MiniMax];
+    /// The model samples without classifier-free guidance, so there's no
+    /// Guidance slider to show (MiniMax H3's guider takes the prompt alone).
+    fn has_guidance(self) -> bool {
+        self != GenFamily::MiniMax
+    }
+    /// The model's frame rate is its own (MiniMax H3: 24, the clock its
+    /// sound is made to), so there's no FPS slider.
+    fn fixed_fps(self) -> Option<i32> {
+        (self == GenFamily::MiniMax).then_some(H3_FPS)
     }
     /// This family loads a single swappable model file, so the picker can offer
     /// auto-detected installed models. SDXL swaps a full checkpoint (CheckpointLoaderSimple);
     /// Anima swaps the diffusion model (UNETLoader); LTX swaps the transformer
     /// checkpoint (CheckpointLoaderSimple) while keeping the shared t5xxl encoder +
     /// spatial upscaler — so a custom file is treated as an LTX-Video 0.9.x finetune
-    /// and run through that pipeline. The other families use multi-file GGUF/UNet
+    /// and run through that pipeline. MiniMax H3 swaps the transformer (UNETLoader)
+    /// for another build of it — the 16 GB w6a8, the fp8, a finetune — keeping the
+    /// encoder and the VAEs. The other families use multi-file GGUF/UNet
     /// setups that can't be swapped wholesale.
     fn uses_checkpoint_picker(self) -> bool {
         matches!(
             self,
-            GenFamily::Sdxl | GenFamily::Anima | GenFamily::Krea2 | GenFamily::Ltx | GenFamily::Wan
+            GenFamily::Sdxl | GenFamily::Anima | GenFamily::Krea2 | GenFamily::Ltx | GenFamily::Wan | GenFamily::MiniMax
         )
     }
     /// The `models/` sub-dir holding this family's swappable model file — used to
     /// route the installed-model picker.
     fn model_subdir(self) -> &'static str {
         match self {
-            GenFamily::Anima | GenFamily::Krea2 | GenFamily::Wan => "diffusion_models",
+            GenFamily::Anima | GenFamily::Krea2 | GenFamily::Wan | GenFamily::MiniMax => "diffusion_models",
             _ => "checkpoints",
         }
     }
@@ -219,6 +259,7 @@ impl GenFamily {
                 &["ltxv-2b-0.9.6-distilled-04-25.safetensors", "ltx-2.3-22b-distilled-fp8.safetensors"]
             }
             GenFamily::Wan => &["wan2.2_ti2v_5B_fp16.safetensors"],
+            GenFamily::MiniMax => &[H3_UNET],
             _ => &[],
         }
     }
@@ -244,6 +285,10 @@ pub enum GenModel {
     // (fp8 cast for lower VRAM vs. full fp16 for quality).
     WanTi2v5bFast,
     WanTi2v5bQuality,
+    // MiniMax H3 (video + sound; one model does t2v+i2v). The two variants
+    // share their files — Turbo adds the 8-step Lightning LoRA.
+    MiniMaxH3,
+    MiniMaxH3Turbo,
     // SDXL Base 1.0 (single checkpoint: UNet + dual CLIP + VAE).
     SdxlBase,
     // Anima Base v1.0 (UNet + Qwen3 0.6B encoder + Qwen-Image VAE).
@@ -258,6 +303,7 @@ impl GenModel {
             GenModel::ZImageFast | GenModel::ZImageQuality => GenFamily::ZImage,
             GenModel::LtxDistilled | GenModel::Ltx2Distilled => GenFamily::Ltx,
             GenModel::WanTi2v5bFast | GenModel::WanTi2v5bQuality => GenFamily::Wan,
+            GenModel::MiniMaxH3 | GenModel::MiniMaxH3Turbo => GenFamily::MiniMax,
             GenModel::SdxlBase => GenFamily::Sdxl,
             GenModel::AnimaBase => GenFamily::Anima,
             GenModel::Krea2Turbo => GenFamily::Krea2,
@@ -271,6 +317,7 @@ impl GenModel {
             GenFamily::ZImage => &[GenModel::ZImageFast, GenModel::ZImageQuality],
             GenFamily::Ltx => &[GenModel::LtxDistilled, GenModel::Ltx2Distilled],
             GenFamily::Wan => &[GenModel::WanTi2v5bFast, GenModel::WanTi2v5bQuality],
+            GenFamily::MiniMax => &[GenModel::MiniMaxH3, GenModel::MiniMaxH3Turbo],
             GenFamily::Sdxl => &[GenModel::SdxlBase],
             GenFamily::Anima => &[GenModel::AnimaBase],
             GenFamily::Krea2 => &[GenModel::Krea2Turbo],
@@ -289,6 +336,8 @@ impl GenModel {
             GenModel::Ltx2Distilled => "LTX-2.3 · 22B distilled (quality video+audio, ~3min)",
             GenModel::WanTi2v5bFast => "Wan 2.2 · 5B TI2V · fp8 load (low VRAM)",
             GenModel::WanTi2v5bQuality => "Wan 2.2 · 5B TI2V · fp16 (quality)",
+            GenModel::MiniMaxH3 => "MiniMax H3 · 33B (video+sound, quality, ~43 GB)",
+            GenModel::MiniMaxH3Turbo => "MiniMax H3 · Turbo 8-step (video+sound, faster)",
             GenModel::SdxlBase => "SDXL Base 1.0 (~6.9 GB)",
             GenModel::AnimaBase => "Anima Base v1.0 (~5 GB)",
             GenModel::Krea2Turbo => "Krea 2 Turbo · 12B fp8 (16GB+, ~17 GB)",
@@ -351,6 +400,10 @@ impl GenModel {
             GenModel::Ltx2Distilled => 8,
             // Wan 2.2 5B: the official template runs 20 steps with uni_pc/simple.
             GenModel::WanTi2v5bFast | GenModel::WanTi2v5bQuality => 20,
+            // MiniMax H3: the official template runs 20 steps (res_multistep /
+            // simple), 8 with the Lightning LoRA.
+            GenModel::MiniMaxH3 => 20,
+            GenModel::MiniMaxH3Turbo => 8,
             // SDXL: 25-30 steps with a moderate CFG is the sweet spot.
             GenModel::SdxlBase => 28,
             // Anima: the official template runs 30 steps (er_sde / simple).
@@ -368,6 +421,8 @@ impl GenModel {
             GenFamily::ZImage => 1.0,
             GenFamily::Ltx => 2.0,
             GenFamily::Wan => 5.0,
+            // No classifier-free guidance (the value is unused).
+            GenFamily::MiniMax => 1.0,
             GenFamily::Sdxl => 7.0,
             GenFamily::Anima => 4.0,
             // Distilled — runs without classifier-free guidance.
@@ -557,6 +612,8 @@ enum LoraBase {
     /// Wan (Alibaba) — DiT video model (5B TI2V / 14B I2V), `model.diffusion_model.
     /// blocks.*` with cross/self-attention; loaded via UNETLoader.
     Wan,
+    /// MiniMax H3 — told by its name ("minimax", "h3" in the file's metadata).
+    MiniMax,
     /// Identified as some other architecture (SD 1.5, …).
     Other,
     /// No recognisable signals — offered in every tab, marked with a caveat.
@@ -573,6 +630,7 @@ impl LoraBase {
             LoraBase::Krea2 => family == GenFamily::Krea2,
             LoraBase::Ltx => family == GenFamily::Ltx,
             LoraBase::Wan => family == GenFamily::Wan,
+            LoraBase::MiniMax => family == GenFamily::MiniMax,
             LoraBase::Other => false,
             LoraBase::Unknown => true,
         }
@@ -588,6 +646,7 @@ impl LoraBase {
             LoraBase::Krea2 => "Krea 2",
             LoraBase::Ltx => "LTX",
             LoraBase::Wan => "Wan",
+            LoraBase::MiniMax => "MiniMax",
             LoraBase::Other => "SD / other",
             LoraBase::Unknown => "Unknown",
         }
@@ -604,6 +663,7 @@ impl LoraBase {
             LoraBase::Krea2 => Color32::from_rgb(235, 125, 95),
             LoraBase::Ltx => Color32::from_rgb(160, 200, 90),
             LoraBase::Wan => Color32::from_rgb(80, 190, 210),
+            LoraBase::MiniMax => Color32::from_rgb(240, 95, 110),
             LoraBase::Other => Color32::from_rgb(150, 120, 220),
             LoraBase::Unknown => MUTED(),
         }
@@ -630,7 +690,9 @@ fn sniff_lora_base(path: &Path) -> LoraBase {
 fn classify_lora_header(obj: &serde_json::Map<String, serde_json::Value>) -> LoraBase {
     // 1 — explicit training metadata.
     if let Some(meta) = obj.get("__metadata__").and_then(|m| m.as_object()) {
-        for key in ["ss_base_model_version", "modelspec.architecture", "ss_sd_model_name"] {
+        // (`base_model`: what MiniMax H3's LoRAs are stamped with — "Comfy-Org/
+        // MiniMax-H3 …", "MiniMaxAI/MiniMax-H3" — in place of kohya's keys.)
+        for key in ["ss_base_model_version", "modelspec.architecture", "ss_sd_model_name", "base_model"] {
             if let Some(v) = meta.get(key).and_then(|v| v.as_str()) {
                 let v = v.to_ascii_lowercase();
                 if v.contains("zimage") || v.contains("z-image") || v.contains("z_image") {
@@ -662,6 +724,10 @@ fn classify_lora_header(obj: &serde_json::Map<String, serde_json::Value>) -> Lor
                 // Wan (Alibaba): "wan2.1"/"wan2.2"/"wanvideo".
                 if v.contains("wan2") || v.contains("wanvideo") || v.contains("wan-video") || v.contains("wan_video") {
                     return LoraBase::Wan;
+                }
+                // MiniMax H3 (Hailuo 3).
+                if v.contains("minimax") || v.contains("hailuo") {
+                    return LoraBase::MiniMax;
                 }
                 if ["stable-diffusion", "sd_v1", "sd_1", "sd15"]
                     .iter()
@@ -726,6 +792,12 @@ fn classify_lora_header(obj: &serde_json::Map<String, serde_json::Value>) -> Lor
         {
             return LoraBase::Krea2;
         }
+        // MiniMax H3: the "blocks" stack again, with joint attention through one
+        // fused projection (blocks.N.attn.qkv_proj) — its alone among these
+        // families. Keys as in the official Lightning LoRA.
+        if (dotted || underscored) && (k.contains(".attn.qkv_proj") || k.contains("_attn_qkv_proj")) {
+            return LoraBase::MiniMax;
+        }
         if dotted || underscored {
             if k.contains("cross_attn") || k.contains("self_attn") {
                 saw_blocks_attn = true;
@@ -763,6 +835,20 @@ fn sniff_checkpoint_base(path: &Path) -> LoraBase {
     let Some(obj) = header.as_object() else {
         return LoraBase::Unknown;
     };
+    let base = classify_checkpoint_header(obj);
+    // MiniMax H3 comes as two transformers with the same tensors: FL2VA (text
+    // and first/last frame, the one this app's graph drives) and Ref2VA
+    // (reference pictures, another node). Only the file's name tells them
+    // apart, so a Ref2VA build isn't offered as one that works here.
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+    if base == LoraBase::MiniMax && name.contains("ref2v") {
+        return LoraBase::Other;
+    }
+    base
+}
+
+/// The classification behind [`sniff_checkpoint_base`], from the header alone.
+fn classify_checkpoint_header(obj: &serde_json::Map<String, serde_json::Value>) -> LoraBase {
 
     // 1 — explicit modelspec metadata, when the trainer stamped it.
     if let Some(meta) = obj.get("__metadata__").and_then(|m| m.as_object()) {
@@ -797,6 +883,10 @@ fn sniff_checkpoint_base(path: &Path) -> LoraBase {
                 if v.contains("wan2") || v.contains("wanvideo") || v.contains("wan-video") || v.contains("wan_video") {
                     return LoraBase::Wan;
                 }
+                // MiniMax H3 (Hailuo 3).
+                if v.contains("minimax") || v.contains("hailuo") {
+                    return LoraBase::MiniMax;
+                }
             }
         }
     }
@@ -825,6 +915,12 @@ fn sniff_checkpoint_base(path: &Path) -> LoraBase {
         // naming — unique to it among the families here.
         if k.contains(".attn.wq") || k.contains(".attn.wk") || k.contains("text_fusion.") {
             return LoraBase::Krea2;
+        }
+        // MiniMax H3: joint attention through one fused projection
+        // (blocks.N.attn.qkv_proj) — in every build of it, quantized or not
+        // (the official files carry no metadata).
+        if k.contains(".attn.qkv_proj.") {
+            return LoraBase::MiniMax;
         }
         // Wan (Alibaba) DiT: transformer blocks with cross-attention to the umt5
         // text embeddings, e.g. model.diffusion_model.blocks.0.cross_attn.k.weight.
@@ -1266,7 +1362,7 @@ mod lora_sniff_tests {
     use super::*;
 
     /// Write a minimal fake .safetensors (header only) and return its path.
-    fn fake_safetensors(name: &str, header: serde_json::Value) -> PathBuf {
+    pub(super) fn fake_safetensors(name: &str, header: serde_json::Value) -> PathBuf {
         let path = std::env::temp_dir().join(format!("ctf_lora_test_{name}.safetensors"));
         let json = serde_json::to_vec(&header).unwrap();
         let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
@@ -1602,6 +1698,8 @@ impl GenerateState {
         // matching the Landscape aspect tile so the initial state isn't a mismatch.
         let (width, height) = match family {
             GenFamily::Wan | GenFamily::Ltx => (1280, 704),
+            // MiniMax H3's own 16:9 (the official 768p).
+            GenFamily::MiniMax => (1344, 768),
             _ => (1024, 1024),
         };
         let frames = default_frames(family);
@@ -3308,6 +3406,16 @@ thread_local! {
     static INSTALLED_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// A ComfyUI version ("0.29.4") older than `major.minor`. One that can't be
+/// read isn't called old.
+fn comfy_older_than(version: &str, (major, minor): (u32, u32)) -> bool {
+    let mut parts = version.trim().trim_start_matches('v').split('.').map(|p| p.parse::<u32>());
+    match (parts.next(), parts.next()) {
+        (Some(Ok(a)), Some(Ok(b))) => (a, b) < (major, minor),
+        _ => false,
+    }
+}
+
 /// The installed ComfyUI version, read from its `comfyui_version.py`
 /// (`__version__ = "x.y.z"`). `None` if not installed or unparsable.
 pub fn comfyui_installed_version() -> Option<String> {
@@ -3514,7 +3622,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                     // Anima / Flux / Z-Image) otherwise — with an arrow glyph to the
                     // left of the model name.
                     let options: &[GenFamily] = if state.family.is_video() {
-                        &[GenFamily::Ltx, GenFamily::Wan]
+                        &GenFamily::VIDEO
                     } else {
                         &[GenFamily::Sdxl, GenFamily::Anima, GenFamily::Krea2, GenFamily::Flux, GenFamily::ZImage]
                     };
@@ -3731,13 +3839,17 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
 
     // --- Settings. ---
     slider(ui, "Steps", &mut state.steps, 1..=50, state.model.default_steps() as f64);
-    slider(ui, "Guidance (CFG)", &mut state.cfg, 1.0..=8.0, state.model.default_cfg() as f64);
+    if state.family.has_guidance() {
+        slider(ui, "Guidance (CFG)", &mut state.cfg, 1.0..=8.0, state.model.default_cfg() as f64);
+    }
     // Video families (LTX / Wan): length + frame rate, grouped with the sliders
     // above the Size / aspect-ratio block. (The text/image-to-video mode toggle
     // sits below the aspect tiles, just above the seed row.)
     if state.family.is_video() {
         slider(ui, "Frames", &mut state.frames, 25..=257, default_frames(state.family) as f64);
-        slider(ui, "FPS", &mut state.fps, 8..=30, DEFAULT_FPS as f64);
+        if state.family.fixed_fps().is_none() {
+            slider(ui, "FPS", &mut state.fps, 8..=30, DEFAULT_FPS as f64);
+        }
     }
     // Resolution: every family uses a single "Size" slider + quick aspect-ratio
     // tiles (square/landscape/portrait) instead of fine Width/Height sliders — the
@@ -4453,6 +4565,8 @@ fn aspect_dims(family: GenFamily, idx: usize, size: i32) -> (i32, i32) {
         // Both video families render landscape best at 16:9; LTX-2.3 upscales a
         // half-res base to exactly 1280×704, and Wan 2.2 5B is native there.
         GenFamily::Wan | GenFamily::Ltx => (1280.0, 704.0),
+        // MiniMax H3's native 16:9 (the official 768p).
+        GenFamily::MiniMax => (1344.0, 768.0),
         _ => (1216.0, 832.0),
     };
     match idx {
@@ -4544,10 +4658,12 @@ fn slider<N: egui::emath::Numeric>(
 /// A family's default clip length (snapped to each model's stride later). Wan
 /// 2.2 5B at its native 1280×704 is heavy (~45 s/step on a 16 GB laptop), so
 /// it defaults to a short 2-second clip (49 = 4·12+1) for a fast first run;
-/// LTX is far lighter, so it keeps the fuller 97-frame default.
+/// LTX is far lighter, so it keeps the fuller 97-frame default. MiniMax H3 is
+/// the heaviest of all: 3 seconds (73 = 17·4+5 at 24 fps) to begin with.
 fn default_frames(family: GenFamily) -> i32 {
     match family {
         GenFamily::Wan => 49,
+        GenFamily::MiniMax => 73,
         _ => 97,
     }
 }
@@ -4654,6 +4770,18 @@ fn required_files(model: GenModel) -> Vec<(&'static str, String)> {
             ("text_encoders", "umt5_xxl_fp8_e4m3fn_scaled.safetensors".into()),
             ("vae", "wan2.2_vae.safetensors".into()),
         ],
+        GenFamily::MiniMax => {
+            let mut files = vec![
+                ("diffusion_models", H3_UNET.to_string()),
+                ("text_encoders", H3_TE.to_string()),
+                ("vae", H3_VAE.to_string()),
+                ("vae", H3_AUDIO_VAE.to_string()),
+            ];
+            if model == GenModel::MiniMaxH3Turbo {
+                files.push(("loras", H3_TURBO_LORA.to_string()));
+            }
+            files
+        }
         GenFamily::Sdxl => vec![("checkpoints", "sd_xl_base_1.0.safetensors".into())],
         GenFamily::Anima => vec![
             ("diffusion_models", "anima-base-v1.0.safetensors".into()),
@@ -4959,6 +5087,21 @@ fn run_setup(
             // The Wan 2.1 VAE — needed by custom 14B I2V models selected from the
             // picker (the 5B itself doesn't use it). Small (~254 MB).
             ok &= fetch(WAN_VAE_21, m("vae").join("wan_2.1_vae.safetensors"), "Wan 2.1 VAE", "", &send);
+        }
+        GenFamily::MiniMax => {
+            // MiniMax H3 — transformer + Qwen3-VL 32B encoder + video and
+            // audio VAEs, all native ComfyUI nodes (0.30+). Both variants
+            // share them; the Lightning LoRA is Turbo's.
+            status("Downloading MiniMax H3 — large, ~43 GB…");
+            for sub in ["diffusion_models", "text_encoders", "vae", "loras"] {
+                let _ = std::fs::create_dir_all(m(sub));
+            }
+            let url = |sub: &str, file: &str| format!("{H3_REPO}/{sub}/{file}?download=true");
+            ok &= fetch(&url("diffusion_models", H3_UNET), m("diffusion_models").join(H3_UNET), "MiniMax H3 model", "", &send);
+            ok &= fetch(&url("text_encoders", H3_TE), m("text_encoders").join(H3_TE), "Qwen3-VL 32B encoder", "", &send);
+            ok &= fetch(&url("vae", H3_VAE), m("vae").join(H3_VAE), "MiniMax H3 video VAE", "", &send);
+            ok &= fetch(&url("vae", H3_AUDIO_VAE), m("vae").join(H3_AUDIO_VAE), "MiniMax H3 audio VAE", "", &send);
+            ok &= fetch(&url("loras", H3_TURBO_LORA), m("loras").join(H3_TURBO_LORA), "MiniMax H3 Turbo LoRA", "", &send);
         }
         GenFamily::Sdxl => {
             // SDXL Base 1.0 — a single checkpoint (UNet + dual CLIP + VAE).
@@ -5995,6 +6138,18 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
             ));
             return false;
         }
+        // MiniMax H3's nodes came with ComfyUI 0.30: on an older one the
+        // queue would only answer that a node doesn't exist.
+        if job.model.family() == GenFamily::MiniMax
+            && let Some(have) = comfyui_installed_version().filter(|v| comfy_older_than(v, H3_MIN_COMFY))
+        {
+            send(format!(
+                "ERROR: MiniMax H3 needs ComfyUI {}.{} or newer — this one is {have}. Update ComfyUI in \
+                 Settings → Updates, then try again.",
+                H3_MIN_COMFY.0, H3_MIN_COMFY.1
+            ));
+            return false;
+        }
     }
 
     // 1 — make sure the ComfyUI server is up. For checkpoint-picker families,
@@ -6415,6 +6570,7 @@ fn build_params(job: &GenJob, applied: ImportedOverrides) -> String {
         GenModel::LtxDistilled => "LTX-Video",
         GenModel::Ltx2Distilled => "LTX-2.3",
         GenModel::WanTi2v5bFast | GenModel::WanTi2v5bQuality => "Wan 2.2 5B",
+        GenModel::MiniMaxH3 | GenModel::MiniMaxH3Turbo => "MiniMax H3",
         GenModel::SdxlBase => "SDXL 1.0",
         GenModel::AnimaBase => "Anima v1.0",
         GenModel::Krea2Turbo => "Krea 2 Turbo",
@@ -6436,6 +6592,7 @@ fn build_params(job: &GenJob, applied: ImportedOverrides) -> String {
         // Video is saved via SaveWEBM and never reaches this PNG path.
         GenFamily::Ltx => ("Euler", "Simple", None),
         GenFamily::Wan => ("UniPC", "Simple", None),
+        GenFamily::MiniMax => ("res_multistep", "Simple", None),
     };
     // Each latent cell is 8 px, so the image comes out at the size rounded down
     // to a multiple of 8 (the SDXL / Anima / Krea 2 builders round it explicitly).
@@ -6497,6 +6654,7 @@ fn build_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
             GenFamily::ZImage => zimage_workflow(job),
             GenFamily::Ltx => ltx_workflow(job, image_name),
             GenFamily::Wan => wan_workflow(job, image_name),
+            GenFamily::MiniMax => minimax_workflow(job, image_name),
             GenFamily::Sdxl => sdxl_workflow(job),
             GenFamily::Anima => anima_workflow(job),
             GenFamily::Krea2 => krea2_workflow(job),
@@ -6912,6 +7070,107 @@ fn wan_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
     // Native ComfyUI SaveWEBM (vp9 .webm) — same as LTX; the app plays webm.
     obj.insert("11".into(), json!({"class_type": "SaveWEBM", "inputs": {
         "images": ["10", 0], "filename_prefix": "ClarityWan", "codec": "vp9", "fps": fps, "crf": 18.0
+    }}));
+    wf
+}
+
+/// MiniMax H3's frame count for a clip of `frames`: the next one up on the
+/// model's grid of 17k+5 (5, 22, 39 … 73 … 124), which is what its node
+/// would snap to itself.
+fn h3_length(frames: i32) -> i32 {
+    let n = frames.max(5);
+    n + (5 - n % 17).rem_euclid(17)
+}
+
+/// MiniMax H3's canvas for the size asked for: multiples of 32, and no more
+/// pixels than the open weights were trained for (1344×768) — a bigger one
+/// is scaled down, its shape kept.
+fn h3_canvas(width: i32, height: i32) -> (i32, i32) {
+    let (mut w, mut h) = (width.max(64) as f64, height.max(64) as f64);
+    let over = (w * h) / H3_MAX_PIXELS as f64;
+    if over > 1.0 {
+        let k = over.sqrt();
+        (w, h) = (w / k, h / k);
+    }
+    let snap = |v: f64| ((v / 32.0).floor() as i32).max(2) * 32;
+    (snap(w), snap(h))
+}
+
+/// MiniMax H3 text/image-to-video workflow with sound, all native ComfyUI
+/// nodes (0.30+) — ComfyUI's own `video_minimax_h3_t2v` / `_i2v` template,
+/// flattened. UNETLoader (the built-in transformer, or a build of it picked
+/// from the installed models; + the Lightning LoRA for Turbo, then any picked
+/// LoRAs, model-only) + CLIPLoader (Qwen3-VL 32B, type "minimax") + the video
+/// and audio VAEs. `MiniMaxH3ImageToVideo` encodes the prompt and makes the
+/// joint video+sound latent in one node; its optional `first_frame` makes it
+/// image-to-video. No negative prompt and no CFG: a BasicGuider on the prompt
+/// alone, sampled by SamplerCustomAdvanced (res_multistep / simple). The one
+/// latent is decoded twice — pictures and sound — and CreateVideo + SaveVideo
+/// write an .mp4 at the model's 24 fps.
+fn minimax_workflow(job: &GenJob, image_name: Option<&str>) -> serde_json::Value {
+    use serde_json::json;
+    let (width, height) = h3_canvas(job.width, job.height);
+    let length = h3_length(job.frames);
+    // A build of the transformer picked from the installed models (the 16 GB
+    // w6a8, the fp8, a finetune) loads in place of the built-in one; the
+    // encoder and the VAEs stay.
+    let unet = job.checkpoint.as_deref().unwrap_or(H3_UNET);
+    let mut wf = json!({
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": unet, "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": H3_TE, "type": "minimax", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": H3_VAE}},
+        "4": {"class_type": "VAELoader", "inputs": {"vae_name": H3_AUDIO_VAE}},
+    });
+    let obj = wf.as_object_mut().unwrap();
+
+    // Model-only LoRA chain from the UNet: Turbo's Lightning LoRA, then the
+    // user's own.
+    let mut model_ref = json!(["1", 0]);
+    if job.model == GenModel::MiniMaxH3Turbo {
+        obj.insert("20".into(), json!({"class_type": "LoraLoaderModelOnly", "inputs": {
+            "model": model_ref, "lora_name": H3_TURBO_LORA, "strength_model": 1.0
+        }}));
+        model_ref = json!(["20", 0]);
+    }
+    for (id, (file, strength)) in (100..).zip(&job.loras) {
+        let node = id.to_string();
+        obj.insert(
+            node.clone(),
+            json!({"class_type": "LoraLoaderModelOnly", "inputs": {
+                "model": model_ref, "lora_name": file, "strength_model": strength
+            }}),
+        );
+        model_ref = json!([node, 0]);
+    }
+
+    // The prompt and the latent, from the one node; image-to-video hands it
+    // the uploaded picture as the first frame (stretched to the canvas).
+    let mut h3 = json!({
+        "clip": ["2", 0], "vae": ["3", 0], "prompt": with_embeds(&job.prompt, &job.pos_embeds),
+        "width": width, "height": height, "length": length
+    });
+    if job.i2v
+        && let Some(name) = image_name
+    {
+        obj.insert("6".into(), json!({"class_type": "LoadImage", "inputs": {"image": name}}));
+        h3["first_frame"] = json!(["6", 0]);
+    }
+    obj.insert("5".into(), json!({"class_type": "MiniMaxH3ImageToVideo", "inputs": h3}));
+
+    obj.insert("7".into(), json!({"class_type": "RandomNoise", "inputs": {"noise_seed": job.seed}}));
+    obj.insert("8".into(), json!({"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}}));
+    obj.insert("9".into(), json!({"class_type": "BasicScheduler", "inputs": {
+        "model": model_ref, "scheduler": "simple", "steps": job.steps, "denoise": 1.0
+    }}));
+    obj.insert("10".into(), json!({"class_type": "BasicGuider", "inputs": {"model": model_ref, "conditioning": ["5", 0]}}));
+    obj.insert("11".into(), json!({"class_type": "SamplerCustomAdvanced", "inputs": {
+        "noise": ["7", 0], "guider": ["10", 0], "sampler": ["8", 0], "sigmas": ["9", 0], "latent_image": ["5", 1]
+    }}));
+    obj.insert("12".into(), json!({"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}}));
+    obj.insert("13".into(), json!({"class_type": "VAEDecodeAudio", "inputs": {"samples": ["11", 0], "vae": ["4", 0]}}));
+    obj.insert("14".into(), json!({"class_type": "CreateVideo", "inputs": {"images": ["12", 0], "audio": ["13", 0], "fps": H3_FPS}}));
+    obj.insert("15".into(), json!({"class_type": "SaveVideo", "inputs": {
+        "video": ["14", 0], "filename_prefix": "ClarityH3", "format": "mp4", "codec": "h264"
     }}));
     wf
 }
@@ -7578,6 +7837,267 @@ mod tests {
         }
     }
 
+    /// MiniMax H3's graph is ComfyUI's own template, flattened: the prompt
+    /// and the joint video+sound latent from one node, no negative and no
+    /// CFG, decoded twice (pictures, sound) into an .mp4 at 24 fps.
+    #[test]
+    fn minimax_h3_workflow_follows_the_official_template() {
+        let mut j = job(GenModel::MiniMaxH3);
+        (j.width, j.height, j.frames, j.fps) = (1344, 768, 73, 30);
+        let wf = build_workflow(&j, None);
+        let of = |class: &str| -> Vec<&serde_json::Value> {
+            wf.as_object().unwrap().values().filter(|n| n["class_type"] == class).collect()
+        };
+        let one = |class: &str| {
+            let found = of(class);
+            assert_eq!(found.len(), 1, "one {class}");
+            &found[0]["inputs"]
+        };
+        assert_eq!(one("UNETLoader")["unet_name"], H3_UNET);
+        assert_eq!((&one("CLIPLoader")["clip_name"], &one("CLIPLoader")["type"]), (&json!(H3_TE), &json!("minimax")));
+        let vaes: Vec<&str> = of("VAELoader").iter().map(|n| n["inputs"]["vae_name"].as_str().unwrap()).collect();
+        assert!(vaes.len() == 2 && vaes.contains(&H3_VAE) && vaes.contains(&H3_AUDIO_VAE), "{vaes:?}");
+
+        let h3 = one("MiniMaxH3ImageToVideo");
+        assert_eq!(h3["prompt"], "a cat embedding:good");
+        assert_eq!((&h3["width"], &h3["height"], &h3["length"]), (&json!(1344), &json!(768), &json!(73)));
+        assert!(h3.get("first_frame").is_none() && of("LoadImage").is_empty(), "text to video");
+        assert_eq!(linked(&wf, &h3["clip"])["class_type"], "CLIPLoader");
+        assert_eq!(linked(&wf, &h3["vae"])["inputs"]["vae_name"], H3_VAE);
+
+        // The user's LoRA sits between the UNet and both the scheduler and
+        // the guider; no Lightning LoRA without Turbo.
+        let loras = of("LoraLoaderModelOnly");
+        assert_eq!(loras.len(), 1);
+        assert_eq!(loras[0]["inputs"]["lora_name"], "detail.safetensors");
+        assert_eq!(linked(&wf, &loras[0]["inputs"]["model"])["class_type"], "UNETLoader");
+        let (sched, guider) = (one("BasicScheduler"), one("BasicGuider"));
+        assert_eq!(sched["model"], guider["model"]);
+        assert_eq!(linked(&wf, &sched["model"])["inputs"]["lora_name"], "detail.safetensors");
+        assert_eq!((&sched["steps"], &sched["scheduler"]), (&json!(20), &json!("simple")));
+        assert_eq!(linked(&wf, &guider["conditioning"])["class_type"], "MiniMaxH3ImageToVideo");
+        assert_eq!(one("KSamplerSelect")["sampler_name"], "res_multistep");
+        assert_eq!(one("RandomNoise")["noise_seed"], 7);
+        assert!(of("KSampler").is_empty() && of("CLIPTextEncode").is_empty(), "no CFG, no negative");
+
+        // One latent, decoded as pictures and as sound.
+        let sampled = one("SamplerCustomAdvanced");
+        assert_eq!(sampled["latent_image"], json!([h3_node(&wf), 1]));
+        let (pictures, sound) = (one("VAEDecode"), one("VAEDecodeAudio"));
+        assert_eq!(pictures["samples"], sound["samples"]);
+        assert_eq!(linked(&wf, &pictures["samples"])["class_type"], "SamplerCustomAdvanced");
+        assert_eq!(linked(&wf, &pictures["vae"])["inputs"]["vae_name"], H3_VAE);
+        assert_eq!(linked(&wf, &sound["vae"])["inputs"]["vae_name"], H3_AUDIO_VAE);
+        let video = one("CreateVideo");
+        assert_eq!(video["fps"], 24, "the model's own rate, whatever the slider was left at");
+        assert_eq!(linked(&wf, &video["audio"])["class_type"], "VAEDecodeAudio");
+        let saved = one("SaveVideo");
+        assert_eq!((&saved["format"], &saved["filename_prefix"]), (&json!("mp4"), &json!("ClarityH3")));
+        // Every link points at a node that's there.
+        for node in wf.as_object().unwrap().values() {
+            for input in node["inputs"].as_object().unwrap().values() {
+                if let Some(link) = input.as_array().filter(|a| a.len() == 2 && a[0].is_string()) {
+                    assert!(wf.get(link[0].as_str().unwrap()).is_some(), "{node}");
+                }
+            }
+        }
+
+        // Turbo: the Lightning LoRA first, then the user's; its own steps.
+        let mut turbo = job(GenModel::MiniMaxH3Turbo);
+        turbo.steps = GenModel::MiniMaxH3Turbo.default_steps();
+        let wf = build_workflow(&turbo, None);
+        let sched = &wf.as_object().unwrap().values().find(|n| n["class_type"] == "BasicScheduler").unwrap()["inputs"];
+        assert_eq!(sched["steps"], 8);
+        let user = linked(&wf, &sched["model"]);
+        assert_eq!(user["inputs"]["lora_name"], "detail.safetensors");
+        let lightning = linked(&wf, &user["inputs"]["model"]);
+        assert_eq!(lightning["inputs"]["lora_name"], H3_TURBO_LORA);
+        assert_eq!(linked(&wf, &lightning["inputs"]["model"])["class_type"], "UNETLoader");
+
+        // Image to video: the uploaded picture is the first frame.
+        let mut i2v = job(GenModel::MiniMaxH3);
+        i2v.i2v = true;
+        let wf = build_workflow(&i2v, Some("frame.png"));
+        let h3 = &wf[h3_node(&wf).as_str()]["inputs"];
+        let first = linked(&wf, &h3["first_frame"]);
+        assert_eq!((&first["class_type"], &first["inputs"]["image"]), (&json!("LoadImage"), &json!("frame.png")));
+    }
+
+    /// Another build of H3's transformer can be picked in its place — told
+    /// from the other families' models by its tensors (the official files
+    /// carry no metadata), and a Ref2VA build, which this graph can't drive,
+    /// by its name. H3's LoRAs are told by what they're stamped with, or by
+    /// the same tensors.
+    #[test]
+    fn minimax_h3_builds_and_loras_are_recognised() {
+        use super::lora_sniff_tests::fake_safetensors;
+        let t = || json!({"dtype": "F16", "shape": [1], "data_offsets": [0, 0]});
+        // Keys verbatim from Comfy-Org/MiniMax-H3's int8 and w6a8 builds.
+        let int8 = json!({
+            "adaln_t_table": t(), "audio_patch_proj.weight": t(),
+            "blocks.0.attn.out_proj.weight_scale": t(), "blocks.0.attn.qkv_proj.weight_scale": t(),
+        });
+        let w6a8 = json!({
+            "adaln_t_table": t(), "blocks.0.attn.qkv_proj.weight_s_channel": t(), "token_refiner.blocks.0.x": t(),
+        });
+        for (name, header) in [("minimax_h3_fl2va_pruned_w6a8", &w6a8), ("some_h3_finetune", &int8)] {
+            let p = fake_safetensors(name, header.clone());
+            assert!(matches!(sniff_checkpoint_base(&p), LoraBase::MiniMax), "{name}");
+        }
+        let p = fake_safetensors("minimax_h3_ref2va_pruned_int8_convrot", int8.clone());
+        assert!(matches!(sniff_checkpoint_base(&p), LoraBase::Other), "a Ref2VA build isn't offered");
+        // Wan's and Krea 2's models still read as themselves.
+        let wan = fake_safetensors("h3_not_wan", json!({"model.diffusion_model.blocks.0.cross_attn.k.weight": t()}));
+        assert!(matches!(sniff_checkpoint_base(&wan), LoraBase::Wan));
+        let krea = fake_safetensors("h3_not_krea", json!({"blocks.0.attn.wq.weight": t()}));
+        assert!(matches!(sniff_checkpoint_base(&krea), LoraBase::Krea2));
+
+        // The family's picker lists them, without the built-in one twice.
+        assert!(GenFamily::MiniMax.uses_checkpoint_picker());
+        assert_eq!(GenFamily::MiniMax.model_subdir(), "diffusion_models");
+        assert_eq!(GenFamily::MiniMax.builtin_ckpt_files(), [H3_UNET]);
+        // Picked, it loads in place of the built-in transformer — and only
+        // that changes.
+        let mut j = job(GenModel::MiniMaxH3);
+        let built_in = build_workflow(&j, None);
+        j.checkpoint = Some("minimax_h3_fl2va_pruned_w6a8.safetensors".into());
+        let mut picked = build_workflow(&j, None);
+        let unet = h3_loader(&picked);
+        assert_eq!(picked[unet.as_str()]["inputs"]["unet_name"], "minimax_h3_fl2va_pruned_w6a8.safetensors");
+        picked[unet.as_str()]["inputs"]["unet_name"] = json!(H3_UNET);
+        assert_eq!(picked, built_in);
+
+        // LoRAs: the official Lightning LoRA's stamp, Pika's, and bare tensors.
+        let lightning = fake_safetensors(
+            "h3_lightning",
+            json!({
+                "__metadata__": {"base_model": "Comfy-Org/MiniMax-H3 minimax_h3_fl2va_bf16.safetensors", "training_rank": "128"},
+                "diffusion_model.blocks.0.attn.qkv_proj.alpha": t(),
+            }),
+        );
+        assert!(matches!(sniff_lora_base(&lightning), LoraBase::MiniMax));
+        let pika = fake_safetensors("h3_pika", json!({"__metadata__": {"base_model": "MiniMaxAI/MiniMax-H3"}}));
+        assert!(matches!(sniff_lora_base(&pika), LoraBase::MiniMax));
+        let bare = fake_safetensors(
+            "h3_bare",
+            json!({
+                "diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight": t(),
+                "diffusion_model.blocks.0.mlp.fc1.lora_A.weight": t(),
+            }),
+        );
+        assert!(matches!(sniff_lora_base(&bare), LoraBase::MiniMax));
+        let kohya = fake_safetensors("h3_kohya", json!({"lora_unet_blocks_0_attn_qkv_proj.lora_down.weight": t()}));
+        assert!(matches!(sniff_lora_base(&kohya), LoraBase::MiniMax));
+        // A `base_model` stamp names the other families too.
+        let flux = fake_safetensors("h3_base_flux", json!({"__metadata__": {"base_model": "black-forest-labs/FLUX.1-dev"}}));
+        assert!(matches!(sniff_lora_base(&flux), LoraBase::Flux));
+    }
+
+    /// The id of the graph's UNETLoader node.
+    fn h3_loader(wf: &serde_json::Value) -> String {
+        wf.as_object().unwrap().iter().find(|(_, n)| n["class_type"] == "UNETLoader").unwrap().0.clone()
+    }
+
+    /// The id of the graph's MiniMaxH3ImageToVideo node.
+    fn h3_node(wf: &serde_json::Value) -> String {
+        wf.as_object().unwrap().iter().find(|(_, n)| n["class_type"] == "MiniMaxH3ImageToVideo").unwrap().0.clone()
+    }
+
+    /// H3's clip lengths sit on a grid of 17k+5 frames, and its canvas on
+    /// multiples of 32 within the 1344×768 it was trained for.
+    #[test]
+    fn minimax_h3_snaps_length_and_canvas() {
+        for (frames, length) in [(1, 5), (5, 5), (6, 22), (25, 39), (73, 73), (74, 90), (97, 107), (124, 124), (257, 260)] {
+            assert_eq!(h3_length(frames), length, "{frames} frames");
+        }
+        assert_eq!(h3_canvas(1344, 768), (1344, 768));
+        assert_eq!(h3_canvas(768, 1344), (768, 1344));
+        assert_eq!(h3_canvas(864, 480), (864, 480));
+        assert_eq!(h3_canvas(870, 500), (864, 480));
+        // Bigger than it was trained for: scaled down, its shape kept.
+        for (w, h) in [(2688, 1536), (2048, 2048), (1536, 2688), (1408, 800)] {
+            let (cw, ch) = h3_canvas(w, h);
+            assert!(cw % 32 == 0 && ch % 32 == 0 && (cw as i64) * (ch as i64) <= H3_MAX_PIXELS, "{w}x{h} -> {cw}x{ch}");
+            let (asked, got) = (w as f64 / h as f64, cw as f64 / ch as f64);
+            assert!((asked / got - 1.0).abs() < 0.08, "{w}x{h} -> {cw}x{ch}");
+        }
+        assert_eq!(h3_canvas(2688, 1536), (1344, 768));
+        // The tab opens on the model's own 768p, three seconds long.
+        let state = GenerateState::new(GenFamily::MiniMax);
+        assert_eq!((state.width, state.height, state.frames), (1344, 768, 73));
+        assert_eq!(aspect_dims(GenFamily::MiniMax, 1, DEFAULT_SIZE), (1344, 768));
+        assert_eq!(h3_canvas(1344, 768), aspect_dims(GenFamily::MiniMax, 1, DEFAULT_SIZE));
+    }
+
+    /// MiniMax H3 is a video family with its own files; Turbo also needs
+    /// the Lightning LoRA. An old ComfyUI is told apart from a new one.
+    #[test]
+    fn minimax_h3_is_a_video_family() {
+        assert!(GenFamily::MiniMax.is_video() && GenFamily::VIDEO.contains(&GenFamily::MiniMax));
+        assert!(!GenFamily::MiniMax.has_guidance() && GenFamily::Wan.has_guidance());
+        assert_eq!((GenFamily::MiniMax.fixed_fps(), GenFamily::Ltx.fixed_fps()), (Some(24), None));
+        assert_eq!(GenModel::all_for(GenFamily::MiniMax), [GenModel::MiniMaxH3, GenModel::MiniMaxH3Turbo]);
+        for m in GenModel::all_for(GenFamily::MiniMax) {
+            assert!(m.family() == GenFamily::MiniMax);
+        }
+        let files = |m| required_files(m).into_iter().map(|(sub, f)| format!("{sub}/{f}")).collect::<Vec<_>>();
+        let base = files(GenModel::MiniMaxH3);
+        assert_eq!(
+            base,
+            [
+                format!("diffusion_models/{H3_UNET}"),
+                format!("text_encoders/{H3_TE}"),
+                format!("vae/{H3_VAE}"),
+                format!("vae/{H3_AUDIO_VAE}"),
+            ]
+        );
+        let turbo = files(GenModel::MiniMaxH3Turbo);
+        assert_eq!(turbo[..4], base[..]);
+        assert_eq!(turbo[4], format!("loras/{H3_TURBO_LORA}"));
+        assert!(LoraBase::MiniMax.matches(GenFamily::MiniMax) && !LoraBase::MiniMax.matches(GenFamily::Wan));
+
+        for (version, old) in [("0.29.9", true), ("0.3.75", true), ("0.30.0", false), ("0.45.0", false), ("1.0.0", false), ("v0.29.0", true), ("nightly", false), ("", false)] {
+            assert_eq!(comfy_older_than(version, H3_MIN_COMFY), old, "{version:?}");
+        }
+    }
+
+    /// MiniMax H3's graph, checked by a running ComfyUI (`CTF_COMFY_URL`,
+    /// e.g. http://127.0.0.1:8188): it knows every node and input — the only
+    /// thing it may turn down is a model file that isn't downloaded. (With
+    /// the files there, this queues a real 5-frame job.)
+    #[test]
+    #[ignore]
+    fn minimax_h3_workflow_validates_on_comfyui() {
+        let url = std::env::var("CTF_COMFY_URL").expect("set CTF_COMFY_URL");
+        for model in [GenModel::MiniMaxH3, GenModel::MiniMaxH3Turbo] {
+            let mut j = job(model);
+            (j.width, j.height, j.frames, j.loras) = (352, 352, 5, vec![]);
+            let wf = build_workflow(&j, None);
+            let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+            let mut resp = agent
+                .post(format!("{url}/prompt"))
+                .header("Content-Type", "application/json")
+                .send(json!({"prompt": wf}).to_string())
+                .expect("ComfyUI answers");
+            let status = resp.status().as_u16();
+            let body: serde_json::Value =
+                serde_json::from_str(&resp.body_mut().read_to_string().expect("a body")).expect("json");
+            eprintln!("[{model:?}] {status}: {body}");
+            if status == 200 {
+                continue;
+            }
+            let errors = body["node_errors"].as_object().expect("node errors");
+            assert!(!errors.is_empty(), "{body}");
+            for (node, e) in errors {
+                for err in e["errors"].as_array().unwrap() {
+                    let input = err["extra_info"]["input_name"].as_str().unwrap_or("");
+                    assert_eq!(err["type"], "value_not_in_list", "node {node}: {err}");
+                    assert!(["unet_name", "clip_name", "vae_name", "lora_name"].contains(&input), "node {node}: {err}");
+                }
+            }
+        }
+    }
+
     /// The node a `[id, slot]` link input points at.
     fn linked<'a>(wf: &'a serde_json::Value, link: &serde_json::Value) -> &'a serde_json::Value {
         &wf[link[0].as_str().unwrap()]
@@ -7844,7 +8364,7 @@ pub(crate) fn remote_is_video(body: &serde_json::Value) -> Option<bool> {
 /// Host side: what's set up here.
 pub(crate) fn remote_catalog() -> Result<serde_json::Value, String> {
     let families =
-        [GenFamily::Flux, GenFamily::ZImage, GenFamily::Ltx, GenFamily::Wan, GenFamily::Sdxl, GenFamily::Anima, GenFamily::Krea2];
+        [GenFamily::Flux, GenFamily::ZImage, GenFamily::Ltx, GenFamily::Wan, GenFamily::MiniMax, GenFamily::Sdxl, GenFamily::Anima, GenFamily::Krea2];
     let ready = families
         .iter()
         .flat_map(|f| GenModel::all_for(*f).iter().copied())

@@ -1066,7 +1066,7 @@ fn host_ui(ui: &mut egui::Ui, settings: &mut crate::settings::Settings, link: &m
                 switch(ui, &mut settings.link.share_images);
             });
             row_sep(ui);
-            row(ui, "Video generation", Some("LTX and Wan."), |ui| {
+            row(ui, "Video generation", Some("LTX, Wan and MiniMax H3."), |ui| {
                 switch(ui, &mut settings.link.share_video);
             });
         } else {
