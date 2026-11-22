@@ -1689,6 +1689,37 @@ impl GenerateState {
         self.prompt = prompt;
     }
 
+    /// The work assistant starts a generation with its own prompt
+    /// (src/assistant.rs): into the prompt box, in place of what's there,
+    /// and run as the Generate button runs it — with the model, size and
+    /// LoRAs the view has. Why not, when it can't: it's busy, or not set up.
+    pub fn assistant_generate(&mut self, prompt: &str, ctx: &egui::Context, current_image: Option<&Path>) -> Result<(), String> {
+        if self.running {
+            return Err(format!("{} is busy with another run.", self.family.title()));
+        }
+        match self.remote_host.as_ref().map(|host| remote_ready(self, host)) {
+            Some(Err(why)) => return Err(why),
+            Some(Ok(())) => {}
+            None if !is_installed() => {
+                return Err("Text to Image isn't set up yet — open it and run its setup first.".to_string());
+            }
+            None => {}
+        }
+        self.prompt = prompt.to_string();
+        start_generate(self, ctx, current_image);
+        if self.running { Ok(()) } else { Err(self.status.clone()) }
+    }
+
+    /// A run is going.
+    pub fn busy(&self) -> bool {
+        self.running
+    }
+
+    /// The model family this view is for, by name ("Krea 2").
+    pub fn family_title(&self) -> &'static str {
+        self.family.title()
+    }
+
     /// Build the state for a given model family (Flux or Z-Image).
     pub fn new(family: GenFamily) -> Self {
         let model = family.default_model();

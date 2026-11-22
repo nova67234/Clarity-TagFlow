@@ -91,6 +91,14 @@ pub struct Settings {
     /// Krea 2 prompts: the chat turns pictures and ideas into Krea 2
     /// text-to-image prompts (tools menu toggle; implies detailed vision).
     pub ai_krea_prompts: bool,
+    /// The work assistant (src/assistant.rs): the chat model as a pill in the
+    /// top bar, over the app, that can look, open places and generate when
+    /// asked (Settings → AI Model).
+    pub ai_assistant: bool,
+    /// While the assistant has an image generated, the chat model steps
+    /// aside so the image model has the graphics card (it loads again with
+    /// the next message). Off for a card with room for both.
+    pub ai_assistant_swap: bool,
     /// Remember across chats (AI Settings → Memory): the AI keeps long-term
     /// memories (src/memory.rs) and looks them up when they're useful.
     pub ai_memory_enabled: bool,
@@ -305,6 +313,8 @@ impl Default for Settings {
             ai_auto_speak: false,
             ai_detailed_vision: false,
             ai_krea_prompts: false,
+            ai_assistant: false,
+            ai_assistant_swap: true,
             ai_memory_enabled: false,
             ai_tag_images: false,
             ai_web_research: false,
@@ -1045,6 +1055,42 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
                     }
                 },
             );
+        });
+
+        section(ui, "Work assistant", |ui| {
+            row(
+                ui,
+                "Activate the work assistant",
+                Some(
+                    "Puts the AI in the top bar while you work. It knows the view you're in and the \
+                     selected image's name, and looks at an image only when you ask. It can open views, \
+                     say what it thinks of a picture, and recreate one in Text to Image.",
+                ),
+                |ui| {
+                    if switch(ui, &mut settings.ai_assistant).changed() {
+                        if settings.ai_assistant {
+                            llm.cancel_unload();
+                        } else if !settings.ai_chat {
+                            llm.unload();
+                        }
+                    }
+                },
+            );
+            if cfg!(not(target_os = "macos")) {
+                row_sep(ui);
+                row(
+                    ui,
+                    "Free the graphics card to generate",
+                    Some(
+                        "When the assistant starts a generation, the chat model steps aside so the image \
+                         model has the graphics card, and loads again with your next message. Switch off \
+                         if your card has room for both.",
+                    ),
+                    |ui| {
+                        switch(ui, &mut settings.ai_assistant_swap);
+                    },
+                );
+            }
         });
 
         section(ui, "Natural voice (OmniVoice)", |ui| {

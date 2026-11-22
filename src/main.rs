@@ -69,6 +69,9 @@ use theme::*;
 
 mod ai_models;
 mod ai_orb;
+// The work assistant: the chat model as a companion over the app (a pill in
+// the top bar), which can look, open places and generate when asked.
+mod assistant;
 // The full-window AI Chat view (Settings → AI Model → Activate AI Chat).
 mod ai_chat;
 // AI Settings window (the Tools menu's gear): replies, memory
@@ -387,6 +390,8 @@ struct ViewerApp {
     /// Favorited ("hearted") files, tracked by content hash so they survive
     /// moves/renames. Shown as a heart badge on the browser thumbnails.
     favorites: favorites::Favorites,
+    /// The work assistant's pill, card and banner (src/assistant.rs).
+    assistant: assistant::card::AssistantUi,
     stats: top_bar::SystemStats,
     /// FTP/FTPS remote-browser state (Settings → FTP/FTPS).
     ftp: ftp::FtpState,
@@ -507,6 +512,7 @@ impl Default for ViewerApp {
             tag_index_rx: None,
             crop_rx: None,
             favorites: favorites::Favorites::load(),
+            assistant: Default::default(),
             stats: top_bar::SystemStats::default(),
             ftp: ftp::FtpState::default(),
             llm: llm::LlmState::default(),
@@ -1037,6 +1043,91 @@ impl ViewerApp {
                     }
                 });
             });
+    }
+
+    /// The work assistant (src/assistant.rs), each frame it's on: its card
+    /// and banner under the pill, what the user asked of it, and what its
+    /// replies asked of the app.
+    fn work_assistant(&mut self, ctx: &egui::Context) {
+        let scene = self.assistant_scene(false);
+        let mut here = if scene.gallery { "Gallery".to_string() } else { format!("Panels · {}", scene.view) };
+        match &scene.selected {
+            Some(path) => here.push_str(&format!(" · {}", ai_tagging::file_name(path))),
+            None => here.push_str(" · no image selected"),
+        }
+        match assistant::card::show(ctx, &mut self.assistant, &mut self.llm, &here, scene.can_generate) {
+            Some(assistant::card::Ask::Send(text)) => {
+                let scene = self.assistant_scene(true);
+                self.llm.assistant_send(&text, scene, ctx);
+            }
+            Some(assistant::card::Ask::Stop) => self.llm.stop_generation(),
+            None => {}
+        }
+        for action in self.llm.take_assistant_actions() {
+            self.carry_out(action, ctx);
+        }
+    }
+
+    /// Where the user is, for the assistant: the layout, the right panel's
+    /// view and the selected file — measured (`measure`) when a message is
+    /// about to go with it.
+    fn assistant_scene(&self, measure: bool) -> assistant::Scene {
+        let selected = self.selected.and_then(|i| self.images.get(i)).cloned();
+        let size = selected.as_deref().filter(|p| measure && !is_video(p)).and_then(image_cache::oriented_dimensions);
+        #[cfg(not(target_os = "macos"))]
+        let generating = self.right_state.generating();
+        #[cfg(target_os = "macos")]
+        let generating = false;
+        assistant::Scene {
+            gallery: self.settings.layout == settings::Layout::Gallery,
+            view: self.right_state.view_label(),
+            selected,
+            size,
+            generating,
+            can_generate: cfg!(not(target_os = "macos")),
+        }
+    }
+
+    /// Do what a reply of the assistant's asked for, and have its note say
+    /// so — or the reply say why it couldn't be done.
+    fn carry_out(&mut self, action: assistant::Action, ctx: &egui::Context) {
+        match action {
+            assistant::Action::Open(place) => {
+                if assistant::open(place, &mut self.settings, &mut self.right_state) {
+                    self.llm.assistant_did(assistant::did_open(place));
+                } else {
+                    self.llm.assistant_could_not(&format!("{} isn't in this build of the app.", place.label()));
+                }
+            }
+            assistant::Action::Generate(prompt) => {
+                #[cfg(not(target_os = "macos"))]
+                {
+                    // (Text to Image is in the right panel.)
+                    self.settings.layout = settings::Layout::Panels;
+                    let current = self.selected.and_then(|i| self.images.get(i)).cloned();
+                    match self.right_state.open_text_to_image().assistant_generate(&prompt, ctx, current.as_deref()) {
+                        Ok(()) => {
+                            self.llm.assistant_did(assistant::did_generate());
+                            // The image model gets the graphics card: the
+                            // chat model steps aside (not one on a Link host,
+                            // which isn't on this card).
+                            if self.settings.ai_assistant_swap && link::remote_chat().is_none() {
+                                self.llm.step_aside();
+                            }
+                        }
+                        Err(why) => self.llm.assistant_could_not(&why),
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = (prompt, ctx);
+                    self.llm.assistant_could_not("Text to Image isn't in the macOS build.");
+                }
+            }
+            assistant::Action::Verdict { image, like } => {
+                self.favorites.set_ai_opinion(&image, like);
+            }
+        }
     }
 
     /// Arrow-key navigation through what the browser actually shows — the
@@ -2167,6 +2258,7 @@ impl eframe::App for ViewerApp {
         // A model loaded only for Link devices goes when they haven't used
         // it for 10 minutes (this PC's own chat keeps it while it's on).
         if !self.settings.ai_chat
+            && !self.settings.ai_assistant
             && !self.llm.needs_poll()
             && llm::worker_loaded()
             && llm::remote_idle_for().is_some_and(|d| d > Duration::from_secs(600))
@@ -2250,7 +2342,15 @@ impl eframe::App for ViewerApp {
         }
 
         let update_badge = self.update.badge(&self.settings);
-        match top_bar::show(ui, &self.stats, self.settings.show_stats, update_badge, self.settings.ftp_enabled) {
+        // The work assistant is over the app, not over AI Chat (which is the
+        // same AI, full-window).
+        let assistant_on = self.settings.ai_assistant && !self.settings.ai_chat && self.llm.usable();
+        let top_bar_action = {
+            let mut pill = |ui: &mut egui::Ui| assistant::card::pill(ui, &mut self.assistant, &self.llm);
+            let pill: Option<&mut dyn FnMut(&mut egui::Ui)> = if assistant_on { Some(&mut pill) } else { None };
+            top_bar::show(ui, &self.stats, self.settings.show_stats, update_badge, self.settings.ftp_enabled, pill)
+        };
+        match top_bar_action {
             // In FTP mode the folder button opens the remote browser instead of
             // the input/output folder popup.
             top_bar::TopBarAction::OpenFolder(pos) => {
@@ -2319,8 +2419,11 @@ impl eframe::App for ViewerApp {
         // keep draining the worker so they finish and the deferred unload
         // frees the model weights (nothing else polls once the chat view and
         // Settings are closed).
-        if !self.settings.ai_chat && self.llm.needs_poll() {
+        if !self.settings.ai_chat && (assistant_on || self.llm.needs_poll()) {
             self.llm.poll(ui.ctx());
+        }
+        if assistant_on {
+            self.work_assistant(ui.ctx());
         }
 
         // AI Chat mode replaces the panels with a full-window chat with the

@@ -6,6 +6,10 @@
 //! array in `hearted.json` under the per-user config dir (the same location the
 //! Gelbooru downloader uses), and saved synchronously on every toggle — the set
 //! is tiny, so there's no need for the background save thread the Java version had.
+//!
+//! The work assistant's own opinion of an image it was shown (src/assistant.rs)
+//! is kept the same way, by the same hash, apart from the user's hearts:
+//! `ai_opinions.json`, hash → liked or not. A tile shows it as a small AI mark.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -17,6 +21,11 @@ use std::path::{Path, PathBuf};
 pub struct Favorites {
     hashes: HashSet<String>,
     cache: HashMap<PathBuf, String>,
+    /// What the work assistant thought of the images it was shown: liked
+    /// (true) or not.
+    ai: HashMap<String, bool>,
+    /// Where `ai` is kept (a test's own file).
+    ai_store: Option<PathBuf>,
 }
 
 impl Favorites {
@@ -26,7 +35,39 @@ impl Favorites {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<HashSet<String>>(&bytes).ok())
             .unwrap_or_default();
-        Self { hashes, cache: HashMap::new() }
+        let ai = std::fs::read(ai_store_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<HashMap<String, bool>>(&bytes).ok())
+            .unwrap_or_default();
+        Self { hashes, cache: HashMap::new(), ai, ai_store: Some(ai_store_path()) }
+    }
+
+    /// What the work assistant thought of `path`'s content, if it has said:
+    /// liked (true) or not.
+    pub fn ai_opinion(&mut self, path: &Path) -> Option<bool> {
+        if self.ai.is_empty() {
+            return None;
+        }
+        let hash = self.hash_of(path)?;
+        self.ai.get(&hash).copied()
+    }
+
+    /// The work assistant liked (or didn't like) the image at `path`: kept,
+    /// in place of what it thought of it before. False when the file can't
+    /// be read.
+    pub fn set_ai_opinion(&mut self, path: &Path, like: bool) -> bool {
+        let Some(hash) = self.hash_of(path) else { return false };
+        if self.ai.insert(hash, like) != Some(like)
+            && let Some(store) = &self.ai_store
+        {
+            if let Some(dir) = store.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Ok(json) = serde_json::to_vec_pretty(&self.ai) {
+                let _ = std::fs::write(store, json);
+            }
+        }
+        true
     }
 
     /// Whether `path`'s content is currently favorited. Takes `&mut self` because
@@ -94,9 +135,45 @@ fn store_path() -> PathBuf {
         .join("hearted.json")
 }
 
+/// `…/Clarity TagFlow/ai_opinions.json`, beside the hearts.
+fn ai_store_path() -> PathBuf {
+    store_path().with_file_name("ai_opinions.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The assistant's opinion goes with the image's content (a renamed file
+    // keeps it), is kept on disk, and a later one replaces it. Apart from the
+    // user's hearts.
+    #[test]
+    fn the_assistants_opinion_is_kept_by_content() {
+        let dir = std::env::temp_dir().join(format!("ctf_ai_opinions_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b, store) = (dir.join("a.png"), dir.join("b.png"), dir.join("ai_opinions.json"));
+        std::fs::write(&a, b"image a").unwrap();
+        std::fs::write(&b, b"image b").unwrap();
+        let mut fav = Favorites { ai_store: Some(store.clone()), ..Default::default() };
+        assert_eq!(fav.ai_opinion(&a), None);
+        assert!(fav.set_ai_opinion(&a, true) && fav.set_ai_opinion(&b, false));
+        assert_eq!((fav.ai_opinion(&a), fav.ai_opinion(&b)), (Some(true), Some(false)));
+        assert!(!fav.is_favorite(&a), "not a heart of the user's");
+        assert!(!fav.set_ai_opinion(&dir.join("gone.png"), true));
+
+        // Read back from disk; renamed, the file keeps its mark.
+        let kept: HashMap<String, bool> = serde_json::from_slice(&std::fs::read(&store).unwrap()).unwrap();
+        let mut later = Favorites { ai: kept, ai_store: Some(store.clone()), ..Default::default() };
+        let moved = dir.join("renamed.png");
+        std::fs::rename(&a, &moved).unwrap();
+        assert_eq!(later.ai_opinion(&moved), Some(true));
+        // It changed its mind.
+        assert!(later.set_ai_opinion(&moved, false));
+        assert_eq!(later.ai_opinion(&moved), Some(false));
+        let kept: HashMap<String, bool> = serde_json::from_slice(&std::fs::read(&store).unwrap()).unwrap();
+        assert!(kept.values().all(|liked| !liked) && kept.len() == 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // Crop, heart the crop, delete it, crop again under the same name: once
     // the path is forgotten the new file is judged by its own content.

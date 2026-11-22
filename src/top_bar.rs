@@ -385,7 +385,16 @@ pub enum TopBarAction {
 /// toggles the CPU / RAM / GPU stats; `update_badge` paints a red dot on the
 /// settings gear when an app/ComfyUI update is available; `ftp_mode` swaps the
 /// folder button for the FTP remote-browser button (Settings → FTP/FTPS).
-pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool, update_badge: bool, ftp_mode: bool) -> TopBarAction {
+/// `assistant` draws the work assistant's pill (src/assistant.rs), left of
+/// the action buttons, while it's switched on.
+pub fn show(
+    ui: &mut egui::Ui,
+    stats: &SystemStats,
+    show_stats: bool,
+    update_badge: bool,
+    ftp_mode: bool,
+    assistant: Option<&mut dyn FnMut(&mut egui::Ui)>,
+) -> TopBarAction {
     let mut action = TopBarAction::None;
 
     egui::Panel::top("topbar")
@@ -451,6 +460,10 @@ pub fn show(ui: &mut egui::Ui, stats: &SystemStats, show_stats: bool, update_bad
                                 action = TopBarAction::FindIssues(fi.rect.right_bottom());
                             }
                             ui.add_space(14.0);
+                            if let Some(pill) = assistant {
+                                pill(ui);
+                                ui.add_space(14.0);
+                            }
 
                             // LEFT, after the folder button: the CPU / RAM / GPU
                             // stats in the leftover space, straight on the bar's

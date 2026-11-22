@@ -74,6 +74,78 @@ fn family_view(family: crate::generate::GenFamily) -> RightView {
     }
 }
 
+impl RightPanelState {
+    /// What the panel shows, in a few words — for the work assistant's note
+    /// of where the user is (src/assistant.rs).
+    pub fn view_label(&self) -> String {
+        match self.view {
+            RightView::Details => "Image details".to_string(),
+            RightView::TagManager => "the Tag Manager".to_string(),
+            RightView::Downloader => "the Downloader".to_string(),
+            RightView::Civitai => "Civitai resources".to_string(),
+            #[cfg(not(target_os = "macos"))]
+            RightView::Pixal3D => "Pixal3D".to_string(),
+            #[cfg(not(target_os = "macos"))]
+            view => match self.generation(view) {
+                Some(state) if matches!(view, RightView::Ltx | RightView::Wan | RightView::MiniMax) => {
+                    format!("Text to Video — {}", state.family_title())
+                }
+                Some(state) => format!("Text to Image — {}", state.family_title()),
+                None => "Image details".to_string(),
+            },
+        }
+    }
+
+    /// The generation state `view` shows, if it's a generation view.
+    #[cfg(not(target_os = "macos"))]
+    fn generation(&self, view: RightView) -> Option<&crate::generate::GenerateState> {
+        Some(match view {
+            RightView::Generate => &self.generate,
+            RightView::ZImage => &self.zimage,
+            RightView::Ltx => &self.ltx,
+            RightView::Wan => &self.wan,
+            RightView::MiniMax => &self.minimax,
+            RightView::Sdxl => &self.sdxl,
+            RightView::Anima => &self.anima,
+            RightView::Krea2 => &self.krea2,
+            _ => return None,
+        })
+    }
+
+    /// A generation is running in any of the views.
+    #[cfg(not(target_os = "macos"))]
+    pub fn generating(&self) -> bool {
+        [&self.generate, &self.zimage, &self.ltx, &self.wan, &self.minimax, &self.sdxl, &self.anima, &self.krea2]
+            .iter()
+            .any(|state| state.busy())
+    }
+
+    /// Text to Image, for the work assistant to generate in: the image
+    /// model's view that's showing, or — from anywhere else — Krea 2's,
+    /// which it opens (the assistant writes a prompt in natural language).
+    #[cfg(not(target_os = "macos"))]
+    pub fn open_text_to_image(&mut self) -> &mut crate::generate::GenerateState {
+        if !matches!(self.view, RightView::Sdxl | RightView::Anima | RightView::Krea2 | RightView::Generate | RightView::ZImage) {
+            self.view = RightView::Krea2;
+        }
+        match self.view {
+            RightView::Sdxl => &mut self.sdxl,
+            RightView::Anima => &mut self.anima,
+            RightView::Generate => &mut self.generate,
+            RightView::ZImage => &mut self.zimage,
+            _ => &mut self.krea2,
+        }
+    }
+
+    /// Text to Video, opened the way its menu entry opens it.
+    #[cfg(not(target_os = "macos"))]
+    pub fn open_text_to_video(&mut self) {
+        if !matches!(self.view, RightView::Ltx | RightView::Wan | RightView::MiniMax) {
+            self.view = RightView::Ltx;
+        }
+    }
+}
+
 /// Read-only file metadata shown in the bottom "Image Details" card. A Rust
 /// port of the fields surfaced by terminus2's `ImageDetails` Swing panel.
 pub struct ImageMeta {

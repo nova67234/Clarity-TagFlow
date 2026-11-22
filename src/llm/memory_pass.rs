@@ -1455,6 +1455,7 @@ mod tests {
             tag_change: None,
             goals: Vec::new(),
             growth: Vec::new(),
+            did: Vec::new(),
             character: None,
             remember,
             picture_memory: false,

@@ -160,6 +160,9 @@ pub fn show(
                                 if col_ui.is_rect_visible(rect) {
                                     let is_fav = favorites.is_favorite(path);
                                     tile(col_ui, thumbs, video_thumbs, video_previews, path, rect, selected == Some(i), is_fav);
+                                    if let Some(liked) = favorites.ai_opinion(path) {
+                                        crate::left_browser::ai_badge(col_ui, rect, liked);
+                                    }
                                 } else {
                                     col_ui
                                         .painter()

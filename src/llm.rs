@@ -40,6 +40,13 @@ static GEN_CANCEL: AtomicBool = AtomicBool::new(false);
 /// Max reply length or the context's edge — so its last line may be cut
 /// short (Tag images then leaves the reply's tag edits unapplied).
 static GEN_CUT_OFF: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+thread_local! {
+    /// A test that plays the model says whether its reply was cut off: every
+    /// test's thread shares `GEN_CUT_OFF`, so one test's cut-off reply would
+    /// be another's too.
+    static CUT_OFF_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Model folder under the shared models root (`tagger::models_root()`).
 pub const FOLDER: &str = "gemma-4";
@@ -1017,6 +1024,36 @@ pub enum ChatRole {
     Model,
 }
 
+/// What a test that plays the model was asked: the turns, how many of them
+/// are pinned, whether the newest picture goes with close-ups, and where the
+/// reply goes.
+#[cfg(test)]
+struct AskedInTest {
+    msgs: Vec<CmdMsg>,
+    pinned: usize,
+    detailed: bool,
+    reply: std::sync::mpsc::Sender<Msg>,
+}
+
+/// The work assistant's side of the chat (src/assistant.rs): which
+/// conversation is its own, where the user was when they wrote the message
+/// being answered, and what its replies have asked the app to do.
+#[derive(Default)]
+pub struct AssistantChat {
+    /// Its conversation — an ordinary one, in the chat list like the rest.
+    pub chat: Option<u64>,
+    /// Where the user was when they sent the message being answered.
+    pub scene: crate::assistant::Scene,
+    /// The reply about to be asked for is the assistant's.
+    turn: bool,
+    /// It asked to be shown the image: the message goes again, with it.
+    ask_again: bool,
+    /// It is being shown the image (the card says so).
+    pub looking: bool,
+    /// What its replies asked for, for main.rs to carry out.
+    pub actions: Vec<crate::assistant::Action>,
+}
+
 /// One message in an AI Chat conversation.
 pub struct ChatMsg {
     pub role: ChatRole,
@@ -1043,6 +1080,9 @@ pub struct ChatMsg {
     /// Role play: what this reply changed about the character — traits
     /// gained or dropped, parts of its persona rewritten (its note).
     pub growth: Vec<crate::roleplay::GrowthEvent>,
+    /// The work assistant: what this reply did in the app (its note) — a
+    /// place opened, a generation started, an image liked.
+    pub did: Vec<String>,
     /// Role play with thoughts in character: the character whose reply this
     /// is — its thoughts are shown as that character's ("Mira's thoughts").
     pub character: Option<String>,
@@ -1285,6 +1325,15 @@ pub struct LlmState {
     /// A Krea 2 prompt the user asked to take to Text to Image (the button
     /// under it), for main.rs.
     pub to_image: Option<String>,
+    /// The work assistant's side of the chat (src/assistant.rs).
+    pub assistant: AssistantChat,
+    /// In a test that plays the model: what this PC's model was asked,
+    /// instead of asking it.
+    #[cfg(test)]
+    asked_in_test: Option<Vec<AskedInTest>>,
+    /// The streaming reply is the work assistant's (settled when it was
+    /// asked): its control lines are read when it ends.
+    pub gen_assistant: bool,
     /// A lookup's notes, open in the chat's viewer.
     pub notes_view: Option<crate::ai_chat::NotesView>,
     /// The input card's tools popup is open.
@@ -1474,6 +1523,10 @@ impl Default for LlmState {
             gen_docs: false,
             gen_krea: false,
             to_image: None,
+            assistant: AssistantChat::default(),
+            #[cfg(test)]
+            asked_in_test: None,
+            gen_assistant: false,
             notes_view: None,
             tools_open: false,
             chats_open: false,
@@ -1710,7 +1763,10 @@ impl LlmState {
                         // Done on errors too, so a reply cut short by a failure
                         // doesn't show raw channel markers.
                         let stopped = GEN_CANCEL.load(Ordering::SeqCst);
+                        #[cfg(not(test))]
                         let cut_off = GEN_CUT_OFF.load(Ordering::SeqCst);
+                        #[cfg(test)]
+                        let cut_off = CUT_OFF_IN_TEST.get();
                         if let Some(chat) = self.gen_chat.and_then(|id| self.chats.iter_mut().find(|c| c.id == id)) {
                             let (chat_id, index) = (chat.id, chat.msgs.len().saturating_sub(1));
                             // The message it answers came with a picture.
@@ -1929,12 +1985,19 @@ impl LlmState {
                                 }
                             }
                         }
+                        // The work assistant: its control lines come out of
+                        // the reply; a finished one's are carried out — a
+                        // look sends the message again with the image, the
+                        // rest wait for main.rs.
+                        if self.gen_assistant {
+                            self.end_assistant_reply(res.is_ok() && !stopped && !cut_off);
+                        }
                         // Auto-speak: read the finished reply aloud (after the
                         // diary lines are gone, so they're never spoken) —
                         // unless it was stopped (Stop means stop), or AI Chat
                         // was switched off meanwhile: nothing would be on
                         // screen to stop it with.
-                        if res.is_ok() && !stopped && self.auto_speak && !self.unload_when_done {
+                        if res.is_ok() && !stopped && self.auto_speak && !self.unload_when_done && !self.assistant.ask_again {
                             let target = self
                                 .gen_chat
                                 .and_then(|id| self.chats.iter().find(|c| c.id == id))
@@ -1964,6 +2027,10 @@ impl LlmState {
                 self.reply_rx = None;
                 self.remote_host = None;
             }
+        }
+        // The assistant asked to look: its message goes again, image attached.
+        if std::mem::take(&mut self.assistant.ask_again) && !self.running {
+            self.assistant_reply(ctx);
         }
         // Remembering by itself: take in the memory pass's answer, start the
         // next one when one is due.
@@ -2103,6 +2170,7 @@ impl LlmState {
             tag_change: None,
             goals: Vec::new(),
             growth: Vec::new(),
+            did: Vec::new(),
             character: None,
             remember,
             picture_memory,
@@ -2306,6 +2374,199 @@ impl LlmState {
         true
     }
 
+    /// Ask this PC's model for a reply to `msgs`.
+    fn ask_local(
+        &mut self,
+        ctx: &egui::Context,
+        msgs: Vec<CmdMsg>,
+        pinned: usize,
+        detailed: bool,
+        reply: std::sync::mpsc::Sender<Msg>,
+    ) -> Result<(), String> {
+        // (A test that plays the model: what it was asked, and where to
+        // answer.)
+        #[cfg(test)]
+        if let Some(asked) = &mut self.asked_in_test {
+            asked.push(AskedInTest { msgs, pinned, detailed, reply });
+            return Ok(());
+        }
+        submit(ctx, self.model, self.image_detail, Cmd::Ask { msgs, params: self.params, pinned, detailed, reply, remote: None })
+    }
+
+    /// The work assistant's conversation, if it has one yet.
+    pub fn assistant_chat(&self) -> Option<&Chat> {
+        self.assistant.chat.and_then(|id| self.chats.iter().find(|c| c.id == id))
+    }
+
+    /// The work assistant's reply is streaming.
+    pub fn assistant_busy(&self) -> bool {
+        self.running && self.gen_assistant
+    }
+
+    /// Send `text` to the work assistant from where the user is (`scene`):
+    /// it goes into the assistant's own conversation — made on first use —
+    /// and the reply streams in after it. False when it couldn't be sent
+    /// (`run_err` says why): another reply is still coming, or no model is
+    /// set up.
+    pub fn assistant_send(&mut self, text: &str, scene: crate::assistant::Scene, ctx: &egui::Context) -> bool {
+        let text = text.trim();
+        if self.running || text.is_empty() {
+            return false;
+        }
+        let remote = crate::link::remote_chat().is_some();
+        if !BUILT_WITH_LLM && !remote {
+            self.run_err = Some("This build was compiled without the AI feature (`llm`).".to_string());
+            return false;
+        }
+        if !self.installed && !remote {
+            self.run_err = Some("Set up the model first (Settings → AI Model).".to_string());
+            return false;
+        }
+        self.run_err = None;
+        self.status = "Starting…".to_string();
+        // (Back from stepping aside for a generation.)
+        self.keep_loaded();
+        let index = match self.assistant.chat.and_then(|id| self.chats.iter().position(|c| c.id == id)) {
+            Some(index) => index,
+            None => {
+                // (Not the chat on screen in AI Chat, nor an empty one of
+                // the user's: its own.)
+                self.chats.push(Chat::new(self.next_chat_id));
+                self.assistant.chat = Some(self.next_chat_id);
+                self.next_chat_id += 1;
+                self.chats.len() - 1
+            }
+        };
+        self.chats[index].msgs.push(ChatMsg {
+            role: ChatRole::User,
+            text: text.to_string(),
+            thinking: None,
+            image: None,
+            doc: None,
+            tag_image: None,
+            tag_change: None,
+            goals: Vec::new(),
+            growth: Vec::new(),
+            did: Vec::new(),
+            character: None,
+            remember: false,
+            picture_memory: false,
+            shared_with: Vec::new(),
+            research: None,
+            krea_prompt: false,
+        });
+        self.assistant.scene = scene;
+        self.assistant.looking = false;
+        self.assistant_reply(ctx);
+        true
+    }
+
+    /// Ask for the assistant's reply to its conversation as it stands (which
+    /// ends with the user's message): `begin_generation` on that chat, with
+    /// the chat on screen in AI Chat left as it is.
+    fn assistant_reply(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.assistant.chat.and_then(|id| self.chats.iter().position(|c| c.id == id)) else { return };
+        if self.chats[index].msgs.last().is_none_or(|m| m.role != ChatRole::User) {
+            return;
+        }
+        let on_screen = std::mem::replace(&mut self.active_chat, index);
+        self.assistant.turn = true;
+        self.begin_generation(ctx);
+        self.assistant.turn = false;
+        self.active_chat = on_screen;
+    }
+
+    /// The assistant's reply has ended: take its control lines out of what
+    /// the user reads, and — when the model ended the reply itself
+    /// (`complete`; one stopped or cut off may end mid-line) — do what they
+    /// ask. A look, the first for this message, attaches the image selected
+    /// when the message was sent and has the message answered again (the
+    /// reply that only asked goes). The rest wait in `assistant.actions`.
+    fn end_assistant_reply(&mut self, complete: bool) {
+        self.assistant.looking = false;
+        let Some(chat) = self.gen_chat.and_then(|id| self.chats.iter_mut().find(|c| c.id == id)) else { return };
+        let Some(asked) = chat.msgs.iter().rposition(|m| m.role == ChatRole::User) else { return };
+        let Some(reply) = chat.msgs.last_mut().filter(|m| m.role == ChatRole::Model) else { return };
+        let d = crate::assistant::extract(&mut reply.text);
+        if !complete {
+            return;
+        }
+        if d.look && chat.msgs[asked].image.is_none() {
+            match self.assistant.scene.selected.clone().filter(|image| image.exists()) {
+                Some(image) => {
+                    chat.msgs.truncate(asked + 1);
+                    chat.msgs[asked].image = Some(image);
+                    self.assistant.looking = true;
+                    self.assistant.ask_again = true;
+                }
+                None => {
+                    if let Some(reply) = chat.msgs.last_mut() {
+                        reply.text = "There's no image selected for me to look at — pick one and ask me again.".to_string();
+                    }
+                }
+            }
+            return;
+        }
+        // Its opinion is of the image it was last shown here.
+        let shown = chat.msgs.iter().rev().filter(|m| m.role == ChatRole::User).find_map(|m| m.image.clone());
+        let Some(reply) = chat.msgs.last_mut() else { return };
+        if let Some(place) = d.open {
+            self.assistant.actions.push(crate::assistant::Action::Open(place));
+        }
+        if let Some(prompt) = d.generate {
+            self.assistant.actions.push(crate::assistant::Action::Generate(prompt));
+        }
+        if let Some((like, why)) = d.verdict
+            && let Some(image) = shown
+        {
+            reply.did.push(crate::assistant::did_verdict(like, &why));
+            self.assistant.actions.push(crate::assistant::Action::Verdict { image, like });
+        }
+    }
+
+    /// The assistant has started a generation: the chat model steps aside,
+    /// so the image model has the graphics card — freed as when AI Chat is
+    /// switched off, once nothing needs it (the reply's voice plays on). The
+    /// next message loads it again.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub fn step_aside(&mut self) {
+        self.begin_unload();
+    }
+
+    /// What the assistant's replies asked for since this was last called.
+    pub fn take_assistant_actions(&mut self) -> Vec<crate::assistant::Action> {
+        std::mem::take(&mut self.assistant.actions)
+    }
+
+    /// main.rs carried out something the assistant's last reply asked for:
+    /// its note says so.
+    pub fn assistant_did(&mut self, what: String) {
+        if let Some(reply) = self
+            .assistant
+            .chat
+            .and_then(|id| self.chats.iter_mut().find(|c| c.id == id))
+            .and_then(|c| c.msgs.last_mut())
+            .filter(|m| m.role == ChatRole::Model)
+        {
+            reply.did.push(what);
+        }
+    }
+
+    /// Something the assistant's last reply asked for couldn't be done: it
+    /// says so, in a line of its own under what it wrote.
+    pub fn assistant_could_not(&mut self, why: &str) {
+        if let Some(reply) = self
+            .assistant
+            .chat
+            .and_then(|id| self.chats.iter_mut().find(|c| c.id == id))
+            .and_then(|c| c.msgs.last_mut())
+            .filter(|m| m.role == ChatRole::Model)
+        {
+            let sep = if reply.text.trim().is_empty() { "" } else { "\n\n" };
+            reply.text = format!("{}{sep}I couldn't do that: {why}", reply.text.trim_end());
+        }
+    }
+
     /// Whether a reply is looked up on the web first (see `begin_generation`).
     fn wants_research(&self) -> bool {
         self.web_research && !self.tag_images && !self.krea_prompts
@@ -2317,6 +2578,10 @@ impl LlmState {
     fn begin_generation(&mut self, ctx: &egui::Context) {
         // A reply never waits for a memory pass: it stops (and runs later).
         self.cancel_pass();
+        // The work assistant's reply (asked from its card), with its own
+        // brief and none of the chat's modes.
+        let assistant = std::mem::take(&mut self.assistant.turn);
+        self.gen_assistant = assistant;
         let chat = &mut self.chats[self.active_chat];
 
         // Snapshot the history for the worker, capped to the most recent
@@ -2371,6 +2636,12 @@ impl LlmState {
                         text = format!("{}\n{text}", crate::ai_tagging::label(tag_image));
                     }
                 }
+                // The work assistant: the newest message says where the
+                // user is, and which image is selected — attached, once the
+                // assistant has asked to look.
+                if assistant && user && Some(i) == newest_user {
+                    text = format!("{}\n\n{text}", self.assistant.scene.line(m.image.as_deref()));
+                }
                 CmdMsg { user, text, image }
             })
             .collect();
@@ -2381,9 +2652,14 @@ impl LlmState {
         // history — it never slides out of the window, so the character (and
         // everything in the diary) survives arbitrarily long sessions.
         let mut pinned = 0;
-        self.gen_roleplay = !self.krea_prompts && self.roleplay.enabled;
-        self.gen_krea = self.krea_prompts;
-        if self.krea_prompts {
+        self.gen_roleplay = !assistant && !self.krea_prompts && self.roleplay.enabled;
+        self.gen_krea = !assistant && self.krea_prompts;
+        if assistant {
+            let brief = crate::assistant::brief(self.assistant.scene.can_generate);
+            msgs.insert(0, CmdMsg { user: false, text: crate::assistant::ACK.to_string(), image: None });
+            msgs.insert(0, CmdMsg { user: true, text: brief, image: None });
+            pinned = 2;
+        } else if self.krea_prompts {
             // The Krea 2 brief is pinned the same way (the tools menu keeps
             // it and role play mutually exclusive) — for a model that thinks
             // first (the one that answers: a Link host's, when it runs
@@ -2447,7 +2723,9 @@ impl LlmState {
 
         GEN_CANCEL.store(false, Ordering::SeqCst);
         GEN_CUT_OFF.store(false, Ordering::SeqCst);
-        let detailed = wants_close_ups(self.krea_prompts, self.detailed_vision, &msgs);
+        // (The assistant reads an image with its close-ups when it's shown
+        // it, as Krea 2 prompts does: it may be asked to recreate it.)
+        let detailed = wants_close_ups(self.krea_prompts || assistant, self.detailed_vision, &msgs);
         let (tx, rx) = std::sync::mpsc::channel();
         // A Link host answers when this PC is linked to one sharing its
         // chat; otherwise the resident worker (a different model selected
@@ -2466,7 +2744,7 @@ impl LlmState {
         // steer that. Nor with Krea 2 prompts: a prompt describes a picture
         // or an idea, there's nothing to look up — and the lookup read the
         // picture a second time, and kept it out of the album.
-        let research = self.wants_research();
+        let research = !assistant && self.wants_research();
         self.gen_research = research;
         // Whether the model that answers thinks first (its thought takes
         // room from what else the prompt can hold).
@@ -2516,12 +2794,7 @@ impl LlmState {
                         .map(|_| ())
                         .map_err(|e| e.to_string())
                 }
-                None => submit(
-                    ctx,
-                    self.model,
-                    self.image_detail,
-                    Cmd::Ask { msgs, params: self.params, pinned, detailed, reply: tx, remote: None },
-                ),
+                None => self.ask_local(ctx, msgs, pinned, detailed, tx),
             }
         };
         match asked {
@@ -2544,6 +2817,7 @@ impl LlmState {
                         tag_change: None,
                         goals: Vec::new(),
                         growth: Vec::new(),
+                        did: Vec::new(),
                         character,
                         // A reply written from web pages or with PDFs in
                         // view stays out of the memory and the album: a page
@@ -4712,6 +4986,7 @@ mod roleplay_goal_tests {
             tag_change: None,
             goals: Vec::new(),
             growth: Vec::new(),
+            did: Vec::new(),
             character: None,
             remember: false,
             picture_memory: false,
@@ -4968,6 +5243,7 @@ mod web_research_tests {
             tag_change: None,
             goals: Vec::new(),
             growth: Vec::new(),
+            did: Vec::new(),
             character: None,
             remember: role == ChatRole::User,
             picture_memory: false,
@@ -5221,6 +5497,243 @@ mod split_channel_tests {
     }
 }
 
+/// The work assistant's chat (src/assistant.rs), with the test playing the
+/// model: what it's asked, and what its replies set off.
+#[cfg(test)]
+mod assistant_tests {
+    use super::*;
+    use crate::assistant::{Action, Place, Scene};
+    use std::path::Path;
+
+    /// An app with no model set up, the test in the model's place.
+    #[allow(clippy::field_reassign_with_default)] // it has a Drop of its own
+    fn bare() -> LlmState {
+        let mut llm = LlmState::default();
+        llm.asked_in_test = Some(Vec::new());
+        llm
+    }
+
+    /// One with a model set up.
+    fn app() -> LlmState {
+        let mut llm = bare();
+        llm.installed = true;
+        llm
+    }
+
+    fn asked(llm: &LlmState) -> &[AskedInTest] {
+        llm.asked_in_test.as_deref().unwrap()
+    }
+
+    /// The model answers what it was last asked with `text`, and ends.
+    fn answer(llm: &mut LlmState, text: &str) {
+        let reply = asked(llm).last().unwrap().reply.clone();
+        reply.send(Msg::Token(text.to_string())).unwrap();
+        reply.send(Msg::Done(Ok(()))).unwrap();
+        llm.poll(&egui::Context::default());
+    }
+
+    fn in_gallery(selected: Option<&Path>) -> Scene {
+        Scene { gallery: true, selected: selected.map(Path::to_path_buf), can_generate: true, ..Default::default() }
+    }
+
+    /// A folder with one real picture in it.
+    fn picture(test: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ctf_assistant_{test}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("fox.png");
+        image::RgbImage::new(16, 16).save(&image).unwrap();
+        (dir, image)
+    }
+
+    fn talk(llm: &LlmState) -> &[ChatMsg] {
+        &llm.assistant_chat().expect("the assistant has a conversation").msgs
+    }
+
+    /// Asked to recreate the selected image, the assistant is told which
+    /// one — by name — and sees it only once it asks to look: the message
+    /// goes again with the image attached, and the reply that only asked is
+    /// gone. What that reply ends with is hidden, and waits to be carried
+    /// out.
+    #[test]
+    fn it_sees_the_image_once_it_asks_to_look() {
+        if !BUILT_WITH_LLM {
+            return;
+        }
+        let (dir, image) = picture("look");
+        let ctx = egui::Context::default();
+        let mut llm = app();
+        assert!(llm.assistant_send("  recreate this image ", in_gallery(Some(&image)), &ctx));
+
+        // Its own conversation, beside the one on screen in AI Chat.
+        assert!(llm.chats.len() == 2 && llm.active_chat == 0 && llm.chats[0].msgs.is_empty());
+        assert!(llm.running && llm.gen_assistant && llm.assistant_busy());
+        assert_eq!(talk(&llm).len(), 2);
+        assert_eq!(talk(&llm)[0].text, "recreate this image");
+
+        // What it was asked: its brief pinned, then the message under the
+        // note of where the user is — the image by name, not shown.
+        let first = &asked(&llm)[0];
+        assert_eq!(first.pinned, 2);
+        assert!(first.msgs[0].user && first.msgs[0].text.starts_with("[Work assistant]"));
+        assert!(first.msgs[0].text.contains("`GENERATE: <prompt>`"));
+        assert!(!first.msgs[1].user && first.msgs[1].text == crate::assistant::ACK);
+        let newest = first.msgs.last().unwrap();
+        assert!(newest.user && newest.image.is_none() && !first.detailed);
+        // (After the line that says what time it is.)
+        assert!(newest.text.contains("\n\n[App note — I am in the Gallery"), "{}", newest.text);
+        assert!(newest.text.contains("Selected image: fox.png — not shown to you."), "{}", newest.text);
+        assert!(newest.text.ends_with("]\n\nrecreate this image"), "{}", newest.text);
+        assert!(first.msgs.iter().all(|m| m.image.is_none()));
+
+        // It asks to look: asked again, the image with the message now (and
+        // on the message in the chat, for the user to see).
+        answer(&mut llm, "LOOK");
+        assert_eq!(asked(&llm).len(), 2);
+        assert!(llm.running && llm.assistant.looking && llm.assistant.actions.is_empty());
+        assert_eq!(talk(&llm).len(), 2, "the reply that only asked is gone");
+        assert_eq!(talk(&llm)[0].image.as_deref(), Some(image.as_path()));
+        let second = &asked(&llm)[1];
+        let newest = second.msgs.last().unwrap();
+        assert_eq!(newest.image.as_deref(), Some(image.as_path()));
+        assert!(newest.text.contains("The selected image, fox.png, is attached: you can see it now."), "{}", newest.text);
+        assert!(second.detailed, "read with its close-ups");
+        assert_eq!(second.msgs.len(), 3, "brief, its yes, and the message — not the reply that asked");
+
+        // It answers, and ends with what it wants done.
+        answer(&mut llm, "A red fox asleep in the snow — I'll make it.\nGENERATE: A red fox asleep in fresh snow, soft morning light.\nLIKE: the soft light");
+        assert!(!llm.running && !llm.assistant.looking && !llm.assistant_busy());
+        assert_eq!(asked(&llm).len(), 2);
+        let reply = talk(&llm).last().unwrap();
+        assert_eq!(reply.text, "A red fox asleep in the snow — I'll make it.");
+        assert_eq!(reply.did, ["Liked it — the soft light"]);
+        assert_eq!(
+            llm.take_assistant_actions(),
+            [
+                Action::Generate("A red fox asleep in fresh snow, soft morning light.".into()),
+                Action::Verdict { image: image.clone(), like: true },
+            ]
+        );
+        assert!(llm.take_assistant_actions().is_empty());
+
+        // What the app then did — or couldn't — goes on that reply.
+        llm.assistant_did("Started generating in Text to Image".into());
+        llm.assistant_could_not("Text to Image is busy with another run.");
+        let reply = talk(&llm).last().unwrap();
+        assert_eq!(reply.did.len(), 2);
+        assert!(reply.text.ends_with("I'll make it.\n\nI couldn't do that: Text to Image is busy with another run."));
+
+        // The next message goes as it is: the image is still in what it
+        // reads, further up.
+        assert!(llm.assistant_send("and what's in the corner?", in_gallery(Some(&image)), &ctx));
+        let third = &asked(&llm)[2];
+        assert!(third.msgs.iter().filter(|m| m.image.is_some()).count() == 1 && !third.detailed);
+        assert!(third.msgs.last().unwrap().text.contains("not shown to you"));
+        // Shown it for this one too, a look it asks for again is not
+        // answered again and again.
+        answer(&mut llm, "LOOK");
+        assert!(llm.running && asked(&llm).len() == 4);
+        answer(&mut llm, "LOOK");
+        assert!(!llm.running && asked(&llm).len() == 4 && !llm.assistant.looking);
+        assert_eq!(talk(&llm).last().unwrap().text, "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A look with nothing selected (or a file that's gone) is answered
+    /// plainly; nothing is asked again.
+    #[test]
+    fn a_look_at_nothing_says_so() {
+        if !BUILT_WITH_LLM {
+            return;
+        }
+        let ctx = egui::Context::default();
+        for selected in [None, Some(Path::new("/nowhere/gone.png"))] {
+            let mut llm = app();
+            assert!(llm.assistant_send("what is this?", in_gallery(selected), &ctx));
+            answer(&mut llm, "LOOK");
+            assert!(!llm.running && asked(&llm).len() == 1);
+            assert!(talk(&llm).last().unwrap().text.starts_with("There's no image selected"));
+            assert!(talk(&llm)[0].image.is_none() && llm.assistant.actions.is_empty());
+        }
+    }
+
+    /// Places, and an opinion: carried out when the reply ended by itself —
+    /// an opinion only of an image it was shown. A reply cut short has its
+    /// lines hidden and nothing done.
+    #[test]
+    fn only_a_finished_reply_acts() {
+        if !BUILT_WITH_LLM {
+            return;
+        }
+        let (dir, image) = picture("acts");
+        let ctx = egui::Context::default();
+        let mut llm = app();
+        assert!(llm.assistant_send("take me to the gallery", in_gallery(Some(&image)), &ctx));
+        answer(&mut llm, "On our way.\nOPEN: gallery\nLIKE: lovely");
+        assert_eq!(talk(&llm).last().unwrap().text, "On our way.");
+        assert_eq!(llm.take_assistant_actions(), [Action::Open(Place::Gallery)], "no opinion of what it hasn't seen");
+        assert!(talk(&llm).last().unwrap().did.is_empty());
+
+        // Cut off at Max reply length: hidden, not done — not even a look.
+        for said in ["Going.\nOPEN: tag manager\nGENERATE: a fox", "LOOK"] {
+            assert!(llm.assistant_send("and now?", in_gallery(Some(&image)), &ctx));
+            CUT_OFF_IN_TEST.set(true);
+            let before = asked(&llm).len();
+            answer(&mut llm, said);
+            CUT_OFF_IN_TEST.set(false);
+            assert!(!llm.running && asked(&llm).len() == before, "{said}");
+            assert!(llm.assistant.actions.is_empty() && !talk(&llm).last().unwrap().text.contains("OPEN"));
+            assert!(talk(&llm).iter().all(|m| m.image.is_none()));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The assistant's replies are its own whatever the chat's modes are —
+    /// and the chat's are the chat's: a message sent in AI Chat afterwards
+    /// has nothing of the assistant's.
+    #[test]
+    fn the_chats_modes_are_not_the_assistants() {
+        if !BUILT_WITH_LLM {
+            return;
+        }
+        let ctx = egui::Context::default();
+        let mut llm = app();
+        // Role play and looking things up, in the chat:
+        llm.web_research = true;
+        llm.roleplay.enabled = true;
+        assert!(llm.wants_research());
+        assert!(llm.assistant_send("hello", Scene { view: "Image details".into(), ..Default::default() }, &ctx));
+        let first = &asked(&llm)[0];
+        assert!(first.msgs[0].text.starts_with("[Work assistant]") && first.pinned == 2);
+        assert!(!first.msgs[0].text.contains("GENERATE"), "nothing to generate with here");
+        assert!(llm.gen_assistant && !llm.gen_roleplay && !llm.gen_research);
+        // Busy: a second message waits.
+        assert!(!llm.assistant_send("and?", Scene::default(), &ctx));
+        answer(&mut llm, "Hi!");
+        // Krea 2 prompts, in the chat:
+        llm.web_research = false;
+        llm.roleplay.enabled = false;
+        llm.krea_prompts = true;
+        assert!(llm.assistant_send("and now?", Scene::default(), &ctx));
+        assert!(asked(&llm).last().unwrap().msgs[0].text.starts_with("[Work assistant]"));
+        assert!(llm.gen_assistant && !llm.gen_krea);
+        answer(&mut llm, "Still me.");
+
+        llm.draft = "a lighthouse at night".into();
+        llm.send_draft(&ctx);
+        let second = asked(&llm).last().unwrap();
+        assert!(!llm.gen_assistant && llm.gen_krea);
+        assert!(second.msgs.iter().all(|m| !m.text.contains("[Work assistant]") && !m.text.contains("[App note")));
+        assert_eq!(llm.chats[0].msgs.len(), 2, "into the chat on screen");
+        answer(&mut llm, "A lighthouse.\nOPEN: gallery");
+        assert!(llm.assistant.actions.is_empty() && llm.chats[0].msgs[1].text.contains("OPEN: gallery"));
+
+        // With no model set up, it says so and sends nothing.
+        let mut bare = bare();
+        assert!(!bare.assistant_send("hello", Scene::default(), &ctx));
+        assert!(bare.run_err.is_some() && bare.assistant_chat().is_none() && asked(&bare).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod reply_end_tests {
     use super::*;
@@ -5237,6 +5750,7 @@ mod reply_end_tests {
             tag_change: None,
             goals: Vec::new(),
             growth: Vec::new(),
+            did: Vec::new(),
             character: None,
             remember: false,
             picture_memory: false,
@@ -5312,10 +5826,9 @@ mod reply_end_tests {
             asked.image = picture.then(|| PathBuf::from("C:/pics/keeper.png"));
             let (mut llm, tx) = replying(asked);
             llm.gen_krea = krea;
-            GEN_CANCEL.store(false, Ordering::SeqCst);
-            GEN_CUT_OFF.store(cut, Ordering::SeqCst);
+            CUT_OFF_IN_TEST.set(cut);
             ended(&mut llm, &tx, raw);
-            GEN_CUT_OFF.store(false, Ordering::SeqCst);
+            CUT_OFF_IN_TEST.set(false);
             llm.chats[llm.active_chat].msgs.last().unwrap().krea_prompt
         };
         assert!(marked(true, false, PROMPT, false));
@@ -6943,6 +7456,7 @@ mod pdf_tests {
             tag_change: None,
             goals: Vec::new(),
             growth: Vec::new(),
+            did: Vec::new(),
             character: None,
             remember: true,
             picture_memory: false,

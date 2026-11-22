@@ -334,6 +334,9 @@ fn thumbnail_list(
 
                 let is_favorite = favorites.is_favorite(&images[i]);
                 draw_tile(ui, thumbs, video_thumbs, video_previews, &images[i], rect, *selected == Some(i), is_favorite);
+                if let Some(liked) = favorites.ai_opinion(&images[i]) {
+                    ai_badge(ui, rect, liked);
+                }
 
                 if resp.clicked() {
                     *selected = Some(i);
@@ -501,6 +504,29 @@ fn draw_tile(
             Stroke::new(3.0_f32, crate::theme::selection_outline()),
             egui::StrokeKind::Inside,
         );
+    }
+}
+
+/// The work assistant's opinion of an image it was shown (src/assistant.rs),
+/// in the tile's bottom-left corner (the top ones have the GIF and video
+/// marks and the user's own heart): the AI mark on a small dark pill, with
+/// a heart when it liked the image and a struck-out one when it didn't.
+pub fn ai_badge(ui: &egui::Ui, rect: egui::Rect, liked: bool) {
+    let h = (rect.width().min(rect.height()) * 0.14).clamp(18.0, 24.0);
+    let icon = h * 0.62;
+    let pill = egui::Rect::from_min_size(rect.left_bottom() + egui::vec2(6.0, -6.0 - h), egui::vec2(h * 0.5 + icon * 2.0 + 4.0, h));
+    if !ui.is_rect_visible(pill) {
+        return;
+    }
+    let p = ui.painter();
+    p.rect_filled(pill, h / 2.0, egui::Color32::from_black_alpha(170));
+    let at = |n: f32| egui::Rect::from_center_size(egui::pos2(pill.left() + h * 0.25 + icon * (n + 0.5) + n * 4.0, pill.center().y), egui::vec2(icon, icon));
+    egui::Image::new(egui::include_image!("../icons/AI.svg")).tint(crate::tag_manager::AI_NEW_VIOLET).paint_at(ui, at(0.0));
+    if liked {
+        // (Its own pink, as the user's heart has.)
+        egui::Image::new(egui::include_image!("../icons/heart.svg")).paint_at(ui, at(1.0));
+    } else {
+        egui::Image::new(egui::include_image!("../icons/heart_minus.svg")).tint(egui::Color32::from_gray(170)).paint_at(ui, at(1.0));
     }
 }
 

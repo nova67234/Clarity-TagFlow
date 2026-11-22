@@ -814,6 +814,7 @@ fn message_key(msg: &ChatMsg, picture: Option<Option<[usize; 2]>>, width: f32, z
     msg.tag_change.is_some().hash(&mut hasher);
     msg.goals.len().hash(&mut hasher);
     msg.growth.len().hash(&mut hasher);
+    msg.did.len().hash(&mut hasher);
     msg.character.hash(&mut hasher);
     msg.research.is_some().hash(&mut hasher);
     msg.krea_prompt.hash(&mut hasher);
@@ -862,7 +863,7 @@ const TO_IMAGE: &str = "Use in Text to Image";
 /// lists, headings, code blocks) straight on the background, like current
 /// assistant UIs. A streaming reply shows a ▌ cursor.
 fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool) {
-    let (role, text, stored_thinking, image, doc, tag_image, tag_change, goals, growth, krea_prompt) = {
+    let (role, text, stored_thinking, image, doc, tag_image, tag_change, goals, growth, did, krea_prompt) = {
         let m = &llm.chats[llm.active_chat].msgs[index];
         (
             m.role,
@@ -874,6 +875,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
             m.tag_change.clone(),
             m.goals.clone(),
             m.growth.clone(),
+            m.did.clone(),
             m.krea_prompt,
         )
     };
@@ -1121,6 +1123,9 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         // them while it streams so they never flash up. (Whether it's a
         // role-play reply was settled when it was asked.)
         crate::roleplay::strip_memory_lines(&body)
+    } else if streaming && llm.gen_assistant {
+        // The work assistant's control lines, the same way.
+        crate::assistant::strip(&body)
     } else if streaming
         && (llm.tag_images
             || index.checked_sub(1).and_then(|i| llm.chats[llm.active_chat].msgs.get(i)).is_some_and(|m| m.tag_image.is_some()))
@@ -1184,6 +1189,12 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
     if !growth.is_empty() {
         ui.add_space(4.0);
         growth_note(ui, &growth);
+    }
+    // The work assistant: what this reply did in the app (it's the same
+    // conversation here as in its card).
+    for did in &did {
+        ui.add_space(4.0);
+        quiet_note(ui, egui::include_image!("../icons/check_circle.svg"), crate::tag_manager::AI_NEW_VIOLET, did);
     }
 
     // Action row under every finished reply: copy / regenerate / listen
@@ -3270,6 +3281,7 @@ mod tests {
             tag_change: None,
             goals: vec![],
             growth: vec![],
+            did: vec![],
             character: None,
             remember: false,
             picture_memory: false,
@@ -3327,6 +3339,7 @@ mod tests {
                 change(GrowthKind::PersonaChanged, "Mira is a sailor."),
                 change(GrowthKind::PersonaRemoved, "She has never left the harbour."),
             ],
+            did: vec![],
             character: None,
             remember: false,
             picture_memory: false,
@@ -3366,6 +3379,7 @@ mod tests {
             tag_change: None,
             goals: vec![],
             growth: vec![],
+            did: vec![],
             character: None,
             remember: false,
             picture_memory: false,

@@ -1550,3 +1550,25 @@ fn a_favorite_model_comes_first() {
     click_text(&mut rig, "Remove Favorite");
     assert!(!shown(&rig, "Favorites") && !shown(&rig, "Built-in"));
 }
+
+/// The work assistant starts a run only where the Generate button could:
+/// not before Text to Image is set up, and not over a run that's going. Its
+/// prompt goes in the box when it does — and stays out when it doesn't.
+#[test]
+fn the_assistant_generates_only_when_the_view_could() {
+    let ctx = egui::Context::default();
+    INSTALLED_FOR_TEST.set(Some(false));
+    let mut state = GenerateState::new(GenFamily::Krea2);
+    state.set_prompt("what the user typed".into());
+    let why = state.assistant_generate("a fox in the snow", &ctx, None).unwrap_err();
+    assert!(why.contains("isn't set up yet"), "{why}");
+    assert!(!state.busy() && state.prompt == "what the user typed");
+
+    INSTALLED_FOR_TEST.set(Some(true));
+    state.running = true;
+    let why = state.assistant_generate("a fox in the snow", &ctx, None).unwrap_err();
+    assert_eq!(why, "Krea 2 is busy with another run.");
+    assert_eq!(state.prompt, "what the user typed");
+    assert_eq!(state.family_title(), "Krea 2");
+    INSTALLED_FOR_TEST.set(None);
+}
