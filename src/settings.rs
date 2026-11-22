@@ -875,9 +875,10 @@ fn ai_model_tab(ui: &mut egui::Ui, settings: &mut Settings, llm: &mut crate::llm
     section(ui, "Local model", |ui| {
         hint(
             ui,
-            "Local vision models (Google's Gemma, Alibaba's Qwen), running \
-             fully inside the app. They understand both text and images — no \
-             server, no account, and nothing ever leaves this device.",
+            "Local models (Google's Gemma, Alibaba's Qwen, DeepSeek), running \
+             fully inside the app. Gemma and Qwen understand both text and \
+             images; DeepSeek reads text only — no server, no account, and \
+             nothing ever leaves this device.",
         );
         ui.add_space(6.0);
 

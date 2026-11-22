@@ -58,9 +58,14 @@ pub const FOLDER_QWEN: &str = "qwen3-vl-8b";
 pub const MODEL_FILE_QWEN: &str = "Qwen3-VL-8B-Instruct-Q4_K_M.gguf";
 pub const FOLDER_QWEN_30B: &str = "qwen3-vl-30b-thinking";
 pub const MODEL_FILE_QWEN_30B: &str = "Qwen3-VL-30B-A3B-Thinking-Q4_K_M.gguf";
+// DeepSeek's local models read text only: one GGUF each, no projector.
+pub const FOLDER_DEEPSEEK_32B: &str = "deepseek-r1-32b";
+pub const MODEL_FILE_DEEPSEEK_32B: &str = "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf";
+pub const FOLDER_DEEPSEEK_8B: &str = "deepseek-r1-8b";
+pub const MODEL_FILE_DEEPSEEK_8B: &str = "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf";
 
-/// Which local model the chat runs (Settings → AI Model). All are
-/// vision-capable; they trade download size + speed for quality.
+/// Which local model the chat runs (Settings → AI Model). They trade
+/// download size + speed for quality; all but DeepSeek's see pictures.
 #[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum GemmaModel {
     /// Gemma 4 E4B instruct — ~6 GB, fast, fits fully on 8 GB+ GPUs. The default.
@@ -78,17 +83,25 @@ pub enum GemmaModel {
     /// so it stays quick even spilling to RAM); reasons in a `<think>` block
     /// before answering.
     Qwen30B,
+    /// DeepSeek R1 Distill 32B — ~19.9 GB, the Gemma 4 31B's size. Reasons in
+    /// a `<think>` block before answering. Text only: no vision projector.
+    DeepSeek32B,
+    /// DeepSeek R1 0528 8B — ~5 GB, the small, quick DeepSeek. Thinks too;
+    /// text only.
+    DeepSeek8B,
 }
 
 impl GemmaModel {
     /// Display order: 31B leads as the developer's pick (best answers in
     /// testing so far), then the rest by family and size.
-    pub const ALL: [GemmaModel; 5] = [
+    pub const ALL: [GemmaModel; 7] = [
         GemmaModel::D31B,
         GemmaModel::E4B,
         GemmaModel::G27B,
         GemmaModel::Qwen8B,
         GemmaModel::Qwen30B,
+        GemmaModel::DeepSeek32B,
+        GemmaModel::DeepSeek8B,
     ];
 
     pub fn folder(self) -> &'static str {
@@ -98,6 +111,8 @@ impl GemmaModel {
             GemmaModel::D31B => FOLDER_31B,
             GemmaModel::Qwen8B => FOLDER_QWEN,
             GemmaModel::Qwen30B => FOLDER_QWEN_30B,
+            GemmaModel::DeepSeek32B => FOLDER_DEEPSEEK_32B,
+            GemmaModel::DeepSeek8B => FOLDER_DEEPSEEK_8B,
         }
     }
 
@@ -108,11 +123,21 @@ impl GemmaModel {
             GemmaModel::D31B => MODEL_FILE_31B,
             GemmaModel::Qwen8B => MODEL_FILE_QWEN,
             GemmaModel::Qwen30B => MODEL_FILE_QWEN_30B,
+            GemmaModel::DeepSeek32B => MODEL_FILE_DEEPSEEK_32B,
+            GemmaModel::DeepSeek8B => MODEL_FILE_DEEPSEEK_8B,
         }
     }
 
-    pub fn mmproj_file(self) -> &'static str {
-        MMPROJ_FILE
+    /// The vision projector beside the weights — none for a model that
+    /// reads text only.
+    pub fn mmproj_file(self) -> Option<&'static str> {
+        self.sees_images().then_some(MMPROJ_FILE)
+    }
+
+    /// The model reads pictures (and so videos' frames and scanned PDFs).
+    /// DeepSeek's local models don't: they are text only.
+    pub fn sees_images(self) -> bool {
+        !matches!(self, GemmaModel::DeepSeek32B | GemmaModel::DeepSeek8B)
     }
 
     pub fn label(self) -> &'static str {
@@ -122,6 +147,8 @@ impl GemmaModel {
             GemmaModel::D31B => "Gemma 4 31B",
             GemmaModel::Qwen8B => "Qwen3-VL 8B",
             GemmaModel::Qwen30B => "Qwen3-VL 30B Thinking",
+            GemmaModel::DeepSeek32B => "DeepSeek R1 32B",
+            GemmaModel::DeepSeek8B => "DeepSeek R1 8B",
         }
     }
 
@@ -134,6 +161,8 @@ impl GemmaModel {
             GemmaModel::D31B => "Strongest, thinks first",
             GemmaModel::Qwen8B => "Fast, a different style",
             GemmaModel::Qwen30B => "Deep reasoning",
+            GemmaModel::DeepSeek32B => "Reasons it through, text only",
+            GemmaModel::DeepSeek8B => "Quick thinker, text only",
         }
     }
 
@@ -146,13 +175,29 @@ impl GemmaModel {
             GemmaModel::Qwen30B => {
                 "~18.6 GB · reasons before answering; only 3B active (MoE), so it stays quick even spilling to RAM"
             }
+            GemmaModel::DeepSeek32B => {
+                "~19.9 GB · DeepSeek's reasoning, the Gemma 4 31B's size; text only — it can't see pictures"
+            }
+            GemmaModel::DeepSeek8B => "~5 GB · the small, quick DeepSeek; thinks first; text only — it can't see pictures",
         }
     }
 
     pub fn installed(self) -> bool {
         crate::tagger::resolve(self.folder(), self.model_file()).is_some()
-            && crate::tagger::resolve(self.folder(), self.mmproj_file()).is_some()
+            && self.mmproj_file().is_none_or(|f| crate::tagger::resolve(self.folder(), f).is_some())
     }
+}
+
+/// What a text-only model says to a picture or a video sent with the
+/// message it's answering.
+#[cfg_attr(not(feature = "llm"), allow(dead_code))] // the worker's
+fn text_only_error(model: GemmaModel, attachment: &std::path::Path) -> String {
+    let what = if crate::is_video(attachment) { "videos" } else { "pictures" };
+    format!(
+        "{} reads text only — it can't see {what}. Take the attachment off, or pick a Gemma or \
+         Qwen model in the chat's model picker.",
+        model.label()
+    )
 }
 
 /// True when this binary was compiled with local-AI support.
@@ -240,7 +285,14 @@ impl GemmaModel {
     /// The models that reason before answering — the only ones the
     /// thinking slider affects.
     pub fn thinks(self) -> bool {
-        matches!(self, GemmaModel::D31B | GemmaModel::Qwen30B)
+        matches!(self, GemmaModel::D31B | GemmaModel::Qwen30B | GemmaModel::DeepSeek32B | GemmaModel::DeepSeek8B)
+    }
+
+    /// Its thought is a `<think> … </think>` block that the prompt opens
+    /// (Qwen's thinking model, DeepSeek R1); Gemma's is a thought channel.
+    #[cfg_attr(not(feature = "llm"), allow(dead_code))] // the worker's
+    pub fn think_tags(self) -> bool {
+        matches!(self, GemmaModel::Qwen30B | GemmaModel::DeepSeek32B | GemmaModel::DeepSeek8B)
     }
 
     /// Qwen3-VL reads a picture at its own size: the bigger it is, the more
@@ -2972,11 +3024,28 @@ mod worker {
         }
     }
 
+    /// A prompt ready to be read: with pictures in it (the vision
+    /// projector's chunks), or — for a model that reads text only — tokens.
+    enum Prompt {
+        Media(llama_cpp_2::mtmd::MtmdInputChunks),
+        Text(Vec<llama_cpp_2::token::LlamaToken>),
+    }
+
+    impl Prompt {
+        fn total_tokens(&self) -> usize {
+            match self {
+                Prompt::Media(chunks) => chunks.total_tokens(),
+                Prompt::Text(tokens) => tokens.len(),
+            }
+        }
+    }
+
     /// Everything a loaded worker keeps resident.
     struct Loaded {
         backend: LlamaBackend,
         model: LlamaModel,
-        mtmd: MtmdContext,
+        /// None for a model that reads text only (DeepSeek).
+        mtmd: Option<MtmdContext>,
         template: llama_cpp_2::model::LlamaChatTemplate,
         threads: i32,
         which: super::GemmaModel,
@@ -2988,7 +3057,7 @@ mod worker {
         match cmd {
             Cmd::Generate { msgs, params, pinned, detailed } => {
                 let res = generate(
-                    &l.backend, &l.model, &l.mtmd, &l.template, l.threads, l.which, &msgs, pinned, detailed,
+                    &l.backend, &l.model, l.mtmd.as_ref(), &l.template, l.threads, l.which, &msgs, pinned, detailed,
                     l.detail, &params, base,
                 );
                 base(Msg::Done(res));
@@ -3000,7 +3069,7 @@ mod worker {
                 };
                 JOB.with(|j| *j.borrow_mut() = remote);
                 let res = generate(
-                    &l.backend, &l.model, &l.mtmd, &l.template, l.threads, l.which, &msgs, pinned, detailed,
+                    &l.backend, &l.model, l.mtmd.as_ref(), &l.template, l.threads, l.which, &msgs, pinned, detailed,
                     l.detail, &params, &send,
                 );
                 JOB.with(|j| *j.borrow_mut() = None);
@@ -3032,8 +3101,13 @@ mod worker {
 
         let model_path = crate::tagger::resolve(which.folder(), which.model_file())
             .ok_or_else(|| "Model file not found — run setup first".to_string())?;
-        let mmproj_path = crate::tagger::resolve(which.folder(), which.mmproj_file())
-            .ok_or_else(|| "Vision projector not found — run setup first".to_string())?;
+        let mmproj_path = match which.mmproj_file() {
+            Some(file) => Some(
+                crate::tagger::resolve(which.folder(), file)
+                    .ok_or_else(|| "Vision projector not found — run setup first".to_string())?,
+            ),
+            None => None,
+        };
 
         // Leave one core for the UI; llama.cpp saturates the rest.
         let threads = std::thread::available_parallelism()
@@ -3058,7 +3132,7 @@ mod worker {
             let mut last_err = String::new();
             // Which rung succeeded: 0 = the whole model on the GPU.
             let mut rung = 0;
-            for (i, layers) in offload_rungs(&model_path, &mmproj_path) {
+            for (i, layers) in offload_rungs(&model_path, mmproj_path.as_deref()) {
                 if i > 0 {
                     send(Msg::Status(
                         "Model doesn't fit in GPU memory — loading partly on the CPU…".into(),
@@ -3072,13 +3146,18 @@ mod worker {
                         continue;
                     }
                 };
-                send(Msg::Status("Loading the vision projector…".into()));
-                let mtmd = match load_mtmd(&mmproj_path, &model, threads, -1) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        last_err = format!("Load vision projector: {e}");
-                        continue;
+                let mtmd = match &mmproj_path {
+                    Some(mmproj) => {
+                        send(Msg::Status("Loading the vision projector…".into()));
+                        match load_mtmd(mmproj, &model, threads, -1) {
+                            Ok(m) => Some(m),
+                            Err(e) => {
+                                last_err = format!("Load vision projector: {e}");
+                                continue;
+                            }
+                        }
                     }
+                    None => None,
                 };
                 // Probe context, created and dropped: proves generation will have
                 // room for the KV cache with this many layers on the GPU.
@@ -3093,14 +3172,17 @@ mod worker {
             let Some((model, mtmd)) = loaded else {
                 return Err(last_err);
             };
-            if !which.has_image_detail() {
-                send(Msg::ImageDetail { effective: None, reason: None });
-                break (model, mtmd, super::ImageDetail::Standard);
-            }
+            let (mtmd, mmproj) = match (mtmd, &mmproj_path) {
+                (Some(mtmd), Some(mmproj)) if which.has_image_detail() => (mtmd, mmproj),
+                (mtmd, _) => {
+                    send(Msg::ImageDetail { effective: None, reason: None });
+                    break (model, mtmd, super::ImageDetail::Standard);
+                }
+            };
 
             // Image detail: the requested level passes the GPU checks; the
             // projector comes back loaded at the level that's safe to run.
-            let checked = decide_detail(req, rung, &backend, &model, mtmd, &mmproj_path, threads, send);
+            let checked = decide_detail(req, rung, &backend, &model, mtmd, mmproj, threads, send);
             // Safety net: a reply's context must still fit. Failed probe
             // allocations can leave Vulkan memory behind (seen on the 31B), so
             // prove it — and if it doesn't fit, reload clean at Standard.
@@ -3110,7 +3192,7 @@ mod worker {
                     || model.new_context(&backend, context_params(threads, batch_for(level))).is_ok()
                 {
                     send(Msg::ImageDetail { effective: Some(level), reason });
-                    break (model, mtmd, level);
+                    break (model, Some(mtmd), level);
                 }
                 carried_reason = reason.or_else(|| {
                     Some(format!(
@@ -3139,7 +3221,7 @@ mod worker {
     fn generate(
         backend: &LlamaBackend,
         model: &LlamaModel,
-        mtmd: &MtmdContext,
+        mtmd: Option<&MtmdContext>,
         template: &llama_cpp_2::model::LlamaChatTemplate,
         threads: i32,
         which: super::GemmaModel,
@@ -3185,9 +3267,31 @@ mod worker {
             // drops their images along with their text.
             let mut turns: Vec<(bool, String, Vec<MtmdBitmap>)> = Vec::new();
             for (mi, m) in msgs.iter().enumerate() {
-                let (text, bitmaps) = match &m.image {
-                    None => (m.text.clone(), Vec::new()),
-                    Some(path) => match read_media(mtmd, path, &m.text, tile_at == Some(mi), by_size, detail, send) {
+                let (text, bitmaps) = match (&m.image, mtmd) {
+                    (None, _) => (m.text.clone(), Vec::new()),
+                    // A model that reads text only: this message's own
+                    // picture says so; an earlier one is left out with a
+                    // note, so a chat begun with another model goes on.
+                    (Some(path), None) => {
+                        let pdf = crate::pdf::is_pdf(path);
+                        if mi + 1 == msgs.len() && !pdf {
+                            return Err(super::text_only_error(which, path));
+                        }
+                        if pdf {
+                            let (_, rest) = crate::pdf::take_pages_line(&m.text);
+                            (
+                                format!("[A scanned PDF's pages were attached, which you can't see: you read text only]\n{rest}"),
+                                Vec::new(),
+                            )
+                        } else {
+                            let what = if crate::is_video(path) { "A video" } else { "A picture" };
+                            (
+                                format!("[{what} was attached here, which you can't see: you read text only]\n{}", m.text),
+                                Vec::new(),
+                            )
+                        }
+                    }
+                    (Some(path), Some(mtmd)) => match read_media(mtmd, path, &m.text, tile_at == Some(mi), by_size, detail, send) {
                         Ok(read) => read,
                         Err(_) if stopped() => return Ok(()),
                         // An attachment from an earlier turn that can't be
@@ -3230,15 +3334,15 @@ mod worker {
             loop {
                 let kept: Vec<&(bool, String, Vec<MtmdBitmap>)> =
                     turns[..pinned].iter().chain(&turns[start..]).collect();
-                let input = MtmdInputText {
-                    text: format_prompt(&kept)?,
-                    add_special: true,
-                    parse_special: true,
+                let text = format_prompt(&kept)?;
+                let chunks = match mtmd {
+                    Some(mtmd) => {
+                        let input = MtmdInputText { text, add_special: true, parse_special: true };
+                        let bitmap_refs: Vec<&MtmdBitmap> = kept.iter().flat_map(|t| t.2.iter()).collect();
+                        Prompt::Media(mtmd.tokenize(input, &bitmap_refs).map_err(|e| format!("Tokenize: {e}"))?)
+                    }
+                    None => Prompt::Text(model.str_to_token(&text, AddBos::Always).map_err(|e| format!("Tokenize: {e}"))?),
                 };
-                let bitmap_refs: Vec<&MtmdBitmap> = kept.iter().flat_map(|t| t.2.iter()).collect();
-                let chunks = mtmd
-                    .tokenize(input, &bitmap_refs)
-                    .map_err(|e| format!("Tokenize: {e}"))?;
                 let prompt = chunks.total_tokens();
                 let fits = prompt + params.max_tokens + think_reserve <= n_ctx;
                 if fits || start + 1 >= turns.len() {
@@ -3273,9 +3377,31 @@ mod worker {
         if stopped() {
             return Ok(());
         }
-        let mut n_past = chunks
-            .eval_chunks(mtmd, &context, 0, 0, batch_for(detail) as i32, true)
-            .map_err(|e| format!("Evaluate prompt: {e}"))?;
+        let mut n_past = match (&chunks, mtmd) {
+            (Prompt::Media(chunks), Some(mtmd)) => chunks
+                .eval_chunks(mtmd, &context, 0, 0, batch_for(detail) as i32, true)
+                .map_err(|e| format!("Evaluate prompt: {e}"))?,
+            (Prompt::Media(_), None) => return Err("Evaluate prompt: no vision projector".to_string()),
+            // Text alone is read a step at a time, so Stop works meanwhile.
+            (Prompt::Text(tokens), _) => {
+                let mut batch = LlamaBatch::new(N_BATCH as usize, 1);
+                let mut n_past: i32 = 0;
+                for step in tokens.chunks(PASS_STEP) {
+                    if stopped() {
+                        return Ok(());
+                    }
+                    batch.clear();
+                    for t in step {
+                        // Logits for the very last prompt token only.
+                        let last = n_past as usize + 1 == tokens.len();
+                        batch.add(*t, n_past, &[0], last).map_err(|e| e.to_string())?;
+                        n_past += 1;
+                    }
+                    context.decode(&mut batch).map_err(|e| format!("Evaluate prompt: {e}"))?;
+                }
+                n_past
+            }
+        };
         // (Shown until the first words come.)
         send(Msg::Status(if thinks { "Thinking…" } else { "Writing…" }.into()));
 
@@ -3286,10 +3412,8 @@ mod worker {
         // Gemma reasons in `<|channel>thought … <channel|>`, Qwen's thinking
         // model in `<think> … </think>` — same budget machinery, different
         // markers.
-        let (thought_start, thought_end) = match which {
-            super::GemmaModel::Qwen30B => ("<think>", "</think>"),
-            _ => ("<|channel>", "<channel|>"),
-        };
+        let (thought_start, thought_end) =
+            if which.think_tags() { ("<think>", "</think>") } else { ("<|channel>", "<channel|>") };
         // Once the thought is closed its markers can't come again: greedy
         // decoding otherwise loops on the closing marker after a forced close
         // ("<channel|>\n" up to the length cap — an empty-looking answer).
@@ -3351,7 +3475,7 @@ mod worker {
         // Mirror the Qwen prefill into the stream so the open-thought
         // bookkeeping below and the UI's split_channels both see the block
         // the prompt already opened.
-        if matches!(which, super::GemmaModel::Qwen30B) && params.thinking != super::ThinkLevel::Off {
+        if which.think_tags() && params.thinking != super::ThinkLevel::Off {
             raw.push_str("<think>\n");
             send(Msg::Token("<think>\n".into()));
         }
@@ -3541,6 +3665,22 @@ mod worker {
                     s.push_str("<|im_start|>assistant\n");
                     s
                 }
+                // DeepSeek's wire format.
+                super::GemmaModel::DeepSeek32B | super::GemmaModel::DeepSeek8B => {
+                    let mut s = String::new();
+                    for (user, text) in turns {
+                        if *user {
+                            s.push_str("<｜User｜>");
+                            s.push_str(text);
+                        } else {
+                            s.push_str("<｜Assistant｜>");
+                            s.push_str(text);
+                            s.push_str("<｜end▁of▁sentence｜>");
+                        }
+                    }
+                    s.push_str("<｜Assistant｜>");
+                    s
+                }
             },
         };
         // Qwen's thinking flavour was trained with the assistant turn
@@ -3549,7 +3689,10 @@ mod worker {
         // fallback above miss. Without it the reasoning arrives untagged and
         // would all land in the visible bubble.
         let mut formatted = formatted;
-        if matches!(which, super::GemmaModel::Qwen30B) {
+        // DeepSeek R1 is the same: its makers say to open the reply with
+        // `<think>`, which its template leaves to the caller.
+        // (A formatter that opened the thought itself isn't opened twice.)
+        if which.think_tags() && !formatted.trim_end().ends_with("<think>") {
             // Thinking mode Off pre-closes an empty thought (Qwen's own
             // no-think form), so the model goes straight to the answer.
             formatted.push_str(if thinking == super::ThinkLevel::Off {
@@ -3979,7 +4122,7 @@ mod worker {
     /// (the 31B: ~15 GB into a 16 GB card), stalling the app's own drawing
     /// for the whole first load, and it read the 18 GB file twice. Without a
     /// memory report it's the old fixed ladder.
-    fn offload_rungs(model_path: &Path, mmproj_path: &Path) -> Vec<(usize, u32)> {
+    fn offload_rungs(model_path: &Path, mmproj_path: Option<&Path>) -> Vec<(usize, u32)> {
         let ladder = vec![(0, 1_000_000), (1, 24), (2, 0)];
         // Diagnostics: the old fixed ladder, for comparing first loads.
         if std::env::var_os("CLARITY_FULL_LADDER").is_some() {
@@ -3989,7 +4132,8 @@ mod worker {
         let (Some(gpu), Some(weights), Some(projector)) = (
             model_gpu().filter(|g| g.memory_free < g.memory_total),
             size(model_path),
-            size(mmproj_path),
+            // (No projector — a text-only model — takes no room.)
+            mmproj_path.map_or(Some(0), size),
         ) else {
             return ladder;
         };
@@ -5666,6 +5810,92 @@ mod tests {
             assert_eq!(*result, Ok(()), "generation {i} failed");
             assert!(!text.trim().is_empty(), "generation {i} produced no tokens");
         }
+    }
+
+    /// DeepSeek's models read text only: no projector to download or load,
+    /// and their thought is a `<think>` block like Qwen's.
+    #[test]
+    fn deepseek_reads_text_only_and_thinks() {
+        for m in [GemmaModel::DeepSeek32B, GemmaModel::DeepSeek8B] {
+            assert!(!m.sees_images() && m.mmproj_file().is_none(), "{}", m.label());
+            assert!(m.thinks() && m.think_tags() && !m.has_image_detail() && !m.image_tokens_by_size());
+            assert!(GemmaModel::ALL.contains(&m));
+            let said = text_only_error(m, std::path::Path::new("cat.png"));
+            assert!(said.starts_with(m.label()) && said.contains("can't see pictures"), "{said}");
+            assert!(text_only_error(m, std::path::Path::new("clip.mp4")).contains("can't see videos"));
+        }
+        for m in GemmaModel::ALL.into_iter().filter(|m| m.sees_images()) {
+            assert_eq!(m.mmproj_file(), Some(MMPROJ_FILE), "{}", m.label());
+        }
+        assert!(!GemmaModel::D31B.think_tags() && GemmaModel::Qwen30B.think_tags());
+    }
+
+    /// DeepSeek on real weights (`CTF_DEEPSEEK_MODEL` = 32b, else the 8B):
+    /// a plain question is thought about in a `<think>` block and answered;
+    /// with thinking off it's answered straight; a picture sent with the
+    /// question is turned down in words; one from earlier in the chat is
+    /// left out and the chat goes on.
+    #[test]
+    #[ignore]
+    fn llm_deepseek_smoke() {
+        let model = match std::env::var("CTF_DEEPSEEK_MODEL").as_deref() {
+            Ok("32b") => GemmaModel::DeepSeek32B,
+            _ => GemmaModel::DeepSeek8B,
+        };
+        assert!(model.installed(), "{} isn't installed", model.label());
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        let img_path = std::env::temp_dir().join("llm_smoke_red.png");
+        image::RgbImage::from_pixel(64, 64, image::Rgb([220, 30, 30])).save(&img_path).unwrap();
+        let u = |t: &str, image: Option<PathBuf>| CmdMsg { user: true, text: t.to_string(), image };
+        let off = GenParams { thinking: ThinkLevel::Off, ..Default::default() };
+        let asks = [
+            (GenParams::default(), vec![u("What is 17 + 26? Answer with the number.", None)]),
+            (off, vec![u("What is 17 + 26? Answer with the number.", None)]),
+            (GenParams::default(), vec![u("What colour is this image?", Some(img_path.clone()))]),
+            (
+                off,
+                vec![
+                    u("Look at this.", Some(img_path)),
+                    CmdMsg { user: false, text: "I see.".to_string(), image: None },
+                    u("What is the capital of France? One word.", None),
+                ],
+            ),
+        ];
+        for (params, msgs) in asks {
+            cmd_tx.send(Cmd::Generate { params, pinned: 0, detailed: false, msgs }).unwrap();
+        }
+        drop(cmd_tx);
+        let ctx = egui::Context::default();
+        let handle = std::thread::spawn(move || worker::run(cmd_rx, msg_tx, ctx, model, ImageDetail::Standard));
+        let mut responses: Vec<(String, Result<(), String>)> = Vec::new();
+        let mut current = String::new();
+        for msg in msg_rx {
+            match msg {
+                Msg::ImageDetail { .. } | Msg::Research(_) => {}
+                Msg::Status(s) => eprintln!("[status] {s}"),
+                Msg::Token(t) => {
+                    eprint!("{t}");
+                    current.push_str(&t);
+                }
+                Msg::Done(r) => {
+                    eprintln!();
+                    responses.push((std::mem::take(&mut current), r));
+                }
+            }
+        }
+        handle.join().unwrap();
+        assert_eq!(responses.len(), 4);
+        let (thinking, visible) = split_channels(&responses[0].0);
+        assert_eq!(responses[0].1, Ok(()));
+        assert!(!thinking.trim().is_empty(), "it thought first");
+        assert!(visible.contains("43") && !visible.contains("think>"), "{visible:?}");
+        let (thinking, visible) = split_channels(&responses[1].0);
+        assert_eq!(responses[1].1, Ok(()));
+        assert!(thinking.trim().is_empty() && visible.contains("43"), "thinking off: {:?}", responses[1].0);
+        assert_eq!(responses[2].1, Err(text_only_error(model, std::path::Path::new("x.png"))));
+        assert_eq!(responses[3].1, Ok(()));
+        assert!(split_channels(&responses[3].0).1.contains("Paris"), "{:?}", responses[3].0);
     }
 
     /// A memory pass on a real model (`CTF_MEMORY_MODEL` = e4b, 31b, 27b,

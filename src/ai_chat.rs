@@ -2236,8 +2236,8 @@ fn paint_wire_cube(painter: &egui::Painter, c: egui::Pos2, r: f32, col: egui::Co
 fn thinking_hint(thinks: bool, level: crate::llm::ThinkLevel) -> String {
     use crate::llm::ThinkLevel as L;
     if !thinks {
-        return "This model answers directly — thinking applies to Gemma 4 31B and \
-                Qwen3-VL 30B Thinking."
+        return "This model answers directly — thinking applies to Gemma 4 31B, \
+                Qwen3-VL 30B Thinking and DeepSeek R1."
             .to_string();
     }
     match level {
@@ -2326,6 +2326,7 @@ fn thinker_badge(m: crate::llm::GemmaModel) -> Option<&'static str> {
     Some(match m {
         G::D31B => "Dense · Thinks",
         G::Qwen30B => "MoE · Thinks",
+        G::DeepSeek32B | G::DeepSeek8B => "Thinks · Text only",
         _ => "Thinks",
     })
 }

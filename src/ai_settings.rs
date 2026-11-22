@@ -682,7 +682,7 @@ fn roleplay_tab(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) 
                 ui,
                 "Thoughts in character",
                 Some(
-                    "With a model that thinks before answering (Gemma 4 31B, Qwen3-VL 30B Thinking), \
+                    "With a model that thinks before answering (Gemma 4 31B, Qwen3-VL 30B Thinking, DeepSeek R1), \
                      its thoughts are the character's inner voice — first person, in character — \
                      instead of notes about the chat.",
                 ),

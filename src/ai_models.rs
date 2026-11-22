@@ -324,6 +324,37 @@ const CATALOG: &[ModelInfo] = &[
         ],
     },
     ModelInfo {
+        name: "DeepSeek R1 32B (local AI, text only)",
+        group: Group::LocalAi,
+        caption: "19.9 GB · DeepSeek's reasoning, text only",
+        folder: crate::llm::FOLDER_DEEPSEEK_32B,
+        desc: "DeepSeek's R1 reasoning model (the 32B distill), the Gemma 4 31B's \
+               size — thinks a question through before answering (shown behind \
+               the chat's collapsible Thinking row). Text only: it can't see \
+               pictures. Selectable in Settings → AI Model. Not a tagger.",
+        note: "Downloads the Q4_K_M weights (~19.9 GB). No vision projector: text only.",
+        repo: "https://huggingface.co/unsloth/DeepSeek-R1-Distill-Qwen-32B-GGUF",
+        kind: None,
+        files: &[
+            (crate::llm::MODEL_FILE_DEEPSEEK_32B, "https://huggingface.co/unsloth/DeepSeek-R1-Distill-Qwen-32B-GGUF/resolve/main/DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf"),
+        ],
+    },
+    ModelInfo {
+        name: "DeepSeek R1 8B (local AI, text only)",
+        group: Group::LocalAi,
+        caption: "5 GB · the small, quick DeepSeek, text only",
+        folder: crate::llm::FOLDER_DEEPSEEK_8B,
+        desc: "The small DeepSeek R1 (0528, 8B) — about E4B's size and speed, and \
+               it still thinks before answering. Text only: it can't see \
+               pictures. Selectable in Settings → AI Model. Not a tagger.",
+        note: "Downloads the Q4_K_M weights (~5 GB). No vision projector: text only.",
+        repo: "https://huggingface.co/unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
+        kind: None,
+        files: &[
+            (crate::llm::MODEL_FILE_DEEPSEEK_8B, "https://huggingface.co/unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF/resolve/main/DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf"),
+        ],
+    },
+    ModelInfo {
         name: "Region Detection (faces / hands / people / feet / age)",
         group: Group::Tools,
         caption: "74 MB · finds faces, hands, people and feet",
@@ -927,6 +958,20 @@ mod tests {
         before.iter().map(|&rows| 14.0 + 8.0 + rows as f32 * ROW_H + (rows - 1) as f32 + 2.0 + GROUP_GAP).sum()
     }
 
+    /// What Get Models downloads for a chat model is what the chat looks
+    /// for: the weights and the vision projector — the weights alone for a
+    /// model that reads text only (DeepSeek).
+    #[test]
+    fn chat_models_download_what_the_chat_loads() {
+        for m in crate::llm::GemmaModel::ALL {
+            let entry = CATALOG.iter().find(|e| e.folder == m.folder()).unwrap_or_else(|| panic!("{} listed", m.label()));
+            let files: Vec<&str> = entry.files.iter().map(|f| f.0).collect();
+            let wanted: Vec<&str> = std::iter::once(m.model_file()).chain(m.mmproj_file()).collect();
+            assert_eq!(files, wanted, "{}", m.label());
+            assert!(entry.name.starts_with(m.label()), "{}", entry.name);
+        }
+    }
+
     /// Every model has its row, under its group's heading, in the
     /// catalog's order — and the groups come one after another.
     #[test]
@@ -944,7 +989,7 @@ mod tests {
                     "WD14 v2 ConvNext",
                 ],
             ),
-            ("LOCAL AI", &["Gemma 4 E4B", "Gemma 3 27B", "Gemma 4 31B", "Qwen3-VL 8B", "Qwen3-VL 30B Thinking"]),
+            ("LOCAL AI", &["Gemma 4 E4B", "Gemma 3 27B", "Gemma 4 31B", "Qwen3-VL 8B", "Qwen3-VL 30B Thinking", "DeepSeek R1 32B", "DeepSeek R1 8B"]),
             ("TOOLS", &["Depth Anything V2 Base", "BiRefNet Lite", "Region Detection", "Whisper Base"]),
         ];
         let mut before = vec![];
