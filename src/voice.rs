@@ -60,11 +60,20 @@ const CPU_INDEX: &str = "https://download.pytorch.org/whl/cpu";
 /// as AMD's guide says: the ROCm runtime first, then PyTorch built on it.
 /// Needs Python 3.12 and AMD Software: Adrenalin Edition 26.2.2 or newer.
 /// https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/windows/install-pytorch.html
-const ROCM_SDK: [&str; 4] = [
+pub(crate) const ROCM_SDK: [&str; 4] = [
     "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
     "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl",
     "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl",
     "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm-7.2.1.tar.gz",
+];
+/// The whole PyTorch set for Text to Image's ComfyUI (src/generate.rs), which
+/// needs torchvision too — all three from the one ROCm build.
+// (Text to Image is not in the macOS build.)
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) const ROCM_TORCH_COMFY: [&str; 3] = [
+    "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+    "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchaudio-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+    "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchvision-0.24.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
 ];
 const ROCM_TORCH: [&str; 2] = [
     "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
@@ -495,7 +504,7 @@ fn read_setup() -> SetupInfo {
 /// Graphics", "NVIDIA GeForce RTX 4090"…); empty when they can't be listed.
 /// Windows asks WMI, which takes a second or so — keep it off the UI thread.
 /// Linux learns only the vendors (sysfs); macOS needs none of this.
-fn detect_adapters() -> Vec<String> {
+pub(crate) fn detect_adapters() -> Vec<String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
@@ -595,6 +604,17 @@ fn rocm_supported(name: &str) -> bool {
         && ["rx 7", "rx 9", "pro w7", "ai pro r", "8060s", "8050s", "8040s", "890m", "880m"]
             .iter()
             .any(|m| n.contains(m))
+}
+
+/// The Radeon AMD's PyTorch is the build for on this PC: a supported one, on
+/// Windows, with no NVIDIA card beside it. (Asks WMI: off the UI thread.)
+// (Text to Image is not in the macOS build.)
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn rocm_card() -> Option<String> {
+    match pick_build(&detect_adapters(), cfg!(windows), cfg!(target_os = "macos")) {
+        (Build::Rocm, card) => card,
+        _ => None,
+    }
 }
 
 /// The PyTorch build for these adapters, and the adapter it's for: NVIDIA →

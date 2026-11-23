@@ -557,11 +557,95 @@ fn notes_box(
                     // Bold and headings: the normal ink, so they stand out.
                     v.widgets.active.fg_stroke.color = TEXT();
                     ui.push_id(id, |ui| {
-                        egui_commonmark::CommonMarkViewer::new().show(ui, cache, body);
+                        // A section for one platform (its heading names it:
+                        // "### Mac", "### AMD graphics cards"…) is set in
+                        // that platform's colour, so its users find it.
+                        for (i, (color, section)) in note_sections(body).into_iter().enumerate() {
+                            ui.push_id(i, |ui| match color {
+                                None => {
+                                    egui_commonmark::CommonMarkViewer::new().show(ui, cache, section);
+                                }
+                                Some(color) => {
+                                    egui::Frame::new()
+                                        .fill(color.gamma_multiply(0.12))
+                                        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.55)))
+                                        .corner_radius(CornerRadius::same(12))
+                                        .inner_margin(Margin::symmetric(8, 6))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            // (Headings and bold take this ink.)
+                                            ui.visuals_mut().widgets.active.fg_stroke.color = color;
+                                            egui_commonmark::CommonMarkViewer::new().show(ui, cache, section);
+                                        });
+                                    ui.add_space(4.0);
+                                }
+                            });
+                        }
                     });
                 })
         })
         .inner
+}
+
+/// The colour release notes use for a platform's section, by the words of
+/// its heading: Mac blue, Windows cyan, Linux amber, AMD red, NVIDIA green.
+fn platform_color(heading: &str) -> Option<egui::Color32> {
+    let words: Vec<String> =
+        heading.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect();
+    let has = |names: &[&str]| words.iter().any(|w| names.contains(&w.as_str()));
+    if has(&["mac", "macs", "macos"]) {
+        Some(egui::Color32::from_rgb(64, 148, 255))
+    } else if has(&["amd", "radeon"]) {
+        Some(egui::Color32::from_rgb(240, 84, 84))
+    } else if has(&["nvidia", "geforce"]) {
+        Some(egui::Color32::from_rgb(118, 200, 40))
+    } else if has(&["windows"]) {
+        Some(egui::Color32::from_rgb(40, 190, 230))
+    } else if has(&["linux"]) {
+        Some(egui::Color32::from_rgb(240, 170, 50))
+    } else {
+        None
+    }
+}
+
+/// Release notes cut at their headings, each part with its platform's
+/// colour if its heading names one ([`platform_color`]). Parts without one
+/// that follow each other stay together, so plain notes are one part.
+fn note_sections(body: &str) -> Vec<(Option<egui::Color32>, &str)> {
+    let mut starts = vec![0];
+    let mut at = 0;
+    let mut fenced = false;
+    for line in body.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+        }
+        if !fenced && at > 0 && line.starts_with('#') {
+            starts.push(at);
+        }
+        at += line.len();
+    }
+    starts.push(body.len());
+    let mut sections: Vec<(Option<egui::Color32>, &str)> = Vec::new();
+    let mut plain_from = None;
+    for pair in starts.windows(2) {
+        let part = &body[pair[0]..pair[1]];
+        let heading = part.lines().next().filter(|l| l.starts_with('#')).unwrap_or("");
+        match platform_color(heading) {
+            Some(color) => {
+                if let Some(from) = plain_from.take() {
+                    sections.push((None, &body[from..pair[0]]));
+                }
+                sections.push((Some(color), part.trim_end()));
+            }
+            None => {
+                plain_from.get_or_insert(pair[0]);
+            }
+        }
+    }
+    if let Some(from) = plain_from {
+        sections.push((None, &body[from..]));
+    }
+    sections
 }
 
 /// A console well (the Generate panel's Log look) for a running job's
@@ -712,6 +796,29 @@ mod tests {
             assert!(laid.used_inside(), "{width}: {:?} spills out of {:?}", laid.used, laid.column);
             assert!(laid.text_inside(), "{width}: text drawn at {:?}, out of {:?}", laid.text, laid.column);
         }
+    }
+
+    /// A section whose heading names a platform is set apart in its colour;
+    /// the rest of the notes stay as they were, in one piece.
+    #[test]
+    fn platform_sections_get_their_colour() {
+        let plain = "## What's new\n\n### Work assistant\n- one\n\n### Fixes\n- two\n";
+        assert_eq!(note_sections(plain), vec![(None, plain)]);
+
+        let notes = "## What's new\n\n### Fixes\n- one\n\n### AMD graphics cards\n- red\n\n### Mac\n- blue\n\nThanks!\n";
+        let parts = note_sections(notes);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], (None, "## What's new\n\n### Fixes\n- one\n\n"));
+        assert_eq!(parts[1], (platform_color("AMD"), "### AMD graphics cards\n- red"));
+        assert_eq!(parts[2], (platform_color("macOS"), "### Mac\n- blue\n\nThanks!"));
+        assert!(parts[1].0.is_some() && parts[2].0.is_some() && parts[1].0 != parts[2].0);
+
+        // Whole words only, and a `#` inside a code block is no heading.
+        assert_eq!(platform_color("### Machine learning"), None);
+        assert_eq!(platform_color("### Damden"), None);
+        assert!(platform_color("### For Mac users").is_some());
+        let code = "### Fixes\n```\n# Mac\n```\n";
+        assert_eq!(note_sections(code), vec![(None, code)]);
     }
 
     /// Whatever the notes hold, their box keeps to the tab's width: a table

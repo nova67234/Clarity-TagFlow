@@ -3775,7 +3775,7 @@ fn show_inner(ui: &mut egui::Ui, state: &mut GenerateState, fill_h: f32, current
                 start_setup(state, ui.ctx());
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let txt = if is_installed() { "Installed" } else { "NVIDIA GPU required" };
+                let txt = if is_installed() { "Installed" } else { "NVIDIA or recent AMD GPU required" };
                 ui.label(RichText::new(txt).color(MUTED()).size(11.0));
             });
         });
@@ -4154,6 +4154,9 @@ fn drain_runner(state: &mut GenerateState, ctx: &egui::Context) {
                     state.running = false;
                     finished = true;
                     state.status_err = !ok;
+                    if DIAG {
+                        diag_send_log(state.family.title(), ok, &state.status, &state.log);
+                    }
                 }
                 RunnerMsg::Nodes(s) => state.nodes_status = Some(s),
             }
@@ -4969,16 +4972,28 @@ fn run_setup(
         return true;
     }
 
-    // 2 — PyTorch (CUDA 12.8).
+    // 2 — PyTorch: CUDA 12.8, or AMD's ROCm build on a Radeon it supports
+    // (never the CUDA one there: it would replace AMD's, and ComfyUI then
+    // ends at startup with "Found no NVIDIA driver").
     status("Installing PyTorch…");
-    send("== [2/6] Installing PyTorch 2.8 (CUDA 12.8)…".into());
+    let amd = crate::voice::rocm_card();
+    match &amd {
+        Some(card) => send(format!("== [2/6] Installing AMD's PyTorch (ROCm 7.2.1) for the {card}…")),
+        None => send("== [2/6] Installing PyTorch 2.8 (CUDA 12.8)…".into()),
+    }
     if !pip_retry(&base, &py, &["-m", "pip", "install", "--upgrade", "pip"], &send) {
         send("WARNING: pip upgrade failed".into());
     }
-    // torch + torchvision + torchaudio MUST come from the same cu128 build, or
-    // torchaudio's native DLL fails to load on Windows (WinError 127) and crashes
-    // ComfyUI at startup (it imports torchaudio).
-    if !pip_retry(
+    if amd.is_some() {
+        if torch_is_rocm(&base) {
+            send("== AMD's PyTorch already present".into());
+        } else if !install_amd_torch(&base, &py, &send) {
+            return false;
+        }
+    } else if !pip_retry(
+        // torch + torchvision + torchaudio MUST come from the same cu128 build, or
+        // torchaudio's native DLL fails to load on Windows (WinError 127) and crashes
+        // ComfyUI at startup (it imports torchaudio).
         &base,
         &py,
         &["-m", "pip", "install", "torch==2.8.0", "torchvision==0.23.0", "torchaudio==2.8.0", "--index-url", TORCH_INDEX],
@@ -5040,13 +5055,16 @@ fn run_setup(
     // ComfyUI's requirements list torchaudio unpinned, which can pull a newer build
     // than torch 2.8.0 — re-pin it (no-deps so torch/vision aren't disturbed) to
     // fix the Windows DLL-load crash.
-    send("== Re-pinning torchaudio to 2.8.0 (cu128) to match torch…".into());
-    pip_retry(
-        &base,
-        &py,
-        &["-m", "pip", "install", "--force-reinstall", "--no-deps", "torchaudio==2.8.0", "--index-url", TORCH_INDEX],
-        &send,
-    );
+    // (AMD's set stays as it is: its three wheels are one build already.)
+    if amd.is_none() {
+        send("== Re-pinning torchaudio to 2.8.0 (cu128) to match torch…".into());
+        pip_retry(
+            &base,
+            &py,
+            &["-m", "pip", "install", "--force-reinstall", "--no-deps", "torchaudio==2.8.0", "--index-url", TORCH_INDEX],
+            &send,
+        );
+    }
     // ComfyUI-GGUF custom node (for the .gguf UNet loader) + the gguf lib.
     let nodes = comfy.join("custom_nodes");
     let _ = std::fs::create_dir_all(&nodes);
@@ -5298,6 +5316,9 @@ fn start_generate(state: &mut GenerateState, ctx: &egui::Context, cur_image: Opt
     // Linked to a host sharing this kind of generation: it runs there.
     let host = remote(state.family);
     std::thread::spawn(move || {
+        if DIAG {
+            diag_report(host.as_ref().map(|(_, name)| name.as_str()), &tx);
+        }
         let ok = match host {
             Some((peer, name)) => run_on_host(job, &peer, &name, &tx, &ctx, &cancel),
             None => run_generate(job, &tx, &ctx, &cancel),
@@ -6251,7 +6272,45 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
             stop_server();
         }
     }
-    if !ping() {
+    // (A ComfyUI the user runs themselves — an AMD build, say — that's slow to
+    // answer is waited for: launching the app's own beside it would only fail,
+    // or on a card that isn't NVIDIA say it needs one.)
+    let up = ping() || match wait_for_foreign_server(cancel, &status) {
+        Some(answered) => answered,
+        None => {
+            send("== Cancelled".into());
+            status("Cancelled");
+            return true;
+        }
+    };
+    if !up {
+        // (Said in the log: which ComfyUI a run used is otherwise a guess.)
+        send(if port_taken() {
+            "== Something holds port 8188 but isn't answering as ComfyUI — starting the app's own.".into()
+        } else {
+            "== No ComfyUI is running on port 8188 — starting the app's own.".into()
+        });
+        // A Radeon whose ComfyUI got the NVIDIA build of PyTorch (every Setup
+        // before 6.2.15 installed it, over AMD's): put AMD's back first, or
+        // the server ends at startup with "Found no NVIDIA driver".
+        if !torch_is_rocm(&base)
+            && let Some(card) = crate::voice::rocm_card()
+        {
+            status("Installing AMD's PyTorch…");
+            send(format!(
+                "== ComfyUI here has the NVIDIA build of PyTorch, which can't run on the {card}: installing AMD's                  (ROCm 7.2.1 — a few GB, one time)…"
+            ));
+            let installed = match InstallGuard::acquire() {
+                Some(_install) => install_amd_torch(&base, &py.to_string_lossy(), &send),
+                None => {
+                    send("ERROR: another ComfyUI Setup or import is running — try again when it's done".into());
+                    false
+                }
+            };
+            if !installed {
+                return false;
+            }
+        }
         status("Starting ComfyUI…");
         match start_server(&comfy, &py, &send, cancel) {
             Ok(true) => {}
@@ -7419,6 +7478,151 @@ fn ping() -> bool {
     agent.get(&format!("{SERVER_URL}/system_stats")).call().is_ok()
 }
 
+/// A debugging build (compiled with `CTF_DIAG` set — never a release): each
+/// run starts its log with what decides where it runs.
+const DIAG: bool = option_env!("CTF_DIAG").is_some();
+
+/// See [`DIAG`]: where a debugging build posts each finished job's log (a
+/// listener on the developer's PC) — addresses given at build time in
+/// `CTF_DIAG_URLS`, comma-separated, tried in turn.
+const DIAG_URLS: Option<&str> = option_env!("CTF_DIAG_URLS");
+
+/// See [`DIAG`]: post a finished job's log, with the end of ComfyUI's own.
+fn diag_send_log(family: &str, ok: bool, status: &str, log: &[String]) {
+    let Some(urls) = DIAG_URLS else { return };
+    let mut body = format!(
+        "Clarity TagFlow {} debug build — {family} — {} — status: {status}
+
+{}
+",
+        env!("CARGO_PKG_VERSION"),
+        if ok { "finished OK" } else { "FAILED" },
+        log.join("
+")
+    );
+    if let Ok(server) = std::fs::read(comfy_base().join("comfyui-server.log")) {
+        let from = server.len().saturating_sub(48 * 1024);
+        body.push_str("
+
+===== end of comfyui-server.log =====
+");
+        body.push_str(&String::from_utf8_lossy(&server[from..]));
+    }
+    std::thread::spawn(move || {
+        let agent: ureq::Agent =
+            ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(6))).build().into();
+        for url in urls.split(',').map(str::trim).filter(|u| !u.is_empty()) {
+            if agent.post(url).header("Content-Type", "text/plain; charset=utf-8").send(body.as_bytes()).is_ok() {
+                break;
+            }
+        }
+    });
+}
+
+/// See [`DIAG`]: the graphics cards, Link, what's on ComfyUI's port, and the
+/// PyTorch the app's own ComfyUI has.
+fn diag_report(host: Option<&str>, tx: &mpsc::Sender<RunnerMsg>) {
+    let say = |s: String| {
+        let _ = tx.send(RunnerMsg::Line(format!("[debug] {s}")));
+    };
+    say(format!("DEBUG BUILD of {} — for testing only", env!("CARGO_PKG_VERSION")));
+    let cards = crate::voice::detect_adapters();
+    say(format!("graphics cards: {}", if cards.is_empty() { "(couldn't list)".to_string() } else { cards.join(" | ") }));
+    say(match host {
+        Some(name) => format!("this run goes to the Link host {name}"),
+        None => "this run is local (no Link host for it)".to_string(),
+    });
+    let ours = SERVER.lock().map(|s| s.is_some()).unwrap_or(false);
+    say(format!("port 8188: listening={} answers_as_comfyui={} started_by_this_app={ours}", port_taken(), ping()));
+    let agent: ureq::Agent =
+        ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(10))).build().into();
+    match agent.get(&format!("{SERVER_URL}/system_stats")).call() {
+        Ok(reply) => match read_json(reply) {
+            Ok(stats) => say(format!("system_stats: {}", stats.to_string().chars().take(900).collect::<String>())),
+            Err(e) => say(format!("system_stats unreadable: {e}")),
+        },
+        Err(e) => say(format!("system_stats (10 s allowed): {e}")),
+    }
+    let base = comfy_base();
+    say(format!("app's ComfyUI: {} (installed={}, version={:?})", base.display(), is_installed(), comfyui_installed_version()));
+    let site = if cfg!(windows) { base.join("python").join("Lib").join("site-packages") } else { base.join("python").join("lib") };
+    match std::fs::read_to_string(site.join("torch").join("version.py")) {
+        Ok(text) => say(format!("its torch/version.py: {}", text.lines().filter(|l| l.contains('=')).collect::<Vec<_>>().join("; "))),
+        Err(e) => say(format!("its torch/version.py: {e}")),
+    }
+    let mut torch: Vec<String> = std::fs::read_dir(&site)
+        .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect())
+        .unwrap_or_default();
+    torch.retain(|n| {
+        let n = n.to_ascii_lowercase();
+        n.starts_with("torch") || n.contains("zluda") || n.contains("directml") || n.contains("rocm")
+    });
+    torch.sort();
+    say(format!("its torch packages: {}", torch.join(", ")));
+}
+
+/// Put AMD's PyTorch (ROCm 7.2.1) in the app's ComfyUI Python, in place of
+/// whatever build is there. As AMD's guide has it: the ROCm runtime first,
+/// then PyTorch built on it (--no-cache-dir: gigabytes of wheels otherwise
+/// stay behind in pip's cache).
+fn install_amd_torch(base: &Path, py: &str, send: &dyn Fn(String)) -> bool {
+    let pip = ["-m", "pip", "install", "--no-cache-dir"];
+    let sdk: Vec<&str> = pip.into_iter().chain(crate::voice::ROCM_SDK).collect();
+    let torch: Vec<&str> = pip.into_iter().chain(crate::voice::ROCM_TORCH_COMFY).collect();
+    if !pip_retry(base, py, &sdk, send) {
+        send("ERROR: AMD's ROCm runtime didn't install".into());
+        return false;
+    }
+    if !pip_retry(base, py, &torch, send) {
+        send("ERROR: AMD's PyTorch didn't install".into());
+        return false;
+    }
+    if !torch_is_rocm(base) {
+        send("ERROR: AMD's PyTorch was installed, but the NVIDIA build is still the one in place".into());
+        return false;
+    }
+    true
+}
+
+/// The PyTorch in the app's ComfyUI Python (under `base`) is AMD's ROCm build.
+fn torch_is_rocm(base: &Path) -> bool {
+    let site = if cfg!(windows) { base.join("python").join("Lib").join("site-packages") } else { base.join("python").join("lib") };
+    std::fs::read_to_string(site.join("torch").join("version.py"))
+        .is_ok_and(|text| text.lines().any(|l| l.trim_start().starts_with("__version__") && l.contains("rocm")))
+}
+
+/// Something is listening on ComfyUI's port (whether or not it answers yet).
+fn port_taken() -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8188));
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).is_ok()
+}
+
+/// A ComfyUI this app didn't launch holds the port but didn't answer in time
+/// (busy loading a model, or the graphics card is full — the chat model was
+/// just on it): wait for it, up to a minute, rather than take it for absent.
+/// `Some(true)` once it answers; `Some(false)` when nothing of someone else's
+/// is there, or it never answered; `None` on Stop.
+fn wait_for_foreign_server(cancel: &AtomicBool, status: &dyn Fn(&str)) -> Option<bool> {
+    let ours = SERVER.lock().map(|s| s.is_some()).unwrap_or(false);
+    if ours || !port_taken() {
+        return Some(false);
+    }
+    status("Waiting for ComfyUI to answer…");
+    for _ in 0..30 {
+        if ping() {
+            return Some(true);
+        }
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        if !port_taken() {
+            return Some(false);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    Some(ping())
+}
+
 /// Launch ComfyUI (server output to a log file) and wait until it answers.
 /// `Ok(false)`: Stop was pressed while waiting — the server is left to finish
 /// starting, since it's shared and the next job will use it.
@@ -7568,6 +7772,19 @@ fn send_server_log_tail(send: &dyn Fn(String)) {
         for line in lines {
             send(format!("   {line}"));
         }
+    }
+    // The app's own ComfyUI is the NVIDIA build: on another card it ends
+    // here, and the traceback alone reads as if images needed NVIDIA.
+    if text.contains("Found no NVIDIA driver") {
+        send(match crate::voice::rocm_card() {
+            Some(card) => format!(
+                "== ComfyUI here has the NVIDIA build of PyTorch, which can't run on the {card}. Click Setup \
+                 Requirements: it installs AMD's PyTorch for this card (a few GB, one time), then generate again."
+            ),
+            None => "== This PC has no NVIDIA card, and its graphics card isn't one AMD's PyTorch supports, so \
+                     the ComfyUI the app installs can't run here. Generate on another PC with Settings → Link."
+                .to_string(),
+        });
     }
 }
 

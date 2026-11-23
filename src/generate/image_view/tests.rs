@@ -213,7 +213,7 @@ fn the_status_says_when_setup_is_needed() {
     rig.idle();
     assert!(rig.state.state.show_setup);
     text(&rig, "Requirements");
-    text(&rig, "NVIDIA GPU required");
+    text(&rig, "NVIDIA or recent AMD GPU required");
     text(&rig, "Setup Requirements");
     // (SDXL isn't gated: no token is asked for.)
     assert!(!shown(&rig, "HF token (dev is gated)"));
@@ -249,7 +249,7 @@ fn set_up_it_is_ready() {
     rig.click(gear_at());
     rig.idle();
     text(&rig, "Installed");
-    assert!(!shown(&rig, "NVIDIA GPU required"));
+    assert!(!shown(&rig, "NVIDIA or recent AMD GPU required"));
     // Flux schnell is free; dev is gated, and asks for the token there
     // (the button says so until there is one).
     assert!(!shown(&rig, "HF token (dev is gated)"));

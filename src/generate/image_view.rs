@@ -229,7 +229,7 @@ fn local_card(ui: &mut egui::Ui, state: &mut GenerateState) -> bool {
         let note = if is_installed() {
             RichText::new("Installed").font(semibold(12.0)).color(GREEN)
         } else {
-            RichText::new("NVIDIA GPU required").font(medium(11.5)).color(MUTED())
+            RichText::new("NVIDIA or recent AMD GPU required").font(medium(11.5)).color(MUTED())
         };
         ui.add(egui::Label::new(note));
     });
