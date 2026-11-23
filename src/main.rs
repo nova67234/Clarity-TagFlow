@@ -1067,7 +1067,7 @@ impl ViewerApp {
                 // The chat model is about to load, and an idle image model
                 // may have the graphics card: it steps aside first.
                 #[cfg(not(target_os = "macos"))]
-                let turns = self.settings.ai_assistant_swap
+                let turns = (self.settings.ai_assistant_swap || generate::amd_takes_turns())
                     && link::remote_chat().is_none()
                     && !llm::worker_loaded()
                     && !self.right_state.generating();
@@ -1165,16 +1165,16 @@ impl ViewerApp {
                     let key = self.llm.assistant.scene.model.as_ref().map(|model| model.key);
                     let view = self.right_state.open_text_to_image(key);
                     let model = view.family_title();
+                    // The image model gets the graphics card: the chat model
+                    // steps aside (not one on a Link host, which isn't on
+                    // this card) — before the run starts, which waits for it
+                    // to be gone: ComfyUI launched beside a chat model still
+                    // on the card may never come up.
+                    if self.settings.ai_assistant_swap && link::remote_chat().is_none() {
+                        self.llm.step_aside();
+                    }
                     match view.assistant_generate(&prompt, ctx, current.as_deref()) {
-                        Ok(()) => {
-                            self.llm.assistant_did(assistant::did_generate(model));
-                            // The image model gets the graphics card: the
-                            // chat model steps aside (not one on a Link host,
-                            // which isn't on this card).
-                            if self.settings.ai_assistant_swap && link::remote_chat().is_none() {
-                                self.llm.step_aside();
-                            }
-                        }
+                        Ok(()) => self.llm.assistant_did(assistant::did_generate(model)),
                         Err(why) => self.llm.assistant_could_not(&why),
                     }
                 }

@@ -5317,7 +5317,7 @@ fn start_generate(state: &mut GenerateState, ctx: &egui::Context, cur_image: Opt
     let host = remote(state.family);
     std::thread::spawn(move || {
         if DIAG {
-            diag_report(host.as_ref().map(|(_, name)| name.as_str()), &tx);
+            diag_report(host.as_ref().map(|(_, name)| name.as_str()), &job, &tx);
         }
         let ok = match host {
             Some((peer, name)) => run_on_host(job, &peer, &name, &tx, &ctx, &cancel),
@@ -6283,6 +6283,25 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
             return true;
         }
     };
+    // On AMD's PyTorch the chat model and the image model can't share the
+    // graphics card (seen on a Radeon 8060S, whatever "Take turns on the
+    // graphics card" says): ComfyUI doesn't come up while the chat model is
+    // on it — it stops where it sets the card up — and one already running
+    // draws a picture of coloured noise with the models it had loaded. So
+    // the chat model goes before the run (it loads again with the next
+    // message), and a ComfyUI that was running beside it loads its models
+    // afresh.
+    if torch_is_rocm(&base) && crate::llm::worker_loaded() {
+        status("Freeing the graphics card…");
+        send("== Freeing the graphics card for the image model (the chat model loads again with your next message)…".into());
+        crate::llm::release_shared_worker();
+        if up {
+            free_server_models();
+        }
+    }
+    // A chat model that has just stepped aside for this run (the work
+    // assistant's) is still freeing its memory: let it finish first.
+    crate::llm::wait_for_retired(std::time::Duration::from_secs(60));
     if !up {
         // (Said in the log: which ComfyUI a run used is otherwise a guess.)
         send(if port_taken() {
@@ -6298,7 +6317,7 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
         {
             status("Installing AMD's PyTorch…");
             send(format!(
-                "== ComfyUI here has the NVIDIA build of PyTorch, which can't run on the {card}: installing AMD's                  (ROCm 7.2.1 — a few GB, one time)…"
+                "== ComfyUI here has the NVIDIA build of PyTorch, which can't run on the {card}: installing AMD's (ROCm 7.2.1 — a few GB, one time)…"
             ));
             let installed = match InstallGuard::acquire() {
                 Some(_install) => install_amd_torch(&base, &py.to_string_lossy(), &send),
@@ -6310,6 +6329,9 @@ fn run_generate(job: GenJob, tx: &mpsc::Sender<RunnerMsg>, ctx: &egui::Context, 
             if !installed {
                 return false;
             }
+        }
+        if DIAG {
+            send(format!("[debug] launching ComfyUI — chat model loaded={} — {}", crate::llm::worker_loaded(), diag_vram()));
         }
         status("Starting ComfyUI…");
         match start_server(&comfy, &py, &send, cancel) {
@@ -7487,6 +7509,85 @@ const DIAG: bool = option_env!("CTF_DIAG").is_some();
 /// `CTF_DIAG_URLS`, comma-separated, tried in turn.
 const DIAG_URLS: Option<&str> = option_env!("CTF_DIAG_URLS");
 
+/// See [`DIAG`]: how much graphics memory is in use right now — per adapter
+/// and per program (Windows' own counters, the same on every vendor; an
+/// integrated GPU's is its "shared" memory) — and how much RAM is free. One
+/// line; takes a second or two, so never on the UI thread.
+#[cfg(windows)]
+fn diag_vram() -> String {
+    const SCRIPT: &str = "$ErrorActionPreference='SilentlyContinue';\
+        $n={param($s) $s.Path.Substring($s.Path.LastIndexOf([char]92)+1)};\
+        $a=(Get-Counter '\\GPU Adapter Memory(*)\\Dedicated Usage','\\GPU Adapter Memory(*)\\Shared Usage').CounterSamples|\
+        Where-Object{$_.CookedValue -gt 20MB}|ForEach-Object{'{0} {1:N0} MB' -f (& $n $_),($_.CookedValue/1MB)};\
+        $p=(Get-Counter '\\GPU Process Memory(*)\\Dedicated Usage','\\GPU Process Memory(*)\\Shared Usage').CounterSamples|\
+        Where-Object{$_.CookedValue -gt 100MB}|Sort-Object CookedValue -Descending|Select-Object -First 8|\
+        ForEach-Object{$id=[int](($_.InstanceName -split '_')[1]);'{0}({1}) {2} {3:N0} MB' -f (Get-Process -Id $id).ProcessName,$id,(& $n $_),($_.CookedValue/1MB)};\
+        $m=Get-CimInstance Win32_OperatingSystem;\
+        'graphics memory in use: '+($a -join '; ')+' | by program: '+($p -join '; ')+(' | RAM free {0:N0} of {1:N0} MB' -f ($m.FreePhysicalMemory/1KB),($m.TotalVisibleMemorySize/1KB))";
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT]);
+    crate::pixal3d::hide_window(&mut cmd);
+    match cmd.output() {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        Err(e) => format!("graphics memory: couldn't ask ({e})"),
+    }
+}
+
+#[cfg(not(windows))]
+fn diag_vram() -> String {
+    "graphics memory: not read on this system".to_string()
+}
+
+/// See [`DIAG`]: the files `model` loads, with their sizes on disk — about
+/// what it takes of the graphics card's memory.
+fn diag_model_files(model: GenModel, custom_ckpt: Option<&str>) -> String {
+    let models = comfy_base().join("ComfyUI").join("models");
+    let model_sub = model.family().model_subdir();
+    let mut total = 0u64;
+    let mut parts = Vec::new();
+    for (sub, file) in required_files(model) {
+        // (A picked checkpoint stands in for the family's own model file.)
+        let (dirs, file): (Vec<&str>, String) = match custom_ckpt {
+            Some(c) if sub == model_sub => (CKPT_DIRS.to_vec(), c.to_string()),
+            _ => (vec![sub], file),
+        };
+        if file.is_empty() {
+            continue;
+        }
+        match dirs.iter().find_map(|d| std::fs::metadata(models.join(d).join(&file)).ok()) {
+            Some(meta) => {
+                total += meta.len();
+                parts.push(format!("{file} {:.1} GB", meta.len() as f64 / 1e9));
+            }
+            None => parts.push(format!("{file} (missing)")),
+        }
+    }
+    format!("{} loads {:.1} GB of model files: {}", model.label(), total as f64 / 1e9, parts.join(", "))
+}
+
+/// See [`DIAG`]: post something else a debugging build wants seen (the work
+/// assistant's replies as the model wrote them). Nothing in a release.
+pub(crate) fn diag_post(what: &str, body: String) {
+    let Some(urls) = DIAG_URLS.filter(|_| DIAG) else { return };
+    let body = format!(
+        "Clarity TagFlow {} debug build {} — {what}\n\n{body}\n",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("CTF_DIAG").unwrap_or("")
+    );
+    std::thread::spawn(move || {
+        let body = format!("{body}
+[debug] when this was sent — {}
+", diag_vram());
+        let agent: ureq::Agent =
+            ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(6))).build().into();
+        for url in urls.split(',').map(str::trim).filter(|u| !u.is_empty()) {
+            if agent.post(url).header("Content-Type", "text/plain; charset=utf-8").send(body.as_bytes()).is_ok() {
+                break;
+            }
+        }
+    });
+}
+
 /// See [`DIAG`]: post a finished job's log, with the end of ComfyUI's own.
 fn diag_send_log(family: &str, ok: bool, status: &str, log: &[String]) {
     let Some(urls) = DIAG_URLS else { return };
@@ -7509,6 +7610,9 @@ fn diag_send_log(family: &str, ok: bool, status: &str, log: &[String]) {
         body.push_str(&String::from_utf8_lossy(&server[from..]));
     }
     std::thread::spawn(move || {
+        let body = format!("{body}
+[debug] when this was sent — {}
+", diag_vram());
         let agent: ureq::Agent =
             ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(6))).build().into();
         for url in urls.split(',').map(str::trim).filter(|u| !u.is_empty()) {
@@ -7521,13 +7625,20 @@ fn diag_send_log(family: &str, ok: bool, status: &str, log: &[String]) {
 
 /// See [`DIAG`]: the graphics cards, Link, what's on ComfyUI's port, and the
 /// PyTorch the app's own ComfyUI has.
-fn diag_report(host: Option<&str>, tx: &mpsc::Sender<RunnerMsg>) {
+fn diag_report(host: Option<&str>, job: &GenJob, tx: &mpsc::Sender<RunnerMsg>) {
     let say = |s: String| {
         let _ = tx.send(RunnerMsg::Line(format!("[debug] {s}")));
     };
-    say(format!("DEBUG BUILD of {} — for testing only", env!("CARGO_PKG_VERSION")));
+    say(diag_model_files(job.model, job.checkpoint.as_deref()));
+    say(format!("at the start of the run — {}", diag_vram()));
+    say(format!(
+        "DEBUG BUILD {} of {} — for testing only",
+        option_env!("CTF_DIAG").unwrap_or(""),
+        env!("CARGO_PKG_VERSION")
+    ));
     let cards = crate::voice::detect_adapters();
     say(format!("graphics cards: {}", if cards.is_empty() { "(couldn't list)".to_string() } else { cards.join(" | ") }));
+    say(format!("chat model loaded={}", crate::llm::worker_loaded()));
     say(match host {
         Some(name) => format!("this run goes to the Link host {name}"),
         None => "this run is local (no Link host for it)".to_string(),
@@ -7582,6 +7693,24 @@ fn install_amd_torch(base: &Path, py: &str, send: &dyn Fn(String)) -> bool {
         return false;
     }
     true
+}
+
+/// Have the running ComfyUI drop the models it has loaded (and its cached
+/// results), so the next run loads them afresh.
+fn free_server_models() {
+    let agent: ureq::Agent =
+        ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(10))).build().into();
+    let _ = agent
+        .post(&format!("{SERVER_URL}/free"))
+        .header("Content-Type", "application/json")
+        .send(serde_json::json!({ "unload_models": true, "free_memory": true }).to_string().as_str());
+}
+
+/// This PC's ComfyUI runs on AMD's PyTorch, where the chat model and the
+/// image model take turns on the graphics card whatever the setting says
+/// (see `run_generate`).
+pub(crate) fn amd_takes_turns() -> bool {
+    torch_is_rocm(&comfy_base())
 }
 
 /// The PyTorch in the app's ComfyUI Python (under `base`) is AMD's ROCm build.
@@ -7679,11 +7808,25 @@ fn start_server(comfy: &Path, py: &Path, send: &dyn Fn(String), cancel: &AtomicB
     // Wait for readiness — but give up as soon as the process dies (a Python
     // import error, a missing DLL…) instead of waiting out the full 3 minutes,
     // and let Stop end the wait.
-    for _ in 0..180 {
+    for waited in 0..180 {
         std::thread::sleep(std::time::Duration::from_millis(1000));
         if ping() {
             send("== ComfyUI server ready".into());
+            if DIAG {
+                send(format!("[debug] ComfyUI is up — {}", diag_vram()));
+            }
             return Ok(true);
+        }
+        if DIAG && waited % 30 == 29 {
+            send(format!("[debug] still waiting — {}", diag_vram()));
+        }
+        if DIAG && waited % 10 == 9 {
+            send(format!(
+                "[debug] {} s waiting for ComfyUI — chat model loaded={} port listening={}",
+                waited + 1,
+                crate::llm::worker_loaded(),
+                port_taken()
+            ));
         }
         if let Some(st) = server_exit_status() {
             return Err(format!("ComfyUI exited while starting ({st})"));

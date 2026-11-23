@@ -372,9 +372,9 @@ pub fn brief(can_generate: bool) -> String {
     };
     let recreate = if can_generate {
         format!(
-            "- To recreate an image: {LOOK_TAG} first; once you see it, say in a sentence what you'll make and end \
-             with a {GENERATE_TAG} prompt that recreates it as faithfully as you can — what is in it, where, in \
-             what light and style.\n"
+            "- To recreate an image: if the note says it is attached, you already see it; otherwise {LOOK_TAG} \
+             first. Once you see it, say in a sentence what you'll make and end with a {GENERATE_TAG} prompt that \
+             recreates it as faithfully as you can — what is in it, where, in what light and style.\n"
         )
     } else {
         String::new()
@@ -392,7 +392,7 @@ pub fn brief(can_generate: bool) -> String {
          - `{LOOK_TAG}` shows you the selected image. You cannot see it before that. Use it only when my \
          message asks you to look at it, describe it, write a prompt for it, say what you think of it, or \
          recreate it — never otherwise. Reply with that line alone: the app then sends you the image, and you \
-         answer.\n\
+         answer. When the note says the image is attached, you already see it: never answer {LOOK_TAG} then.\n\
          - `{OPEN_TAG} <place>` takes me to a place in the app: {places}. Only when I ask to go there, or \
          what I ask for needs it.\n\
          {generate}\

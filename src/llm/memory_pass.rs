@@ -1191,6 +1191,29 @@ impl LlmState {
         self.finish_unload_if_idle();
     }
 
+    /// The work assistant has started a generation, and the image model
+    /// needs the graphics card now: the chat model goes at once — a memory
+    /// pass in flight is stopped (it runs next time), not waited for like
+    /// when AI Chat is switched off. On a card both share, ComfyUI otherwise
+    /// starts up against a chat model that is still loaded, and still working.
+    /// (A reply still coming is let finish first.)
+    pub(super) fn unload_now(&mut self) {
+        let (running, before) = (self.running, super::worker_loaded());
+        if self.running {
+            self.begin_unload();
+        } else {
+            self.mem_pass.cancel();
+            self.unload_when_done = false;
+            self.mem_pass.off_until = None;
+            super::release_shared_worker();
+        }
+        #[cfg(not(target_os = "macos"))]
+        crate::generate::diag_post(
+            "chat model steps aside",
+            format!("a reply was still coming={running}; chat model loaded before={before}, after={}", super::worker_loaded()),
+        );
+    }
+
     /// AI Chat came back on before the model went.
     pub(super) fn keep_loaded(&mut self) {
         self.unload_when_done = false;

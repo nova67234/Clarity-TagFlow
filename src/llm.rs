@@ -610,6 +610,28 @@ struct SharedWorker {
 /// the CPU only.
 static RETIRED: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(Vec::new());
 
+/// Wait (up to `limit`) for workers that were let go to finish freeing their
+/// models. Text to Image does before it launches ComfyUI for the work
+/// assistant: on a graphics card both share, ComfyUI doesn't come up while
+/// the chat model is still on it.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn wait_for_retired(limit: std::time::Duration) {
+    let until = std::time::Instant::now() + limit;
+    loop {
+        {
+            let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+            retired.retain(|t| !t.is_finished());
+            if retired.is_empty() {
+                return;
+            }
+        }
+        if std::time::Instant::now() >= until {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 impl Drop for SharedWorker {
     fn drop(&mut self) {
         if let Some(t) = self.thread.take() {
@@ -1074,6 +1096,9 @@ pub struct AssistantChat {
     ask_again: bool,
     /// It is being shown the image (the card says so).
     pub looking: bool,
+    /// It answered only LOOK to a message that already had the image, and
+    /// is being asked again — told that it sees it. Once per message.
+    told_it_sees: bool,
     /// What its replies asked for, for main.rs to carry out.
     pub actions: Vec<crate::assistant::Action>,
     /// Its last reply had an image to generate and no model to generate it
@@ -2518,6 +2543,7 @@ impl LlmState {
         });
         self.assistant.scene = scene;
         self.assistant.looking = image.is_some();
+        self.assistant.told_it_sees = false;
         self.assistant_reply(ctx);
         true
     }
@@ -2548,8 +2574,26 @@ impl LlmState {
         let Some(chat) = self.gen_chat.and_then(|id| self.chats.iter_mut().find(|c| c.id == id)) else { return };
         let Some(asked) = chat.msgs.iter().rposition(|m| m.role == ChatRole::User) else { return };
         let Some(reply) = chat.msgs.last_mut().filter(|m| m.role == ChatRole::Model) else { return };
+        #[cfg(not(target_os = "macos"))]
+        crate::generate::diag_post(
+            "work assistant reply",
+            format!("complete={complete}\nthinking={:?}\n--- reply as the model wrote it ---\n{}", reply.thinking, reply.text),
+        );
         let d = crate::assistant::extract(&mut reply.text);
         if !complete {
+            return;
+        }
+        // Only LOOK, to a message that came with the image (the card's
+        // "Recreate this image"): the brief's "LOOK first", taken to the
+        // letter. Asked again, once, told that it sees the image — rather
+        // than leave an empty reply ("No answer.").
+        let only_look =
+            d.look && reply.text.trim().is_empty() && d.open.is_none() && d.generate.is_none() && d.verdict.is_none();
+        if only_look && chat.msgs[asked].image.is_some() && !self.assistant.told_it_sees {
+            chat.msgs.truncate(asked + 1);
+            self.assistant.told_it_sees = true;
+            self.assistant.looking = true;
+            self.assistant.ask_again = true;
             return;
         }
         if d.look && chat.msgs[asked].image.is_none() {
@@ -2600,12 +2644,11 @@ impl LlmState {
     }
 
     /// The assistant has started a generation: the chat model steps aside,
-    /// so the image model has the graphics card — freed as when AI Chat is
-    /// switched off, once nothing needs it (the reply's voice plays on). The
-    /// next message loads it again.
+    /// so the image model has the graphics card — at once (`unload_now`; the
+    /// reply's voice plays on). The next message loads it again.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn step_aside(&mut self) {
-        self.begin_unload();
+        self.unload_now();
     }
 
     /// What the assistant's replies asked for since this was last called.
@@ -2716,6 +2759,12 @@ impl LlmState {
                 // assistant has asked to look.
                 if assistant && user && Some(i) == newest_user {
                     text = format!("{}\n\n{text}", self.assistant.scene.line(m.image.as_deref()));
+                    if self.assistant.told_it_sees && m.image.is_some() {
+                        text.push_str(
+                            "\n\n[App note — The image is attached to this message: you are looking at it now. Do \
+                             not answer LOOK. Do what I asked, now.]",
+                        );
+                    }
                 }
                 CmdMsg { user, text, image }
             })
@@ -5720,8 +5769,12 @@ mod assistant_tests {
         // answered again and again.
         answer(&mut llm, "LOOK");
         assert!(llm.running && asked(&llm).len() == 4);
+        // (Once more, told that it sees it — and then no more.)
         answer(&mut llm, "LOOK");
-        assert!(!llm.running && asked(&llm).len() == 4 && !llm.assistant.looking);
+        assert!(llm.running && asked(&llm).len() == 5);
+        assert!(asked(&llm)[4].msgs.last().unwrap().text.contains("Do not answer LOOK"));
+        answer(&mut llm, "LOOK");
+        assert!(!llm.running && asked(&llm).len() == 5 && !llm.assistant.looking);
         assert_eq!(talk(&llm).last().unwrap().text, "");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5771,6 +5824,36 @@ mod assistant_tests {
             assert!(!llm.assistant.looking && asked(&llm).last().unwrap().msgs.last().unwrap().image.is_none());
             answer(&mut llm, "Which?");
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Shown the image from the start and answering only LOOK all the same
+    /// (the brief's "LOOK first", to the letter), it is asked again — once —
+    /// told that it sees it, rather than leaving an empty reply.
+    #[test]
+    fn only_look_at_an_image_it_has_is_asked_again() {
+        if !BUILT_WITH_LLM {
+            return;
+        }
+        let (dir, image) = picture("look_again");
+        let ctx = egui::Context::default();
+        let mut llm = app();
+        assert!(llm.assistant_send_shown("Recreate this image", in_gallery(Some(&image)), &ctx));
+        assert!(!asked(&llm)[0].msgs.last().unwrap().text.contains("Do not answer LOOK"));
+        answer(&mut llm, "LOOK");
+        // Asked again: the same message, the image still with it, and told.
+        assert!(llm.running && asked(&llm).len() == 2 && llm.assistant.looking);
+        let again = asked(&llm)[1].msgs.last().unwrap();
+        assert_eq!(again.image.as_deref(), Some(image.as_path()));
+        assert!(again.text.contains("Do not answer LOOK") && again.text.ends_with("Do what I asked, now.]"), "{}", again.text);
+        // Once only: a second LOOK ends it.
+        answer(&mut llm, "LOOK");
+        assert!(!llm.running && asked(&llm).len() == 2 && llm.take_assistant_actions().is_empty());
+        // The next message starts afresh.
+        assert!(llm.assistant_send_shown("Recreate this image", in_gallery(Some(&image)), &ctx));
+        assert!(!asked(&llm)[2].msgs.last().unwrap().text.contains("Do not answer LOOK"));
+        answer(&mut llm, "A fox in the snow.\nGENERATE: a red fox asleep in the snow");
+        assert!(matches!(llm.take_assistant_actions().as_slice(), [Action::Generate(_)]));
         let _ = std::fs::remove_dir_all(dir);
     }
 
