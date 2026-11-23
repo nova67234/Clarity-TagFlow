@@ -42,6 +42,10 @@ enum Tool {
 impl Tool {
     const ALL: [Tool; 6] =
         [Tool::Roleplay, Tool::AutoSpeak, Tool::Krea, Tool::TagImages, Tool::DetailedVision, Tool::WebResearch];
+    /// The ones the work assistant has too, in its card's menu: the rest are
+    /// ways of using the chat itself (a prompt writer, the tagging layout,
+    /// researched answers with their sources).
+    const ASSISTANT: [Tool; 3] = [Tool::Roleplay, Tool::AutoSpeak, Tool::DetailedVision];
 
     fn name(self) -> &'static str {
         match self {
@@ -116,13 +120,40 @@ impl Shown {
     }
 }
 
-fn shown(tool: Tool, llm: &LlmState, settings: &Settings) -> Shown {
+/// Which menu: AI Chat's, or the work assistant's in its card.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Menu {
+    Chat,
+    Assistant,
+}
+
+impl Menu {
+    fn tools(self) -> &'static [Tool] {
+        match self {
+            Menu::Chat => &Tool::ALL,
+            Menu::Assistant => &Tool::ASSISTANT,
+        }
+    }
+}
+
+fn shown(menu: Menu, tool: Tool, llm: &LlmState, settings: &Settings) -> Shown {
     match tool {
+        Tool::Roleplay if menu == Menu::Assistant => Shown::plain(
+            mode_on(llm, settings, ChatMode::Roleplay),
+            "Answers as your character",
+            "The assistant becomes your role play character — its name, persona, traits and diary — and can \
+             still look at images, open views and generate. Set the character up with the gear above.",
+        ),
         Tool::Roleplay => Shown::plain(
             mode_on(llm, settings, ChatMode::Roleplay),
             "Persona & memory",
             "The AI plays a character with its own name, persona and memories, kept apart from its main \
              memory. Set it up with the gear above.",
+        ),
+        Tool::AutoSpeak if menu == Menu::Assistant => Shown::plain(
+            settings.ai_auto_speak,
+            "Read replies aloud",
+            "Read every reply aloud the moment it finishes — the send button stops it.",
         ),
         Tool::AutoSpeak => Shown::plain(
             settings.ai_auto_speak,
@@ -142,14 +173,17 @@ fn shown(tool: Tool, llm: &LlmState, settings: &Settings) -> Shown {
              sees each image's tags and can change them, with Undo.",
         ),
         Tool::DetailedVision => {
-            // Held on while the Krea 2 writer is (it relies on it).
-            let held = settings.ai_krea_prompts;
-            let mut s = Shown::plain(
-                settings.ai_detailed_vision || held,
-                "Close-up crop analysis",
+            // Held on while the Krea 2 writer is (it relies on it) — in the
+            // chat: the assistant goes by the switch alone.
+            let held = settings.ai_krea_prompts && menu == Menu::Chat;
+            let about = if menu == Menu::Assistant {
+                "Show the assistant an image whole plus a few close-up sections, so small details (eyes, hands, \
+                 text, jewelry) aren't missed. It takes several times longer to read one."
+            } else {
                 "Show the AI the newest picture whole plus a few close-up sections, so small details (eyes, \
-                 hands, text, jewelry) aren't missed. Replies start slower. Always on with Krea 2 prompts.",
-            );
+                 hands, text, jewelry) aren't missed. Replies start slower. Always on with Krea 2 prompts."
+            };
+            let mut s = Shown::plain(settings.ai_detailed_vision || held, "Close-up crop analysis", about);
             if held {
                 s.usable = false;
                 s.line = "Auto-on with Krea 2".to_string();
@@ -187,9 +221,6 @@ fn set(tool: Tool, llm: &mut LlmState, settings: &mut Settings, on: bool) {
 /// the Tools button's (`button`). Clicking outside closes it, and so does its
 /// gear (which opens AI Settings instead); flipping a switch doesn't.
 pub(super) fn popup(button: &egui::Response, llm: &mut LlmState, settings: &mut Settings) {
-    if !llm.tools_open {
-        return;
-    }
     // Docked to the card's top edge like the model picker: the button sits
     // in the card's bottom row, so a gap from it alone would cover the draft.
     // (The card's rect is last frame's; before there is one, the button
@@ -197,12 +228,36 @@ pub(super) fn popup(button: &egui::Response, llm: &mut LlmState, settings: &mut 
     let dock = llm.input_rect.map_or(button.rect, |(card, _)| {
         egui::Rect::from_x_y_ranges(button.rect.x_range(), card.top()..=card.top())
     });
+    // Opens upward (the card sits at the bottom).
+    popup_at(Menu::Chat, button, dock, egui::RectAlign::TOP_START, llm, settings);
+}
+
+/// The work assistant's menu ([`Menu::Assistant`]), while `llm.tools_open`:
+/// under its send box (`dock`: the box), its left edge on the Tools
+/// button's. The assistant's card hangs from the top bar, so there's room
+/// below it and none above.
+pub(crate) fn assistant_popup(button: &egui::Response, dock: egui::Rect, llm: &mut LlmState, settings: &mut Settings) {
+    let dock = egui::Rect::from_x_y_ranges(button.rect.x_range(), dock.bottom()..=dock.bottom());
+    popup_at(Menu::Assistant, button, dock, egui::RectAlign::BOTTOM_START, llm, settings);
+}
+
+fn popup_at(
+    menu: Menu,
+    button: &egui::Response,
+    dock: egui::Rect,
+    align: egui::RectAlign,
+    llm: &mut LlmState,
+    settings: &mut Settings,
+) {
+    if !llm.tools_open {
+        return;
+    }
     let mut open = true;
     egui::Popup::from_response(button)
         .anchor(dock)
         .open_bool(&mut open)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .align(egui::RectAlign::TOP_START) // opens upward (the card sits at the bottom)
+        .align(align)
         .width(INNER_W + 2.0 * MARGIN as f32 + 2.0)
         .gap(10.0)
         // The model picker's popover card: see-through glass in the Glass
@@ -220,11 +275,11 @@ pub(super) fn popup(button: &egui::Response, llm: &mut LlmState, settings: &mut 
                     color: egui::Color32::from_black_alpha(165),
                 }),
         )
-        .show(|ui| contents(ui, llm, settings));
+        .show(|ui| contents(ui, menu, llm, settings));
     llm.tools_open &= open;
 }
 
-fn contents(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
+fn contents(ui: &mut egui::Ui, menu: Menu, llm: &mut LlmState, settings: &mut Settings) {
     // Both, or the width is only a minimum (see notes/ui-style-guide.md).
     ui.set_width(INNER_W);
     ui.set_max_width(INNER_W);
@@ -254,21 +309,22 @@ fn contents(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) {
         .inner_margin(egui::Margin::same(WELL_PAD))
         .stroke(egui::Stroke::new(1.0_f32, super::picker_hairline()))
         .show(ui, |ui| {
-            let inspected = grid(ui, llm, settings);
+            let inspected = grid(ui, menu, llm, settings);
             ui.add_space(10.0);
             let (line, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
             ui.painter().rect_filled(line, 0.0, super::picker_hairline());
             ui.add_space(10.0);
-            panel(ui, llm, settings, inspected);
+            panel(ui, menu, llm, settings, inspected);
         });
 }
 
 /// The cards. Returns the tool the panel describes: the card under the
 /// pointer, else the one it last was on (Role playing at first).
-fn grid(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) -> Tool {
+fn grid(ui: &mut egui::Ui, menu: Menu, llm: &mut LlmState, settings: &mut Settings) -> Tool {
+    let tools = menu.tools();
     let w = ui.available_width();
     let card_w = (w - GAP) / 2.0;
-    let rows = Tool::ALL.len().div_ceil(2) as f32;
+    let rows = tools.len().div_ceil(2) as f32;
     let (_, area) = ui.allocate_space(egui::vec2(w, rows * CARD_H + (rows - 1.0) * GAP));
     let rect_of = |i: usize| {
         let (col, row) = ((i % 2) as f32, (i / 2) as f32);
@@ -281,21 +337,22 @@ fn grid(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) -> Tool 
     // The cards sense first, so their switches (added after) sit on top and
     // take the clicks. A card's own click only points the panel at it: a
     // stray click mustn't start a new chat (the modes do).
-    let cards: Vec<egui::Response> = Tool::ALL
+    let cards: Vec<egui::Response> = tools
         .iter()
         .enumerate()
         .map(|(i, t)| ui.interact(rect_of(i), egui::Id::new("ai_tools_card").with(t.key()), egui::Sense::click()))
         .collect();
     let keep_id = egui::Id::new("ai_tools_inspected");
-    let mut inspected = ui.data(|d| d.get_temp::<Tool>(keep_id)).unwrap_or(Tool::Roleplay);
+    // (The one it last was on in the other menu may not be in this one.)
+    let mut inspected = ui.data(|d| d.get_temp::<Tool>(keep_id)).filter(|t| tools.contains(t)).unwrap_or(Tool::Roleplay);
     let pointed = cards.iter().position(|c| c.contains_pointer());
     if let Some(i) = pointed {
-        inspected = Tool::ALL[i];
+        inspected = tools[i];
     }
 
-    for (i, &tool) in Tool::ALL.iter().enumerate() {
+    for (i, &tool) in tools.iter().enumerate() {
         let rect = rect_of(i);
-        let s = shown(tool, llm, settings);
+        let s = shown(menu, tool, llm, settings);
         let id = cards[i].id;
         let t_on = ui.ctx().animate_bool_with_time(id.with("on"), s.on, 0.15);
         let t_in = ui.ctx().animate_bool_with_time(id.with("in"), tool == inspected, 0.12);
@@ -356,8 +413,8 @@ fn grid(ui: &mut egui::Ui, llm: &mut LlmState, settings: &mut Settings) -> Tool 
 
 /// The panel under the cards: the inspected tool's name, whether it's on,
 /// and what it does.
-fn panel(ui: &mut egui::Ui, llm: &LlmState, settings: &Settings, tool: Tool) {
-    let s = shown(tool, llm, settings);
+fn panel(ui: &mut egui::Ui, menu: Menu, llm: &LlmState, settings: &Settings, tool: Tool) {
+    let s = shown(menu, tool, llm, settings);
     let dark = !is_light();
     egui::Frame::new()
         .fill(if dark { egui::Color32::from_black_alpha(64) } else { egui::Color32::from_black_alpha(10) })
@@ -377,10 +434,11 @@ fn panel(ui: &mut egui::Ui, llm: &LlmState, settings: &Settings, tool: Tool) {
             // from the input card — never moves under the pointer as it goes
             // from card to card.
             let gap = ui.spacing().item_spacing.y;
-            let tallest = Tool::ALL
-                .into_iter()
-                .map(|t| {
-                    let s = shown(t, llm, settings);
+            let tallest = menu
+                .tools()
+                .iter()
+                .map(|&t| {
+                    let s = shown(menu, t, llm, settings);
                     let mut h = ui.fonts_mut(|f| f.layout(s.about, about_font(), TEXT(), w)).size().y;
                     if let Some(p) = s.problem {
                         h += gap + ui.fonts_mut(|f| f.layout(p, problem_font(), TEXT(), w)).size().y;

@@ -12,7 +12,7 @@ use crate::theme::*;
 /// The pill's size in the top bar.
 const PILL: egui::Vec2 = egui::vec2(206.0, 40.0);
 /// The card's width, and the banner's.
-const CARD_W: f32 = 400.0;
+const CARD_W: f32 = 430.0;
 const BANNER_W: f32 = 340.0;
 /// How long a banner stays, and how long it takes to fade at the end.
 const BANNER_SECS: f64 = 7.0;
@@ -27,10 +27,15 @@ const RECREATE_FIRST: &str = "Recreate this image";
 const OPEN_FIRST: &str = "Open Text to Image";
 
 /// The assistant's pill, card and banner, between frames.
+#[derive(Default)]
 pub struct AssistantUi {
     /// The card is open.
     pub open: bool,
     draft: String,
+    /// An image attached to the message being written (the send box's +).
+    attached: Option<std::path::PathBuf>,
+    /// The app's orb, as AI Chat's thinking row has it at this size (more
+    /// particles than its 56 run together into a blob here).
     orb: AiOrb,
     /// Where the pill was drawn (the card hangs under it).
     pill: Option<egui::Rect>,
@@ -47,22 +52,6 @@ pub struct AssistantUi {
     markdown: egui_commonmark::CommonMarkCache,
 }
 
-impl Default for AssistantUi {
-    fn default() -> Self {
-        AssistantUi {
-            open: false,
-            draft: String::new(),
-            orb: AiOrb::new(260),
-            pill: None,
-            seen: (0, 0),
-            banner: None,
-            unread: false,
-            focus: false,
-            markdown: Default::default(),
-        }
-    }
-}
-
 /// What the card asks of the app.
 #[derive(Debug, PartialEq)]
 pub enum Ask {
@@ -71,8 +60,12 @@ pub enum Ask {
     /// Send this with the selected image shown: it asks the assistant to
     /// look, in so many words (the card's own asks).
     Show(String),
+    /// Send this with an image the user attached (the send box's +).
+    With(String, std::path::PathBuf),
     /// Stop the reply that's coming.
     Stop,
+    /// Stop the reply being read aloud (Tools → Auto-speak replies).
+    Quiet,
 }
 
 /// What a reply still coming is doing, while its words aren't there to
@@ -130,7 +123,7 @@ fn doing(llm: &LlmState) -> Option<Doing> {
 
 /// What the pill says: what the assistant is doing, or just that it's there.
 fn pill_text(llm: &LlmState) -> String {
-    doing(llm).map_or_else(|| "Assistant".to_string(), |doing| doing.what)
+    doing(llm).map_or_else(|| llm.assistant_name().to_string(), |doing| doing.what)
 }
 
 /// The pill in the top bar: the orb — alive while a reply is coming — and a
@@ -174,6 +167,10 @@ struct Shown {
     text: String,
     image: Option<std::path::PathBuf>,
     did: Vec<String>,
+    /// Role play: the goals the character set or met with this reply, and
+    /// how it grew (traits, its persona) — noted under it, as in AI Chat.
+    goals: Vec<crate::roleplay::GoalEvent>,
+    growth: Vec<crate::roleplay::GrowthEvent>,
 }
 
 /// The newest messages of the assistant's conversation, as they read now:
@@ -189,11 +186,15 @@ fn conversation(llm: &LlmState) -> Vec<Shown> {
         .map(|(i, m)| {
             let user = m.role == ChatRole::User;
             let text = if !user && streaming && i == last {
-                crate::assistant::strip(&crate::llm::split_channels(&m.text).1)
+                let said = crate::llm::split_channels(&m.text).1;
+                // (In character, the diary lines it ends with are the
+                // app's too.)
+                let said = if llm.gen_roleplay { crate::roleplay::strip_memory_lines(&said) } else { said };
+                crate::assistant::strip(&said)
             } else {
                 m.text.clone()
             };
-            Shown { user, text, image: m.image.clone(), did: m.did.clone() }
+            Shown { user, text, image: m.image.clone(), did: m.did.clone(), goals: m.goals.clone(), growth: m.growth.clone() }
         })
         .collect()
 }
@@ -201,7 +202,14 @@ fn conversation(llm: &LlmState) -> Vec<Shown> {
 /// The card and the banner, hung under the pill. `here` is where the user
 /// is, in a few words (the card's second line: what the assistant knows).
 /// What the user asked of it, if anything.
-pub fn show(ctx: &egui::Context, state: &mut AssistantUi, llm: &mut LlmState, here: &str, can_generate: bool) -> Option<Ask> {
+pub fn show(
+    ctx: &egui::Context,
+    state: &mut AssistantUi,
+    llm: &mut LlmState,
+    settings: &mut crate::settings::Settings,
+    here: &str,
+    can_generate: bool,
+) -> Option<Ask> {
     let pill = state.pill?;
     let busy = llm.assistant_busy();
     // A reply that has come in since the conversation was last looked at.
@@ -224,7 +232,7 @@ pub fn show(ctx: &egui::Context, state: &mut AssistantUi, llm: &mut LlmState, he
     let opened = ctx.animate_bool_with_time(egui::Id::new("assistant_card_open"), state.open, 0.16);
     let mut ask = None;
     if opened > 0.0 {
-        ask = card(ctx, state, llm, pill, here, can_generate, opened);
+        ask = card(ctx, state, llm, settings, pill, here, can_generate, opened);
     } else if let Some((index, since)) = state.banner {
         let age = ctx.input(|i| i.time) - since;
         if age >= BANNER_SECS {
@@ -278,7 +286,7 @@ fn banner(ctx: &egui::Context, llm: &LlmState, pill: egui::Rect, index: usize, f
                 .show(ui, |ui| {
                     ui.set_width(BANNER_W - 28.0);
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Assistant").color(TEXT()).strong().size(12.5));
+                        ui.label(egui::RichText::new(llm.assistant_name()).color(TEXT()).strong().size(12.5));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(egui::RichText::new("now").color(MUTED()).size(11.5));
                         });
@@ -312,10 +320,12 @@ fn did_line(ui: &mut egui::Ui, did: &str) {
 
 /// The chat card: who it is and where you are, the conversation, and the
 /// box to write in.
+#[allow(clippy::too_many_arguments)]
 fn card(
     ctx: &egui::Context,
     state: &mut AssistantUi,
     llm: &mut LlmState,
+    settings: &mut crate::settings::Settings,
     pill: egui::Rect,
     here: &str,
     can_generate: bool,
@@ -336,7 +346,8 @@ fn card(
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 1.0;
-                        ui.label(egui::RichText::new("Assistant").color(TEXT()).strong().size(14.5));
+                        // (Its character's name, in role play.)
+                        ui.label(egui::RichText::new(llm.assistant_name()).color(TEXT()).strong().size(14.5));
                         ui.add(egui::Label::new(egui::RichText::new(here).color(MUTED()).size(11.5)).truncate());
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -378,7 +389,7 @@ fn card(
                     ui.add(egui::Label::new(egui::RichText::new(why).color(Color32::from_rgb(230, 90, 90)).size(11.5)).wrap());
                 }
                 ui.add_space(10.0);
-                ask = composer(ui, state, busy).or(ask.take());
+                ask = composer(ui, state, llm, settings, busy).or(ask.take());
             });
         });
     if state.open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) && ctx.memory(|m| m.focused().is_none()) {
@@ -459,7 +470,7 @@ fn user_message(ui: &mut egui::Ui, llm: &mut LlmState, m: &Shown) {
 /// The assistant's reply: its words, then what it did. While it's coming
 /// and has said nothing yet, what it's busy with.
 fn reply(ui: &mut egui::Ui, cache: &mut egui_commonmark::CommonMarkCache, m: &Shown, coming: Option<&Doing>) {
-    if m.text.trim().is_empty() && m.did.is_empty() {
+    if m.text.trim().is_empty() && m.did.is_empty() && m.goals.is_empty() && m.growth.is_empty() {
         match coming {
             Some(coming) => waiting(ui, coming),
             None => {
@@ -481,6 +492,8 @@ fn reply(ui: &mut egui::Ui, cache: &mut egui_commonmark::CommonMarkCache, m: &Sh
     for did in &m.did {
         did_line(ui, did);
     }
+    crate::ai_chat::goal_note(ui, &m.goals);
+    crate::ai_chat::growth_note(ui, &m.growth);
     // Its words are there, and more is coming that isn't for reading: the
     // prompt of the image it's about to make.
     if let Some(coming) = coming.filter(|c| c.what.starts_with("Writing the prompt")) {
@@ -505,46 +518,154 @@ fn waiting(ui: &mut egui::Ui, doing: &Doing) {
     ui.ctx().request_repaint();
 }
 
-/// The box to write in, and the button after it: send — on Enter too — or,
-/// while a reply is coming, stop.
-fn composer(ui: &mut egui::Ui, state: &mut AssistantUi, busy: bool) -> Option<Ask> {
+/// The send box's height: a pill.
+const BOX_H: f32 = 40.0;
+
+/// The send box: one pill holding what AI Chat's input card has but its
+/// Chats list (the assistant has the one conversation) — attach (+), Tools,
+/// the text, the model, and send. Enter sends; while a reply is coming, or
+/// being read aloud, the button stops it.
+fn composer(
+    ui: &mut egui::Ui,
+    state: &mut AssistantUi,
+    llm: &mut LlmState,
+    settings: &mut crate::settings::Settings,
+    busy: bool,
+) -> Option<Ask> {
     let mut ask = None;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        let width = ui.available_width() - 40.0;
-        let field = ui
-            .allocate_ui_with_layout(egui::vec2(width, 32.0), Layout::left_to_right(Align::Center), |ui| {
-                crate::settings::pill_field(ui, width, egui::TextEdit::singleline(&mut state.draft).hint_text("Ask the assistant"))
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), BOX_H), Sense::hover());
+    // The pill goes under what's in it: its slot first, filled in once the
+    // text says whether it has the keyboard (as settings::pill_field does).
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let inner = egui::Rect::from_min_max(rect.min + egui::vec2(6.0, 0.0), rect.max - egui::vec2(5.0, 0.0));
+    let mut row = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
+    row.spacing_mut().item_spacing.x = 2.0;
+
+    // Attach: an image for the assistant to see with the message. Once
+    // there is one, it shows here — a click takes it off again.
+    match state.attached.clone() {
+        Some(path) => {
+            let (slot, resp) = row.allocate_exact_size(egui::vec2(28.0, 28.0), Sense::click());
+            let resp = resp
+                .on_hover_text(format!("{} — click to remove", crate::ai_tagging::file_name(&path)))
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Remove the attachment"));
+            let at = egui::Rect::from_center_size(slot.center(), egui::vec2(26.0, 26.0));
+            match llm.media_thumb(row.ctx(), &path) {
+                Some(tex) => {
+                    // Cut square from its middle, to fill the round slot.
+                    let size = tex.size_vec2();
+                    let (u, v) = ((1.0 - (size.y / size.x).min(1.0)) / 2.0, (1.0 - (size.x / size.y).min(1.0)) / 2.0);
+                    egui::Image::from_texture(&tex)
+                        .uv(egui::Rect::from_min_max(egui::pos2(u, v), egui::pos2(1.0 - u, 1.0 - v)))
+                        .corner_radius(13)
+                        .paint_at(&row, at);
+                }
+                None => {
+                    row.painter().circle_filled(at.center(), 13.0, FIELD2());
+                }
+            }
+            if resp.hovered() {
+                row.painter().circle_filled(at.center(), 13.0, Color32::from_black_alpha(150));
+                egui::Image::new(egui::include_image!("../../icons/close.svg"))
+                    .tint(Color32::WHITE)
+                    .paint_at(&row, egui::Rect::from_center_size(at.center(), egui::vec2(12.0, 12.0)));
+            }
+            if resp.clicked() {
+                state.attached = None;
+            }
+        }
+        None => {
+            let add = egui::include_image!("../../icons/add.svg");
+            if crate::ai_chat::icon_button(&mut row, add, 19.0, "Attach an image for the assistant to see", !busy).clicked()
+                && let Some(path) = rfd::FileDialog::new().add_filter("Images", crate::ai_chat::DROP_EXTS).pick_file()
+            {
+                state.attached = Some(path);
+                state.focus = true;
+            }
+        }
+    }
+    // Tools: role play, reading replies aloud, close-ups — the ones of AI
+    // Chat's menu that are the assistant's too.
+    let tools = crate::ai_chat::icon_button(&mut row, egui::include_image!("../../icons/tools.svg"), 17.0, "Tools", true);
+    if tools.clicked() {
+        llm.tools_open = !llm.tools_open;
+    }
+    crate::ai_chat::assistant_tools(&tools, rect, llm, settings);
+    row.add_space(4.0);
+
+    // From the right: send (or stop), the model, and the text in between.
+    let speaking = !busy && llm.speaking_aloud();
+    let mut has_focus = false;
+    row.with_layout(Layout::right_to_left(Align::Center), |row| {
+        row.spacing_mut().item_spacing.x = 6.0;
+        let (icon, tip) = if busy {
+            (egui::include_image!("../../icons/stop.svg"), "Stop")
+        } else if speaking {
+            (egui::include_image!("../../icons/stop.svg"), "Stop reading aloud")
+        } else {
+            (egui::include_image!("../../icons/send.svg"), "Send")
+        };
+        let ready = busy || speaking || !state.draft.trim().is_empty() || state.attached.is_some();
+        let (at, resp) = row.allocate_exact_size(egui::vec2(30.0, 30.0), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ready, tip));
+        let resp = resp.on_hover_text(tip);
+        let fill = if !ready { FIELD2() } else if resp.hovered() { ACCENT1().gamma_multiply(0.85) } else { ACCENT1() };
+        row.painter().circle_filled(at.center(), 15.0, fill);
+        let tint = if ready { Color32::WHITE } else { MUTED() };
+        egui::Image::new(icon).tint(tint).paint_at(row, egui::Rect::from_center_size(at.center(), egui::vec2(14.0, 14.0)));
+
+        crate::ai_chat::assistant_model_selector(row, rect, llm, settings);
+
+        let hint = if llm.roleplay.enabled { format!("Message {}", llm.assistant_name()) } else { "Ask the assistant".to_string() };
+        let field = row
+            .with_layout(Layout::left_to_right(Align::Center), |row| {
+                row.add(
+                    egui::TextEdit::singleline(&mut state.draft)
+                        .hint_text(hint)
+                        .frame(egui::Frame::NONE)
+                        .margin(egui::Margin::ZERO)
+                        .font(egui::FontId::proportional(13.0))
+                        .text_color(TEXT())
+                        .vertical_align(Align::Center)
+                        .desired_width(row.available_width()),
+                )
             })
             .inner;
         if std::mem::take(&mut state.focus) {
             field.request_focus();
         }
-        let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        let (icon, tip) = if busy {
-            (egui::include_image!("../../icons/stop.svg"), "Stop")
-        } else {
-            (egui::include_image!("../../icons/send.svg"), "Send")
-        };
-        let ready = busy || !state.draft.trim().is_empty();
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), Sense::click());
-        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ready, tip));
-        let resp = resp.on_hover_text(tip);
-        let fill = if !ready { FIELD2() } else if resp.hovered() { ACCENT1().gamma_multiply(0.85) } else { ACCENT1() };
-        ui.painter().circle_filled(rect.center(), 16.0, fill);
-        let tint = if ready { Color32::WHITE } else { MUTED() };
-        egui::Image::new(icon).tint(tint).paint_at(ui, egui::Rect::from_center_size(rect.center(), egui::vec2(15.0, 15.0)));
+        has_focus = field.has_focus();
+        let entered = field.lost_focus() && row.input(|i| i.key_pressed(egui::Key::Enter));
+        let text = state.draft.trim();
         if busy {
             if resp.clicked() {
                 ask = Some(Ask::Stop);
             }
-        } else if (resp.clicked() || entered) && !state.draft.trim().is_empty() {
-            ask = Some(Ask::Send(std::mem::take(&mut state.draft)));
+        } else if (resp.clicked() || entered) && (!text.is_empty() || state.attached.is_some()) {
+            let text = std::mem::take(&mut state.draft).trim().to_string();
+            ask = Some(match state.attached.take() {
+                Some(image) => Ask::With(text, image),
+                None => Ask::Send(text),
+            });
             field.request_focus();
+        } else if resp.clicked() && speaking {
+            ask = Some(Ask::Quiet);
         } else if entered {
             field.request_focus();
         }
     });
+    let ring = if has_focus { crate::theme::selection_outline() } else { EDGE() };
+    ui.painter().set(
+        bg,
+        egui::epaint::RectShape::new(
+            rect,
+            BOX_H / 2.0,
+            crate::settings::well_fill(),
+            egui::Stroke::new(1.0_f32, ring),
+            egui::StrokeKind::Inside,
+        ),
+    );
     ask
 }
 
@@ -558,17 +679,29 @@ mod tests {
     struct Over {
         ui: AssistantUi,
         llm: LlmState,
+        settings: crate::settings::Settings,
         can_generate: bool,
         asks: Vec<Ask>,
+        /// The app's fonts are in (the Tools menu sets names in its bold).
+        fonts: bool,
     }
 
     fn scene(ui: &mut egui::Ui, s: &mut Over) {
+        if !s.fonts {
+            // (main.rs binds "bold" to its bold face; any face does here.)
+            let mut fonts = egui::FontDefinitions::default();
+            let plain = fonts.families[&egui::FontFamily::Proportional].clone();
+            fonts.families.insert(egui::FontFamily::Name("bold".into()), plain);
+            ui.ctx().set_fonts(fonts);
+            s.fonts = true;
+            return;
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.set_height(56.0);
             ui.add_space(300.0);
             pill(ui, &mut s.ui, &s.llm);
         });
-        s.asks.extend(show(ui.ctx(), &mut s.ui, &mut s.llm, "Gallery · fox.png", s.can_generate));
+        s.asks.extend(show(ui.ctx(), &mut s.ui, &mut s.llm, &mut s.settings, "Gallery · fox.png", s.can_generate));
     }
 
     fn msg(role: ChatRole, text: &str, did: &[&str]) -> ChatMsg {
@@ -602,7 +735,9 @@ mod tests {
             llm.chats.push(chat);
             llm.assistant.chat = Some(77);
         }
-        let mut rig = Rig::new(Over { ui: AssistantUi::default(), llm, can_generate: true, asks: vec![] }, scene);
+        let over =
+            Over { ui: AssistantUi::default(), llm, settings: Default::default(), can_generate: true, asks: vec![], fonts: false };
+        let mut rig = Rig::new(over, scene);
         rig.screen = egui::vec2(1200.0, 800.0);
         rig.idle();
         rig
@@ -612,6 +747,24 @@ mod tests {
         let found = rig.texts(text);
         assert_eq!(found.len(), 1, "{text:?} is on screen once");
         found[0]
+    }
+
+    /// Where the send box's buttons are, going by its hint (the box is one
+    /// pill: attach and Tools before the text, send at its far end).
+    struct SendBox {
+        attach: egui::Pos2,
+        tools: egui::Pos2,
+        send: egui::Pos2,
+    }
+
+    fn send_box(rig: &Rig<Over>) -> SendBox {
+        let hint = rig.texts("Ask the assistant").into_iter().chain(rig.texts("Message Mira")).next().expect("the send box's hint");
+        let (left, y) = (hint.left() - 70.0, hint.center().y);
+        SendBox {
+            attach: egui::pos2(left + 20.0, y),
+            tools: egui::pos2(left + 50.0, y),
+            send: egui::pos2(left + (CARD_W - 28.0) - 20.0, y),
+        }
     }
 
     /// Where the pill is: its line of text (the topmost "Assistant" — the
@@ -755,6 +908,124 @@ mod tests {
         assert!(rig.texts("Thinking…").is_empty() && rig.texts("A streetlamp outside, then.").is_empty());
     }
 
+    /// The send box is one pill with what AI Chat's input has, but for its
+    /// Chats: Tools opens the assistant's menu — role play, reading aloud,
+    /// close-ups, and none of the chat's own modes — under the box.
+    #[test]
+    fn the_send_box_has_the_assistants_tools() {
+        let mut rig = over(vec![]);
+        // (Room under the card, as there is under the top bar: with none,
+        // the menu goes over it instead.)
+        rig.screen = egui::vec2(1200.0, 1500.0);
+        rig.idle();
+        let pill = pill_at(&rig);
+        rig.click(pill);
+        rig.idle();
+        assert!(rig.texts("Role playing").is_empty() && !rig.state.llm.tools_open);
+        let tools = send_box(&rig).tools;
+        rig.click(tools);
+        rig.idle();
+        assert!(rig.state.llm.tools_open);
+        let hint = one(&rig, "Ask the assistant");
+        // (Each is named on its card, and the one the panel is about there too.)
+        for tool in ["Role playing", "Auto-speak replies", "Detailed vision"] {
+            let named = rig.texts(tool);
+            assert!(!named.is_empty() && named.iter().all(|r| r.top() > hint.bottom()), "{tool}: under the box, {named:?} {hint:?}");
+        }
+        for tool in ["Krea 2 prompts", "Tag images", "Web research"] {
+            assert!(rig.texts(tool).is_empty(), "{tool} is the chat's");
+        }
+        one(&rig, "Answers as your character");
+
+        // Its switches are the app's own: Detailed vision's, here.
+        assert!(!rig.state.settings.ai_detailed_vision);
+        let vision = rig.texts("Detailed vision").into_iter().min_by(|a, b| a.top().total_cmp(&b.top())).unwrap();
+        rig.click(egui::pos2(vision.left() + 142.0, vision.center().y));
+        assert!(rig.state.settings.ai_detailed_vision && rig.state.llm.detailed_vision);
+        assert!(rig.state.llm.tools_open, "a switch doesn't close it");
+        // A click outside does.
+        rig.click(egui::pos2(40.0, 700.0));
+        rig.idle();
+        assert!(!rig.state.llm.tools_open && rig.texts("Role playing").is_empty());
+    }
+
+    /// With Role playing on the card is the character's: its name on the
+    /// pill and the card, and in the send box's hint. The conversation with
+    /// the assistant isn't theirs: the card starts empty.
+    #[test]
+    fn in_role_play_the_card_is_the_characters() {
+        let mut rig = over(vec![msg(ChatRole::User, "hello", &[]), msg(ChatRole::Model, "Hi!", &[])]);
+        let pill = pill_at(&rig);
+        rig.click(pill);
+        rig.idle();
+        one(&rig, "Hi!");
+        assert_eq!(rig.texts("Assistant").len(), 2);
+        rig.state.llm.roleplay.ai_name = "Mira".into();
+        rig.state.llm.roleplay.enabled = true;
+        rig.idle();
+        assert!(rig.texts("Assistant").is_empty() && rig.texts("Mira").len() == 2, "on the pill and the card");
+        one(&rig, "Message Mira");
+        assert!(rig.texts("Hi!").is_empty() && rig.texts("hello").is_empty());
+        one(&rig, LOOK_FIRST);
+        rig.type_text("there you are");
+        rig.key(egui::Key::Enter);
+        assert_eq!(rig.state.asks, [Ask::Send("there you are".to_string())]);
+
+        // Back with the assistant, its conversation is there again.
+        rig.state.llm.roleplay.enabled = false;
+        rig.idle();
+        one(&rig, "Hi!");
+        one(&rig, "Ask the assistant");
+
+        // A reply the character is still writing (asked while Role playing
+        // was on) shows without the diary line it ends with, and without
+        // the app's.
+        rig.state.llm.chats[1].msgs.push(msg(ChatRole::User, "come and see", &[]));
+        rig.state.llm.chats[1].msgs.push(msg(ChatRole::Model, "On my way!\nMEMORY: Andrew likes foxes\nOPEN: gall", &[]));
+        rig.state.llm.running = true;
+        rig.state.llm.gen_assistant = true;
+        rig.state.llm.gen_roleplay = true;
+        rig.idle();
+        one(&rig, "On my way!");
+        assert!(rig.texts("MEMORY: Andrew likes foxes").is_empty() && rig.texts("OPEN: gall").is_empty());
+    }
+
+    /// An image attached with the + goes with the next message — with no
+    /// words, too — and a click on it in the box takes it off again.
+    #[test]
+    fn an_attached_image_goes_with_what_is_sent() {
+        let mut rig = over(vec![]);
+        let pill = pill_at(&rig);
+        rig.click(pill);
+        rig.idle();
+        let image = std::path::PathBuf::from("/pics/cat.png");
+        rig.state.ui.attached = Some(image.clone());
+        rig.idle();
+        rig.type_text("what is it?");
+        rig.key(egui::Key::Enter);
+        assert_eq!(rig.state.asks, [Ask::With("what is it?".to_string(), image.clone())]);
+        assert!(rig.state.ui.attached.is_none(), "sent with it");
+
+        // Alone: the send button, with nothing written.
+        rig.state.ui.attached = Some(image.clone());
+        rig.idle();
+        let send = send_box(&rig).send;
+        rig.click(send);
+        assert_eq!(rig.state.asks[1], Ask::With(String::new(), image.clone()));
+        rig.click(send);
+        assert_eq!(rig.state.asks.len(), 2, "nothing left to send");
+
+        // Taken off again: where the + was.
+        rig.state.ui.attached = Some(image);
+        rig.idle();
+        let attach = send_box(&rig).attach;
+        rig.click(attach);
+        rig.idle();
+        assert!(rig.state.ui.attached.is_none());
+        rig.click(send);
+        assert_eq!(rig.state.asks.len(), 2);
+    }
+
     /// "Which model should I use?": the models to pick from are under the
     /// question, and a click answers with that model's name. Not while a
     /// reply is coming, and not once it's answered.
@@ -817,8 +1088,7 @@ mod tests {
         assert_eq!(writing.len(), 2, "in the pill, and under what it said");
         assert!(writing.iter().any(|r| r.top() > coming.bottom() - 2.0));
         // Stop, where Send was.
-        let hint = one(&rig, "Ask the assistant");
-        let button = egui::pos2(hint.left() - 14.0 + (CARD_W - 28.0 - 40.0) + 8.0 + 16.0, hint.center().y);
+        let button = send_box(&rig).send;
         rig.click(button);
         assert_eq!(rig.state.asks, [Ask::Stop]);
 

@@ -31,7 +31,7 @@ const DROP_BLUE: egui::Color32 = egui::Color32::from_rgb(56, 132, 255);
 /// Image types the input card accepts from a drop (matches the + picker).
 /// Videos are accepted too, via `crate::is_video` — the model worker samples
 /// them into a handful of timestamped frames.
-const DROP_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"];
+pub(crate) const DROP_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"];
 
 /// Video types offered by the + picker (matches `main::VIDEO_EXTENSIONS`).
 const VIDEO_PICK_EXTS: &[&str] = &["mp4", "mov", "mkv", "webm", "avi", "m4v", "wmv", "flv"];
@@ -1118,14 +1118,19 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
         // A researched reply never carries out memory, picture or tag lines
         // (llm/web.rs takes them out when it ends) — never shown either.
         crate::ai_tagging::strip_lines(&crate::roleplay::strip_memory_lines(&body))
+    } else if streaming && llm.gen_assistant {
+        // The work assistant's control lines, the same way as role play's
+        // below — and those too, when it answers in character.
+        if llm.gen_roleplay {
+            crate::assistant::strip(&crate::roleplay::strip_memory_lines(&body))
+        } else {
+            crate::assistant::strip(&body)
+        }
     } else if streaming && llm.gen_roleplay {
         // Diary lines are extracted for real when the reply finishes; hide
         // them while it streams so they never flash up. (Whether it's a
         // role-play reply was settled when it was asked.)
         crate::roleplay::strip_memory_lines(&body)
-    } else if streaming && llm.gen_assistant {
-        // The work assistant's control lines, the same way.
-        crate::assistant::strip(&body)
     } else if streaming
         && (llm.tag_images
             || index.checked_sub(1).and_then(|i| llm.chats[llm.active_chat].msgs.get(i)).is_some_and(|m| m.tag_image.is_some()))
@@ -1279,7 +1284,7 @@ fn message(ui: &mut egui::Ui, llm: &mut LlmState, index: usize, streaming: bool)
 
 /// Role play: one quiet line per goal a reply set, achieved or failed (the
 /// character's goals, src/roleplay.rs) — small, so the story stays in front.
-fn goal_note(ui: &mut egui::Ui, events: &[crate::roleplay::GoalEvent]) {
+pub(crate) fn goal_note(ui: &mut egui::Ui, events: &[crate::roleplay::GoalEvent]) {
     use crate::roleplay::GoalStatus;
     for e in events {
         let (icon, tint, what) = match e.status {
@@ -1297,7 +1302,7 @@ fn goal_note(ui: &mut egui::Ui, events: &[crate::roleplay::GoalEvent]) {
 /// trait gained or dropped, a part of its persona added, rewritten or
 /// removed (src/roleplay.rs). The persona's can be undone in AI Settings →
 /// Role play, where the traits are too.
-fn growth_note(ui: &mut egui::Ui, events: &[crate::roleplay::GrowthEvent]) {
+pub(crate) fn growth_note(ui: &mut egui::Ui, events: &[crate::roleplay::GrowthEvent]) {
     for e in events {
         let (icon, tint, what) = growth_line(e.kind);
         quiet_note(ui, icon, tint, &format!("{what}: {}", e.text));
@@ -1951,7 +1956,7 @@ fn chat_icon_tint(fallback: egui::Color32) -> egui::Color32 {
 /// text colour, dimmed when disabled. Used by the side panel and the composer;
 /// the messages area uses [`msg_icon_button`] so the icon-colour override
 /// applies there only.
-fn icon_button(
+pub(crate) fn icon_button(
     ui: &mut egui::Ui,
     icon: egui::ImageSource<'_>,
     icon_size: f32,
@@ -1987,6 +1992,44 @@ fn chat_model_selector(
     llm: &mut LlmState,
     settings: &mut crate::settings::Settings,
 ) {
+    model_selector(ui, llm, settings, None);
+}
+
+/// The model picker in the work assistant's send box: the model's name
+/// alone — the assistant thinks briefly whatever the chat's level is, so
+/// the level isn't its to show or set — over a menu of the installed models
+/// that opens under the box (`dock`: the box's rect).
+pub(crate) fn assistant_model_selector(
+    ui: &mut egui::Ui,
+    dock: egui::Rect,
+    llm: &mut LlmState,
+    settings: &mut crate::settings::Settings,
+) {
+    model_selector(ui, llm, settings, Some(dock));
+}
+
+/// The work assistant's Tools menu, for the Tools button of its send box
+/// (`dock`: the box's rect): see [`tools_menu::assistant_popup`].
+pub(crate) fn assistant_tools(
+    button: &egui::Response,
+    dock: egui::Rect,
+    llm: &mut LlmState,
+    settings: &mut crate::settings::Settings,
+) {
+    tools_menu::assistant_popup(button, dock, llm, settings);
+}
+
+/// The most of a model's name the assistant's send box has room for.
+const ASSISTANT_MODEL_W: f32 = 92.0;
+
+/// [`chat_model_selector`], or — `assistant`: its send box's rect — the
+/// work assistant's ([`assistant_model_selector`]).
+fn model_selector(
+    ui: &mut egui::Ui,
+    llm: &mut LlmState,
+    settings: &mut crate::settings::Settings,
+    assistant: Option<egui::Rect>,
+) {
     // Linked to a host that runs the chat: its model, shown (the host picks
     // it); the thinking level still applies.
     let remote = crate::link::remote_chat().map(|(_, host)| host);
@@ -2012,21 +2055,23 @@ fn chat_model_selector(
     // keeps "Qwen3-VL 30B Thinking · Off" from reading "Thinking Off").
     let mut job = egui::text::LayoutJob::default();
     job.append(&label, 0.0, egui::TextFormat::simple(egui::FontId::proportional(12.5), TEXT()));
-    if thinks {
+    if thinks && assistant.is_none() {
         job.append(
             &format!("· {}", settings.ai_gen.thinking.label()),
             5.0,
             egui::TextFormat::simple(egui::FontId::proportional(12.5), MUTED()),
         );
     }
-    job.wrap = egui::text::TextWrapping::truncate_at_width(200.0);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(if assistant.is_some() { ASSISTANT_MODEL_W } else { 200.0 });
     let galley = ui.fonts_mut(|f| f.layout_job(job));
     let (arrow, gap) = (14.0, 4.0);
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(galley.size().x + gap + arrow, 28.0), egui::Sense::click());
-    let tip = match &remote {
-        Some(host) => format!("Runs on {host} (Settings → Link) — thinking level"),
-        None => "Model and thinking level".to_string(),
+    let tip = match (&remote, assistant) {
+        (Some(host), None) => format!("Runs on {host} (Settings → Link) — thinking level"),
+        (Some(host), Some(_)) => format!("{label} — runs on {host} (Settings → Link)"),
+        (None, None) => "Model and thinking level".to_string(),
+        (None, Some(_)) => format!("Model: {label}"),
     };
     let resp = resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
     if ui.is_rect_visible(rect) {
@@ -2051,10 +2096,18 @@ fn chat_model_selector(
     let dock = llm.input_rect.map_or(resp.rect, |(card, _)| {
         egui::Rect::from_x_y_ranges(resp.rect.x_range(), card.top()..=card.top())
     });
+    // (The assistant's card hangs from the top bar: its menu opens under
+    // the send box instead.)
+    let (dock, align) = match assistant {
+        Some(send_box) => {
+            (egui::Rect::from_x_y_ranges(resp.rect.x_range(), send_box.bottom()..=send_box.bottom()), egui::RectAlign::BOTTOM_END)
+        }
+        None => (dock, egui::RectAlign::TOP_END),
+    };
     egui::Popup::menu(&resp)
         .id(menu_id)
         .anchor(dock)
-        .align(egui::RectAlign::TOP_END)
+        .align(align)
         .gap(10.0)
         // Dragging the thinking slider mustn't close the menu; picking a
         // model closes it explicitly.
@@ -2107,6 +2160,9 @@ fn chat_model_selector(
                             llm.set_model(m);
                             ui.close();
                         }
+                    }
+                    if assistant.is_some() {
+                        return;
                     }
 
                     ui.add_space(3.0);

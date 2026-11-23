@@ -1088,6 +1088,10 @@ struct AskedInTest {
 pub struct AssistantChat {
     /// Its conversation — an ordinary one, in the chat list like the rest.
     pub chat: Option<u64>,
+    /// That conversation is role play's: the character's, begun with Role
+    /// playing on. Like AI Chat's modes it never switches mid-conversation:
+    /// with the Tools switch flipped, the next message begins another.
+    in_character: bool,
     /// Where the user was when they sent the message being answered.
     pub scene: crate::assistant::Scene,
     /// The reply about to be asked for is the assistant's.
@@ -2465,7 +2469,15 @@ impl LlmState {
 
     /// The work assistant's conversation, if it has one yet.
     pub fn assistant_chat(&self) -> Option<&Chat> {
-        self.assistant.chat.and_then(|id| self.chats.iter().find(|c| c.id == id))
+        // (One begun before Role playing was switched isn't it any more.)
+        let id = self.assistant.chat.filter(|_| self.assistant.in_character == self.roleplay.enabled)?;
+        self.chats.iter().find(|c| c.id == id)
+    }
+
+    /// Who the work assistant is: the role play character while Role
+    /// playing is on — it answers as them — and otherwise just "Assistant".
+    pub fn assistant_name(&self) -> &str {
+        if self.roleplay.enabled { self.roleplay.ai_display() } else { "Assistant" }
     }
 
     /// The work assistant's reply is streaming.
@@ -2479,7 +2491,20 @@ impl LlmState {
     /// (`run_err` says why): another reply is still coming, or no model is
     /// set up.
     pub fn assistant_send(&mut self, text: &str, scene: crate::assistant::Scene, ctx: &egui::Context) -> bool {
-        self.assistant_ask(text, scene, false, ctx)
+        self.assistant_ask(text, scene, None, ctx)
+    }
+
+    /// [`Self::assistant_send`] with an image the user attached to the
+    /// message themselves (the card's +) — shown to the assistant with it;
+    /// `text` may be empty.
+    pub fn assistant_send_with(
+        &mut self,
+        text: &str,
+        image: PathBuf,
+        scene: crate::assistant::Scene,
+        ctx: &egui::Context,
+    ) -> bool {
+        self.assistant_ask(text, scene, Some(image), ctx)
     }
 
     /// [`Self::assistant_send`] for a message that asks it to look, in so
@@ -2487,12 +2512,21 @@ impl LlmState {
     /// selected image goes with it at once, without the reply that would
     /// only ask to be shown it.
     pub fn assistant_send_shown(&mut self, text: &str, scene: crate::assistant::Scene, ctx: &egui::Context) -> bool {
-        self.assistant_ask(text, scene, true, ctx)
+        let selected = scene.selected.clone();
+        self.assistant_ask(text, scene, selected, ctx)
     }
 
-    fn assistant_ask(&mut self, text: &str, scene: crate::assistant::Scene, shown: bool, ctx: &egui::Context) -> bool {
+    /// `shown`: the image that goes with the message (if it's there).
+    fn assistant_ask(
+        &mut self,
+        text: &str,
+        scene: crate::assistant::Scene,
+        shown: Option<PathBuf>,
+        ctx: &egui::Context,
+    ) -> bool {
         let text = text.trim();
-        if self.running || text.is_empty() {
+        let image = shown.filter(|image| image.exists());
+        if self.running || (text.is_empty() && image.is_none()) {
             return false;
         }
         let remote = crate::link::remote_chat().is_some();
@@ -2508,6 +2542,12 @@ impl LlmState {
         self.status = "Starting…".to_string();
         // (Back from stepping aside for a generation.)
         self.keep_loaded();
+        // Role playing was switched since its conversation began: the
+        // character (or the assistant) begins its own.
+        if self.assistant.in_character != self.roleplay.enabled {
+            self.assistant.in_character = self.roleplay.enabled;
+            self.assistant.chat = None;
+        }
         let index = match self.assistant.chat.and_then(|id| self.chats.iter().position(|c| c.id == id)) {
             Some(index) => index,
             None => {
@@ -2519,7 +2559,6 @@ impl LlmState {
                 self.chats.len() - 1
             }
         };
-        let image = scene.selected.clone().filter(|image| shown && image.exists());
         // (Whatever it says, it answers "Which model should I use?", if
         // that was asked: it isn't asked twice.)
         self.assistant.model_question = false;
@@ -2546,6 +2585,30 @@ impl LlmState {
         self.assistant.told_it_sees = false;
         self.assistant_reply(ctx);
         true
+    }
+
+    /// Role play's priming pair for the reply to the chat on screen
+    /// (`active_chat`): who the character is, with its diary, and its
+    /// acknowledgement. `thinking`: how long the reply may think.
+    fn roleplay_primer(&self, thinking: ThinkLevel) -> [CmdMsg; 2] {
+        // High / Max thinking lifts the role-play "think briefly" rule
+        // (the model that answers: a Link host's, when it runs there).
+        let thinks = if crate::link::remote_chat().is_some() {
+            crate::link::remote_chat_thinks()
+        } else {
+            self.model.thinks()
+        };
+        let deep = thinks && matches!(thinking, ThinkLevel::High | ThinkLevel::Max);
+        // The diary's room: a share of what the prompt may take once the
+        // reply (and the thought) has its room, as the worker reckons it.
+        // A diary too long for it brings what binds the character, what
+        // matters for what's being said, and the newest (roleplay::diary).
+        let reserve =
+            self.params.max_tokens + if thinks && thinking != ThinkLevel::Off { thinking.budget() + 192 } else { 0 };
+        let room = crate::roleplay::diary_room(CONTEXT_TOKENS.saturating_sub(reserve));
+        let said = memory_pass::said_now(&self.chats[self.active_chat]);
+        let primer = self.roleplay.preamble_with(&self.rp_memory, deep, &said, room);
+        [CmdMsg { user: true, text: primer, image: None }, CmdMsg { user: false, text: self.roleplay.ack(), image: None }]
     }
 
     /// Ask for the assistant's reply to its conversation as it stands (which
@@ -2776,13 +2839,30 @@ impl LlmState {
         // history — it never slides out of the window, so the character (and
         // everything in the diary) survives arbitrarily long sessions.
         let mut pinned = 0;
-        self.gen_roleplay = !assistant && !self.krea_prompts && self.roleplay.enabled;
+        // (The assistant plays the character too, with Role playing on: it
+        // has the Tools switch in its own card. Krea 2 prompts and Tag
+        // images are the chat's alone.)
+        self.gen_roleplay = if assistant { self.roleplay.enabled } else { !self.krea_prompts && self.roleplay.enabled };
         self.gen_krea = !assistant && self.krea_prompts;
         if assistant {
-            let brief = crate::assistant::brief(self.assistant.scene.can_generate);
-            msgs.insert(0, CmdMsg { user: false, text: crate::assistant::ACK.to_string(), image: None });
+            let character = self.gen_roleplay.then(|| (self.roleplay.ai_display(), self.roleplay.user_display()));
+            let ack = match character {
+                Some((ai, _)) => crate::assistant::ack_in_character(ai),
+                None => crate::assistant::ACK.to_string(),
+            };
+            let brief = crate::assistant::brief(self.assistant.scene.can_generate, character);
+            msgs.insert(0, CmdMsg { user: false, text: ack, image: None });
             msgs.insert(0, CmdMsg { user: true, text: brief, image: None });
             pinned = 2;
+            // In character: who it is goes first — the role play brief with
+            // its diary, as in AI Chat — and what it can do in the app after.
+            // (It thinks briefly here: see `thinking_at_most` below.)
+            if self.gen_roleplay {
+                let [primer, ack] = self.roleplay_primer(ThinkLevel::Low);
+                msgs.insert(0, ack);
+                msgs.insert(0, primer);
+                pinned = 4;
+            }
         } else if self.krea_prompts {
             // The Krea 2 brief is pinned the same way (the tools menu keeps
             // it and role play mutually exclusive) — for a model that thinks
@@ -2805,25 +2885,9 @@ impl LlmState {
                 pinned = 4;
             }
         } else if self.roleplay.enabled {
-            msgs.insert(0, CmdMsg { user: false, text: self.roleplay.ack(), image: None });
-            // High / Max thinking lifts the role-play "think briefly" rule
-            // (the model that answers: a Link host's, when it runs there).
-            let thinks = if crate::link::remote_chat().is_some() {
-                crate::link::remote_chat_thinks()
-            } else {
-                self.model.thinks()
-            };
-            let deep = thinks && matches!(self.params.thinking, ThinkLevel::High | ThinkLevel::Max);
-            // The diary's room: a share of what the prompt may take once the
-            // reply (and the thought) has its room, as the worker reckons it.
-            // A diary too long for it brings what binds the character, what
-            // matters for what's being said, and the newest (roleplay::diary).
-            let reserve = self.params.max_tokens
-                + if thinks && self.params.thinking != ThinkLevel::Off { self.params.thinking.budget() + 192 } else { 0 };
-            let room = crate::roleplay::diary_room(CONTEXT_TOKENS.saturating_sub(reserve));
-            let said = memory_pass::said_now(&self.chats[self.active_chat]);
-            let primer = self.roleplay.preamble_with(&self.rp_memory, deep, &said, room);
-            msgs.insert(0, CmdMsg { user: true, text: primer, image: None });
+            let [primer, ack] = self.roleplay_primer(self.params.thinking);
+            msgs.insert(0, ack);
+            msgs.insert(0, primer);
             pinned = 2;
         } else if self.tag_images {
             // The tagging brief: how to see the image and change its tags.
@@ -3034,6 +3098,20 @@ impl LlmState {
             return;
         }
         self.start_speaking(text, ctx);
+    }
+
+    /// A reply is being read aloud (or its voice is being made).
+    pub fn speaking_aloud(&mut self) -> bool {
+        self.voice.busy() || self.speaking()
+    }
+
+    /// Stop reading aloud — for the work assistant's card, which has no
+    /// Listen button on a reply to stop it with.
+    pub fn stop_speaking(&mut self) {
+        self.voice.stop();
+        if let Some(mut c) = self.tts.take() {
+            let _ = c.kill();
+        }
     }
 
     /// Start speaking `text`, replacing whatever was playing (used by the
@@ -5989,9 +6067,9 @@ mod assistant_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The assistant's replies are its own whatever the chat's modes are —
-    /// and the chat's are the chat's: a message sent in AI Chat afterwards
-    /// has nothing of the assistant's.
+    /// The assistant's replies are its own whatever Krea 2 prompts and web
+    /// research are set to in the chat — and the chat's are the chat's: a
+    /// message sent in AI Chat afterwards has nothing of the assistant's.
     #[test]
     fn the_chats_modes_are_not_the_assistants() {
         if !BUILT_WITH_LLM {
@@ -5999,21 +6077,20 @@ mod assistant_tests {
         }
         let ctx = egui::Context::default();
         let mut llm = app();
-        // Role play and looking things up, in the chat:
+        // Looking things up, in the chat:
         llm.web_research = true;
-        llm.roleplay.enabled = true;
         assert!(llm.wants_research());
         assert!(llm.assistant_send("hello", Scene { view: "Image details".into(), ..Default::default() }, &ctx));
         let first = &asked(&llm)[0];
         assert!(first.msgs[0].text.starts_with("[Work assistant]") && first.pinned == 2);
         assert!(!first.msgs[0].text.contains("GENERATE"), "nothing to generate with here");
         assert!(llm.gen_assistant && !llm.gen_roleplay && !llm.gen_research);
+        assert_eq!(llm.assistant_name(), "Assistant");
         // Busy: a second message waits.
         assert!(!llm.assistant_send("and?", Scene::default(), &ctx));
         answer(&mut llm, "Hi!");
         // Krea 2 prompts, in the chat:
         llm.web_research = false;
-        llm.roleplay.enabled = false;
         llm.krea_prompts = true;
         assert!(llm.assistant_send("and now?", Scene::default(), &ctx));
         assert!(asked(&llm).last().unwrap().msgs[0].text.starts_with("[Work assistant]"));
@@ -6030,9 +6107,134 @@ mod assistant_tests {
         assert!(llm.assistant.actions.is_empty() && llm.chats[0].msgs[1].text.contains("OPEN: gallery"));
 
         // With no model set up, it says so and sends nothing.
-        let mut bare = bare();
-        assert!(!bare.assistant_send("hello", Scene::default(), &ctx));
-        assert!(bare.run_err.is_some() && bare.assistant_chat().is_none() && asked(&bare).is_empty());
+        let mut none = bare();
+        assert!(!none.assistant_send("hello", Scene::default(), &ctx));
+        assert!(none.run_err.is_some() && none.assistant_chat().is_none() && asked(&none).is_empty());
+    }
+
+    /// A character for role play (kept, under test, in this test thread's
+    /// own temp file: `roleplay::store_path`).
+    fn mira() -> crate::roleplay::RoleplayState {
+        let _ = std::fs::remove_file(crate::roleplay::test_store_path());
+        crate::roleplay::RoleplayState { enabled: true, ai_name: "Mira".into(), user_name: "Andrew".into(), ..Default::default() }
+    }
+
+    /// With Role playing on, the assistant is the character: who it is goes
+    /// first — role play's own brief, with its diary — and what it can do
+    /// in the app after. What its reply ends with is acted on, the
+    /// character's lines and the app's alike, and neither shows.
+    #[test]
+    fn in_role_play_the_assistant_is_the_character() {
+        if !BUILT_WITH_LLM {
+            return;
+        }
+        let ctx = egui::Context::default();
+        let mut llm = app();
+        llm.roleplay = mira();
+        // (A model that thinks, set to think at length.)
+        llm.model = GemmaModel::D31B;
+        llm.params.thinking = ThinkLevel::Max;
+        assert_eq!(llm.assistant_name(), "Mira");
+        assert!(llm.assistant_send("Hello!", in_gallery(None), &ctx));
+        let first = &asked(&llm)[0];
+        assert_eq!(first.pinned, 4);
+        let pinned: Vec<&str> = first.msgs[..4].iter().map(|m| m.text.as_str()).collect();
+        assert!(pinned[0].starts_with("[Role play]") && pinned[0].contains("Mira") && pinned[0].contains("Andrew"));
+        assert_eq!(pinned[1], llm.roleplay.ack());
+        assert!(pinned[2].starts_with("[In the app]") && pinned[2].contains("you are Mira") && pinned[2].contains("`OPEN: <place>`"));
+        assert_eq!(pinned[3], "Understood — I'm here in the app with you, and still Mira.");
+        assert!(first.msgs.iter().all(|m| !m.text.contains("[Work assistant]")));
+        assert_eq!(first.msgs.iter().map(|m| m.user).collect::<Vec<_>>(), [true, false, true, false, true]);
+        assert!(first.msgs[4].text.contains("[App note — I am in the Gallery") && first.msgs[4].text.ends_with("Hello!"));
+        assert!(llm.gen_assistant && llm.gen_roleplay);
+        // (It thinks briefly here too, and is told to: the character's
+        // brief as the chat has it at Low, not as at Max, which lifts the
+        // rule.)
+        assert!(first.params.thinking == ThinkLevel::Low);
+        let (at_low, at_max) = (llm.roleplay_primer(ThinkLevel::Low), llm.roleplay_primer(ThinkLevel::Max));
+        assert!(pinned[0] == at_low[0].text && at_low[0].text != at_max[0].text);
+
+        answer(&mut llm, "Andrew! There you are.\nGOAL: Learn to sail with Andrew\nOPEN: gallery");
+        let reply = talk(&llm).last().unwrap();
+        assert_eq!(reply.text, "Andrew! There you are.");
+        assert!(reply.goals.len() == 1 && llm.roleplay.goals.len() == 1 && llm.roleplay.goals[0].text == "Learn to sail with Andrew");
+        assert_eq!(llm.take_assistant_actions(), [Action::Open(Place::Gallery)]);
+        let _ = std::fs::remove_file(crate::roleplay::test_store_path());
+    }
+
+    /// A conversation is the assistant's or the character's, never both:
+    /// with Role playing switched, the card is empty at once and the next
+    /// message begins another — the one before stays in the chat list.
+    #[test]
+    fn switching_role_play_begins_another_conversation() {
+        if !BUILT_WITH_LLM {
+            return;
+        }
+        let ctx = egui::Context::default();
+        let mut llm = app();
+        assert!(llm.assistant_send("about the xylophone", in_gallery(None), &ctx));
+        answer(&mut llm, "Go on.");
+        let plain = llm.assistant_chat().unwrap().id;
+
+        llm.roleplay = mira();
+        assert!(llm.assistant_chat().is_none(), "the character hasn't said a word yet");
+        assert!(llm.assistant_send("hi", in_gallery(None), &ctx));
+        let theirs = llm.assistant_chat().unwrap().id;
+        assert_ne!(theirs, plain);
+        let second = asked(&llm).last().unwrap();
+        assert!(second.pinned == 4 && second.msgs.len() == 5 && second.msgs.iter().all(|m| !m.text.contains("xylophone")));
+        answer(&mut llm, "Hi, Andrew.");
+        assert!(llm.chats.iter().any(|c| c.id == plain && c.msgs.len() == 2), "the first one is kept");
+
+        // The same message again goes on with it; switching back begins a
+        // third.
+        assert!(llm.assistant_send("still there?", in_gallery(None), &ctx));
+        assert!(llm.assistant_chat().unwrap().id == theirs && asked(&llm).last().unwrap().msgs.len() == 7);
+        answer(&mut llm, "Always.");
+        llm.roleplay.enabled = false;
+        assert!(llm.assistant_chat().is_none());
+        assert!(llm.assistant_send("and now?", in_gallery(None), &ctx));
+        let third = asked(&llm).last().unwrap();
+        assert!(third.pinned == 2 && third.msgs.len() == 3 && third.msgs[0].text.starts_with("[Work assistant]"));
+        assert!(![plain, theirs].contains(&llm.assistant_chat().unwrap().id));
+        answer(&mut llm, "Now it's me.");
+        let _ = std::fs::remove_file(crate::roleplay::test_store_path());
+    }
+
+    /// An image attached to a message (the send box's +) goes with it — it,
+    /// not the selected one, which stays unseen — and may go with no words
+    /// at all. A file that's gone doesn't.
+    #[test]
+    fn an_attached_image_goes_with_the_message() {
+        if !BUILT_WITH_LLM {
+            return;
+        }
+        let (dir, selected) = picture("attached");
+        let cat = dir.join("cat.png");
+        image::RgbImage::new(16, 16).save(&cat).unwrap();
+        let ctx = egui::Context::default();
+        let mut llm = app();
+        assert!(llm.assistant_send_with("What's this?", cat.clone(), in_gallery(Some(&selected)), &ctx));
+        assert!(llm.assistant.looking);
+        let newest = asked(&llm)[0].msgs.last().unwrap();
+        assert_eq!(newest.image.as_deref(), Some(cat.as_path()));
+        assert!(newest.text.contains("not shown to you. I attached the image, cat.png, to this message: you can see it now."), "{}", newest.text);
+        // Its opinion is of what it saw.
+        answer(&mut llm, "A cat.\nDISLIKE: too dark");
+        assert_eq!(llm.take_assistant_actions(), [Action::Verdict { image: cat.clone(), like: false }]);
+
+        assert!(llm.assistant_send_with("  ", cat.clone(), in_gallery(None), &ctx), "the image alone is a message");
+        let newest = asked(&llm).last().unwrap().msgs.last().unwrap();
+        assert!(newest.image.as_deref() == Some(cat.as_path()) && newest.text.trim_end().ends_with("you can see it now.]"));
+        assert_eq!(talk(&llm).last().unwrap().text, "");
+        answer(&mut llm, "The cat again.");
+
+        let gone = dir.join("gone.png");
+        assert!(!llm.assistant_send_with("  ", gone.clone(), in_gallery(None), &ctx), "nothing to send");
+        assert!(llm.assistant_send_with("hm", gone, in_gallery(None), &ctx));
+        assert!(asked(&llm).last().unwrap().msgs.last().unwrap().image.is_none() && !llm.assistant.looking);
+        answer(&mut llm, "Hm?");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

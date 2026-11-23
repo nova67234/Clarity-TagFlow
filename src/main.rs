@@ -1055,12 +1055,20 @@ impl ViewerApp {
             Some(path) => here.push_str(&format!(" · {}", ai_tagging::file_name(path))),
             None => here.push_str(" · no image selected"),
         }
-        match assistant::card::show(ctx, &mut self.assistant, &mut self.llm, &here, scene.can_generate) {
-            Some(ask @ (assistant::card::Ask::Send(_) | assistant::card::Ask::Show(_))) => {
-                let (text, shown) = match ask {
-                    assistant::card::Ask::Show(text) => (text, true),
-                    assistant::card::Ask::Send(text) => (text, false),
-                    assistant::card::Ask::Stop => unreachable!("matched above"),
+        use assistant::card::Ask;
+        let ask = assistant::card::show(ctx, &mut self.assistant, &mut self.llm, &mut self.settings, &here, scene.can_generate);
+        // Its Tools menu's gear opens AI Settings (the character's persona
+        // and traits): drawn here, as AI Chat draws it for its own.
+        ai_settings::window(ctx, &mut self.llm, &mut self.settings);
+        match ask {
+            Some(ask @ (Ask::Send(_) | Ask::Show(_) | Ask::With(..))) => {
+                // What goes with the message: nothing, the selected image
+                // (asked to look at it), or a file the user attached.
+                let (text, shown, attached) = match ask {
+                    Ask::Show(text) => (text, true, None),
+                    Ask::With(text, image) => (text, false, Some(image)),
+                    Ask::Send(text) => (text, false, None),
+                    Ask::Stop | Ask::Quiet => unreachable!("matched above"),
                 };
                 let mut scene = self.assistant_scene(true);
                 let pick = self.choose_model(&mut scene, &text);
@@ -1073,7 +1081,9 @@ impl ViewerApp {
                     && !self.right_state.generating();
                 #[cfg(not(target_os = "macos"))]
                 llm::image_model_steps_aside(turns);
-                let sent = if shown {
+                let sent = if let Some(image) = attached {
+                    self.llm.assistant_send_with(&text, image, scene, ctx)
+                } else if shown {
                     self.llm.assistant_send_shown(&text, scene, ctx)
                 } else {
                     self.llm.assistant_send(&text, scene, ctx)
@@ -1087,7 +1097,8 @@ impl ViewerApp {
                     llm::image_model_steps_aside(false);
                 }
             }
-            Some(assistant::card::Ask::Stop) => self.llm.stop_generation(),
+            Some(Ask::Stop) => self.llm.stop_generation(),
+            Some(Ask::Quiet) => self.llm.stop_speaking(),
             None => {}
         }
         for action in self.llm.take_assistant_actions() {

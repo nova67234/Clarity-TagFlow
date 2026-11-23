@@ -382,7 +382,7 @@ impl RoleplayState {
         if n.is_empty() { "the AI" } else { n }
     }
 
-    fn user_display(&self) -> &str {
+    pub(crate) fn user_display(&self) -> &str {
         let n = self.user_name.trim();
         if n.is_empty() { "the user" } else { n }
     }
