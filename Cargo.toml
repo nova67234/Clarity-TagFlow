@@ -1,6 +1,6 @@
 [package]
 name = "Clarity_TagFlow"
-version = "6.2.14-alpha"
+version = "6.2.15-alpha"
 edition = "2024"
 license = "MIT"
 
